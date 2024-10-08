@@ -8,8 +8,9 @@ readme = "README.md"
 [tool.poetry.dependencies]
 python = "^3.12"
 langchain = "^0.2.5"
-torchvision = {version = "^0.18.1+cu121", source = "torch"}
-torchaudio = {version = "^2.3.1+cu121", source = "torch"}
+torch = {version = "^2.4.0+cu121", source = "torch"}
+torchvision = {version = "^0.19.0+cu121", source = "torch"}
+torchaudio = {version = "^2.4.0+cu121", source = "torch"}
 # jax = {extras = ["cuda11"], version = "^0.4.30" }
 transformers = { git="https://github.com/huggingface/transformers.git" }
 faiss-cpu = "^1.8.0.post1"
