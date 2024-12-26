@@ -24,16 +24,16 @@ deepspeed_config = "ds_config.json"
 os.environ["WANDB_PROJECT"]=f"{model_id.split('/')[1]}-{rlhf_method}"
 
 # save your trained model checkpoint to wandb
-os.environ["WANDB_LOG_MODEL"]="checkpoint"
+# os.environ["WANDB_LOG_MODEL"]="checkpoint"
 
 # turn off watch to log faster
 os.environ["WANDB_WATCH"]="0"
 
 # model_id = "microsoft/Phi-3.5-mini-instruct"
-max_seq_len = 4096
+max_seq_len = 8192 * 2
 batch_per_device = 1
 max_epochs = 10
-lr = 3e-5 # default 1e-6
+lr = 3e-7 # default 1e-6
 
 print(f'''
 --------------------
@@ -47,19 +47,21 @@ model = AutoModelForCausalLM.from_pretrained(
         torch_dtype=torch.float16,
         trust_remote_code=True,
         quantization_config=BitsAndBytesConfig(
-            load_in_4bit=True,
+            load_in_4bit=False,
             load_in_8bit=False,
             llm_int8_threshold=6.0,
             llm_int8_has_fp16_weight=True,
             bnb_4bit_quant_type="nf4",
             bnb_4bit_compute_dtype=torch.float16,
-            bnb_4bit_quant_storage=torch.uint8,
+            bnb_4bit_quant_storage=torch.float16,
             bnb_4bit_use_double_quant=True,
         ),
         device_map={
             "": PartialState().process_index
             # "": torch.cuda.current_device()
         },
+        rope_scaling_factor=2.0,
+        rope_theta=250000,
         low_cpu_mem_usage=True,
         use_flash_attention_2=False,
         attn_implementation="eager",
@@ -100,8 +102,8 @@ peft_config = LoraConfig( # Lora 설정 정의
     use_mora=True,  # Mora Config
     mora_type=6,
     target_modules=lora_targets,
-    r=1024,
-    lora_alpha=32,
+    r=1024, # if mora, r should be fitted with size of model
+    lora_alpha=16,
     lora_dropout=0.05,
     bias="none",
     # init_lora_weights="gaussian",
@@ -133,11 +135,9 @@ match rlhf_method:
     case "DPO":
         # DPO 설정 정의
         dpo_config = DPOConfig(
-            beta=0.1,
+            beta=0.01,
             # loss_type="ipo",
-            # max_prompt_length=256,
-            max_steps=1000,
-            max_target_length=max_seq_len,
+            # max_steps=1000,
             max_length=max_seq_len,
             learning_rate=lr,
             num_train_epochs=max_epochs,
@@ -149,18 +149,18 @@ match rlhf_method:
             # fp16_full_eval=True,
             # bf16_full_eval=False,
             output_dir="dpo_output",
-            # optim="paged_adamw_8bit", # paged_adamw_8bit adamw_bnb_8bit adamw_8bit adamw_hf
+            optim="paged_adamw_8bit", # paged_adamw_8bit adamw_bnb_8bit adamw_8bit adamw_hf
+            gradient_checkpointing=True,
             logging_steps=100,
-            gradient_accumulation_steps=16,
+            warmup_steps=100,
+            gradient_accumulation_steps=64,
             generate_during_eval=True,
-            dataset_num_proc=8,
+            dataset_num_proc=1,
             report_to="wandb",
-            deepspeed=deepspeed_config,
+            # deepspeed=deepspeed_config,
             use_legacy_prediction_loop=True,
             per_device_eval_batch_size=batch_per_device,
             per_device_train_batch_size=batch_per_device,
-            per_gpu_eval_batch_size=batch_per_device,
-            per_gpu_train_batch_size=batch_per_device,
             lr_scheduler_type="cosine_with_restarts",  #linear, polynomial, reduce_on_plateau, cosine_with_restarts
         )
 
@@ -186,39 +186,40 @@ match rlhf_method:
             # processing_class=tokenizer,
             peft_config=peft_config,
             # optimizers=(bnb.optim.PagedAdamW, {"lr": 3e-5}),
-            callbacks=[TrainerDebugCallback(model=model, tokenizer=tokenizer)]  # 여러 콜백을 리스트로 전달 가능
+            callbacks=[TrainerDebugCallback()]  # 여러 콜백을 리스트로 전달 가능
         )
 
     case "SIMPO":
         # CPO 설정 정의
         cpo_config = CPOConfig(
-            beta=0.1,
+            beta=10.0,
             loss_type="simpo", # SimPO Loss
-            cpo_alpha=0.5, # SimPO 학습시 0 으로, CPO-SimPO 학습시 0 이상으로 설정
-            # max_prompt_length=256,
-            max_steps=1000,
+            simpo_gamma=0.5,
+            cpo_alpha=0.0, # SimPO 학습시 0 으로, CPO-SimPO 학습시 0 이상으로 설정
+            # max_steps=1000,
             learning_rate=lr,
-            num_train_epochs=max_epochs,            
+            num_train_epochs=max_epochs,
           # trainer options 
-            max_length=max_seq_len,
+            # max_length=max_seq_len,
             fp16=True,
             bf16=False,
             tf32=False,
+            eval_strategy="steps",
             # fp16_full_eval=True,
             # bf16_full_eval=False,
             output_dir="cpo_output",
-            # optim="paged_adamw_8bit", # paged_adamw_8bit adamw_bnb_8bit adamw_8bit adamw_hf
+            optim="paged_adamw_8bit", # paged_adamw_8bit adamw_bnb_8bit adamw_8bit adamw_hf
+            gradient_checkpointing=True,
             logging_steps=100,
-            gradient_accumulation_steps=16,
+            warmup_steps=100,
+            gradient_accumulation_steps=64,
             generate_during_eval=True,
-            dataset_num_proc=8,
+            dataset_num_proc=1,
             report_to="wandb",
-            deepspeed=deepspeed_config,
-            use_legacy_prediction_loop=True,
-            per_device_eval_batch_size=batch_per_device,
+            # deepspeed=deepspeed_config,
+            use_legacy_prediction_loop=False,
+            per_device_eval_batch_size= batch_per_device,
             per_device_train_batch_size=batch_per_device,
-            per_gpu_eval_batch_size=batch_per_device,
-            per_gpu_train_batch_size=batch_per_device,
             lr_scheduler_type="cosine_with_restarts",  #linear, polynomial, reduce_on_plateau, cosine_with_restarts
         )
 
@@ -244,7 +245,7 @@ match rlhf_method:
             processing_class=tokenizer,
             peft_config=peft_config,
             # optimizers=(bnb.optim.PagedAdamW, {"lr": 3e-5}),
-            callbacks=[TrainerDebugCallback(model=model, tokenizer=tokenizer)]  # 여러 콜백을 리스트로 전달 가능
+            callbacks=[TrainerDebugCallback()]  # 여러 콜백을 리스트로 전달 가능
         )
 
 

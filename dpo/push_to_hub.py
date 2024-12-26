@@ -4,12 +4,12 @@ from huggingface_hub import HfApi, HfFolder
 import torch
 
 # Load the base model and tokenizer
-model_name = "Gunulhona/Gemma-Ko-Merge"
+model_name = "AIChenKai/TinyLlama-1.1B-Chat-v1.0-x2-MoE"
 model = AutoModelForCausalLM.from_pretrained(model_name)
 
 
 # Load the PEFT model
-peft_model_path = "/home/conan/workspace/llama3_finetuning/dpo/dpo_output/checkpoint-57500"
+peft_model_path = "/home/work/conan/llama3_finetuning/dpo/cpo_output/checkpoint-14000"
 peft_model = PeftModel.from_pretrained(
     model=model, 
     model_id=peft_model_path, 
