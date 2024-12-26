@@ -60,7 +60,10 @@ model = AutoModelForCausalLM.from_pretrained(
             "": PartialState().process_index
             # "": torch.cuda.current_device()
         },
-        rope_scaling_factor=2.0,
+        rope_scaling={
+            "type": "dynamic",
+            "factor": 8
+            },
         rope_theta=250000,
         low_cpu_mem_usage=True,
         use_flash_attention_2=False,
