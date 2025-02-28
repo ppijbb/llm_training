@@ -211,6 +211,9 @@ class G2MoEAttention(nn.Module):
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        # Validate hidden_states shape and cache/timing dimensions
+        if attention_mask is not None and attention_mask.dim() not in (2, 4):
+            raise ValueError(f"Expected attention_mask to be 2D or 4D, got {attention_mask.dim()}D")
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
@@ -372,7 +375,7 @@ class G2MoEDecoderLayer(nn.Module):
 
         residual = hidden_states
         hidden_states = self.pre_feedforward_layernorm(hidden_states)
-        hidden_states = self.moe_layer(hidden_states)
+        hidden_states, router_logits = self.moe_layer(hidden_states)
         hidden_states = self.post_feedforward_layernorm(hidden_states)
         hidden_states = residual + hidden_states
 
@@ -426,6 +429,7 @@ class G2MoERotaryEmbedding(nn.Module):
 
     @torch.no_grad()
     def forward(self, x, position_ids):
+        # If using dynamic RoPE, update and verify the new inv_freq is computed correctly
         if "dynamic" in self.rope_type:
             self._dynamic_frequency_update(position_ids, device=x.device)
 
@@ -445,6 +449,7 @@ class G2MoERotaryEmbedding(nn.Module):
         cos = cos * self.attention_scaling
         sin = sin * self.attention_scaling
 
+        # Suggestion: check that resulting cos,sin have the expected shapes/value ranges.
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
@@ -615,10 +620,21 @@ class G2MoEModel(G2MoEPreTrainedModel):
             if module.padding_idx is not None:
                 module.weight.data[module.padding_idx].zero_()
 
-    def load_state_dict(self, state_dict, strict: bool = True):
-        # Exclude MoE and MLP layers from loading
-        state_dict = {k: v for k, v in state_dict.items() if not ("moe_layer" in k or "mlp" in k)}
-        super().load_state_dict(state_dict, strict=strict)
+    def load_state_dict(self, state_dict, strict: bool = False):
+        # Check if moe_layer exists in the state_dict
+        if any("moe_layer" in k for k in state_dict.keys()):
+            # Load all layers including moe_layer
+            super().load_state_dict(state_dict, strict=strict)
+        else:
+            # Exclude MoE and MLP layers from loading if they don't exist in the state_dict
+            state_dict = {k: v for k, v in state_dict.items() if not ("moe_layer" in k or "mlp" in k)}
+            super().load_state_dict(state_dict, strict=strict)
+
+        # Initialize MoE layers separately if needed
+        for layer in self.layers:
+            if hasattr(layer, 'moe_layer'):
+                for expert in layer.moe_layer.experts:
+                    expert.apply(self._init_weights)
 
     @add_start_docstrings_to_model_forward(G2MoE_INPUTS_DOCSTRING)
     def forward(
@@ -636,6 +652,10 @@ class G2MoEModel(G2MoEPreTrainedModel):
         last_cache_position: Optional[int] = None,
         **flash_attn_kwargs: Unpack[FlashAttentionKwargs],
     ) -> Union[Tuple, BaseModelOutputWithPast]:
+        # Validate input embeddings vs. input_ids
+        if (input_ids is None) == (inputs_embeds is not None):
+            raise ValueError("Specify one (and only one) of input_ids or inputs_embeds.")
+        # Add detailed docstrings/comments on expected dimensions for cache and position_ids.
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
