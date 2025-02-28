@@ -2,7 +2,7 @@ CUDA_VISIBLE_DEVICES="0,1,2,3"
 CUDA_LAUNCH_BLOCKING=1
 PYTORCH_CUDA_ALLOC_CONF='expandable_segments:False'
 TORCH_USE_CUDA_DSA=1
-HF_DATASETS_CACHE="/home/conan/.cache/huggingface/datasets"
+HF_DATASETS_CACHE="/nas/conan/hf/datasets"
 NCCL_P2P_DISABLE=1
 NCCL_IB_DISABLE=1
 

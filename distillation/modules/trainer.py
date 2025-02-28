@@ -19,10 +19,17 @@ class DistillationModel(pl.LightningModule):
         
         # Weight for distillation loss
         self.alpha = 0.5
+        self.temperature = 2.0  # You can adjust this temperature
+
             
     def train_loss(self, distillation_loss, classification_loss):
         return self.alpha * distillation_loss + (1 - self.alpha) * classification_loss
-        
+    
+    def distillation_loss(self, student_output, teacher_output):
+        return self.loss_fn(
+            nn.functional.log_softmax(student_output / self.temperature, dim=-1),
+            nn.functional.softmax(teacher_output / self.temperature, dim=-1)
+        ) * (self.temperature ** 2)
 
     def forward(self, x):
         return self.student_model(x)
@@ -36,16 +43,12 @@ class DistillationModel(pl.LightningModule):
             teacher_output = self.teacher_model(data)
         
         # Calculate distillation loss
-        temperature = 2.0  # You can adjust this temperature
-        distillation_loss = self.loss_fn(
-            nn.functional.log_softmax(student_output / temperature, dim=-1),
-            nn.functional.softmax(teacher_output / temperature, dim=-1)
-        ) * (temperature ** 2)
         
         # Calculate standard classification loss
         classification_loss = self.classification_loss(student_output, targets)
         
         # Combine the losses
+        distillation_loss = self.distillation_loss(student_output, teacher_output)
         
         train_loss = self._train_loss(distillation_loss, classification_loss)
         

@@ -5,7 +5,7 @@ import random
 import torch
 from datasets import load_dataset
 from transformers import AutoTokenizer, TrainingArguments
-from trl.commands.cli_utils import  TrlParser
+from trl import TrlParser
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
