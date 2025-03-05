@@ -321,8 +321,7 @@ class G2MoEMoeLayer(nn.Module):
             expert_output = expert(hidden_states) * expert_mask
             final_hidden_states += expert_output
 
-        return final_hidden_states.view(batch_size, sequence_length, hidden_dim)
-
+        return final_hidden_states.view(batch_size, sequence_length, hidden_dim), router_logits
 
 class G2MoEDecoderLayer(nn.Module):
     def __init__(self, config: G2MoEConfig, layer_idx: int):
