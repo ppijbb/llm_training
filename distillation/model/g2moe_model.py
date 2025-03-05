@@ -708,7 +708,8 @@ class G2MoEModel(G2MoEPreTrainedModel):
         **flash_attn_kwargs: Unpack[FlashAttentionKwargs],
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         # Validate input embeddings vs. input_ids
-        if (input_ids is None) == (inputs_embeds is not None):
+        if (input_ids is None) == (inputs_embeds is None):
+            print(input_ids is None, inputs_embeds is None)
             print(712, input_ids, inputs_embeds)
             raise ValueError("Specify one (and only one) of input_ids or inputs_embeds.")
         # Add detailed docstrings/comments on expected dimensions for cache and position_ids.
@@ -1022,7 +1023,7 @@ class G2MoEForCausalLM(G2MoEPreTrainedModel, GenerationMixin):
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
-            inputs_embeds=None if inputs_embeds is None else inputs_embeds,
+            inputs_embeds=inputs_embeds,
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
