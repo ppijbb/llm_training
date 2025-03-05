@@ -99,7 +99,7 @@ class G2MoEConfig(PretrainedConfig):
         num_hidden_layers=26,
         num_attention_heads=8,
         num_key_value_heads=4,
-        num_local_experts=8,
+        num_local_experts=5,
         num_experts_per_tok=1,
         head_dim=256,
         hidden_activation="gelu_pytorch_tanh",
