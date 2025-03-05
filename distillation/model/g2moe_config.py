@@ -99,6 +99,8 @@ class G2MoEConfig(PretrainedConfig):
         num_hidden_layers=26,
         num_attention_heads=8,
         num_key_value_heads=4,
+        num_local_experts=8,
+        num_experts_per_tok=1,
         head_dim=256,
         hidden_activation="gelu_pytorch_tanh",
         max_position_embeddings=8192,
@@ -132,6 +134,8 @@ class G2MoEConfig(PretrainedConfig):
         self.intermediate_size = intermediate_size
         self.num_hidden_layers = num_hidden_layers
         self.num_attention_heads = num_attention_heads
+        self.num_local_experts = num_local_experts
+        self.num_experts_per_tok = num_experts_per_tok
         self.head_dim = head_dim
         self.num_key_value_heads = num_key_value_heads
         self.initializer_range = initializer_range

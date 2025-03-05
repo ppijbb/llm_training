@@ -192,7 +192,7 @@ isoduration==20.11.0
 isort==6.0.0
 itsdangerous==2.2.0
 jaraco.classes==3.4.0
-jaxlib==0.5.1
+jaxlib==0.4.28
 jedi==0.17.2
 jeepney==0.8.0
 Jinja2==3.1.5
@@ -518,7 +518,7 @@ tqdm==4.67.1
 traitlets==5.14.3
 transformer_engine==1.13.0
 transformer_engine_cu12==1.13.0
-transformers @ git+https://github.com/huggingface/transformers.git@33eef992503689ba1af98090e26d3e98865b2a9b
+transformers @ git+https://github.com/huggingface/transformers.git
 triton==3.2.0
 trl==0.15.2
 trove-classifiers==2025.2.18.16
