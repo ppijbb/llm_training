@@ -2,21 +2,22 @@ import torch
 
 import torch.nn as nn
 import torch.optim as optim
+from transformers import Phi3ForCausalLM, AutoTokenizer
 
 class TeacherModel(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim):
+    def __init__(self,):
         super(TeacherModel, self).__init__()
-        self.fc1 = nn.Linear(input_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.relu = nn.ReLU()
-        self.fc3 = nn.Linear(hidden_dim, output_dim)
-    
+        self.teacher_name = "microsoft/phi-4"
+        self.teacher = Phi3ForCausalLM.from_pretrained(
+            self.teacher_name
+        )
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            self.teacher_name
+        )
+        
+    @torch.inference_mode
     def forward(self, x):
-        out = self.fc1(x)
-        out = self.fc2(out)
-        out = self.relu(out)
-        out = self.fc3(out)
-        return out
+        return self.teacher(x)
 
 def train_teacher_model(model, dataloader, criterion, optimizer, num_epochs):
     model.train()
@@ -34,3 +35,6 @@ def train_teacher_model(model, dataloader, criterion, optimizer, num_epochs):
 # criterion = nn.CrossEntropyLoss()
 # optimizer = optim.Adam(model.parameters(), lr=0.001)
 # train_teacher_model(model, dataloader, criterion, optimizer, num_epochs=20)
+
+test = TeacherModel()
+print(test.teacher.config)
