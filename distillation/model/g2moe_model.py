@@ -527,6 +527,7 @@ class G2MoEDecoderLayer(nn.Module):
         self.is_sliding = not bool(layer_idx % 2)
         self.self_attn = G2MoEAttention(config=config, layer_idx=layer_idx)
         self.moe_layer = G2MoEMoeLayer(config)
+        self.mlp = G2MoEMLP(config)
         self.input_layernorm = G2MoERMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = G2MoERMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
