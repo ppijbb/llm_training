@@ -105,6 +105,13 @@ lora_targets=[
 # 참조 모델 불러오기 (필요에 따라 수정)
 # ref_model = model
 
+print(f'Training Model size : {format_parameters(model.num_parameters())}')
+print(
+    tokenizer.decode(
+        model.generate(**tokenizer(
+            "<start_of_turn>user\nHello, World!<end_of_turn>\n\n<start_of_turn>model\n", 
+            return_tensors="pt"))[0].to('cpu')
+    ))
 
 # Lora를 기본 모델에 적용
 peft_config = LoraConfig( # Lora 설정 정의
@@ -267,5 +274,4 @@ match rlhf_method:
 # DPO를 사용하여 모델 학습
 if __name__ == "__main__":
     # with torch.autocast("cuda"): 
-        print(f'Training Model size : {format_parameters(model.num_parameters())}')
         rlhf_trainer.train(resume_from_checkpoint=True)

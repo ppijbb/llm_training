@@ -19,11 +19,15 @@ print(test_model)
     
 print(format_parameters(test_model.num_parameters()))
 test_input = tokenizer(
-        text="this is the test text message.",
+        text="this is the test text message. i am a",
         return_tensors="pt",
     )["input_ids"]
 print(test_input)
-print(test_model(
-    input_ids=test_input,
-    inputs_embeds=None,
-))
+print(
+    tokenizer.batch_decode(
+        test_model.generate(
+            input_ids=test_input,
+            inputs_embeds=None,
+            )
+        )
+    )

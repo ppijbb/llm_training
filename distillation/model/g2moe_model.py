@@ -44,7 +44,7 @@ from transformers.integrations.flash_attention import flash_attention_forward
 from transformers.integrations.flex_attention import flex_attention_forward
 from transformers.integrations.sdpa_attention import sdpa_attention_forward
 from transformers.utils.deprecation import deprecate_kwarg
-from .g2moe_config import G2MoEConfig
+from g2moe_config import G2MoEConfig
 
 from transformers.utils.import_utils import is_torch_fx_available
 
