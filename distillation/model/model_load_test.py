@@ -2,7 +2,7 @@ import torch
 from g2moe_config import G2MoEConfig
 from g2moe_model import G2MoEForCausalLM
 from transformers import AutoTokenizer
-# from transformers import Gemma3Model
+from transformers.models.gemma3 import Gemma3ForCausalLM
 
 def format_parameters(number):
     if number >= 1_000_000_000:
@@ -24,13 +24,16 @@ test_input = tokenizer(
         text="this is the test text message. i am a",
         return_tensors="pt",
     )["input_ids"]
-print(test_input)
+
+print(test_model.config)
+
 with torch.inference_mode():
     print(
         tokenizer.batch_decode(
             test_model.generate(
                 input_ids=test_input.to(test_model.device),
                 # inputs_embeds=None,
+                top_k=1
                 )
             )
         )
