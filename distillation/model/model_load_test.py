@@ -1,6 +1,8 @@
+import torch
 from g2moe_config import G2MoEConfig
 from g2moe_model import G2MoEForCausalLM
 from transformers import AutoTokenizer
+# from transformers import Gemma3Model
 
 def format_parameters(number):
     if number >= 1_000_000_000:
@@ -13,7 +15,7 @@ def format_parameters(number):
 
 test_model = G2MoEForCausalLM.from_pretrained(
     pretrained_model_name_or_path="google/gemma-2-2b-it",
-    )
+    ).to("cuda:0")
 tokenizer = AutoTokenizer.from_pretrained("google/gemma-2-2b-it")
 print(test_model)
     
@@ -23,11 +25,12 @@ test_input = tokenizer(
         return_tensors="pt",
     )["input_ids"]
 print(test_input)
-print(
-    tokenizer.batch_decode(
-        test_model.generate(
-            input_ids=test_input,
-            inputs_embeds=None,
+with torch.inference_mode():
+    print(
+        tokenizer.batch_decode(
+            test_model.generate(
+                input_ids=test_input.to(test_model.device),
+                # inputs_embeds=None,
+                )
             )
         )
-    )
