@@ -21,7 +21,7 @@ print(test_model)
     
 print(format_parameters(test_model.num_parameters()))
 test_input = tokenizer(
-        text="this is the test text message. i am a",
+        text="<start_of_turn>user\nthis is the test text message. now you must instruct the model to generate a response to this message.<end_of_turn>\n<start_of_turn>model\n",
         return_tensors="pt",
     )["input_ids"]
 
@@ -33,7 +33,6 @@ with torch.inference_mode():
             test_model.generate(
                 input_ids=test_input.to(test_model.device),
                 # inputs_embeds=None,
-                top_k=1
                 )
             )
         )
