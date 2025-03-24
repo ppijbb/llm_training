@@ -906,8 +906,6 @@ class G2MoEModel(G2MoEPreTrainedModel):
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         # Validate input embeddings vs. input_ids
         if (input_ids is None) == (inputs_embeds is None):
-            print(input_ids is None, inputs_embeds is None)
-            print(712, input_ids, inputs_embeds)
             raise ValueError("Specify one (and only one) of input_ids or inputs_embeds.")
         # Add detailed docstrings/comments on expected dimensions for cache and position_ids.
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -1215,7 +1213,6 @@ class G2MoEForCausalLM(G2MoEPreTrainedModel, GenerationMixin):
         >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
         "What is your favorite condiment?"
         ```"""
-        print(input_ids, inputs_embeds)
         if self.training and self.config._attn_implementation != "eager":
             logger.warning_once(
                 "It is strongly recommended to train G2MoE models with the `eager` attention implementation "
