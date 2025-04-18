@@ -27,24 +27,24 @@ from typing import List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 
-from ...activations import ACT2FN
-from ...cache_utils import Cache, HybridCache, StaticCache
-from ...generation import GenerationMixin
-from ...modeling_flash_attention_utils import FlashAttentionKwargs
-from ...modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast, ModelOutput
-from ...modeling_rope_utils import ROPE_INIT_FUNCTIONS
-from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
-from ...processing_utils import Unpack
-from ...utils import (
+from transformers.activations import ACT2FN
+from transformers.cache_utils import Cache, HybridCache, StaticCache
+from transformers.generation import GenerationMixin
+from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
+from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast, ModelOutput
+from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
+from transformers.processing_utils import Unpack
+from transformers.utils import (
     add_start_docstrings,
     add_start_docstrings_to_model_forward,
     is_torchdynamo_compiling,
     logging,
     replace_return_docstrings,
 )
-from ...utils.deprecation import deprecate_kwarg
-from ..auto import AutoModel, AutoModelForCausalLM
-from .configuration_gemma3 import Gemma3Config, Gemma3TextConfig
+from transformers.utils.deprecation import deprecate_kwarg
+from transformers import AutoModel, AutoModelForCausalLM
+from g3moe_config import Gemma3Config, Gemma3TextConfig
 
 
 logger = logging.get_logger(__name__)

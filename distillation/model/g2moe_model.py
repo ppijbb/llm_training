@@ -842,49 +842,44 @@ class G2MoEModel(G2MoEPreTrainedModel):
         has_moe_layers = any("moe_layer" in k for k in state_dict.keys())
         
         if not has_moe_layers:
-            # Warn the user that we're converting FFN to MoE
             logging.get_logger("transformers").warning(
                 "The pretrained model does not have MoE layers. "
                 "Converting FFN layers to MoE layers by replicating them for each expert."
             )
-            
-            # Extract MLP keys for later use
-            mlp_keys = [k for k in state_dict.keys() if "mlp" in k]
-            
-            # Exclude MoE and MLP layers from loading
-            filtered_state_dict = {k: v for k, v in state_dict.items() if not ("moe_layer" in k or "mlp" in k)}
-            super().load_state_dict(filtered_state_dict, strict=False)
-            
-            # Initialize MoE layers by replicating FFN weights
             for i, layer in enumerate(self.layers):
                 if hasattr(layer, 'moe_layer'):
-                    # Find corresponding MLP weights in the original state dict
                     mlp_prefix = f"layers.{i}.mlp"
-                    layer_mlp_keys = [k for k in mlp_keys if k.startswith(mlp_prefix)]
-                    
-                    if layer_mlp_keys:
-                        # For each expert, copy the weights from the FFN
-                        for expert_idx, expert in enumerate(layer.moe_layer.experts):
-                            for mlp_key in layer_mlp_keys:
-                                # Map MLP keys to expert keys
-                                if "gate_proj" in mlp_key:
-                                    expert.gate_proj.weight.data.copy_(state_dict[mlp_key])
-                                elif "up_proj" in mlp_key:
-                                    expert.up_proj.weight.data.copy_(state_dict[mlp_key])
-                                elif "down_proj" in mlp_key:
-                                    expert.down_proj.weight.data.copy_(state_dict[mlp_key])
-                    else:
-                        # If no corresponding MLP weights found, initialize with random weights
-                        for expert in layer.moe_layer.experts:
-                            expert.apply(self._init_weights)
-                    
-                    # Initialize the router weights
+                    gate_proj_key = f"{mlp_prefix}.gate_proj.weight"
+                    up_proj_key = f"{mlp_prefix}.up_proj.weight"
+                    down_proj_key = f"{mlp_prefix}.down_proj.weight"
+                    print(f"[DEBUG] Layer {i} - gate_proj_key: {gate_proj_key} exists: {gate_proj_key in state_dict}")
+                    print(f"[DEBUG] Layer {i} - up_proj_key: {up_proj_key} exists: {up_proj_key in state_dict}")
+                    print(f"[DEBUG] Layer {i} - down_proj_key: {down_proj_key} exists: {down_proj_key in state_dict}")
+                    for expert in layer.moe_layer.experts:
+                        if gate_proj_key in state_dict:
+                            expert.gate_proj.weight.data.copy_(state_dict[gate_proj_key])
+                            if not torch.allclose(expert.gate_proj.weight.data, state_dict[gate_proj_key]):
+                                print(f"[WARNING] gate_proj weight copy failed for layer {i}")
+                        else:
+                            print(f"[WARNING] {gate_proj_key} not found in state_dict!")
+                        if up_proj_key in state_dict:
+                            expert.up_proj.weight.data.copy_(state_dict[up_proj_key])
+                            if not torch.allclose(expert.up_proj.weight.data, state_dict[up_proj_key]):
+                                print(f"[WARNING] up_proj weight copy failed for layer {i}")
+                        else:
+                            print(f"[WARNING] {up_proj_key} not found in state_dict!")
+                        if down_proj_key in state_dict:
+                            expert.down_proj.weight.data.copy_(state_dict[down_proj_key])
+                            if not torch.allclose(expert.down_proj.weight.data, state_dict[down_proj_key]):
+                                print(f"[WARNING] down_proj weight copy failed for layer {i}")
+                        else:
+                            print(f"[WARNING] {down_proj_key} not found in state_dict!")
                     nn.init.zeros_(layer.moe_layer.gate.weight)
-                    # Set diagonal elements to a small positive value to initially route tokens evenly
                     for j in range(min(layer.moe_layer.gate.weight.size(0), layer.moe_layer.gate.weight.size(1))):
                         layer.moe_layer.gate.weight[j, j] = 0.1
+            filtered_state_dict = {k: v for k, v in state_dict.items() if not ("moe_layer" in k or "mlp" in k)}
+            super().load_state_dict(filtered_state_dict, strict=False)
         else:
-            # Load all layers including moe_layer
             super().load_state_dict(state_dict, strict=strict)
 
     @add_start_docstrings_to_model_forward(G2MoE_INPUTS_DOCSTRING)
