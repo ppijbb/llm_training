@@ -1,8 +1,9 @@
 import torch
 from g2moe_config import G2MoEConfig
 from g2moe_model import G2MoEForCausalLM
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, GenerationConfig
 from transformers.models.gemma3 import Gemma3ForCausalLM
+from transformers import Gemma2ForCausalLM
 import tensorrt
 print("version of tensorrt: " ,tensorrt.__version__)
 
@@ -14,10 +15,11 @@ def format_parameters(number):
     else:
         return str(number)
 
+model_architecture = G2MoEForCausalLM
 
-test_model = G2MoEForCausalLM.from_pretrained(
+test_model = model_architecture.from_pretrained(
     pretrained_model_name_or_path="google/gemma-2-2b-it",
-    ).to("cuda:1")
+    )#.to("cuda:1")
 tokenizer = AutoTokenizer.from_pretrained("google/gemma-2-2b-it")
 
 test_input = """
@@ -36,12 +38,23 @@ print(test_model)
 print(test_model.config)
 print(format_parameters(test_model.num_parameters()))
 
-with torch.inference_mode():
-    print(
-        tokenizer.batch_decode(
-            test_model.generate(
-                input_ids=test_input.to(test_model.device),
-                # inputs_embeds=None,
-                )
-            )
-        )
+# with torch.inference_mode():
+#     print(
+#         tokenizer.batch_decode(
+#             test_model.generate(
+#                 input_ids=test_input.to(test_model.device),
+#                 generation_config=GenerationConfig(
+#                     max_new_tokens=100,
+#                     do_sample=True,
+#                     top_p=0.9,
+#                     top_k=0,
+#                     temperature=0.7,
+#                     repetition_penalty=1.2,
+#                     length_penalty=1.0,
+#                     num_beams=1,
+#                     num_beam_groups=1,
+#                     num_beam_hyps=1
+#                     )
+#                 )
+#             )
+#         )

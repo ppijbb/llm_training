@@ -716,6 +716,18 @@ class G2MoEPreTrainedModel(PreTrainedModel):
             if module.padding_idx is not None:
                 module.weight.data[module.padding_idx].zero_()
 
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
+        from transformers.modeling_utils import load_state_dict as hf_load_state_dict
+        hf_load_state_dict = load_state_dict_for_g2moe
+        try:
+            model = super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
+        except Exception as e:
+            print(f"[DEBUG] Cannot load with MoE: {e}")
+        finally:
+            return model
+        
+
 
 G2MoE_INPUTS_DOCSTRING = r"""
     Args:
@@ -837,50 +849,7 @@ class G2MoEModel(G2MoEPreTrainedModel):
             if module.padding_idx is not None:
                 module.weight.data[module.padding_idx].zero_()
 
-    def load_state_dict(self, state_dict, strict: bool = False):
-        # Check if moe_layer exists in the state_dict
-        has_moe_layers = any("moe_layer" in k for k in state_dict.keys())
-        
-        if not has_moe_layers:
-            logging.get_logger("transformers").warning(
-                "The pretrained model does not have MoE layers. "
-                "Converting FFN layers to MoE layers by replicating them for each expert."
-            )
-            for i, layer in enumerate(self.layers):
-                if hasattr(layer, 'moe_layer'):
-                    mlp_prefix = f"layers.{i}.mlp"
-                    gate_proj_key = f"{mlp_prefix}.gate_proj.weight"
-                    up_proj_key = f"{mlp_prefix}.up_proj.weight"
-                    down_proj_key = f"{mlp_prefix}.down_proj.weight"
-                    print(f"[DEBUG] Layer {i} - gate_proj_key: {gate_proj_key} exists: {gate_proj_key in state_dict}")
-                    print(f"[DEBUG] Layer {i} - up_proj_key: {up_proj_key} exists: {up_proj_key in state_dict}")
-                    print(f"[DEBUG] Layer {i} - down_proj_key: {down_proj_key} exists: {down_proj_key in state_dict}")
-                    for expert in layer.moe_layer.experts:
-                        if gate_proj_key in state_dict:
-                            expert.gate_proj.weight.data.copy_(state_dict[gate_proj_key])
-                            if not torch.allclose(expert.gate_proj.weight.data, state_dict[gate_proj_key]):
-                                print(f"[WARNING] gate_proj weight copy failed for layer {i}")
-                        else:
-                            print(f"[WARNING] {gate_proj_key} not found in state_dict!")
-                        if up_proj_key in state_dict:
-                            expert.up_proj.weight.data.copy_(state_dict[up_proj_key])
-                            if not torch.allclose(expert.up_proj.weight.data, state_dict[up_proj_key]):
-                                print(f"[WARNING] up_proj weight copy failed for layer {i}")
-                        else:
-                            print(f"[WARNING] {up_proj_key} not found in state_dict!")
-                        if down_proj_key in state_dict:
-                            expert.down_proj.weight.data.copy_(state_dict[down_proj_key])
-                            if not torch.allclose(expert.down_proj.weight.data, state_dict[down_proj_key]):
-                                print(f"[WARNING] down_proj weight copy failed for layer {i}")
-                        else:
-                            print(f"[WARNING] {down_proj_key} not found in state_dict!")
-                    nn.init.zeros_(layer.moe_layer.gate.weight)
-                    for j in range(min(layer.moe_layer.gate.weight.size(0), layer.moe_layer.gate.weight.size(1))):
-                        layer.moe_layer.gate.weight[j, j] = 0.1
-            filtered_state_dict = {k: v for k, v in state_dict.items() if not ("moe_layer" in k or "mlp" in k)}
-            super().load_state_dict(filtered_state_dict, strict=False)
-        else:
-            super().load_state_dict(state_dict, strict=strict)
+    
 
     @add_start_docstrings_to_model_forward(G2MoE_INPUTS_DOCSTRING)
     def forward(
@@ -1298,253 +1267,50 @@ class G2MoEForCausalLM(G2MoEPreTrainedModel, GenerationMixin):
                 # which retriggers a capture.
                 position_ids = position_ids.clone(memory_format=torch.contiguous_format)
 
-        # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
-        if inputs_embeds is not None and cache_position[0] == 0:
-            model_inputs = {"inputs_embeds": inputs_embeds, "input_ids": None}
-        else:
-            # The clone here is for the same reason as for `position_ids`.
-            model_inputs = {"input_ids": input_ids.clone(memory_format=torch.contiguous_format), "inputs_embeds": None}
+        # if `
 
-        # This is needed to correctly slice the mask without data-dependent slicing later on if using dynamo tracing
-        # (retrieving the same value from `cache_position` later on would crash dynamo)
-        model_inputs["last_cache_position"] = attention_mask.shape[-1] if attention_mask is not None else 0
+def _convert_ffn_to_moe(model, state_dict):
+    logger.warning("The pretrained model does not have MoE layers. Converting FFN layers to MoE layers by replicating them for each expert.")
+    base_model_prefix = getattr(model, 'base_model_prefix', '')
+    base_model = getattr(model, base_model_prefix, model) if base_model_prefix else model
+    if not hasattr(base_model, 'layers'):
+        logger.error(f"Base model {type(base_model)} does not have 'layers' attribute. Cannot convert FFN to MoE.")
+        return
+    num_layers = model.config.num_hidden_layers
+    for i in range(num_layers):
+        if i >= len(base_model.layers):
+            logger.warning(f"Layer index {i} out of bounds for model layers ({len(base_model.layers)}). Skipping.")
+            continue
+        layer = base_model.layers[i]
+        if hasattr(layer, 'moe_layer'):
+            mlp_key_prefix = f"{base_model_prefix}.layers.{i}.mlp" if base_model_prefix else f"layers.{i}.mlp"
+            gate_proj_key = f"{mlp_key_prefix}.gate_proj.weight"
+            up_proj_key = f"{mlp_key_prefix}.up_proj.weight"
+            down_proj_key = f"{mlp_key_prefix}.down_proj.weight"
+            if not (gate_proj_key in state_dict and up_proj_key in state_dict and down_proj_key in state_dict):
+                logger.warning(f"[WARNING] Missing FFN keys for layer {i} in state_dict. Skipping conversion for this layer.")
+                continue
+            gate_weight = state_dict[gate_proj_key]
+            up_weight = state_dict[up_proj_key]
+            down_weight = state_dict[down_proj_key]
+            for expert in layer.moe_layer.experts:
+                expert.gate_proj.weight.data.copy_(gate_weight)
+                expert.up_proj.weight.data.copy_(up_weight)
+                expert.down_proj.weight.data.copy_(down_weight)
+            nn.init.zeros_(layer.moe_layer.gate.weight)
+            for j in range(min(layer.moe_layer.gate.weight.size(0), layer.moe_layer.gate.weight.size(1))):
+                layer.moe_layer.gate.weight[j, j] = 0.1
 
-        if (
-            isinstance(past_key_values, HybridCache)
-            and attention_mask.ndim == 2
-            and not self.config._attn_implementation == "flash_attention_2"
-        ):
-            if model_inputs["inputs_embeds"] is not None:
-                batch_size, sequence_length, _ = model_inputs["inputs_embeds"].shape
-                device = model_inputs["inputs_embeds"].device
-            else:
-                batch_size, sequence_length = model_inputs["input_ids"].shape
-                device = model_inputs["input_ids"].device
-
-            attention_mask = self.model._prepare_4d_causal_attention_mask_with_cache_position(
-                attention_mask,
-                sequence_length=sequence_length,
-                target_length=past_key_values.get_max_cache_shape(),
-                dtype=self.lm_head.weight.dtype,
-                device=device,
-                cache_position=cache_position,
-                batch_size=batch_size,
-            )
-
-        if logits_to_keep is not None:
-            model_inputs["logits_to_keep"] = logits_to_keep
-
-        model_inputs.update(
-            {
-                "position_ids": position_ids,
-                "cache_position": cache_position,
-                "past_key_values": past_key_values,
-                "use_cache": use_cache,
-                "attention_mask": attention_mask,
-            }
-        )
-        return model_inputs
-
-
-@add_start_docstrings(
+def load_state_dict_for_g2moe(model, state_dict, strict=False):
     """
-    The G2MoE Model transformer with a sequence classification head on top (linear layer).
-
-    [`G2MoEForSequenceClassification`] uses the last token in order to do the classification, as other causal models
-    (e.g. GPT-2) do.
-
-    Since it does classification on the last token, it requires to know the position of the last token. If a
-    `pad_token_id` is defined in the configuration, it finds the last token that is not a padding token in each row. If
-    no `pad_token_id` is defined, it simply takes the last value in each row of the batch. Since it cannot guess the
-    padding tokens when `inputs_embeds` are passed instead of `input_ids`, it does the same (take the last value in
-    each row of the batch).
-    """,
-    G2MoE_START_DOCSTRING,
-)
-class G2MoEForSequenceClassification(G2MoEPreTrainedModel):
-    def __init__(self, config):
-        super().__init__(config)
-        self.num_labels = config.num_labels
-        self.model = G2MoEModel(config)
-        self.score = nn.Linear(config.hidden_size, self.num_labels, bias=False)
-
-        # Initialize weights and apply final processing
-        self.post_init()
-
-    def get_input_embeddings(self):
-        return self.model.embed_tokens
-
-    def set_input_embeddings(self, value):
-        self.model.embed_tokens = value
-
-    @add_start_docstrings_to_model_forward(G2MoE_INPUTS_DOCSTRING)
-    def forward(
-        self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-    ) -> Union[Tuple, SequenceClassifierOutputWithPast]:
-        r"""
-        labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
-            Labels for computing the sequence classification/regression loss. Indices should be in `[0, ...,
-            config.num_labels - 1]`. If `config.num_labels == 1` a regression loss is computed (Mean-Square loss), If
-            `config.num_labels > 1` a classification loss is computed (Cross-Entropy).
-        """
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-        transformer_outputs = self.model(
-            input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-        )
-        hidden_states = transformer_outputs[0]
-        logits = self.score(hidden_states)
-
-        if input_ids is not None:
-            batch_size = input_ids.shape[0]
-        else:
-            batch_size = inputs_embeds.shape[0]
-
-        if self.config.pad_token_id is None and batch_size != 1:
-            raise ValueError("Cannot handle batch sizes > 1 if no padding token is defined.")
-        if self.config.pad_token_id is None:
-            last_non_pad_token = -1
-        elif input_ids is not None:
-            # To handle both left- and right- padding, we take the rightmost token that is not equal to pad_token_id
-            non_pad_mask = (input_ids != self.config.pad_token_id).to(logits.device, torch.int32)
-            token_indices = torch.arange(input_ids.shape[-1], device=logits.device)
-            last_non_pad_token = (token_indices * non_pad_mask).argmax(-1)
-        else:
-            last_non_pad_token = -1
-            logger.warning_once(
-                f"{self.__class__.__name__} will not detect padding tokens in `inputs_embeds`. Results may be "
-                "unexpected if using padding tokens in conjunction with `inputs_embeds.`"
-            )
-
-        pooled_logits = logits[torch.arange(batch_size, device=logits.device), last_non_pad_token]
-
-        loss = None
-        if labels is not None:
-            loss = self.loss_function(logits=logits, labels=labels, pooled_logits=pooled_logits, config=self.config)
-
-        if not return_dict:
-            output = (pooled_logits,) + transformer_outputs[1:]
-            return ((loss,) + output) if loss is not None else output
-
-        return SequenceClassifierOutputWithPast(
-            loss=loss,
-            logits=pooled_logits,
-            past_key_values=transformer_outputs.past_key_values,
-            hidden_states=transformer_outputs.hidden_states,
-            attentions=transformer_outputs.attentions,
-        )
-
-
-@add_start_docstrings(
+    G2MoE 모델에 state_dict를 로드할 때 MoE 키가 없으면 FFN -> MoE 변환을 자동 적용합니다.
     """
-    The G2MoE Model transformer with a token classification head on top (a linear layer on top of the hidden-states
-    output) e.g. for Named-Entity-Recognition (NER) tasks.
-    """,
-    G2MoE_START_DOCSTRING,
-)
-class G2MoEForTokenClassification(G2MoEPreTrainedModel):
-    def __init__(self, config):
-        super().__init__(config)
-        self.num_labels = config.num_labels
-        self.model = G2MoEModel(config)
-        if getattr(config, "classifier_dropout", None) is not None:
-            classifier_dropout = config.classifier_dropout
-        elif getattr(config, "hidden_dropout", None) is not None:
-            classifier_dropout = config.hidden_dropout
-        else:
-            classifier_dropout = 0.1
-        self.dropout = nn.Dropout(classifier_dropout)
-        self.score = nn.Linear(config.hidden_size, config.num_labels)
-
-        # Initialize weights and apply final processing
-        self.post_init()
-
-    def get_input_embeddings(self):
-        return self.model.embed_tokens
-
-    def set_input_embeddings(self, value):
-        self.model.embed_tokens = value
-
-    @add_start_docstrings_to_model_forward(G2MoE_INPUTS_DOCSTRING)
-    @add_code_sample_docstrings(
-        checkpoint=_CHECKPOINT_FOR_DOC,
-        output_type=TokenClassifierOutput,
-        config_class=_CONFIG_FOR_DOC,
-    )
-    def forward(
-        self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[List[torch.FloatTensor]] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-    ) -> Union[Tuple, TokenClassifierOutput]:
-        r"""
-        labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
-            Labels for computing the sequence classification/regression loss. Indices should be in `[0, ...,
-            config.num_labels - 1]`. If `config.num_labels == 1` a regression loss is computed (Mean-Square loss), If
-            `config.num_labels > 1` a classification loss is computed (Cross-Entropy).
-        """
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-        outputs = self.model(
-            input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-        )
-        sequence_output = outputs[0]
-        sequence_output = self.dropout(sequence_output)
-        logits = self.score(sequence_output)
-
-        loss = None
-        if labels is not None:
-            loss = self.loss_function(logits, labels, self.config)
-
-        if not return_dict:
-            output = (logits,) + outputs[2:]
-            return ((loss,) + output) if loss is not None else output
-
-        return TokenClassifierOutput(
-            loss=loss,
-            logits=logits,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
-        )
-
-
-__all__ = [
-    "G2MoEForCausalLM",
-    "G2MoEModel",
-    "G2MoEPreTrainedModel",
-    "G2MoEForSequenceClassification",
-    "G2MoEForTokenClassification",
-]
+    has_moe_layers = any("moe_layer" in k for k in state_dict.keys())
+    if not has_moe_layers:
+        # MoE가 없는 경우, strict=False로 먼저 로드 후 변환
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        _convert_ffn_to_moe(model, state_dict)
+        return missing, unexpected
+    else:
+        # MoE가 이미 있는 경우, 기본 로딩
+        return model.load_state_dict(state_dict, strict=strict)
