@@ -719,12 +719,18 @@ class G2MoEPreTrainedModel(PreTrainedModel):
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
         from transformers.modeling_utils import load_state_dict as hf_load_state_dict
-        hf_load_state_dict = load_state_dict_for_g2moe
+        import transformers
+        del transformers.modeling_utils.load_state_dict
+        transformers.modeling_utils.load_state_dict = load_state_dict_for_g2moe
+        model = None
         try:
             model = super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
         except Exception as e:
             print(f"[DEBUG] Cannot load with MoE: {e}")
+            transformers.modeling_utils.load_state_dict = hf_load_state_dict
         finally:
+            if model is None:
+                model = super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
             return model
         
 
