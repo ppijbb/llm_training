@@ -1275,7 +1275,7 @@ class G2MoEForCausalLM(G2MoEPreTrainedModel, GenerationMixin):
 
         # if `
 
-def _convert_ffn_to_moe(model, state_dict):
+def _convert_ffn_to_moe(model, state_dict, **kwargs):
     logger.warning("The pretrained model does not have MoE layers. Converting FFN layers to MoE layers by replicating them for each expert.")
     base_model_prefix = getattr(model, 'base_model_prefix', '')
     base_model = getattr(model, base_model_prefix, model) if base_model_prefix else model
@@ -1307,16 +1307,16 @@ def _convert_ffn_to_moe(model, state_dict):
             for j in range(min(layer.moe_layer.gate.weight.size(0), layer.moe_layer.gate.weight.size(1))):
                 layer.moe_layer.gate.weight[j, j] = 0.1
 
-def load_state_dict_for_g2moe(model, state_dict, strict=False):
+def load_state_dict_for_g2moe(model, state_dict, strict=False, **kwargs):
     """
     G2MoE 모델에 state_dict를 로드할 때 MoE 키가 없으면 FFN -> MoE 변환을 자동 적용합니다.
     """
     has_moe_layers = any("moe_layer" in k for k in state_dict.keys())
     if not has_moe_layers:
         # MoE가 없는 경우, strict=False로 먼저 로드 후 변환
-        missing, unexpected = model.load_state_dict(state_dict, strict=False)
-        _convert_ffn_to_moe(model, state_dict)
+        missing, unexpected = model.load_state_dict(state_dict, strict=False, **kwargs)
+        _convert_ffn_to_moe(model, state_dict, **kwargs)
         return missing, unexpected
     else:
         # MoE가 이미 있는 경우, 기본 로딩
-        return model.load_state_dict(state_dict, strict=strict)
+        return model.load_state_dict(state_dict, strict=strict, **kwargs)
