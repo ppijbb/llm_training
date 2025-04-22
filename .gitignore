@@ -8,3 +8,9 @@ trainer_start
 LLM-Finetuning/
 *_output/
 *outputs/
+unsloth_compiled_cache/
+saved_models/
+hf_cache/
+unsloth_training_checkpoints/
+.jsonl
+

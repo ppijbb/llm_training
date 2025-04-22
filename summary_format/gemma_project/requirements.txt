@@ -1,0 +1,16 @@
+unsloth
+torch>=2.0.0
+transformers==4.49.0
+bitsandbytes
+accelerate
+xformers==0.0.29.post3
+peft
+trl==0.15.2
+triton
+cut_cross_entropy
+unsloth_zoo
+sentencepiece
+protobuf
+datasets
+huggingface_hub
+hf_transfer 
