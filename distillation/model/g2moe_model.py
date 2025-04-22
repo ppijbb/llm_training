@@ -3,7 +3,7 @@ import os
 from packaging import version
 import importlib.metadata
 import inspect
-
+from typing import Type
 import torch
 import torch.nn as nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
@@ -50,6 +50,14 @@ from transformers.utils.import_utils import is_torch_fx_available
 
 from einops import rearrange
 from flash_attn.layers.rotary import RotaryEmbedding as FlashRotaryEmbedding
+from transformers.modeling_utils import (
+    restore_default_torch_dtype,
+    SpecificPreTrainedModelType,
+    PretrainedConfig,
+    load_state_dict as hf_load_state_dict
+)
+
+
 
 if is_flash_attn_2_available():
     from flash_attn import flash_attn_func, flash_attn_varlen_func
@@ -717,21 +725,48 @@ class G2MoEPreTrainedModel(PreTrainedModel):
                 module.weight.data[module.padding_idx].zero_()
 
     @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
-        from transformers.modeling_utils import load_state_dict as hf_load_state_dict
+    @restore_default_torch_dtype
+    def from_pretrained(
+        cls: Type[SpecificPreTrainedModelType],
+        pretrained_model_name_or_path: Optional[Union[str, os.PathLike]],
+        *model_args,
+        config: Optional[Union[PretrainedConfig, str, os.PathLike]] = None,
+        cache_dir: Optional[Union[str, os.PathLike]] = None,
+        ignore_mismatched_sizes: bool = False,
+        force_download: bool = False,
+        local_files_only: bool = False,
+        token: Optional[Union[str, bool]] = None,
+        revision: str = "main",
+        use_safetensors: Optional[bool] = None,
+        weights_only: bool = True,
+        **kwargs,
+    ) -> SpecificPreTrainedModelType:
         import transformers
         del transformers.modeling_utils.load_state_dict
         transformers.modeling_utils.load_state_dict = load_state_dict_for_g2moe
-        model = None
-        try:
-            model = super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
-        except Exception as e:
-            print(f"[DEBUG] Cannot load with MoE: {e}")
-            transformers.modeling_utils.load_state_dict = hf_load_state_dict
-        finally:
-            if model is None:
-                model = super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
-            return model
+        # try:
+        model = super().from_pretrained(
+            pretrained_model_name_or_path,
+            *model_args,
+            config=config,
+            cache_dir=cache_dir,
+            ignore_mismatched_sizes=ignore_mismatched_sizes,
+            force_download=force_download,
+            local_files_only=local_files_only,
+            token=token,
+            revision=revision,
+            use_safetensors=use_safetensors,
+            weights_only=weights_only,
+            **kwargs
+        )
+        return model
+        # except Exception as e:
+        #     print(f"[DEBUG] Cannot load with MoE: {e}")
+        #     transformers.modeling_utils.load_state_dict = hf_load_state_dict
+        # finally:
+        #     if model is None:
+        #         model = super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
+            # return model
         
 
 
@@ -1275,48 +1310,34 @@ class G2MoEForCausalLM(G2MoEPreTrainedModel, GenerationMixin):
 
         # if `
 
-def _convert_ffn_to_moe(model, state_dict, **kwargs):
-    logger.warning("The pretrained model does not have MoE layers. Converting FFN layers to MoE layers by replicating them for each expert.")
-    base_model_prefix = getattr(model, 'base_model_prefix', '')
-    base_model = getattr(model, base_model_prefix, model) if base_model_prefix else model
-    if not hasattr(base_model, 'layers'):
-        logger.error(f"Base model {type(base_model)} does not have 'layers' attribute. Cannot convert FFN to MoE.")
-        return
-    num_layers = model.config.num_hidden_layers
-    for i in range(num_layers):
-        if i >= len(base_model.layers):
-            logger.warning(f"Layer index {i} out of bounds for model layers ({len(base_model.layers)}). Skipping.")
-            continue
-        layer = base_model.layers[i]
-        if hasattr(layer, 'moe_layer'):
-            mlp_key_prefix = f"{base_model_prefix}.layers.{i}.mlp" if base_model_prefix else f"layers.{i}.mlp"
-            gate_proj_key = f"{mlp_key_prefix}.gate_proj.weight"
-            up_proj_key = f"{mlp_key_prefix}.up_proj.weight"
-            down_proj_key = f"{mlp_key_prefix}.down_proj.weight"
-            if not (gate_proj_key in state_dict and up_proj_key in state_dict and down_proj_key in state_dict):
-                logger.warning(f"[WARNING] Missing FFN keys for layer {i} in state_dict. Skipping conversion for this layer.")
-                continue
-            gate_weight = state_dict[gate_proj_key]
-            up_weight = state_dict[up_proj_key]
-            down_weight = state_dict[down_proj_key]
-            for expert in layer.moe_layer.experts:
-                expert.gate_proj.weight.data.copy_(gate_weight)
-                expert.up_proj.weight.data.copy_(up_weight)
-                expert.down_proj.weight.data.copy_(down_weight)
-            nn.init.zeros_(layer.moe_layer.gate.weight)
-            for j in range(min(layer.moe_layer.gate.weight.size(0), layer.moe_layer.gate.weight.size(1))):
-                layer.moe_layer.gate.weight[j, j] = 0.1
+def _convert_ffn_to_moe(state_dict, num_experts=8, **kwargs):
+    # num_experts는 config에서 받아오거나 하드코딩
+    new_state_dict = state_dict.copy()
+    for layer_idx in range(num_layers):  # num_layers도 config에서 받아와야 함
+        for proj in ["gate_proj", "up_proj", "down_proj"]:
+            ffn_key = f"model.layers.{layer_idx}.mlp.{proj}.weight"
+            if ffn_key in state_dict:
+                for expert_idx in range(num_experts):
+                    moe_key = f"model.layers.{layer_idx}.moe_layer.experts.{expert_idx}.{proj}.weight"
+                    new_state_dict[moe_key] = state_dict[ffn_key].clone()
+    # MoE gate 초기화 등 추가
+    return new_state_dict
 
-def load_state_dict_for_g2moe(model, state_dict, strict=False, **kwargs):
+def load_state_dict_for_g2moe(
+    checkpoint_file: Union[str, os.PathLike],
+    is_quantized: bool = False,
+    map_location: Optional[Union[str, torch.device]] = "cpu",
+    weights_only: bool = True,
+    **kwargs,
+):
     """
     G2MoE 모델에 state_dict를 로드할 때 MoE 키가 없으면 FFN -> MoE 변환을 자동 적용합니다.
     """
-    has_moe_layers = any("moe_layer" in k for k in state_dict.keys())
+    model = hf_load_state_dict(checkpoint_file, is_quantized, map_location, weights_only)
+    has_moe_layers = any("moe_layer" in k for k in model.keys())
     if not has_moe_layers:
         # MoE가 없는 경우, strict=False로 먼저 로드 후 변환
-        missing, unexpected = model.load_state_dict(state_dict, strict=False, **kwargs)
-        _convert_ffn_to_moe(model, state_dict, **kwargs)
-        return missing, unexpected
-    else:
-        # MoE가 이미 있는 경우, 기본 로딩
-        return model.load_state_dict(state_dict, strict=strict, **kwargs)
+        model = _convert_ffn_to_moe(model, **kwargs)
+        print("Load FFN -> MoE")
+    return model
+    

@@ -21,10 +21,10 @@
 # limitations under the License.
 from typing import Optional
 
-from ...configuration_utils import PretrainedConfig
-from ...modeling_rope_utils import rope_config_validation
-from ...utils import logging
-from ..siglip import SiglipVisionConfig
+from transformers.configuration_utils import PretrainedConfig
+from transformers.modeling_rope_utils import rope_config_validation
+from transformers.utils import logging
+from transformers.models.siglip import SiglipVisionConfig
 
 
 logger = logging.get_logger(__name__)

@@ -38,23 +38,23 @@ print(test_model)
 print(test_model.config)
 print(format_parameters(test_model.num_parameters()))
 
-# with torch.inference_mode():
-#     print(
-#         tokenizer.batch_decode(
-#             test_model.generate(
-#                 input_ids=test_input.to(test_model.device),
-#                 generation_config=GenerationConfig(
-#                     max_new_tokens=100,
-#                     do_sample=True,
-#                     top_p=0.9,
-#                     top_k=0,
-#                     temperature=0.7,
-#                     repetition_penalty=1.2,
-#                     length_penalty=1.0,
-#                     num_beams=1,
-#                     num_beam_groups=1,
-#                     num_beam_hyps=1
-#                     )
-#                 )
-#             )
-#         )
+with torch.inference_mode():
+    print(
+        tokenizer.batch_decode(
+            test_model.generate(
+                input_ids=test_input.to(test_model.device),
+                generation_config=GenerationConfig(
+                    max_new_tokens=15,
+                    do_sample=True,
+                    top_p=0.9,
+                    top_k=0,
+                    temperature=0.5,
+                    repetition_penalty=1.2,
+                    length_penalty=1.0,
+                    num_beams=1,
+                    num_beam_groups=1,
+                    num_beam_hyps=1
+                    )
+                )
+            )
+        )
