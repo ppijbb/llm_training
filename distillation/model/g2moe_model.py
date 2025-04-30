@@ -87,7 +87,7 @@ ALL_ATTENTION_FUNCTIONS = {
 
 
 class G2MoERMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6):
+    def __init__(self, dim: int, eps: float = 1e-6, **kwargs):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.zeros(dim))
@@ -107,7 +107,7 @@ class G2MoERMSNorm(nn.Module):
 
 
 class G2MoEMLP(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, **kwargs):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
@@ -206,7 +206,7 @@ def eager_attention_forward(
 class G2MoEAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config: G2MoEConfig, layer_idx: int):
+    def __init__(self, config: G2MoEConfig, layer_idx: int, **kwargs):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -297,7 +297,7 @@ class G2MoEAttention(nn.Module):
 
 
 class G2MoEBlockSparseTop2MLP(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, **kwargs):
         super().__init__()
         self.ffn_dim = config.intermediate_size
         self.hidden_dim = config.hidden_size
@@ -356,7 +356,6 @@ def sparsemixer(scores, top_k, jitter_eps, training):
     assert top_k == 2
     
     ################ first expert ################
-    
     with torch.no_grad():
         # compute mask for sparsity
         mask_logits_threshold, max_ind = scores.max(dim=-1, keepdim=True)
@@ -457,7 +456,7 @@ def sparsemixer(scores, top_k, jitter_eps, training):
 iterations = 0
 
 class G2MoEMoeLayer(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, **kwargs):
         super().__init__()
         self.hidden_dim = config.hidden_size
         self.ffn_dim = config.intermediate_size
@@ -528,7 +527,7 @@ class G2MoEMoeLayer(nn.Module):
 
 
 class G2MoEDecoderLayer(nn.Module):
-    def __init__(self, config: G2MoEConfig, layer_idx: int):
+    def __init__(self, config: G2MoEConfig, layer_idx: int, **kwargs):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.config = config
@@ -616,7 +615,7 @@ class G2MoEDecoderLayer(nn.Module):
 
 
 class G2MoERotaryEmbedding(nn.Module):
-    def __init__(self, config: G2MoEConfig, device=None):
+    def __init__(self, config: G2MoEConfig, device=None, **kwargs):
         super().__init__()
         # BC: "rope_type" was originally "type"
         if hasattr(config, "rope_scaling") and config.rope_scaling is not None:
@@ -742,9 +741,14 @@ class G2MoEPreTrainedModel(PreTrainedModel):
         **kwargs,
     ) -> SpecificPreTrainedModelType:
         import transformers
+        from transformers import AutoConfig
         del transformers.modeling_utils.load_state_dict
-        transformers.modeling_utils.load_state_dict = load_state_dict_for_g2moe
+        def wrapped_load_state_dict(*args, **kwargs):
+            print(args, kwargs)
+            return load_state_dict_for_g2moe(num_layers=config.num_hidden_layers, num_experts=config.num_local_experts, *args, **kwargs)
+        transformers.modeling_utils.load_state_dict = wrapped_load_state_dict
         # try:
+        config = G2MoEConfig(**AutoConfig.from_pretrained(pretrained_model_name_or_path).to_dict())
         model = super().from_pretrained(
             pretrained_model_name_or_path,
             *model_args,
@@ -857,7 +861,7 @@ class G2MoEModel(G2MoEPreTrainedModel):
         config: G2MoEConfig
     """
 
-    def __init__(self, config: G2MoEConfig):
+    def __init__(self, config: G2MoEConfig, **kwargs):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -1140,7 +1144,7 @@ class G2MoEForCausalLM(G2MoEPreTrainedModel, GenerationMixin):
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
 
-    def __init__(self, config):
+    def __init__(self, config, **kwargs):
         super().__init__(config)
         self.model = G2MoEModel(config)
         self.vocab_size = config.vocab_size
@@ -1308,18 +1312,76 @@ class G2MoEForCausalLM(G2MoEPreTrainedModel, GenerationMixin):
                 # which retriggers a capture.
                 position_ids = position_ids.clone(memory_format=torch.contiguous_format)
 
-        # if `
+    def prepare_inputs_for_generation(
+        self,
+        input_ids,
+        past_key_values=None,
+        attention_mask=None,
+        inputs_embeds=None,
+        cache_position=None,
+        position_ids=None,
+        use_cache=True,
+        logits_to_keep=None,
+        **kwargs,
+    ):
+        # Overwritten: has a special cache type, `HybridCache`
 
-def _convert_ffn_to_moe(state_dict, num_experts=8, **kwargs):
+        model_inputs = super().prepare_inputs_for_generation(
+            input_ids,
+            past_key_values=past_key_values,
+            attention_mask=attention_mask,
+            inputs_embeds=inputs_embeds,
+            cache_position=cache_position,
+            position_ids=position_ids,
+            use_cache=use_cache,
+            logits_to_keep=logits_to_keep,
+            **kwargs,
+        )
+
+        # This is needed to correctly slice the mask without data-dependent slicing later on if using dynamo tracing
+        # (retrieving the same value from `cache_position` later on would crash dynamo)
+        model_inputs["last_cache_position"] = attention_mask.shape[-1] if attention_mask is not None else 0
+        if logits_to_keep is None:
+            _ = model_inputs.pop("logits_to_keep", None)
+
+        if (
+            isinstance(past_key_values, HybridCache)
+            and attention_mask.ndim == 2
+            and not self.config._attn_implementation == "flash_attention_2"
+        ):
+            if model_inputs["inputs_embeds"] is not None:
+                batch_size, sequence_length, _ = model_inputs["inputs_embeds"].shape
+                device = model_inputs["inputs_embeds"].device
+            else:
+                batch_size, sequence_length = model_inputs["input_ids"].shape
+                device = model_inputs["input_ids"].device
+
+            attention_mask = self.model._prepare_4d_causal_attention_mask_with_cache_position(
+                attention_mask,
+                sequence_length=sequence_length,
+                target_length=past_key_values.get_max_cache_shape(),
+                dtype=self.lm_head.weight.dtype,
+                device=device,
+                cache_position=cache_position,
+                batch_size=batch_size,
+            )
+            model_inputs["attention_mask"] = attention_mask
+
+        return model_inputs
+
+
+def _convert_ffn_to_moe(state_dict, num_layers, num_experts=5, **kwargs):
+    from tqdm.auto import tqdm
     # num_experts는 config에서 받아오거나 하드코딩
     new_state_dict = state_dict.copy()
-    for layer_idx in range(num_layers):  # num_layers도 config에서 받아와야 함
+    for layer_idx in tqdm(range(num_layers), desc="Converting FFN to MoE"):  # num_layers도 config에서 받아와야 함
         for proj in ["gate_proj", "up_proj", "down_proj"]:
             ffn_key = f"model.layers.{layer_idx}.mlp.{proj}.weight"
             if ffn_key in state_dict:
                 for expert_idx in range(num_experts):
                     moe_key = f"model.layers.{layer_idx}.moe_layer.experts.{expert_idx}.{proj}.weight"
                     new_state_dict[moe_key] = state_dict[ffn_key].clone()
+                    print(f'{ffn_key} -> {moe_key}')
     # MoE gate 초기화 등 추가
     return new_state_dict
 
@@ -1328,16 +1390,20 @@ def load_state_dict_for_g2moe(
     is_quantized: bool = False,
     map_location: Optional[Union[str, torch.device]] = "cpu",
     weights_only: bool = True,
+    num_layers: int = 0,
+    num_experts: int = 0,
+    *args,
     **kwargs,
 ):
     """
     G2MoE 모델에 state_dict를 로드할 때 MoE 키가 없으면 FFN -> MoE 변환을 자동 적용합니다.
     """
     model = hf_load_state_dict(checkpoint_file, is_quantized, map_location, weights_only)
+    # num_layers = len(tuple([key for key in model.keys() if "layers" in key and "mlp.gate_proj" in key]))
     has_moe_layers = any("moe_layer" in k for k in model.keys())
     if not has_moe_layers:
         # MoE가 없는 경우, strict=False로 먼저 로드 후 변환
-        model = _convert_ffn_to_moe(model, **kwargs)
+        model = _convert_ffn_to_moe(model, num_layers, num_experts, **kwargs)
         print("Load FFN -> MoE")
     return model
     
