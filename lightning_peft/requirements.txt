@@ -518,7 +518,7 @@ tqdm==4.67.1
 traitlets==5.14.3
 transformer_engine==1.13.0
 transformer_engine_cu12==1.13.0
-transformers @ git+https://github.com/huggingface/transformers.git@v4.49.0-Gemma-3
+transformers @ git+https://github.com/huggingface/transformers.git
 triton==3.2.0
 trl==0.15.2
 trove-classifiers==2025.2.18.16
