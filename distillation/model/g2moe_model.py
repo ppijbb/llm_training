@@ -523,7 +523,7 @@ class G2MoEMoeLayer(nn.Module):
     #     final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
     #     return final_hidden_states, router_logits
     
-    def forward(self, hidden_states: torch.Tensor, mlp: nn.Module) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         if self.training and self.input_jitter_noise > 0:
             hidden_states *= torch.empty_like(hidden_states).uniform_(1.0 - self.input_jitter_noise, 1.0 + self.input_jitter_noise)
@@ -577,7 +577,7 @@ class G2MoEDecoderLayer(nn.Module):
         self.is_sliding = not bool(layer_idx % 2)
         self.self_attn = G2MoEAttention(config=config, layer_idx=layer_idx)
         self.moe_layer = G2MoEMoeLayer(config)
-        # self.mlp = G2MoEMLP(config)
+        self.mlp = G2MoEMLP(config)
         self.input_layernorm = G2MoERMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = G2MoERMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -642,9 +642,7 @@ class G2MoEDecoderLayer(nn.Module):
 
         residual = hidden_states
         hidden_states = self.pre_feedforward_layernorm(hidden_states)
-        # hidden_states, router_logits = self.moe_layer(hidden_states, self.mlp)
-        # hidden_states = self.mlp(hidden_states)
-        hidden_states = self.moe_layer.experts[0](hidden_states)
+        hidden_states, router_logits = self.moe_layer(hidden_states)
         hidden_states = self.post_feedforward_layernorm(hidden_states)
         hidden_states = residual + hidden_states
 
@@ -783,43 +781,80 @@ class G2MoEPreTrainedModel(PreTrainedModel):
         revision: str = "main",
         use_safetensors: Optional[bool] = None,
         weights_only: bool = True,
+        ffn_checkpoint_for_moe_conversion: Optional[Union[str, os.PathLike, dict]] = None,
         **kwargs,
     ) -> SpecificPreTrainedModelType:
         import transformers
-        from transformers import AutoConfig
-        del transformers.modeling_utils.load_state_dict
-        def wrapped_load_state_dict(*args, **kwargs):
-            return load_state_dict_for_g2moe(
-                num_layers=config.num_hidden_layers, 
-                num_experts=config.num_local_experts, 
-                *args, 
-                **kwargs
-            )
-        transformers.modeling_utils.load_state_dict = wrapped_load_state_dict
-        # try:
-        config = G2MoEConfig(**AutoConfig.from_pretrained(pretrained_model_name_or_path).to_dict())
+        from transformers import AutoConfig, PretrainedConfig
+        from transformers.modeling_utils import load_state_dict as hf_load_state_dict
+
+        # config 처리 (G2MoEConfig 인스턴스 확보)
+        if config is None:
+            config = AutoConfig.from_pretrained(pretrained_model_name_or_path, **kwargs.get("config_kwargs", {}))
+        if not isinstance(config, G2MoEConfig):
+            config = G2MoEConfig(**config.to_dict())
+
+        # Step 1: 모델 골격 로드 (MoE 구조로)
+        # ignore_mismatched_sizes=True로 설정하여, FFN 가중치가 없어도 에러나지 않도록 함
+        # (또는 FFN 가중치가 있더라도, MoE 구조와 맞지 않는 키는 무시됨)
+        print("Loading G2MoE model skeleton using super().from_pretrained...")
+        # `weights_only`는 super().from_pretrained로 직접 전달되지 않을 수 있음.
+        # 내부적으로 _load_pretrained_model을 통해 처리됨.
+        # `ignore_mismatched_sizes`는 여기서 True로 하거나, 사용자가 True로 전달하도록 함.
+        
+        # device_map과 같은 GPU 오프로딩 관련 kwargs가 있다면, CPU로 먼저 로드 후 수동 이동 고려
+        # 여기서는 일단 kwargs를 그대로 전달
+        logging.set_verbosity_error()
         model = super().from_pretrained(
             pretrained_model_name_or_path,
             *model_args,
             config=config,
             cache_dir=cache_dir,
-            ignore_mismatched_sizes=ignore_mismatched_sizes,
+            ignore_mismatched_sizes=True, # FFN->MoE 변환을 위해 중요
             force_download=force_download,
             local_files_only=local_files_only,
             token=token,
             revision=revision,
-            use_safetensors=use_safetensors,
-            weights_only=weights_only,
-            **kwargs
+            use_safetensors=use_safetensors, # safetensors 사용 여부
+            **{k: v for k, v in kwargs.items() if k in inspect.signature(super().from_pretrained).parameters}
         )
+        logging.set_verbosity_warning()
+        print("G2MoE model skeleton loaded.")
+
+        # Step 2: MLP 가중치를 MoE 전문가들에게 복사
+        print("Initializing MoE experts with MLP weights...")
+        if hasattr(model, 'model') and hasattr(model.model, 'layers'):
+            with torch.no_grad():
+                # 각 디코더 레이어에 대해 반복
+                processing = tqdm(
+                    enumerate(model.model.layers), 
+                    total=len(model.model.layers), 
+                    desc=f"Copying MLP weights to MoE experts : Start"
+                )
+                for layer_idx, decoder_layer in processing:
+                    # Update description for each layer
+                    processing.set_description(f"Copying MLP weights to MoE experts : Processing layer {layer_idx}")
+                    # MLP 레이어의 가중치를 가져옴
+                    mlp = decoder_layer.mlp
+                    moe_layer = decoder_layer.moe_layer
+                    
+                    # 현재 MLP 레이어의 가중치
+                    gate_proj_weight = mlp.gate_proj.weight
+                    up_proj_weight = mlp.up_proj.weight
+                    down_proj_weight = mlp.down_proj.weight
+                    
+                    # 각 전문가에게 MLP 가중치 복사
+                    for expert_idx, expert in enumerate(moe_layer.experts):
+                        expert.gate_proj.weight.copy_(gate_proj_weight)
+                        expert.up_proj.weight.copy_(up_proj_weight)
+                        expert.down_proj.weight.copy_(down_proj_weight)
+                    del mlp
+
+            print("MoE experts initialization completed.")
+        else:
+            print("Model does not have expected structure. MoE experts not initialized from MLP weights.")
+
         return model
-        # except Exception as e:
-        #     print(f"[DEBUG] Cannot load with MoE: {e}")
-        #     transformers.modeling_utils.load_state_dict = hf_load_state_dict
-        # finally:
-        #     if model is None:
-        #         model = super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
-            # return model
 
 
 G2MoE_INPUTS_DOCSTRING = r"""
@@ -1416,44 +1451,3 @@ class G2MoEForCausalLM(G2MoEPreTrainedModel, GenerationMixin):
             model_inputs["attention_mask"] = attention_mask
 
         return model_inputs
-
-def _convert_ffn_to_moe(state_dict, num_layers, num_experts=5, **kwargs):
-    # num_experts는 config에서 받아오거나 하드코딩
-    new_state_dict = state_dict.copy()
-    with torch.inference_mode():
-        for layer_idx in tqdm(range(num_layers), desc="Converting FFN to MoE..."):  # num_layers도 config에서 받아와야 함
-            for proj in ["gate_proj", "up_proj", "down_proj", "act_fn"]:
-                ffn_key = f"model.layers.{layer_idx}.mlp.{proj}.weight"
-                if ffn_key in state_dict:
-                    for expert_idx in range(num_experts):
-                        moe_key = f"model.layers.{layer_idx}.moe_layer.experts.{expert_idx}.{proj}.weight"
-                        new_state_dict[moe_key] = state_dict[ffn_key].clone()
-
-                    if ffn_key in new_state_dict: # new_state_dict에 아직 키가 있는지 확인 후 삭제
-                        del new_state_dict[ffn_key]
-    # MoE gate 초기화 등 추가
-    return new_state_dict
-
-def load_state_dict_for_g2moe(
-    checkpoint_file: Union[str, os.PathLike],
-    is_quantized: bool = False,
-    map_location: Optional[Union[str, torch.device]] = "cpu",
-    weights_only: bool = True,
-    num_layers: int = 0,
-    num_experts: int = 0,
-    *args,
-    **kwargs,
-):
-    # logging.set_verbosity_error()
-    """
-    G2MoE 모델에 state_dict를 로드할 때 MoE 키가 없으면 FFN -> MoE 변환을 자동 적용합니다.
-    """
-    model = hf_load_state_dict(checkpoint_file, is_quantized, map_location, weights_only)
-    # num_layers = len(tuple([key for key in model.keys() if "layers" in key and "mlp.gate_proj" in key]))
-    has_moe_layers = any("moe_layer" in k for k in model.keys())
-    if not has_moe_layers:
-        # MoE가 없는 경우, strict=False로 먼저 로드 후 변환
-        model = _convert_ffn_to_moe(model, num_layers, num_experts, **kwargs)
-    # logging.set_verbosity_info()
-    return model
-    
