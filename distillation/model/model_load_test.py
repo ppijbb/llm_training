@@ -23,16 +23,25 @@ test_model = model_architecture.from_pretrained(
 tokenizer = AutoTokenizer.from_pretrained("google/gemma-2-2b-it")
 
 test_input = """
+hello<end_of_turn><eos>
 <start_of_turn>system
 You are a helpful assistant named G2MoE.<end_of_turn><eos>
 <start_of_turn>user
 this is the test text message. now you must instruct the model to generate a response to this message.<end_of_turn><eos>
 <bos><start_of_turn>model
 """.lstrip()
-test_input = tokenizer(
-        text=test_input,
-        return_tensors="pt",
-    )["input_ids"]
+
+test_input = tokenizer.apply_chat_template(
+    [
+            {
+                "role": "user", 
+                "content": test_input
+            },
+    ],
+    tokenize=True,
+    add_generation_prompt=True,
+    return_tensors="pt",
+)
 
 print(test_model)
 # print(test_model.config)
@@ -47,8 +56,8 @@ with torch.inference_mode():
                 generation_config=GenerationConfig(
                     max_new_tokens=10,
                     do_sample=True,
-                    top_p=0.9,
-                    top_k=0,
+                    # top_p=0.9,
+                    # top_k=0,
                     temperature=0.5,
                     repetition_penalty=1.2,
                     length_penalty=1.0,

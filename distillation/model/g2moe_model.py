@@ -56,6 +56,8 @@ from transformers.modeling_utils import (
     PretrainedConfig,
     load_state_dict as hf_load_state_dict
 )
+from tqdm.auto import tqdm
+from transformers import logging
 
 
 
@@ -296,22 +298,19 @@ class G2MoEAttention(nn.Module):
         return attn_output, attn_weights
 
 
-class G2MoEBlockSparseTop2MLP(nn.Module):
-    def __init__(self, config, **kwargs):
-        super().__init__()
-        self.ffn_dim = config.intermediate_size
-        self.hidden_dim = config.hidden_size
+class G2MoEBlockSparseTop2MLP(G2MoEMLP):
+    # def __init__(self, config, **kwargs):
+    #     super().__init__(config, **kwargs)
+    #     self.config = config
+    #     self.ffn_dim = config.intermediate_size
+    #     self.hidden_dim = config.hidden_size
+    #     self.gate_proj = nn.Linear(self.hidden_dim, self.ffn_dim, bias=False)
+    #     self.down_proj = nn.Linear(self.ffn_dim, self.hidden_dim, bias=False)
+    #     self.up_proj = nn.Linear(self.hidden_dim, self.ffn_dim, bias=False)
+    #     self.act_fn = ACT2FN[config.hidden_activation]
 
-        self.gate_proj = nn.Linear(self.hidden_dim, self.ffn_dim, bias=False)
-        self.down_proj = nn.Linear(self.ffn_dim, self.hidden_dim, bias=False)
-        self.up_proj = nn.Linear(self.hidden_dim, self.ffn_dim, bias=False)
-
-        self.act_fn = ACT2FN[config.hidden_activation]
-
-    def forward(self, hidden_states):
-        current_hidden_states = self.act_fn(self.gate_proj(hidden_states)) * self.up_proj(hidden_states)
-        current_hidden_states = self.down_proj(current_hidden_states)
-        return current_hidden_states
+    def forward(self, x):
+        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
 class mp(torch.autograd.Function):
@@ -475,8 +474,56 @@ class G2MoEMoeLayer(nn.Module):
         # Jitter parameters - default to small values if not in config
         self.router_jitter_noise = getattr(config, 'router_jitter_noise', 0.01)
         self.input_jitter_noise = getattr(config, 'input_jitter_noise', 0.0)
+        
+    # def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    #     batch_size, sequence_length, hidden_dim = hidden_states.shape
+    #     if self.training and self.input_jitter_noise > 0:
+    #         hidden_states *= torch.empty_like(hidden_states).uniform_(1.0 - self.input_jitter_noise, 1.0 + self.input_jitter_noise)
+    #     hidden_states = hidden_states.view(-1, hidden_dim)
+        
+    #     # Router logits: (batch * sequence_length, n_experts)
+    #     router_logits = self.gate(hidden_states)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    #     routing_weights, selected_experts = sparsemixer(
+    #         router_logits, 
+    #         top_k=self.top_k, 
+    #         jitter_eps=self.router_jitter_noise, 
+    #         training=self.training,
+    #     )
+
+    #     final_hidden_states = torch.zeros(
+    #         (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
+    #     )
+
+    #     # One hot encode the selected experts to create an expert mask
+    #     # this will be used to easily index which expert is going to be solicited
+    #     expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
+    #     # Loop over all available experts in the model and perform the computation on each expert
+    #     for expert_idx in range(self.num_experts):
+    #         expert_layer = self.experts[expert_idx]
+    #         idx, top_x = torch.where(expert_mask[expert_idx])
+
+    #         if top_x.shape[0] == 0:
+    #             continue
+
+    #         # in torch it is faster to index using lists than torch tensors
+    #         top_x_list = top_x.tolist()
+    #         idx_list = idx.tolist()
+
+    #         # Index the correct hidden states and compute the expert hidden state for
+    #         # the current expert. We need to make sure to multiply the output hidden
+    #         # states by `routing_weights` on the corresponding tokens (top-1 and top-2)
+    #         current_state = hidden_states[None, top_x_list].reshape(-1, hidden_dim)
+    #         current_hidden_states = expert_layer(current_state) * routing_weights[top_x_list, idx_list, None]
+
+    #         # However `index_add_` only support torch tensors for indexing so we'll use
+    #         # the `top_x` tensor here.
+    #         final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
+            
+    #     final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+    #     return final_hidden_states, router_logits
+    
+    def forward(self, hidden_states: torch.Tensor, mlp: nn.Module) -> torch.Tensor:
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         if self.training and self.input_jitter_noise > 0:
             hidden_states *= torch.empty_like(hidden_states).uniform_(1.0 - self.input_jitter_noise, 1.0 + self.input_jitter_noise)
@@ -496,31 +543,27 @@ class G2MoEMoeLayer(nn.Module):
             (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
         )
 
-        # One hot encode the selected experts to create an expert mask
-        # this will be used to easily index which expert is going to be solicited
-        expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
+        # Get the indices of the top-1 expert for each token
+        # selected_experts from sparsemixer has shape (batch_size * sequence_length, top_k)
+        # We want the first column for the top-1 expert.
+        top1_expert_indices_for_tokens = selected_experts[:, 0]  # Shape: (batch_size * sequence_length)
 
-        # Loop over all available experts in the model and perform the computation on each expert
+        # Iterate over each expert available in the model
         for expert_idx in range(self.num_experts):
             expert_layer = self.experts[expert_idx]
-            idx, top_x = torch.where(expert_mask[expert_idx])
+            # Find all token indices (in the flattened view) that selected this expert_idx as their top-1 choice
+            tokens_for_this_expert = torch.where(top1_expert_indices_for_tokens == expert_idx)[0]
 
-            if top_x.shape[0] == 0:
-                continue
-
-            # in torch it is faster to index using lists than torch tensors
-            top_x_list = top_x.tolist()
-            idx_list = idx.tolist()
-
-            # Index the correct hidden states and compute the expert hidden state for
-            # the current expert. We need to make sure to multiply the output hidden
-            # states by `routing_weights` on the corresponding tokens (top-1 and top-2)
-            current_state = hidden_states[None, top_x_list].reshape(-1, hidden_dim)
-            current_hidden_states = expert_layer(current_state) * routing_weights[top_x_list, idx_list, None]
-
-            # However `index_add_` only support torch tensors for indexing so we'll use
-            # the `top_x` tensor here.
-            final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
+            if tokens_for_this_expert.numel() > 0:
+                # Get the hidden states for these specific tokens
+                current_input_to_expert = hidden_states[tokens_for_this_expert]
+                
+                # Pass these tokens through the current expert_layer
+                expert_output = expert_layer(current_input_to_expert)
+                
+                # Add the expert's output to the final_hidden_states for these tokens.
+                # The output is used directly, not scaled by routing_weights.
+                final_hidden_states.index_add_(0, tokens_for_this_expert, expert_output.to(hidden_states.dtype))
             
         final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
         return final_hidden_states, router_logits
@@ -534,7 +577,7 @@ class G2MoEDecoderLayer(nn.Module):
         self.is_sliding = not bool(layer_idx % 2)
         self.self_attn = G2MoEAttention(config=config, layer_idx=layer_idx)
         self.moe_layer = G2MoEMoeLayer(config)
-        self.mlp = G2MoEMLP(config)
+        # self.mlp = G2MoEMLP(config)
         self.input_layernorm = G2MoERMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = G2MoERMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -599,7 +642,9 @@ class G2MoEDecoderLayer(nn.Module):
 
         residual = hidden_states
         hidden_states = self.pre_feedforward_layernorm(hidden_states)
-        hidden_states, router_logits = self.moe_layer(hidden_states)
+        # hidden_states, router_logits = self.moe_layer(hidden_states, self.mlp)
+        # hidden_states = self.mlp(hidden_states)
+        hidden_states = self.moe_layer.experts[0](hidden_states)
         hidden_states = self.post_feedforward_layernorm(hidden_states)
         hidden_states = residual + hidden_states
 
@@ -744,8 +789,12 @@ class G2MoEPreTrainedModel(PreTrainedModel):
         from transformers import AutoConfig
         del transformers.modeling_utils.load_state_dict
         def wrapped_load_state_dict(*args, **kwargs):
-            print(args, kwargs)
-            return load_state_dict_for_g2moe(num_layers=config.num_hidden_layers, num_experts=config.num_local_experts, *args, **kwargs)
+            return load_state_dict_for_g2moe(
+                num_layers=config.num_hidden_layers, 
+                num_experts=config.num_local_experts, 
+                *args, 
+                **kwargs
+            )
         transformers.modeling_utils.load_state_dict = wrapped_load_state_dict
         # try:
         config = G2MoEConfig(**AutoConfig.from_pretrained(pretrained_model_name_or_path).to_dict())
@@ -771,7 +820,6 @@ class G2MoEPreTrainedModel(PreTrainedModel):
         #     if model is None:
         #         model = super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
             # return model
-        
 
 
 G2MoE_INPUTS_DOCSTRING = r"""
@@ -1369,19 +1417,20 @@ class G2MoEForCausalLM(G2MoEPreTrainedModel, GenerationMixin):
 
         return model_inputs
 
-
 def _convert_ffn_to_moe(state_dict, num_layers, num_experts=5, **kwargs):
-    from tqdm.auto import tqdm
     # num_experts는 config에서 받아오거나 하드코딩
     new_state_dict = state_dict.copy()
-    for layer_idx in tqdm(range(num_layers), desc="Converting FFN to MoE"):  # num_layers도 config에서 받아와야 함
-        for proj in ["gate_proj", "up_proj", "down_proj"]:
-            ffn_key = f"model.layers.{layer_idx}.mlp.{proj}.weight"
-            if ffn_key in state_dict:
-                for expert_idx in range(num_experts):
-                    moe_key = f"model.layers.{layer_idx}.moe_layer.experts.{expert_idx}.{proj}.weight"
-                    new_state_dict[moe_key] = state_dict[ffn_key].clone()
-                    print(f'{ffn_key} -> {moe_key}')
+    with torch.inference_mode():
+        for layer_idx in tqdm(range(num_layers), desc="Converting FFN to MoE..."):  # num_layers도 config에서 받아와야 함
+            for proj in ["gate_proj", "up_proj", "down_proj", "act_fn"]:
+                ffn_key = f"model.layers.{layer_idx}.mlp.{proj}.weight"
+                if ffn_key in state_dict:
+                    for expert_idx in range(num_experts):
+                        moe_key = f"model.layers.{layer_idx}.moe_layer.experts.{expert_idx}.{proj}.weight"
+                        new_state_dict[moe_key] = state_dict[ffn_key].clone()
+
+                    if ffn_key in new_state_dict: # new_state_dict에 아직 키가 있는지 확인 후 삭제
+                        del new_state_dict[ffn_key]
     # MoE gate 초기화 등 추가
     return new_state_dict
 
@@ -1395,6 +1444,7 @@ def load_state_dict_for_g2moe(
     *args,
     **kwargs,
 ):
+    # logging.set_verbosity_error()
     """
     G2MoE 모델에 state_dict를 로드할 때 MoE 키가 없으면 FFN -> MoE 변환을 자동 적용합니다.
     """
@@ -1404,6 +1454,6 @@ def load_state_dict_for_g2moe(
     if not has_moe_layers:
         # MoE가 없는 경우, strict=False로 먼저 로드 후 변환
         model = _convert_ffn_to_moe(model, num_layers, num_experts, **kwargs)
-        print("Load FFN -> MoE")
+    # logging.set_verbosity_info()
     return model
     
