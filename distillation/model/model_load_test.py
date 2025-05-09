@@ -1,9 +1,9 @@
 import torch
 from g2moe_config import G2MoEConfig
 from g2moe_model import G2MoEForCausalLM
+from g3moe_config import G3MoEConfig
+from g3moe_model import Gemma3ForCausalLM
 from transformers import AutoTokenizer, GenerationConfig
-from transformers.models.gemma3 import Gemma3ForCausalLM
-from transformers import Gemma2ForCausalLM
 import tensorrt
 print("version of tensorrt: " ,tensorrt.__version__)
 
@@ -15,12 +15,12 @@ def format_parameters(number):
     else:
         return str(number)
 
-model_architecture = G2MoEForCausalLM
+model_architecture = Gemma3ForCausalLM
 
 test_model = model_architecture.from_pretrained(
-    pretrained_model_name_or_path="google/gemma-2-2b-it",
+    pretrained_model_name_or_path="google/gemma-3-1b-it",
     )#.to("cuda:1")
-tokenizer = AutoTokenizer.from_pretrained("google/gemma-2-2b-it")
+tokenizer = AutoTokenizer.from_pretrained("google/gemma-3-1b-it")
 
 test_input = """
 hello<end_of_turn><eos>

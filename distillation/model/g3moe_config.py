@@ -30,7 +30,7 @@ from transformers.models.siglip import SiglipVisionConfig
 logger = logging.get_logger(__name__)
 
 
-class Gemma3TextConfig(PretrainedConfig):
+class G3MoEConfig(PretrainedConfig):
     r"""
     This is the configuration class to store the configuration of a [`Gemma3TextModel`]. It is used to instantiate an Gemma3Text
     model according to the specified arguments, defining the model architecture. Instantiating a configuration with the
@@ -178,6 +178,10 @@ class Gemma3TextConfig(PretrainedConfig):
         num_attention_heads=8,
         num_key_value_heads=4,
         head_dim=256,
+        n_shared_experts=1,
+        n_routed_experts=256,
+        routed_scaling_factor=2.5,
+        num_experts_per_tok=8,
         hidden_activation="gelu_pytorch_tanh",
         max_position_embeddings=131_072,
         initializer_range=0.02,
@@ -215,6 +219,10 @@ class Gemma3TextConfig(PretrainedConfig):
         self.num_attention_heads = num_attention_heads
         self.head_dim = head_dim
         self.num_key_value_heads = num_key_value_heads
+        self.n_shared_experts = n_shared_experts
+        self.n_routed_experts = n_routed_experts
+        self.routed_scaling_factor = routed_scaling_factor
+        self.num_experts_per_tok = num_experts_per_tok
         self.initializer_range = initializer_range
         self.rms_norm_eps = rms_norm_eps
         self.use_cache = use_cache
@@ -235,7 +243,7 @@ class Gemma3TextConfig(PretrainedConfig):
         rope_config_validation(self)
 
 
-class Gemma3Config(PretrainedConfig):
+class G3MoETextConfig(PretrainedConfig):
     r"""
     This is the configuration class to store the configuration of a [`Gemma3ForConditionalGeneration`]. It is used to instantiate an
     Gemma3ForConditionalGeneration according to the specified arguments, defining the model architecture. Instantiating a configuration
@@ -286,13 +294,13 @@ class Gemma3Config(PretrainedConfig):
 
     model_type = "gemma3"
     sub_configs = {
-        "text_config": Gemma3TextConfig,
+        "text_config": G3MoEConfig,
         "vision_config": SiglipVisionConfig,
     }
 
     def __init__(
         self,
-        text_config: Optional[Gemma3TextConfig] = None,
+        text_config: Optional[G3MoEConfig] = None,
         vision_config: Optional[SiglipVisionConfig] = None,
         mm_tokens_per_image: int = 256,
         boi_token_index: int = 255_999,
@@ -302,10 +310,10 @@ class Gemma3Config(PretrainedConfig):
         **kwargs,
     ):
         if text_config is None:
-            text_config = Gemma3TextConfig()
-            logger.info("text_config is None, using default Gemma3TextConfig vision config.")
+            text_config = G3MoETextConfig()
+            logger.info("text_config is None, using default G3MoETextConfig vision config.")
         elif isinstance(text_config, dict):
-            text_config = Gemma3TextConfig(**text_config)
+            text_config = G3MoETextConfig(**text_config)
 
         if isinstance(vision_config, dict):
             vision_config = SiglipVisionConfig(**vision_config)
@@ -327,4 +335,4 @@ class Gemma3Config(PretrainedConfig):
         super().__init__(**kwargs)
 
 
-__all__ = ["Gemma3Config", "Gemma3TextConfig"]
+__all__ = ["G3MoEConfig", "G3MoETextConfig"]

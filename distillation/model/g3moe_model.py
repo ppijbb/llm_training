@@ -20,12 +20,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import copy
+import os
+import inspect
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union, Type
+
+from tqdm.auto import tqdm
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, HybridCache, StaticCache
@@ -42,13 +47,20 @@ from transformers.utils import (
     logging,
     replace_return_docstrings,
 )
+from transformers.modeling_utils import (
+    restore_default_torch_dtype,
+    SpecificPreTrainedModelType,
+    PretrainedConfig,
+    load_state_dict as hf_load_state_dict
+)
+from transformers import logging
 from transformers.utils.deprecation import deprecate_kwarg
 from transformers import AutoModel, AutoModelForCausalLM
-from g3moe_config import Gemma3Config, Gemma3TextConfig
-
+from g3moe_config import G3MoEConfig as Gemma3Config
+from g3moe_config import G3MoETextConfig as Gemma3TextConfig
 
 logger = logging.get_logger(__name__)
-_CONFIG_FOR_DOC = "Gemma3Config"
+_CONFIG_FOR_DOC = "G3MoEConfig"
 
 
 @dataclass
@@ -118,6 +130,106 @@ class Gemma3MLP(nn.Module):
     def forward(self, x):
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
         return down_proj
+
+class Gemma3TopkRouter(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config.text_config
+        self.top_k = config.num_experts_per_tok
+        self.n_routed_experts = config.n_routed_experts
+        self.routed_scaling_factor = config.routed_scaling_factor
+        self.n_group = config.n_group
+        self.topk_group = config.topk_group
+        self.norm_topk_prob = config.norm_topk_prob
+
+        self.weight = nn.Parameter(torch.empty((self.n_routed_experts, config.hidden_size)))
+        self.register_buffer("e_score_correction_bias", torch.zeros((self.n_routed_experts)))
+
+    @torch.no_grad()
+    def get_topk_indices(self, scores):
+        scores_for_choice = scores.view(-1, self.n_routed_experts) + self.e_score_correction_bias.unsqueeze(0)
+        group_scores = (
+            scores_for_choice.view(-1, self.n_group, self.n_routed_experts // self.n_group)
+            .topk(2, dim=-1)[0]
+            .sum(dim=-1)
+        )
+        group_idx = torch.topk(group_scores, k=self.topk_group, dim=-1, sorted=False)[1]
+        group_mask = torch.zeros_like(group_scores)
+        group_mask.scatter_(1, group_idx, 1)
+        score_mask = (
+            group_mask.unsqueeze(-1)
+            .expand(-1, self.n_group, self.n_routed_experts // self.n_group)
+            .reshape(-1, self.n_routed_experts)
+        )
+        scores_for_choice = scores_for_choice.masked_fill(~score_mask.bool(), 0.0)
+        topk_indices = torch.topk(scores_for_choice, k=self.top_k, dim=-1, sorted=False)[1]
+        return topk_indices
+
+    def forward(self, hidden_states):
+        hidden_states = hidden_states.view(-1, self.config.hidden_size)
+        router_logits = F.linear(hidden_states.type(torch.float32), self.weight.type(torch.float32))
+        scores = router_logits.sigmoid()
+        topk_indices = self.get_topk_indices(scores)
+        topk_weights = scores.gather(1, topk_indices)
+        if self.norm_topk_prob:
+            denominator = topk_weights.sum(dim=-1, keepdim=True) + 1e-20
+            topk_weights /= denominator
+        topk_weights = topk_weights * self.routed_scaling_factor
+        return topk_indices, topk_weights
+
+class Gemma3MoE(nn.Module):
+    """
+    A mixed expert module containing shared experts.
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        self.config = config.text_config
+        self.experts = nn.ModuleList(
+            [
+                Gemma3MLP(config, intermediate_size=config.intermediate_size)
+                for _ in range(config.n_routed_experts)
+            ]
+        )
+        self.gate = Gemma3TopkRouter(config)
+        self.shared_experts = Gemma3MLP(
+            config=config, intermediate_size=config.intermediate_size * config.n_shared_experts
+        )
+
+    def moe(self, hidden_states: torch.Tensor, topk_indices: torch.Tensor, topk_weights: torch.Tensor):
+        r"""
+        CALL FOR CONTRIBUTION! I don't have time to optimise this right now, but expert weights need to be fused
+        to not have to do a loop here (deepseek has 256 experts soooo yeah).
+        """
+        final_hidden_states = torch.zeros_like(hidden_states, dtype=topk_weights.dtype)
+        expert_mask = torch.nn.functional.one_hot(topk_indices, num_classes=len(self.experts))
+        expert_mask = expert_mask.permute(2, 0, 1)
+
+        for expert_idx in range(len(self.experts)):
+            expert = self.experts[expert_idx]
+            mask = expert_mask[expert_idx]
+            token_indices, weight_indices = torch.where(mask)
+
+            if token_indices.numel() > 0:
+                expert_weights = topk_weights[token_indices, weight_indices]
+                expert_input = hidden_states[token_indices]
+                expert_output = expert(expert_input)
+                weighted_output = expert_output * expert_weights.unsqueeze(-1)
+                final_hidden_states.index_add_(0, token_indices, weighted_output)
+
+        # in original deepseek, the output of the experts are gathered once we leave this module
+        # thus the moe module is itelsf an IsolatedParallel module
+        # and all expert are "local" meaning we shard but we don't gather
+        return final_hidden_states.type(hidden_states.dtype)
+
+    def forward(self, hidden_states):
+        residuals = hidden_states
+        orig_shape = hidden_states.shape
+        topk_indices, topk_weights = self.gate(hidden_states)
+        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+        hidden_states = self.moe(hidden_states, topk_indices, topk_weights).view(*orig_shape)
+        hidden_states = hidden_states + self.shared_experts(residuals)
+        return hidden_states
 
 
 class Gemma3RMSNorm(nn.Module):
@@ -525,7 +637,96 @@ class Gemma3PreTrainedModel(PreTrainedModel):
             module.weight.data.normal_(mean=0.0, std=std)
             if module.padding_idx is not None:
                 module.weight.data[module.padding_idx].zero_()
+    
+    @classmethod
+    @restore_default_torch_dtype
+    def from_pretrained(
+        cls: Type[SpecificPreTrainedModelType],
+        pretrained_model_name_or_path: Optional[Union[str, os.PathLike]],
+        *model_args,
+        config: Optional[Union[PretrainedConfig, str, os.PathLike]] = None,
+        cache_dir: Optional[Union[str, os.PathLike]] = None,
+        ignore_mismatched_sizes: bool = False,
+        force_download: bool = False,
+        local_files_only: bool = False,
+        token: Optional[Union[str, bool]] = None,
+        revision: str = "main",
+        use_safetensors: Optional[bool] = None,
+        weights_only: bool = True,
+        ffn_checkpoint_for_moe_conversion: Optional[Union[str, os.PathLike, dict]] = None,
+        **kwargs,
+    ) -> SpecificPreTrainedModelType:
+        import transformers
+        from transformers import AutoConfig, PretrainedConfig
+        from transformers.modeling_utils import load_state_dict as hf_load_state_dict
 
+        # config 처리 (G2MoEConfig 인스턴스 확보)
+        if config is None:
+            config = AutoConfig.from_pretrained(pretrained_model_name_or_path, **kwargs.get("config_kwargs", {}))
+        if not isinstance(config, Gemma3Config):
+            config = Gemma3Config(**config.to_dict())
+
+        # Step 1: 모델 골격 로드 (MoE 구조로)
+        # ignore_mismatched_sizes=True로 설정하여, FFN 가중치가 없어도 에러나지 않도록 함
+        # (또는 FFN 가중치가 있더라도, MoE 구조와 맞지 않는 키는 무시됨)
+        print("Loading G2MoE model skeleton using super().from_pretrained...")
+        # `weights_only`는 super().from_pretrained로 직접 전달되지 않을 수 있음.
+        # 내부적으로 _load_pretrained_model을 통해 처리됨.
+        # `ignore_mismatched_sizes`는 여기서 True로 하거나, 사용자가 True로 전달하도록 함.
+        
+        # device_map과 같은 GPU 오프로딩 관련 kwargs가 있다면, CPU로 먼저 로드 후 수동 이동 고려
+        # 여기서는 일단 kwargs를 그대로 전달
+        logging.set_verbosity_error()
+        model = super().from_pretrained(
+            pretrained_model_name_or_path,
+            *model_args,
+            config=config,
+            cache_dir=cache_dir,
+            ignore_mismatched_sizes=True, # FFN->MoE 변환을 위해 중요
+            force_download=force_download,
+            local_files_only=local_files_only,
+            token=token,
+            revision=revision,
+            use_safetensors=use_safetensors, # safetensors 사용 여부
+            **{k: v for k, v in kwargs.items() if k in inspect.signature(super().from_pretrained).parameters}
+        )
+        logging.set_verbosity_warning()
+        print("G2MoE model skeleton loaded.")
+
+        # Step 2: MLP 가중치를 MoE 전문가들에게 복사
+        print("Initializing MoE experts with MLP weights...")
+        if hasattr(model, 'model') and hasattr(model.model, 'layers'):
+            with torch.no_grad():
+                # 각 디코더 레이어에 대해 반복
+                processing = tqdm(
+                    enumerate(model.model.layers), 
+                    total=len(model.model.layers), 
+                    desc=f"Copying MLP weights to MoE experts : Start"
+                )
+                for layer_idx, decoder_layer in processing:
+                    # Update description for each layer
+                    processing.set_description(f"Copying MLP weights to MoE experts : Processing layer {layer_idx}")
+                    # MLP 레이어의 가중치를 가져옴
+                    mlp = decoder_layer.mlp
+                    moe_layer = decoder_layer.moe_layer
+                    
+                    # 현재 MLP 레이어의 가중치
+                    gate_proj_weight = mlp.gate_proj.weight
+                    up_proj_weight = mlp.up_proj.weight
+                    down_proj_weight = mlp.down_proj.weight
+                    
+                    # 각 전문가에게 MLP 가중치 복사
+                    for expert_idx, expert in enumerate(moe_layer.experts):
+                        expert.gate_proj.weight.copy_(gate_proj_weight)
+                        expert.up_proj.weight.copy_(up_proj_weight)
+                        expert.down_proj.weight.copy_(down_proj_weight)
+                    del mlp
+
+            print("MoE experts initialization completed.")
+        else:
+            print("Model does not have expected structure. MoE experts not initialized from MLP weights.")
+
+        return model
 
 GEMMA3_INPUTS_DOCSTRING = r"""
     Args:
