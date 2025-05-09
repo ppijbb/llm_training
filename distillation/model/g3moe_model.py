@@ -134,7 +134,7 @@ class Gemma3MLP(nn.Module):
 class Gemma3TopkRouter(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.config = config.text_config
+        self.config = config
         self.top_k = config.num_experts_per_tok
         self.n_routed_experts = config.n_routed_experts
         self.routed_scaling_factor = config.routed_scaling_factor
@@ -184,17 +184,15 @@ class Gemma3MoE(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.config = config.text_config
+        self.config = config
         self.experts = nn.ModuleList(
             [
-                Gemma3MLP(config, intermediate_size=config.intermediate_size)
+                Gemma3MLP(config)
                 for _ in range(config.n_routed_experts)
             ]
         )
         self.gate = Gemma3TopkRouter(config)
-        self.shared_experts = Gemma3MLP(
-            config=config, intermediate_size=config.intermediate_size * config.n_shared_experts
-        )
+        self.shared_experts = Gemma3MLP(config)
 
     def moe(self, hidden_states: torch.Tensor, topk_indices: torch.Tensor, topk_weights: torch.Tensor):
         r"""
@@ -498,6 +496,7 @@ class Gemma3DecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.layer_idx = layer_idx
         self.self_attn = Gemma3Attention(config=config, layer_idx=layer_idx)
+        self.moe = Gemma3MoE(config=config)
         self.mlp = Gemma3MLP(config)
         self.input_layernorm = Gemma3RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = Gemma3RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
@@ -568,7 +567,8 @@ class Gemma3DecoderLayer(nn.Module):
 
         residual = hidden_states
         hidden_states = self.pre_feedforward_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        # hidden_states = self.mlp(hidden_states)
+        hidden_states = self.moe(hidden_states)
         hidden_states = self.post_feedforward_layernorm(hidden_states)
         hidden_states = residual + hidden_states
 
@@ -669,7 +669,7 @@ class Gemma3PreTrainedModel(PreTrainedModel):
         # Step 1: 모델 골격 로드 (MoE 구조로)
         # ignore_mismatched_sizes=True로 설정하여, FFN 가중치가 없어도 에러나지 않도록 함
         # (또는 FFN 가중치가 있더라도, MoE 구조와 맞지 않는 키는 무시됨)
-        print("Loading G2MoE model skeleton using super().from_pretrained...")
+        print("Loading G3MoE model skeleton using super().from_pretrained...")
         # `weights_only`는 super().from_pretrained로 직접 전달되지 않을 수 있음.
         # 내부적으로 _load_pretrained_model을 통해 처리됨.
         # `ignore_mismatched_sizes`는 여기서 True로 하거나, 사용자가 True로 전달하도록 함.
@@ -691,7 +691,7 @@ class Gemma3PreTrainedModel(PreTrainedModel):
             **{k: v for k, v in kwargs.items() if k in inspect.signature(super().from_pretrained).parameters}
         )
         logging.set_verbosity_warning()
-        print("G2MoE model skeleton loaded.")
+        print("G3MoE model skeleton loaded.")
 
         # Step 2: MLP 가중치를 MoE 전문가들에게 복사
         print("Initializing MoE experts with MLP weights...")
