@@ -497,7 +497,7 @@ class Gemma3DecoderLayer(nn.Module):
         self.layer_idx = layer_idx
         self.self_attn = Gemma3Attention(config=config, layer_idx=layer_idx)
         self.moe = Gemma3MoE(config=config)
-        self.mlp = Gemma3MLP(config)
+        self.mlp = Gemma3MLP(config=config) # this layer is for loading pretrained base gemma3 model weights
         self.input_layernorm = Gemma3RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = Gemma3RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
         self.pre_feedforward_layernorm = Gemma3RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
@@ -695,7 +695,9 @@ class Gemma3PreTrainedModel(PreTrainedModel):
 
         # Step 2: MLP 가중치를 MoE 전문가들에게 복사
         print("Initializing MoE experts with MLP weights...")
-        if hasattr(model, 'model') and hasattr(model.model, 'layers'):
+        if hasattr(model, 'model') and hasattr(model.model, 'layers') and hasattr(model.model.layers, 'moe'):
+          print("G3MoE Pretrained model loaded.")
+        elif hasattr(model, 'model') and hasattr(model.model, 'layers'):
             with torch.no_grad():
                 # 각 디코더 레이어에 대해 반복
                 processing = tqdm(
@@ -708,7 +710,7 @@ class Gemma3PreTrainedModel(PreTrainedModel):
                     processing.set_description(f"Copying MLP weights to MoE experts : Processing layer {layer_idx}")
                     # MLP 레이어의 가중치를 가져옴
                     mlp = decoder_layer.mlp
-                    moe_layer = decoder_layer.moe_layer
+                    moe = decoder_layer.moe
                     
                     # 현재 MLP 레이어의 가중치
                     gate_proj_weight = mlp.gate_proj.weight
@@ -716,12 +718,12 @@ class Gemma3PreTrainedModel(PreTrainedModel):
                     down_proj_weight = mlp.down_proj.weight
                     
                     # 각 전문가에게 MLP 가중치 복사
-                    for expert_idx, expert in enumerate(moe_layer.experts):
+                    for expert_idx, expert in enumerate(moe.experts):
                         expert.gate_proj.weight.copy_(gate_proj_weight)
                         expert.up_proj.weight.copy_(up_proj_weight)
                         expert.down_proj.weight.copy_(down_proj_weight)
-                    del mlp
-
+                        processing.set_description(f"Copying MLP weights to MoE experts : Processing layer {layer_idx} to expert {expert_idx}")
+                    del decoder_layer.mlp
             print("MoE experts initialization completed.")
         else:
             print("Model does not have expected structure. MoE experts not initialized from MLP weights.")

@@ -19,6 +19,14 @@ model_architecture = Gemma3ForCausalLM
 
 test_model = model_architecture.from_pretrained(
     pretrained_model_name_or_path="google/gemma-3-1b-it",
+    config=G3MoEConfig(
+        n_shared_experts=1,
+        n_routed_experts=3,
+        n_group=2,
+        topk_group=1,
+        num_experts_per_tok=1,
+        routed_scaling_factor=2.5,        
+        )
     )#.to("cuda:1")
 tokenizer = AutoTokenizer.from_pretrained("google/gemma-3-1b-it")
 
