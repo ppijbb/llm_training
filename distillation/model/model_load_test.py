@@ -21,11 +21,11 @@ test_model = model_architecture.from_pretrained(
     pretrained_model_name_or_path="google/gemma-3-1b-it",
     config=G3MoEConfig(
         n_shared_experts=1,
-        n_routed_experts=3,
+        n_routed_experts=6, # 15, 6, 1
         n_group=2,
-        topk_group=1,
+        topk_group=2,
         num_experts_per_tok=1,
-        routed_scaling_factor=2.5,        
+        first_k_dense_replace=0,
         )
     )#.to("cuda:1")
 tokenizer = AutoTokenizer.from_pretrained("google/gemma-3-1b-it")
@@ -41,11 +41,20 @@ this is the test text message. now you must instruct the model to generate a res
 
 test_input = tokenizer.apply_chat_template(
     [
-            {
-                "role": "user", 
-                "content": test_input
-            },
-    ],
+    {
+        "role": "system",
+        "content": [{
+            "type": "text", 
+            "text": test_input}]
+    },
+    {
+        "role": "user",
+        "content": [
+            {"type": "image", "url": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/p-blog/candy.JPG"},
+            {"type": "text", "text": "What animal is on the candy?"}
+        ]
+    }
+],
     tokenize=True,
     add_generation_prompt=True,
     return_tensors="pt",
@@ -56,7 +65,6 @@ print(test_model)
 print(format_parameters(test_model.num_parameters()))
 
 with torch.inference_mode():
-    test_model(test_input.to(test_model.device))
     print(
         tokenizer.batch_decode(
             test_model.generate(

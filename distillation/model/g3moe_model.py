@@ -117,11 +117,11 @@ class Gemma3TextScaledWordEmbedding(nn.Embedding):
 
 
 class Gemma3MLP(nn.Module):
-    def __init__(self, config: Gemma3TextConfig):
+    def __init__(self, config: Gemma3TextConfig, intermediate_size: int=None):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size
+        self.intermediate_size = config.hidden_size if intermediate_size is None else intermediate_size
         self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
@@ -191,8 +191,9 @@ class Gemma3MoE(nn.Module):
                 for _ in range(config.n_routed_experts)
             ]
         )
-        self.gate = Gemma3TopkRouter(config)
-        self.shared_experts = Gemma3MLP(config)
+        self.gate = Gemma3TopkRouter(config=config)
+        self.shared_experts = Gemma3MLP(
+            config=config, intermediate_size=config.hidden_size * config.n_shared_experts)
 
     def moe(self, hidden_states: torch.Tensor, topk_indices: torch.Tensor, topk_weights: torch.Tensor):
         r"""
@@ -207,14 +208,14 @@ class Gemma3MoE(nn.Module):
             expert = self.experts[expert_idx]
             mask = expert_mask[expert_idx]
             token_indices, weight_indices = torch.where(mask)
-
+            print("weight_indices",weight_indices)
             if token_indices.numel() > 0:
                 expert_weights = topk_weights[token_indices, weight_indices]
                 expert_input = hidden_states[token_indices]
                 expert_output = expert(expert_input)
                 weighted_output = expert_output * expert_weights.unsqueeze(-1)
+                print("weighted_output",weighted_output)
                 final_hidden_states.index_add_(0, token_indices, weighted_output)
-
         # in original deepseek, the output of the experts are gathered once we leave this module
         # thus the moe module is itelsf an IsolatedParallel module
         # and all expert are "local" meaning we shard but we don't gather
@@ -435,17 +436,15 @@ class Gemma3Attention(nn.Module):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
-
         query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-
         query_states = self.q_norm(query_states)
         key_states = self.k_norm(key_states)
 
+
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-
         if past_key_value is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {
@@ -455,13 +454,12 @@ class Gemma3Attention(nn.Module):
                 "sliding_window": self.sliding_window,
             }
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
-
             # Here we need to slice as we use a static cache by default, but FA2 does not support it
             if attention_mask is not None and self.config._attn_implementation == "flash_attention_2":
                 seq_len = attention_mask.shape[-1]
                 key_states, value_states = key_states[:, :, :seq_len, :], value_states[:, :, :seq_len, :]
-
         attention_interface: Callable = eager_attention_forward
+
         if self.config._attn_implementation != "eager":
             if self.config._attn_implementation == "sdpa" and kwargs.get("output_attentions", False):
                 logger.warning_once(
@@ -471,7 +469,6 @@ class Gemma3Attention(nn.Module):
                 )
             else:
                 attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
-
         attn_output, attn_weights = attention_interface(
             self,
             query_states,
@@ -483,7 +480,6 @@ class Gemma3Attention(nn.Module):
             sliding_window=self.sliding_window,
             **kwargs,
         )
-
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
@@ -540,11 +536,9 @@ class Gemma3DecoderLayer(nn.Module):
                 # Should only be used when beyond the sliding window (i.e. offset > 0)
                 offset = max(0, offset)
                 attention_mask = attention_mask[:, :, :, offset : offset + effective_seq_len]
-
         residual = hidden_states
 
         hidden_states = self.input_layernorm(hidden_states)
-
         # apply global RoPE to non-sliding layer only
         if self.self_attn.is_sliding:
             position_embeddings = position_embeddings_local
@@ -564,16 +558,13 @@ class Gemma3DecoderLayer(nn.Module):
         )
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = residual + hidden_states
-
         residual = hidden_states
         hidden_states = self.pre_feedforward_layernorm(hidden_states)
-        # hidden_states = self.mlp(hidden_states)
-        hidden_states = self.moe(hidden_states)
+        hidden_states = self.moe(hidden_states) if self.layer_idx >= self.config.first_k_dense_replace else self.mlp(hidden_states)
         hidden_states = self.post_feedforward_layernorm(hidden_states)
         hidden_states = residual + hidden_states
 
         outputs = (hidden_states,)
-
         if output_attentions:
             outputs += (self_attn_weights,)
 
@@ -666,64 +657,55 @@ class Gemma3PreTrainedModel(PreTrainedModel):
         if not isinstance(config, Gemma3Config):
             config = Gemma3Config(**config.to_dict())
 
-        # Step 1: 모델 골격 로드 (MoE 구조로)
-        # ignore_mismatched_sizes=True로 설정하여, FFN 가중치가 없어도 에러나지 않도록 함
-        # (또는 FFN 가중치가 있더라도, MoE 구조와 맞지 않는 키는 무시됨)
         print("Loading G3MoE model skeleton using super().from_pretrained...")
-        # `weights_only`는 super().from_pretrained로 직접 전달되지 않을 수 있음.
-        # 내부적으로 _load_pretrained_model을 통해 처리됨.
-        # `ignore_mismatched_sizes`는 여기서 True로 하거나, 사용자가 True로 전달하도록 함.
-        
-        # device_map과 같은 GPU 오프로딩 관련 kwargs가 있다면, CPU로 먼저 로드 후 수동 이동 고려
-        # 여기서는 일단 kwargs를 그대로 전달
         logging.set_verbosity_error()
         model = super().from_pretrained(
             pretrained_model_name_or_path,
             *model_args,
             config=config,
             cache_dir=cache_dir,
-            ignore_mismatched_sizes=True, # FFN->MoE 변환을 위해 중요
+            ignore_mismatched_sizes=True,
             force_download=force_download,
             local_files_only=local_files_only,
             token=token,
             revision=revision,
-            use_safetensors=use_safetensors, # safetensors 사용 여부
+            use_safetensors=use_safetensors,
             **{k: v for k, v in kwargs.items() if k in inspect.signature(super().from_pretrained).parameters}
         )
         logging.set_verbosity_warning()
         print("G3MoE model skeleton loaded.")
 
-        # Step 2: MLP 가중치를 MoE 전문가들에게 복사
         print("Initializing MoE experts with MLP weights...")
         if hasattr(model, 'model') and hasattr(model.model, 'layers') and hasattr(model.model.layers, 'moe'):
           print("G3MoE Pretrained model loaded.")
         elif hasattr(model, 'model') and hasattr(model.model, 'layers'):
             with torch.no_grad():
-                # 각 디코더 레이어에 대해 반복
                 processing = tqdm(
                     enumerate(model.model.layers), 
                     total=len(model.model.layers), 
                     desc=f"Copying MLP weights to MoE experts : Start"
                 )
                 for layer_idx, decoder_layer in processing:
-                    # Update description for each layer
                     processing.set_description(f"Copying MLP weights to MoE experts : Processing layer {layer_idx}")
-                    # MLP 레이어의 가중치를 가져옴
                     mlp = decoder_layer.mlp
                     moe = decoder_layer.moe
                     
-                    # 현재 MLP 레이어의 가중치
                     gate_proj_weight = mlp.gate_proj.weight
                     up_proj_weight = mlp.up_proj.weight
                     down_proj_weight = mlp.down_proj.weight
                     
-                    # 각 전문가에게 MLP 가중치 복사
                     for expert_idx, expert in enumerate(moe.experts):
+                        processing.set_description(f"Copying MLP weights to MoE experts : Processing layer {layer_idx} to expert {expert_idx}")
                         expert.gate_proj.weight.copy_(gate_proj_weight)
                         expert.up_proj.weight.copy_(up_proj_weight)
                         expert.down_proj.weight.copy_(down_proj_weight)
-                        processing.set_description(f"Copying MLP weights to MoE experts : Processing layer {layer_idx} to expert {expert_idx}")
-                    del decoder_layer.mlp
+                    
+                    processing.set_description(f"Copying MLP weights to MoE experts : Processing layer {layer_idx} to shared experts")
+                    moe.shared_experts.gate_proj.weight.copy_(gate_proj_weight)
+                    moe.shared_experts.up_proj.weight.copy_(up_proj_weight)
+                    moe.shared_experts.down_proj.weight.copy_(down_proj_weight)
+                    
+                    # del decoder_layer.mlp
             print("MoE experts initialization completed.")
         else:
             print("Model does not have expected structure. MoE experts not initialized from MLP weights.")
