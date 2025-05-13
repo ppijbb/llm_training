@@ -202,18 +202,16 @@ class G3MoEMoE(nn.Module):
         final_hidden_states = torch.zeros_like(hidden_states, dtype=topk_weights.dtype)
         expert_mask = torch.nn.functional.one_hot(topk_indices, num_classes=len(self.experts))
         expert_mask = expert_mask.permute(2, 0, 1)
-
+        
         for expert_idx in range(len(self.experts)):
             expert = self.experts[expert_idx]
             mask = expert_mask[expert_idx]
             token_indices, weight_indices = torch.where(mask)
-            print("weight_indices",weight_indices)
             if token_indices.numel() > 0:
                 expert_weights = topk_weights[token_indices, weight_indices]
                 expert_input = hidden_states[token_indices]
                 expert_output = expert(expert_input)
                 weighted_output = expert_output * expert_weights.unsqueeze(-1)
-                print("weighted_output",weighted_output)
                 final_hidden_states.index_add_(0, token_indices, weighted_output)
         # in original deepseek, the output of the experts are gathered once we leave this module
         # thus the moe module is itelsf an IsolatedParallel module
@@ -228,6 +226,228 @@ class G3MoEMoE(nn.Module):
         hidden_states = self.moe(hidden_states, topk_indices, topk_weights).view(*orig_shape)
         hidden_states = hidden_states + self.shared_experts(residuals)
         return hidden_states
+
+
+class G3MoEBlockSparseTop2MLP(G3MoEMLP):
+    # def __init__(self, config, **kwargs):
+    #     super().__init__(config, **kwargs)
+    #     self.config = config
+    #     self.ffn_dim = config.intermediate_size
+    #     self.hidden_dim = config.hidden_size
+    #     self.gate_proj = nn.Linear(self.hidden_dim, self.ffn_dim, bias=False)
+    #     self.down_proj = nn.Linear(self.ffn_dim, self.hidden_dim, bias=False)
+    #     self.up_proj = nn.Linear(self.hidden_dim, self.ffn_dim, bias=False)
+    #     self.act_fn = ACT2FN[config.hidden_activation]
+
+    def forward(self, x):
+        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+
+
+class mp(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx, 
+        scores: torch.Tensor, 
+        multiplier: torch.Tensor, 
+        selected_experts: torch.Tensor,
+        masked_gates: torch.Tensor,
+        mask_for_one: torch.Tensor,
+    ):
+        ctx.save_for_backward(multiplier, selected_experts, masked_gates)
+        return multiplier * mask_for_one
+        
+    @staticmethod
+    def backward(
+        ctx, 
+        grad_at_output: torch.Tensor, 
+    ):
+        multiplier, selected_experts, masked_gates = ctx.saved_tensors
+        
+        grad_at_output = grad_at_output * multiplier
+        
+        grad_at_scores_expaned = masked_gates * grad_at_output.mul(-1)
+        grad_at_scores_expaned.scatter_add_(
+            dim=-1,
+            index=selected_experts,
+            src=grad_at_output,
+        )
+        
+        return (
+            grad_at_scores_expaned, 
+            None, 
+            None, 
+            None, 
+            None, 
+        )
+
+
+def sparsemixer(scores, top_k, jitter_eps, training):
+    assert top_k == 2
+    
+    ################ first expert ################
+    with torch.no_grad():
+        # compute mask for sparsity
+        mask_logits_threshold, max_ind = scores.max(dim=-1, keepdim=True)
+        factor = scores.abs().clamp(min=mask_logits_threshold)
+        mask_logits_threshold = (
+            (mask_logits_threshold - scores) / factor
+        ) > (2 * jitter_eps)
+
+    # apply mask 
+    masked_gates = scores.masked_fill(mask_logits_threshold, float('-inf'))
+    if training:
+        selected_experts = (
+            masked_gates - torch.empty_like(masked_gates, memory_format=torch.legacy_contiguous_format).exponential_().log()
+        ).max(dim=-1)[1].unsqueeze(-1) # gumbel sampling, more robust than than the multinomial method
+    else:
+        selected_experts = max_ind
+        
+    # compute scores for gradients
+    masked_gates = torch.softmax(masked_gates, dim=-1)
+    multiplier_o = masked_gates.gather(dim=-1, index=selected_experts)
+    
+    if training:
+        # compute midpoint mask 
+        max_scores, max_ind = masked_gates.max(dim=-1, keepdim=True)
+        mask_for_one = torch.logical_or(
+            selected_experts == max_ind,
+            torch.rand_like(max_scores) > 0.75 # Heun's third-order method: f(x) - f(0) = .25 f'(x) + .75 f'(x/3.)
+        ) 
+        # 1 -> 1.0 & 0 -> 1./3: lambda x: (x + 0.5) / 1.5
+        mask_for_one = torch.add(0.3333, mask_for_one, alpha=0.6667).type_as(masked_gates)
+
+        multiplier = mp.apply(
+            scores, 
+            multiplier_o, 
+            selected_experts, 
+            masked_gates, 
+            mask_for_one,
+        )
+    else:
+        multiplier = multiplier_o
+
+    # masked out first expert 
+    masked_scores = torch.scatter(
+        scores,
+        -1,
+        selected_experts,
+        float('-inf'),
+    )
+    with torch.no_grad():
+        # compute mask for sparsity
+        mask_logits_threshold, max_ind = masked_scores.max(dim=-1, keepdim=True)
+        factor = scores.abs().clamp(min=mask_logits_threshold)
+        mask_logits_threshold = (
+            (mask_logits_threshold - scores) / factor
+        ) > (2 * jitter_eps)
+
+    # apply mask 
+    masked_gates_top2 = masked_scores.masked_fill(mask_logits_threshold, float('-inf'))
+    if training:
+        selected_experts_top2 = (
+            masked_gates_top2 - torch.empty_like(masked_gates_top2, memory_format=torch.legacy_contiguous_format).exponential_().log()
+        ).max(dim=-1)[1].unsqueeze(-1) # gumbel sampling, more robust than than the multinomial method
+    else:
+        selected_experts_top2 = max_ind
+    # compute scores for gradients
+    masked_gates_top2 = torch.softmax(masked_gates_top2, dim=-1)
+    multiplier_top2_o = masked_gates_top2.gather(dim=-1, index=selected_experts_top2)
+    
+    if training: 
+        # compute midpoint mask 
+        max_scores, max_ind = masked_gates_top2.max(dim=-1, keepdim=True)
+        mask_for_one_top2 = torch.logical_or(
+            selected_experts_top2 == max_ind,
+            torch.rand_like(max_scores).uniform_() > 0.75 # Heun's third-order method: f(x) - f(0) = .25 f'(x) + .75 f'(x/3.)
+        ) 
+        # 1 -> 1.0 & 0 -> 1./3: lambda x: (x + 0.5) / 1.5
+        mask_for_one_top2 = torch.add(0.3333, mask_for_one_top2, alpha=0.6667).type_as(masked_gates_top2)
+
+        multiplier_top2 = mp.apply(
+            scores, 
+            multiplier_top2_o, 
+            selected_experts_top2, 
+            masked_gates_top2, 
+            mask_for_one_top2,
+        )
+    else:
+        multiplier_top2 = multiplier_top2_o
+    
+    multiplier = torch.concat((multiplier, multiplier_top2), dim=-1)
+    selected_experts = torch.concat((selected_experts, selected_experts_top2), dim=-1)
+    
+    return (
+        multiplier, 
+        selected_experts,
+    )
+
+iterations = 0
+
+class G3MoEMoeLayer(nn.Module):
+    def __init__(self, config, **kwargs):
+        super().__init__()
+        self.hidden_dim = config.hidden_size
+        self.ffn_dim = config.intermediate_size
+        self.num_experts = config.n_routed_experts
+        self.top_k = config.num_experts_per_tok
+        global iterations
+        iterations += 1
+        self.iter = iterations
+
+        # Gating mechanism
+        self.gate = nn.Linear(self.hidden_dim, self.num_experts, bias=False)
+
+        # Experts
+        self.experts = nn.ModuleList([G3MoEBlockSparseTop2MLP(config) for _ in range(self.num_experts)])
+        
+        # Jitter parameters - default to small values if not in config
+        self.router_jitter_noise = getattr(config, 'router_jitter_noise', 0.01)
+        self.input_jitter_noise = getattr(config, 'input_jitter_noise', 0.0)
+    
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        batch_size, sequence_length, hidden_dim = hidden_states.shape
+        if self.training and self.input_jitter_noise > 0:
+            hidden_states *= torch.empty_like(hidden_states).uniform_(1.0 - self.input_jitter_noise, 1.0 + self.input_jitter_noise)
+        hidden_states = hidden_states.view(-1, hidden_dim)
+        
+        # Router logits: (batch * sequence_length, n_experts)
+        router_logits = self.gate(hidden_states)
+        routing_weights, selected_experts = sparsemixer(
+            router_logits, 
+            top_k=self.top_k, 
+            jitter_eps=self.router_jitter_noise, 
+            training=self.training,
+        )
+
+        final_hidden_states = torch.zeros(
+            (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
+        )
+
+        # Get the indices of the top-1 expert for each token
+        # selected_experts from sparsemixer has shape (batch_size * sequence_length, top_k)
+        # We want the first column for the top-1 expert.
+        top1_expert_indices_for_tokens = selected_experts[:, 0]  # Shape: (batch_size * sequence_length)
+
+        # Iterate over each expert available in the model
+        for expert_idx in range(self.num_experts):
+            expert_layer = self.experts[expert_idx]
+            # Find all token indices (in the flattened view) that selected this expert_idx as their top-1 choice
+            tokens_for_this_expert = torch.where(top1_expert_indices_for_tokens == expert_idx)[0]
+
+            if tokens_for_this_expert.numel() > 0:
+                # Get the hidden states for these specific tokens
+                current_input_to_expert = hidden_states[tokens_for_this_expert]
+                
+                # Pass these tokens through the current expert_layer
+                expert_output = expert_layer(current_input_to_expert)
+                
+                # Add the expert's output to the final_hidden_states for these tokens.
+                # The output is used directly, not scaled by routing_weights.
+                final_hidden_states.index_add_(0, tokens_for_this_expert, expert_output.to(hidden_states.dtype))
+            
+        final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+        return final_hidden_states, router_logits
+
 
 
 class G3MoERMSNorm(nn.Module):
@@ -491,7 +711,7 @@ class G3MoEDecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.layer_idx = layer_idx
         self.self_attn = G3MoEAttention(config=config, layer_idx=layer_idx)
-        self.moe = G3MoEMoE(config=config)
+        self.moe = G3MoEMoeLayer(config=config)# G3MoEMoE(config=config)
         self.mlp = G3MoEMLP(config=config) # this layer is for loading pretrained base G3MoE model weights
         self.input_layernorm = G3MoERMSNorm(self.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = G3MoERMSNorm(self.hidden_size, eps=config.rms_norm_eps)
@@ -559,7 +779,10 @@ class G3MoEDecoderLayer(nn.Module):
         hidden_states = residual + hidden_states
         residual = hidden_states
         hidden_states = self.pre_feedforward_layernorm(hidden_states)
-        hidden_states = self.moe(hidden_states) if self.layer_idx >= self.config.first_k_dense_replace else self.mlp(hidden_states)
+        if self.layer_idx >= self.config.first_k_dense_replace:
+            hidden_states, router_logits = self.moe(hidden_states)
+        else:
+            hidden_states = self.mlp(hidden_states)
         hidden_states = self.post_feedforward_layernorm(hidden_states)
         hidden_states = residual + hidden_states
 
@@ -627,6 +850,14 @@ class G3MoEPreTrainedModel(PreTrainedModel):
             module.weight.data.normal_(mean=0.0, std=std)
             if module.padding_idx is not None:
                 module.weight.data[module.padding_idx].zero_()
+        elif isinstance(module, G3MoETopkRouter):
+            module.weight.data.normal_(mean=0.0, std=std)
+        elif isinstance(module, nn.Linear):
+            module.weight.data.normal_(mean=0.0, std=std)
+            if module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, nn.Parameter):
+            module.weight.data.normal_(mean=0.0, std=std)
     
     @classmethod
     @restore_default_torch_dtype
@@ -700,9 +931,11 @@ class G3MoEPreTrainedModel(PreTrainedModel):
                         expert.down_proj.weight.copy_(down_proj_weight)
                     
                     processing.set_description(f"Copying MLP weights to MoE experts : Processing layer {layer_idx} to shared experts")
-                    moe.shared_experts.gate_proj.weight.copy_(gate_proj_weight)
-                    moe.shared_experts.up_proj.weight.copy_(up_proj_weight)
-                    moe.shared_experts.down_proj.weight.copy_(down_proj_weight)
+                    
+                    if  hasattr(moe, 'shared_experts'):
+                        moe.shared_experts.gate_proj.weight.copy_(gate_proj_weight)
+                        moe.shared_experts.up_proj.weight.copy_(up_proj_weight)
+                        moe.shared_experts.down_proj.weight.copy_(down_proj_weight)
                     
                     # del decoder_layer.mlp
             print("MoE experts initialization completed.")
