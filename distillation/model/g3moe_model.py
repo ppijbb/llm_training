@@ -120,7 +120,7 @@ class G3MoEMLP(nn.Module):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
-        self.intermediate_size = config.hidden_size if intermediate_size is None else intermediate_size
+        self.intermediate_size = config.intermediate_size if intermediate_size is None else intermediate_size
         self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
@@ -134,6 +134,7 @@ class G3MoETopkRouter(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
+        config = config.text_config
         self.top_k = config.num_experts_per_tok
         self.n_routed_experts = config.n_routed_experts
         self.routed_scaling_factor = config.routed_scaling_factor
@@ -176,7 +177,7 @@ class G3MoETopkRouter(nn.Module):
         topk_weights = topk_weights * self.routed_scaling_factor
         return topk_indices, topk_weights
 
-class G3MoEMoE(nn.Module):
+class G3MoESharedExpertsLayer(nn.Module):
     """
     A mixed expert module containing shared experts.
     """
@@ -192,7 +193,7 @@ class G3MoEMoE(nn.Module):
         )
         self.gate = G3MoETopkRouter(config=config)
         self.shared_experts = G3MoEMLP(
-            config=config, intermediate_size=config.hidden_size * config.n_shared_experts)
+            config=config, intermediate_size=config.intermediate_size * config.n_shared_experts)
 
     def moe(self, hidden_states: torch.Tensor, topk_indices: torch.Tensor, topk_weights: torch.Tensor):
         r"""
@@ -229,16 +230,6 @@ class G3MoEMoE(nn.Module):
 
 
 class G3MoEBlockSparseTop2MLP(G3MoEMLP):
-    # def __init__(self, config, **kwargs):
-    #     super().__init__(config, **kwargs)
-    #     self.config = config
-    #     self.ffn_dim = config.intermediate_size
-    #     self.hidden_dim = config.hidden_size
-    #     self.gate_proj = nn.Linear(self.hidden_dim, self.ffn_dim, bias=False)
-    #     self.down_proj = nn.Linear(self.ffn_dim, self.hidden_dim, bias=False)
-    #     self.up_proj = nn.Linear(self.hidden_dim, self.ffn_dim, bias=False)
-    #     self.act_fn = ACT2FN[config.hidden_activation]
-
     def forward(self, x):
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
@@ -383,11 +374,12 @@ def sparsemixer(scores, top_k, jitter_eps, training):
 
 iterations = 0
 
-class G3MoEMoeLayer(nn.Module):
+class G3MoESparseExpertsLayer(nn.Module):
     def __init__(self, config, **kwargs):
         super().__init__()
+        config = config
         self.hidden_dim = config.hidden_size
-        self.ffn_dim = config.intermediate_size
+        self.ffn_dim = config.hidden_size
         self.num_experts = config.n_routed_experts
         self.top_k = config.num_experts_per_tok
         global iterations
@@ -409,7 +401,6 @@ class G3MoEMoeLayer(nn.Module):
         if self.training and self.input_jitter_noise > 0:
             hidden_states *= torch.empty_like(hidden_states).uniform_(1.0 - self.input_jitter_noise, 1.0 + self.input_jitter_noise)
         hidden_states = hidden_states.view(-1, hidden_dim)
-        
         # Router logits: (batch * sequence_length, n_experts)
         router_logits = self.gate(hidden_states)
         routing_weights, selected_experts = sparsemixer(
@@ -418,16 +409,13 @@ class G3MoEMoeLayer(nn.Module):
             jitter_eps=self.router_jitter_noise, 
             training=self.training,
         )
-
         final_hidden_states = torch.zeros(
             (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
         )
-
         # Get the indices of the top-1 expert for each token
         # selected_experts from sparsemixer has shape (batch_size * sequence_length, top_k)
         # We want the first column for the top-1 expert.
         top1_expert_indices_for_tokens = selected_experts[:, 0]  # Shape: (batch_size * sequence_length)
-
         # Iterate over each expert available in the model
         for expert_idx in range(self.num_experts):
             expert_layer = self.experts[expert_idx]
@@ -447,7 +435,6 @@ class G3MoEMoeLayer(nn.Module):
             
         final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
         return final_hidden_states, router_logits
-
 
 
 class G3MoERMSNorm(nn.Module):
@@ -711,8 +698,13 @@ class G3MoEDecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.layer_idx = layer_idx
         self.self_attn = G3MoEAttention(config=config, layer_idx=layer_idx)
-        self.moe = G3MoEMoeLayer(config=config)# G3MoEMoE(config=config)
+        # self.moe = G3MoESparseExpertsLayer(config=config) 
+        # self.moe = G3MoESharedExpertsLayer(config=config)
         self.mlp = G3MoEMLP(config=config) # this layer is for loading pretrained base G3MoE model weights
+        if layer_idx >= config.first_k_dense_replace:
+            self.moe = G3MoESharedExpertsLayer(config=config)
+        else:
+            self.moe = G3MoEMLP(config=config)
         self.input_layernorm = G3MoERMSNorm(self.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = G3MoERMSNorm(self.hidden_size, eps=config.rms_norm_eps)
         self.pre_feedforward_layernorm = G3MoERMSNorm(self.hidden_size, eps=config.rms_norm_eps)
@@ -756,14 +748,12 @@ class G3MoEDecoderLayer(nn.Module):
                 offset = max(0, offset)
                 attention_mask = attention_mask[:, :, :, offset : offset + effective_seq_len]
         residual = hidden_states
-
         hidden_states = self.input_layernorm(hidden_states)
         # apply global RoPE to non-sliding layer only
         if self.self_attn.is_sliding:
             position_embeddings = position_embeddings_local
         else:
             position_embeddings = position_embeddings_global
-
         hidden_states, self_attn_weights = self.self_attn(
             hidden_states=hidden_states,
             position_embeddings=position_embeddings,
@@ -779,13 +769,9 @@ class G3MoEDecoderLayer(nn.Module):
         hidden_states = residual + hidden_states
         residual = hidden_states
         hidden_states = self.pre_feedforward_layernorm(hidden_states)
-        if self.layer_idx >= self.config.first_k_dense_replace:
-            hidden_states, router_logits = self.moe(hidden_states)
-        else:
-            hidden_states = self.mlp(hidden_states)
+        hidden_states = self.moe(hidden_states)
         hidden_states = self.post_feedforward_layernorm(hidden_states)
         hidden_states = residual + hidden_states
-
         outputs = (hidden_states,)
         if output_attentions:
             outputs += (self_attn_weights,)
@@ -924,24 +910,29 @@ class G3MoEPreTrainedModel(PreTrainedModel):
                     up_proj_weight = mlp.up_proj.weight
                     down_proj_weight = mlp.down_proj.weight
                     
-                    for expert_idx, expert in enumerate(moe.experts):
-                        processing.set_description(f"Copying MLP weights to MoE experts : Processing layer {layer_idx} to expert {expert_idx}")
-                        expert.gate_proj.weight.copy_(gate_proj_weight)
-                        expert.up_proj.weight.copy_(up_proj_weight)
-                        expert.down_proj.weight.copy_(down_proj_weight)
+                    if hasattr(moe, 'experts') and hasattr(moe, 'shared_experts'):
+                        for expert_idx, expert in enumerate(moe.experts):
+                            processing.set_description(f"Copying MLP weights to MoE experts : Processing layer {layer_idx} to expert {expert_idx}")
+                            expert.gate_proj.weight.copy_(gate_proj_weight)
+                            expert.up_proj.weight.copy_(up_proj_weight)
+                            expert.down_proj.weight.copy_(down_proj_weight)
                     
-                    processing.set_description(f"Copying MLP weights to MoE experts : Processing layer {layer_idx} to shared experts")
-                    
-                    if  hasattr(moe, 'shared_experts'):
-                        moe.shared_experts.gate_proj.weight.copy_(gate_proj_weight)
-                        moe.shared_experts.up_proj.weight.copy_(up_proj_weight)
-                        moe.shared_experts.down_proj.weight.copy_(down_proj_weight)
+                        processing.set_description(f"Copying MLP weights to MoE experts : Processing layer {layer_idx} to shared experts")
+                        
+                        if  hasattr(moe, 'shared_experts'):
+                            moe.shared_experts.gate_proj.weight.copy_(gate_proj_weight)
+                            moe.shared_experts.up_proj.weight.copy_(up_proj_weight)
+                            moe.shared_experts.down_proj.weight.copy_(down_proj_weight)
+                    else:
+                        moe.gate_proj.weight.copy_(gate_proj_weight)
+                        moe.up_proj.weight.copy_(up_proj_weight)
+                        moe.down_proj.weight.copy_(down_proj_weight)
                     
                     # del decoder_layer.mlp
             print("MoE experts initialization completed.")
         else:
             print("Model does not have expected structure. MoE experts not initialized from MLP weights.")
-
+        logging.set_verbosity_info()
         return model
 
 G3MoE_INPUTS_DOCSTRING = r"""

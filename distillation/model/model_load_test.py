@@ -4,6 +4,7 @@ from g2moe_model import G2MoEForCausalLM
 from g3moe_config import G3MoEConfig
 from g3moe_model import G3MoEForCausalLM
 from transformers import AutoTokenizer, GenerationConfig
+from transformers import Gemma3Config
 import tensorrt
 print("version of tensorrt: " ,tensorrt.__version__)
 
@@ -15,25 +16,39 @@ def format_parameters(number):
     else:
         return str(number)
 
+base_model_name = "google/gemma-3-1b-it"
 model_architecture = G3MoEForCausalLM
-
+base_config = Gemma3Config.from_pretrained(base_model_name)
+base_config = base_config.to_dict()
+base_config.update(
+    {
+        "n_shared_experts": 1,
+        "n_routed_experts": 6, # 256, 15, 6
+        "n_group": 2,
+        "topk_group": 2,
+        "num_experts_per_tok": 1,
+        "first_k_dense_replace": 2,
+        "model_type": "g3moe_text",
+        "rope_scaling":{
+            "rope_type": "linear",
+            "factor": 8.0
+        },
+        "use_bfloat16": True
+    }
+)
+model_config = G3MoEConfig(**base_config)
 test_model = model_architecture.from_pretrained(
-    pretrained_model_name_or_path="google/gemma-3-1b-it",
-    config=G3MoEConfig(
-        n_shared_experts=1,
-        n_routed_experts=6, # 15, 6
-        n_group=4,
-        topk_group=1,
-        num_experts_per_tok=2,
-        first_k_dense_replace=0
-        )
+    pretrained_model_name_or_path=base_model_name,
+    config=model_config
     )#.to("cuda:1")
 tokenizer = AutoTokenizer.from_pretrained("google/gemma-3-1b-it")
 
 test_input = """
 hello<end_of_turn><eos>
 <start_of_turn>system
-You are a helpful assistant named G2MoE.<end_of_turn><eos>
+You are a helpful assistant named G2MoE.
+Always answer in shortest possible sentence.
+<end_of_turn><eos>
 <start_of_turn>user
 this is the test text message. now you must instruct the model to generate a response to this message.<end_of_turn><eos>
 <bos><start_of_turn>model
@@ -41,20 +56,20 @@ this is the test text message. now you must instruct the model to generate a res
 
 test_input = tokenizer.apply_chat_template(
     [
-    {
-        "role": "system",
-        "content": [
-            {"type": "text", "text": test_input}
-        ]
-    },
-    {
-        "role": "user",
-        "content": [
-            {"type": "image", "url": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/p-blog/candy.JPG"},
-            {"type": "text", "text": "What animal is on the candy?"}
-        ]
-    }
-],
+        {
+            "role": "system",
+            "content": [
+                {"type": "text", "text": test_input}
+            ]
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "url": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/p-blog/candy.JPG"},
+                {"type": "text", "text": "What animal is on the candy?"}
+            ]
+        }
+    ],
     tokenize=True,
     add_generation_prompt=True,
     return_tensors="pt",

@@ -19,7 +19,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Optional
+from typing import Optional, Union, Dict, Any
 
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_rope_utils import rope_config_validation
@@ -30,7 +30,7 @@ from transformers.models.siglip import SiglipVisionConfig
 logger = logging.get_logger(__name__)
 
 
-class G3MoEConfig(PretrainedConfig):
+class G3MoETextConfig(PretrainedConfig):
     r"""
     This is the configuration class to store the configuration of a [`Gemma3TextModel`]. It is used to instantiate an Gemma3Text
     model according to the specified arguments, defining the model architecture. Instantiating a configuration with the
@@ -257,7 +257,7 @@ class G3MoEConfig(PretrainedConfig):
         rope_config_validation(self)
 
 
-class G3MoETextConfig(PretrainedConfig):
+class G3MoEConfig(PretrainedConfig):
     r"""
     This is the configuration class to store the configuration of a [`Gemma3ForConditionalGeneration`]. It is used to instantiate an
     Gemma3ForConditionalGeneration according to the specified arguments, defining the model architecture. Instantiating a configuration
@@ -308,14 +308,14 @@ class G3MoETextConfig(PretrainedConfig):
 
     model_type = "gemma3"
     sub_configs = {
-        "text_config": G3MoEConfig,
+        "text_config": G3MoETextConfig,
         "vision_config": SiglipVisionConfig,
     }
 
     def __init__(
         self,
-        text_config: Optional[G3MoEConfig] = None,
-        vision_config: Optional[SiglipVisionConfig] = None,
+        text_config: Optional[Union[G3MoETextConfig, Dict[str, Any]]] = None,
+        vision_config: Optional[Union[SiglipVisionConfig, Dict[str, Any]]] = None,
         mm_tokens_per_image: int = 256,
         boi_token_index: int = 255_999,
         eoi_token_index: int = 256_000,
@@ -327,6 +327,7 @@ class G3MoETextConfig(PretrainedConfig):
             text_config = G3MoETextConfig()
             logger.info("text_config is None, using default G3MoETextConfig vision config.")
         elif isinstance(text_config, dict):
+            text_config.update(kwargs)
             text_config = G3MoETextConfig(**text_config)
 
         if isinstance(vision_config, dict):
@@ -334,7 +335,7 @@ class G3MoETextConfig(PretrainedConfig):
         else:
             vision_config = SiglipVisionConfig()
             logger.info(
-                "vision_config is None or incompatible with Gemma3VisionConfig intialization. Gemma3 will be limited "
+                "vision_config is None or incompatible with G3MoEVisionConfig intialization. G3MoE will be limited "
                 "to text tasks."
             )
 
