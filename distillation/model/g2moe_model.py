@@ -823,7 +823,9 @@ class G2MoEPreTrainedModel(PreTrainedModel):
 
         # Step 2: MLP 가중치를 MoE 전문가들에게 복사
         print("Initializing MoE experts with MLP weights...")
-        if hasattr(model, 'model') and hasattr(model.model, 'layers'):
+        if hasattr(model, 'model') and hasattr(model.model, 'layers') and hasattr(model.model.layers, 'moe'):
+          print("G3MoE Pretrained model loaded.")
+        elif hasattr(model, 'model') and hasattr(model.model, 'layers'):
             with torch.no_grad():
                 # 각 디코더 레이어에 대해 반복
                 processing = tqdm(
@@ -832,24 +834,21 @@ class G2MoEPreTrainedModel(PreTrainedModel):
                     desc=f"Copying MLP weights to MoE experts : Start"
                 )
                 for layer_idx, decoder_layer in processing:
-                    # Update description for each layer
                     processing.set_description(f"Copying MLP weights to MoE experts : Processing layer {layer_idx}")
-                    # MLP 레이어의 가중치를 가져옴
                     mlp = decoder_layer.mlp
                     moe_layer = decoder_layer.moe_layer
                     
-                    # 현재 MLP 레이어의 가중치
                     gate_proj_weight = mlp.gate_proj.weight
                     up_proj_weight = mlp.up_proj.weight
                     down_proj_weight = mlp.down_proj.weight
                     
-                    # 각 전문가에게 MLP 가중치 복사
                     for expert_idx, expert in enumerate(moe_layer.experts):
+                        processing.set_description(f"Copying MLP weights to MoE experts : Processing layer {layer_idx} to expert {expert_idx}")
                         expert.gate_proj.weight.copy_(gate_proj_weight)
                         expert.up_proj.weight.copy_(up_proj_weight)
                         expert.down_proj.weight.copy_(down_proj_weight)
+                    
                     del mlp
-
             print("MoE experts initialization completed.")
         else:
             print("Model does not have expected structure. MoE experts not initialized from MLP weights.")
@@ -1034,7 +1033,9 @@ class G2MoEModel(G2MoEPreTrainedModel):
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
             cache_position = torch.arange(
-                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
+                past_seen_tokens, 
+                past_seen_tokens + inputs_embeds.shape[1], 
+                device=inputs_embeds.device
             )
 
         if position_ids is None:
@@ -1051,7 +1052,11 @@ class G2MoEModel(G2MoEPreTrainedModel):
                     attention_mask.shape[-1] if attention_mask.dim() == 2 else cache_position[-1].item()
                 )
         causal_mask = self._update_causal_mask(
-            attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
+            attention_mask, 
+            inputs_embeds, 
+            cache_position, 
+            past_key_values, 
+            output_attentions
         )
 
         # embed positions
