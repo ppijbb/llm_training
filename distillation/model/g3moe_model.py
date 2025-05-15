@@ -374,7 +374,7 @@ def sparsemixer(scores, top_k, jitter_eps, training):
 
 iterations = 0
 
-class G3MoESparseExpertsLayer(nn.Module):
+class G3MoEGRINMoE(nn.Module):
     def __init__(self, config, **kwargs):
         super().__init__()
         config = config

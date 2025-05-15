@@ -454,7 +454,7 @@ def sparsemixer(scores, top_k, jitter_eps, training):
 
 iterations = 0
 
-class G2MoEMoeLayer(nn.Module):
+class G2MoEGRINMoeLayer(nn.Module):
     def __init__(self, config, **kwargs):
         super().__init__()
         self.hidden_dim = config.hidden_size
@@ -576,7 +576,7 @@ class G2MoEDecoderLayer(nn.Module):
         self.config = config
         self.is_sliding = not bool(layer_idx % 2)
         self.self_attn = G2MoEAttention(config=config, layer_idx=layer_idx)
-        self.moe_layer = G2MoEMoeLayer(config)
+        self.moe_layer = G2MoEGRINMoeLayer(config)
         self.mlp = G2MoEMLP(config)
         self.input_layernorm = G2MoERMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = G2MoERMSNorm(config.hidden_size, eps=config.rms_norm_eps)
