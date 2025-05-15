@@ -60,9 +60,31 @@ class G3MoETextConfig(PretrainedConfig):
             `num_attention_heads`.
         head_dim (`int`, *optional*, defaults to 256):
             The attention head dimension.
-        hidden_activation (`str` or `function`, *optional*, defaults to `"gelu_pytorch_tanh"`):
-            The non-linear activation function (function or string) in the decoder. Will default to `"gelu_pytorch_tanh"`
-            if not specified. `"gelu_pytorch_tanh"` uses an approximation of the `"gelu"` activation function.
+        kv_lora_rank (`int`, *optional*, defaults to 512):
+            LoRA rank for key/value projections.
+        q_lora_rank (`int`, *optional*, defaults to 1536):
+            LoRA rank for query projections.
+        qk_rope_head_dim (`int`, *optional*, defaults to 64):
+            Head dimension for RoPE in Q/K projections.
+        n_shared_experts (`int`, *optional*, defaults to 1):
+            Number of shared experts in MoE.
+        n_routed_experts (`int`, *optional*, defaults to 256):
+            Number of routed experts in MoE.
+        routed_scaling_factor (`float`, *optional*, defaults to 2.5):
+            Scaling factor for routed experts.
+        n_group (`int`, *optional*, defaults to 8):
+            Number of groups for expert routing.
+        topk_group (`int`, *optional*, defaults to 4):
+            Number of top groups for expert routing.
+        num_experts_per_tok (`int`, *optional*, defaults to 8):
+            Number of experts per token (top-k).
+        first_k_dense_replace (`int`, *optional*, defaults to 3):
+            Number of initial layers to use dense MLP instead of MoE.
+        norm_topk_prob (`bool`, *optional*, defaults to True):
+            Whether to normalize top-k routing probabilities.
+        hidden_activation (`str` or `function`, *optional*, defaults to "gelu_pytorch_tanh"):
+            The non-linear activation function (function or string) in the decoder. Will default to "gelu_pytorch_tanh"
+            if not specified. "gelu_pytorch_tanh" uses an approximation of the "gelu" activation function.
         max_position_embeddings (`int`, *optional*, defaults to 131072):
             The maximum sequence length that this model might ever be used with.
         initializer_range (`float`, *optional*, defaults to 0.02):
@@ -82,19 +104,20 @@ class G3MoETextConfig(PretrainedConfig):
             Whether to tie weight embeddings
         rope_theta (`float`, *optional*, defaults to 1000000.0):
             The base period of the RoPE embeddings.
-        attention_bias (`bool`, defaults to `False`, *optional*, defaults to `False`):
+        attention_bias (`bool`, *optional*, defaults to `False`):
             Whether to use a bias in the query, key, value and output projection layers during self-attention.
         attention_dropout (`float`, *optional*, defaults to 0.0):
             The dropout ratio for the attention probabilities.
         query_pre_attn_scalar (`float`, *optional*, defaults to 256):
             Scaling factor used on the attention scores
-        sliding_window (`int`, *optional*, defaults to 4096): in Gemma3Text, every other layer uses sliding window attention. This is the
-            size of the sliding window.
+        sliding_window (`int`, *optional*, defaults to 4096):
+            Size of the sliding window attention.
         final_logit_softcapping (`float`, *optional*):
             Scaling factor when applying tanh softcapping on the logits.
         attn_logit_softcapping (`float`, *optional*):
             Scaling factor when applying tanh softcapping on the attention scores.
-        cache_implementation (`str`, *optional*, defaults to `"hybrid"`): the cache type to be used with `generate`.
+        cache_implementation (`str`, *optional*, defaults to "hybrid"):
+            The cache type to be used with `generate`.
         rope_scaling (`Dict`, *optional*):
             Dictionary containing the scaling configuration for the RoPE embeddings used in gloabl attention. NOTE: if you apply new rope type
             and you expect the model to work on longer `max_position_embeddings`, we recommend you to update this value
@@ -269,9 +292,9 @@ class G3MoEConfig(PretrainedConfig):
     documentation from [`PretrainedConfig`] for more information.
 
     Args:
-        text_config (`Union[Gemma3TextConfig, dict]`, *optional*):
+        text_config (`Union[G3MoETextConfig, dict]`, *optional*):
             The config object of the text backbone.
-        vision_config (`Union[AutoConfig, dict]`,  *optional*):
+        vision_config (`Union[SiglipVisionConfig, dict]`,  *optional*):
             Custom vision config or dict.
         mm_tokens_per_image (`int`, *optional*, defaults to 256):
             The number of tokens per image embedding.
