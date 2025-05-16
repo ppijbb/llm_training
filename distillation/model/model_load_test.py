@@ -16,10 +16,12 @@ def format_parameters(number):
     else:
         return str(number)
 
-base_model_name = "google/gemma-3-1b-it"
+base_model_name = "google/gemma-3-4b-it"
 model_architecture = G3MoEForCausalLM
 base_config = Gemma3Config.from_pretrained(base_model_name)
 base_config = base_config.to_dict()
+base_config.update(base_config['text_config'])
+base_config.update({"use_bfloat16": True})
 base_config.update(
     {
         "n_shared_experts": 1,
@@ -33,7 +35,8 @@ base_config.update(
             "rope_type": "linear",
             "factor": 8.0
         },
-        "use_bfloat16": True
+        "use_bfloat16": True,
+        "vocab_size": 262_208,
     }
 )
 model_config = G3MoEConfig(**base_config)
