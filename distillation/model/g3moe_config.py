@@ -212,6 +212,9 @@ class G3MoETextConfig(PretrainedConfig):
         num_experts_per_tok=8,
         first_k_dense_replace=3,
         norm_topk_prob=True,
+        router_aux_loss_coef=0.001,
+        router_jitter_noise=0.01,
+        input_jitter_noise=0.01,
         hidden_activation="gelu_pytorch_tanh",
         max_position_embeddings=131_072,
         initializer_range=0.02,
@@ -260,6 +263,9 @@ class G3MoETextConfig(PretrainedConfig):
         self.num_experts_per_tok = num_experts_per_tok
         self.first_k_dense_replace = first_k_dense_replace
         self.norm_topk_prob = norm_topk_prob
+        self.router_aux_loss_coef = router_aux_loss_coef
+        self.router_jitter_noise = router_jitter_noise
+        self.input_jitter_noise = input_jitter_noise
         self.initializer_range = initializer_range
         self.rms_norm_eps = rms_norm_eps
         self.use_cache = use_cache

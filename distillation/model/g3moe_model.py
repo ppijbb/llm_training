@@ -62,6 +62,93 @@ logger = logging.get_logger(__name__)
 _CONFIG_FOR_DOC = "G3MoEConfig"
 
 
+
+def load_balancing_loss_func(
+    gate_logits: torch.Tensor, num_experts: torch.Tensor = None, top_k=2, attention_mask: Optional[torch.Tensor] = None
+) -> float:
+    r"""
+    Computes auxiliary load balancing loss as in Switch Transformer - implemented in Pytorch.
+    See Switch Transformer (https://arxiv.org/abs/2101.03961) for more details. This function implements the loss
+    function presented in equations (4) - (6) of the paper. It aims at penalizing cases where the routing between
+    experts is too unbalanced.
+    Args:
+        gate_logits (Union[`torch.Tensor`, Tuple[torch.Tensor]):
+            Logits from the `gate`, should be a tuple of model.config.num_hidden_layers tensors of
+            shape [batch_size X sequence_length, num_experts].
+        attention_mask (`torch.Tensor`, None):
+            The attention_mask used in forward function
+            shape [batch_size X sequence_length] if not None.
+        num_experts (`int`, *optional*):
+            Number of experts
+    Returns:
+        The auxiliary loss.
+    """
+    if gate_logits is None or not isinstance(gate_logits, tuple):
+        return 0
+
+    if isinstance(gate_logits, tuple):
+        compute_device = gate_logits[0].device
+        concatenated_gate_logits = torch.cat([layer_gate.to(compute_device) for layer_gate in gate_logits], dim=0)
+
+    routing_weights = torch.nn.functional.softmax(concatenated_gate_logits, dim=-1)
+
+    _, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
+
+    expert_mask = torch.nn.functional.one_hot(selected_experts, num_experts)
+
+    if attention_mask is None:
+        # Compute the percentage of tokens routed to each experts
+        tokens_per_expert = torch.mean(expert_mask.float(), dim=0)
+
+        # Compute the average probability of routing to these experts
+        router_prob_per_expert = torch.mean(routing_weights, dim=0)
+    else:
+        batch_size, sequence_length = attention_mask.shape
+        num_hidden_layers = concatenated_gate_logits.shape[0] // (batch_size * sequence_length)
+
+        # Compute the mask that masks all padding tokens as 0 with the same shape of expert_mask
+        expert_attention_mask = (
+            attention_mask[None, :, :, None, None]
+            .expand((num_hidden_layers, batch_size, sequence_length, top_k, num_experts))
+            .reshape(-1, top_k, num_experts)
+            .to(compute_device)
+        )
+
+        # Compute the percentage of tokens routed to each experts
+        tokens_per_expert = torch.sum(expert_mask.float() * expert_attention_mask, dim=0) / torch.sum(
+            expert_attention_mask, dim=0
+        )
+
+        # Compute the mask that masks all padding tokens as 0 with the same shape of tokens_per_expert
+        router_per_expert_attention_mask = (
+            attention_mask[None, :, :, None]
+            .expand((num_hidden_layers, batch_size, sequence_length, num_experts))
+            .reshape(-1, num_experts)
+            .to(compute_device)
+        )
+
+        # Compute the average probability of routing to these experts
+        router_prob_per_expert = torch.sum(routing_weights * router_per_expert_attention_mask, dim=0) / torch.sum(
+            router_per_expert_attention_mask, dim=0
+        )
+
+    overall_loss = torch.sum(tokens_per_expert * router_prob_per_expert.unsqueeze(0))
+    return overall_loss * num_experts
+
+
+# Copied from Phi-3.5-MoE
+def _get_unpad_data(attention_mask):
+    seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
+    indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
+    max_seqlen_in_batch = seqlens_in_batch.max().item()
+    cu_seqlens = F.pad(torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0))
+    return (
+        indices,
+        cu_seqlens,
+        max_seqlen_in_batch,
+    )
+    
+
 @dataclass
 class G3MoECausalLMOutputWithPast(ModelOutput):
     """
@@ -100,6 +187,9 @@ class G3MoECausalLMOutputWithPast(ModelOutput):
     hidden_states: Optional[Tuple[torch.FloatTensor]] = None
     attentions: Optional[Tuple[torch.FloatTensor]] = None
     image_hidden_states: Optional[torch.FloatTensor] = None
+    # this is moe specific
+    aux_loss: Optional[torch.FloatTensor] = None
+    router_logits: Optional[torch.FloatTensor] = None
 
 
 class G3MoETextScaledWordEmbedding(nn.Embedding):
@@ -129,6 +219,7 @@ class G3MoEMLP(nn.Module):
     def forward(self, x):
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
         return down_proj
+
 
 class G3MoETopkRouter(nn.Module):
     def __init__(self, config):
@@ -227,11 +318,6 @@ class G3MoESharedExpertsLayer(nn.Module):
         hidden_states = self.moe(hidden_states, topk_indices, topk_weights).view(*orig_shape)
         hidden_states = hidden_states + self.shared_experts(residuals)
         return hidden_states
-
-
-class G3MoEBlockSparseTop2MLP(G3MoEMLP):
-    def forward(self, x):
-        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
 class mp(torch.autograd.Function):
@@ -388,15 +474,17 @@ class G3MoEGRINMoE(nn.Module):
 
         # Gating mechanism
         self.gate = nn.Linear(self.hidden_dim, self.num_experts, bias=False)
-
         # Experts
-        self.experts = nn.ModuleList([G3MoEBlockSparseTop2MLP(config) for _ in range(self.num_experts)])
+        self.experts = nn.ModuleList([G3MoEMLP(config) for _ in range(self.num_experts)])
+        self.shared_experts = G3MoEMLP(
+            config=config, intermediate_size=config.intermediate_size * config.n_shared_experts)
         
         # Jitter parameters - default to small values if not in config
         self.router_jitter_noise = getattr(config, 'router_jitter_noise', 0.01)
         self.input_jitter_noise = getattr(config, 'input_jitter_noise', 0.0)
     
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        residual = hidden_states
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         if self.training and self.input_jitter_noise > 0:
             hidden_states *= torch.empty_like(hidden_states).uniform_(1.0 - self.input_jitter_noise, 1.0 + self.input_jitter_noise)
@@ -433,7 +521,7 @@ class G3MoEGRINMoE(nn.Module):
                 # The output is used directly, not scaled by routing_weights.
                 final_hidden_states.index_add_(0, tokens_for_this_expert, expert_output.to(hidden_states.dtype))
             
-        final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+        final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim) + self.shared_experts(residual)
         return final_hidden_states, router_logits
 
 
@@ -698,11 +786,10 @@ class G3MoEDecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.layer_idx = layer_idx
         self.self_attn = G3MoEAttention(config=config, layer_idx=layer_idx)
-        # self.moe = G3MoESparseExpertsLayer(config=config) 
-        # self.moe = G3MoESharedExpertsLayer(config=config)
         self.mlp = G3MoEMLP(config=config) # this layer is for loading pretrained base G3MoE model weights
-        if layer_idx >= config.first_k_dense_replace:
-            self.moe = G3MoESharedExpertsLayer(config=config)
+        self.is_dense_replacement = layer_idx >= config.first_k_dense_replace
+        if self.is_dense_replacement:
+            self.moe = G3MoEGRINMoE(config=config)
         else:
             self.moe = G3MoEMLP(config=config)
         self.input_layernorm = G3MoERMSNorm(self.hidden_size, eps=config.rms_norm_eps)
@@ -769,13 +856,17 @@ class G3MoEDecoderLayer(nn.Module):
         hidden_states = residual + hidden_states
         residual = hidden_states
         hidden_states = self.pre_feedforward_layernorm(hidden_states)
-        hidden_states = self.moe(hidden_states)
+        if self.layer_idx >= self.config.first_k_dense_replace:
+            hidden_states, router_logits = self.moe(hidden_states)
+        else:
+            hidden_states = self.moe(hidden_states)
+            router_logits = None
         hidden_states = self.post_feedforward_layernorm(hidden_states)
         hidden_states = residual + hidden_states
         outputs = (hidden_states,)
         if output_attentions:
             outputs += (self_attn_weights,)
-
+        outputs += (router_logits,)
         return outputs
 
 
@@ -1039,7 +1130,7 @@ class G3MoETextModel(G3MoEPreTrainedModel):
         self.norm = G3MoERMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = G3MoERotaryEmbedding(config=config)
         self.gradient_checkpointing = False
-
+        self.router_aux_loss_coef = config.router_aux_loss_coef
         # TODO: raushan fix this after RoPE refactor. For now we hack it by reassigning thetas
         # when we want to create a local RoPE layer. Config defaults should hold values for global RoPE
         config = copy.deepcopy(config)
@@ -1071,7 +1162,7 @@ class G3MoETextModel(G3MoEPreTrainedModel):
         cache_position: Optional[torch.LongTensor] = None,
         last_cache_position: Optional[int] = None,
         **flash_attn_kwargs: Unpack[FlashAttentionKwargs],
-    ) -> Union[Tuple, BaseModelOutputWithPast]:
+    ) -> Union[Tuple, G3MoECausalLMOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -1174,7 +1265,7 @@ class G3MoETextModel(G3MoEPreTrainedModel):
                 )
 
             hidden_states = layer_outputs[0]
-
+            router_logits = layer_outputs[-1]
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
 
@@ -1183,11 +1274,12 @@ class G3MoETextModel(G3MoEPreTrainedModel):
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
-        output = BaseModelOutputWithPast(
-            last_hidden_state=hidden_states,
+        output = G3MoECausalLMOutputWithPast(
+            logits=hidden_states,
             past_key_values=past_key_values,
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
+            router_logits=router_logits,
         )
         return output if return_dict else output.to_tuple()
 
@@ -1321,7 +1413,7 @@ class G3MoEForCausalLM(G3MoEPreTrainedModel, GenerationMixin):
 
     @deprecate_kwarg("num_logits_to_keep", version="4.50", new_name="logits_to_keep")
     @add_start_docstrings_to_model_forward(G3MoE_INPUTS_DOCSTRING)
-    @replace_return_docstrings(output_type=CausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
+    @replace_return_docstrings(output_type=G3MoECausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -1337,7 +1429,7 @@ class G3MoEForCausalLM(G3MoEPreTrainedModel, GenerationMixin):
         cache_position: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
         **loss_kwargs,
-    ) -> Union[Tuple, CausalLMOutputWithPast]:
+    ) -> Union[Tuple, G3MoECausalLMOutputWithPast]:
         r"""
             labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
                 Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
@@ -1405,19 +1497,30 @@ class G3MoEForCausalLM(G3MoEPreTrainedModel, GenerationMixin):
             logits = logits * self.config.final_logit_softcapping
 
         loss = None
+        aux_loss = None
         if labels is not None:
             loss = self.loss_function(logits, labels, self.vocab_size, **loss_kwargs)
+            if outputs.router_logits is not None:
+                aux_loss = load_balancing_loss_func(
+                    outputs.router_logits,
+                    self.num_experts,
+                    self.num_experts_per_tok,
+                    attention_mask,
+                )
+                loss += self.router_aux_loss_coef * aux_loss
 
         if not return_dict:
             output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output
 
-        return CausalLMOutputWithPast(
+        return G3MoECausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
+            aux_loss=outputs.aux_loss,
+            router_logits=outputs.router_logits,
         )
 
     def prepare_inputs_for_generation(
@@ -1804,6 +1907,8 @@ class G3MoEForConditionalGeneration(G3MoEPreTrainedModel, GenerationMixin):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
             image_hidden_states=image_features if pixel_values is not None else None,
+            aux_loss=outputs.aux_loss,
+            router_logits=outputs.router_logits,
         )
 
     def prepare_inputs_for_generation(

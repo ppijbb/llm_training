@@ -16,7 +16,7 @@ def format_parameters(number):
     else:
         return str(number)
 
-base_model_name = "google/gemma-3-4b-it"
+base_model_name = "Gunulhona/Gemma-3-4B"
 model_architecture = G3MoEForCausalLM
 base_config = Gemma3Config.from_pretrained(base_model_name)
 base_config = base_config.to_dict()
@@ -28,8 +28,11 @@ base_config.update(
         "n_routed_experts": 6, # 256, 15, 6
         "n_group": 2,
         "topk_group": 2,
-        "num_experts_per_tok": 1,
-        "first_k_dense_replace": 2,
+        "num_experts_per_tok": 2,
+        "first_k_dense_replace": 8,
+        "router_aux_loss_coef": 0.001,
+        "router_jitter_noise": 0.01,
+        "input_jitter_noise": 0.01,
         "model_type": "g3moe_text",
         "rope_scaling":{
             "rope_type": "linear",
@@ -44,12 +47,12 @@ test_model = model_architecture.from_pretrained(
     pretrained_model_name_or_path=base_model_name,
     config=model_config
     )#.to("cuda:1")
-tokenizer = AutoTokenizer.from_pretrained("google/gemma-3-1b-it")
+tokenizer = AutoTokenizer.from_pretrained(base_model_name)
 
 test_input = """
 hello<end_of_turn><eos>
-<start_of_turn>system
-You are a helpful assistant named G2MoE.
+<bos><start_of_turn>system
+You are a helpful assistant named Sparkle.
 Always answer in shortest possible sentence.
 <end_of_turn><eos>
 <start_of_turn>user
@@ -92,7 +95,7 @@ with torch.inference_mode():
                     do_sample=True,
                     # top_p=0.9,
                     # top_k=0,
-                    temperature=0.5,
+                    temperature=0.1,
                     repetition_penalty=1.2,
                     length_penalty=1.0,
                     # num_beams=1,

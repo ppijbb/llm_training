@@ -12,9 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-""" PyTorch Phi-MoE model."""
-
+""" PyTorch GRINMoE model"""
 
 from transformers.configuration_utils import PretrainedConfig
 from transformers.utils import logging
@@ -22,26 +20,27 @@ from transformers.utils import logging
 
 logger = logging.get_logger(__name__)
 
-
+#from transformers.models.deprecated._archive_maps import PHIMOE_PRETRAINED_CONFIG_ARCHIVE_MAP  # noqa: F401, E402
 PHIMOE_PRETRAINED_CONFIG_ARCHIVE_MAP = {
-    "microsoft/Phi-3.5-MoE-instruct": "https://huggingface.co/microsoft/Phi-3.5-MoE-instruct/resolve/main/config.json",
-}
+    "microsoft/GRIN-MoE": "https://huggingface.co/microsoft/GRIN-MoE/resolve/main/config.json"
+} 
 
-class PhiMoEConfig(PretrainedConfig):
+class GRINMoEConfig(PretrainedConfig):
     r"""
-    This is the configuration class to store the configuration of a [`PhiMoEModel`]. It is used to instantiate a Phi-MoE
-    model according to the specified arguments, defining the model architecture. Instantiating a configuration with the
-    defaults will yield a similar configuration to that of the
-    [microsoft/Phi-3.5-MoE-instruct](https://huggingface.co/microsoft/Phi-3.5-MoE-instruct).
+    This is the configuration class to store the configuration of a [`GRINMoE`]. It is used to instantiate an
+    PhiMoE model according to the specified arguments, defining the model architecture. Instantiating a configuration
+    with the defaults will yield a similar configuration to that of the 
+    [microsoft/GRIN-MoE](https://huggingface.co/microsoft/GRIN-MoE).
+    
     Configuration objects inherit from [`PretrainedConfig`] and can be used to control the model outputs. Read the
     documentation from [`PretrainedConfig`] for more information.
     Args:
-        vocab_size (`int`, *optional*, defaults to 32064):
+        vocab_size (`int`, *optional*, defaults to 32000):
             Vocabulary size of the PhiMoE model. Defines the number of different tokens that can be represented by the
-            `inputs_ids` passed when calling [`PhiMoEModel`]
+            `inputs_ids` passed when calling [`GRINMoE`]
         hidden_size (`int`, *optional*, defaults to 4096):
             Dimension of the hidden representations.
-        intermediate_size (`int`, *optional*, defaults to 6400):
+        intermediate_size (`int`, *optional*, defaults to 14336):
             Dimension of the MLP representations.
         num_hidden_layers (`int`, *optional*, defaults to 32):
             Number of hidden layers in the Transformer encoder.
@@ -57,7 +56,7 @@ class PhiMoEConfig(PretrainedConfig):
         hidden_act (`str` or `function`, *optional*, defaults to `"silu"`):
             The non-linear activation function (function or string) in the decoder.
         max_position_embeddings (`int`, *optional*, defaults to `4096*32`):
-            The maximum sequence length that this model might ever be used with. Mixtral's sliding window attention
+            The maximum sequence length that this model might ever be used with. PhiMoE's sliding window attention
             allows sequence of up to 4096*32 tokens.
         initializer_range (`float`, *optional*, defaults to 0.02):
             The standard deviation of the truncated_normal_initializer for initializing all weight matrices.
@@ -74,46 +73,44 @@ class PhiMoEConfig(PretrainedConfig):
             The id of the "end-of-sequence" token.
         tie_word_embeddings (`bool`, *optional*, defaults to `False`):
             Whether the model's input and output word embeddings should be tied.
-        rope_theta (`float`, *optional*, defaults to 10000.0):
+        rope_theta (`float`, *optional*, defaults to 1000000.0):
             The base period of the RoPE embeddings.
-        rope_scaling (`dict`, *optional*):
-            The scaling strategy for the RoPE embeddings. If `None`, no scaling is applied. If a dictionary, it must
-            contain the following keys: `type`, `short_factor`, `long_factor`, `short_mscale`, `long_mscale` and
-            `original_max_position_embeddings`. The `type` must be `longrope`, the `short_mscale` and `long_scale` must
-            be numbers, the `short_factor` and `long_factor` must be lists of numbers with the same length as half of
-            the attention head size and the `original_max_position_embeddings` must be an integer.
         sliding_window (`int`, *optional*):
-            Sliding window attention window size. If not specified, will default to `262144`.
+            Sliding window attention window size. If not specified, will default to `4096`.
         attention_dropout (`float`, *optional*, defaults to 0.0):
             The dropout ratio for the attention probabilities.
         num_experts_per_tok (`int`, *optional*, defaults to 2):
             The number of experts to root per-token, can be also interpreted as the `top-p` routing
             parameter
-        num_local_experts (`int`, *optional*, defaults to 16):
+        num_local_experts (`int`, *optional*, defaults to 8):
             Number of experts per Sparse MLP layer.
         output_router_logits (`bool`, *optional*, defaults to `False`):
             Whether or not the router logits should be returned by the model. Enabeling this will also
             allow the model to output the auxiliary loss. See [here]() for more details
-        router_aux_loss_coef (`float`, *optional*, defaults to 0.0):
+        router_aux_loss_coef (`float`, *optional*, defaults to 0.001):
             The aux loss factor for the total loss.
-        router_jitter_noise (`float`, *optional*, defaults to 0.01):
+        router_jitter_noise (`float`, *optional*, defaults to 0.0):
             Amount of noise to add to the router.
     ```python
-    >>> from transformers import PhiMoEModel, PhiMoEConfig
-    >>> # Initializing a Phi-3 style configuration
-    >>> configuration = PhiMoEConfig.from_pretrained("microsoft/Phi-3.5-MoE-instruct")
-    >>> # Initializing a model from the configuration
-    >>> model = PhiMoEModel(configuration)
+    >>> from transformers import GRINMoE, GRINMoEConfig
+    >>> # Initializing a GRIN-MoE style configuration
+    >>> configuration = GRINMoEConfig()
+    >>> # Initializing a model from the GRIN-MoE style configuration
+    >>> model = GRINMoE(configuration)
     >>> # Accessing the model configuration
     >>> configuration = model.config
     ```"""
-    
-    model_type = "phimoe"
+
+    model_type = "grinmoe"
     keys_to_ignore_at_inference = ["past_key_values"]
 
+    # _attn_implementation = 'eager'
+    _attn_implementation = 'sdpa'
+    # _attn_implementation = 'flash_attention_2'
+    
     def __init__(
         self,
-        vocab_size=32064,
+        vocab_size=32000,
         hidden_size=4096,
         intermediate_size=6400,
         num_hidden_layers=32,
@@ -129,7 +126,6 @@ class PhiMoEConfig(PretrainedConfig):
         eos_token_id=2,
         tie_word_embeddings=False,
         rope_theta=1e6,
-        rope_scaling=None,
         sliding_window=None,
         attention_dropout=0.0,
         num_experts_per_tok=2,
@@ -137,7 +133,7 @@ class PhiMoEConfig(PretrainedConfig):
         output_router_logits=False,
         router_aux_loss_coef=0.001,
         router_jitter_noise=0.01,
-        input_jitter_noise=0.0,
+        input_jitter_noise=0.01,
         attention_bias = False,
         lm_head_bias = False,
         **kwargs,
@@ -169,10 +165,7 @@ class PhiMoEConfig(PretrainedConfig):
         self.router_aux_loss_coef = router_aux_loss_coef
         self.router_jitter_noise = router_jitter_noise
         self.input_jitter_noise = input_jitter_noise
-
-        self.rope_scaling = rope_scaling
-        self._rope_scaling_validation()
-
+        
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
@@ -180,58 +173,3 @@ class PhiMoEConfig(PretrainedConfig):
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )
-
-    def _rope_scaling_validation(self):
-        """
-        Validate the `rope_scaling` configuration.
-        """
-        if self.rope_scaling is None:
-            return
-
-        if not isinstance(self.rope_scaling, dict) or len(self.rope_scaling) != 6:
-            raise ValueError(
-                "`rope_scaling` must be a dictionary with three fields, `type`, `short_factor`, `long_factor`, "
-                f"`short_mscale`, `long_mscale` and `original_max_position_embeddings`, got {self.rope_scaling}"
-            )
-        rope_scaling_type = self.rope_scaling.get("type", None)
-        rope_scaling_short_factor = self.rope_scaling.get("short_factor", None)
-        rope_scaling_long_factor = self.rope_scaling.get("long_factor", None)
-        rope_scaling_short_mscale = self.rope_scaling.get("short_mscale", None)
-        rope_scaling_long_mscale = self.rope_scaling.get("long_mscale", None)
-        original_max_position_embeddings = self.rope_scaling.get("original_max_position_embeddings", None)
-        if rope_scaling_type is None or rope_scaling_type not in ["longrope"]:
-            raise ValueError(f"`rope_scaling`'s type field must be one of ['longrope'], got {rope_scaling_type}")
-        if not (
-            isinstance(rope_scaling_short_factor, list)
-            and all(isinstance(x, (int, float)) for x in rope_scaling_short_factor)
-        ):
-            raise ValueError(
-                f"`rope_scaling`'s short_factor field must be a list of numbers, got {rope_scaling_short_factor}"
-            )
-        if not len(rope_scaling_short_factor) == self.hidden_size // self.num_attention_heads // 2:
-            raise ValueError(
-                f"`rope_scaling`'s short_factor field must have length {self.hidden_size // self.num_attention_heads // 2}, got {len(rope_scaling_short_factor)}"
-            )
-        if not (
-            isinstance(rope_scaling_long_factor, list)
-            and all(isinstance(x, (int, float)) for x in rope_scaling_long_factor)
-        ):
-            raise ValueError(
-                f"`rope_scaling`'s long_factor field must be a list of numbers, got {rope_scaling_long_factor}"
-            )
-        if not len(rope_scaling_long_factor) == self.hidden_size // self.num_attention_heads // 2:
-            raise ValueError(
-                f"`rope_scaling`'s long_factor field must have length {self.hidden_size // self.num_attention_heads // 2}, got {len(rope_scaling_long_factor)}"
-            )
-        if not isinstance(rope_scaling_short_mscale, (int, float)):
-            raise ValueError(
-                f"`rope_scaling`'s short_mscale field must be a number, got {rope_scaling_short_mscale}"
-            )
-        if not isinstance(rope_scaling_long_mscale, (int, float)):
-            raise ValueError(
-                f"`rope_scaling`'s long_mscale field must be a number, got {rope_scaling_long_mscale}"
-            )
-        if not isinstance(original_max_position_embeddings, int):
-            raise ValueError(
-                f"`rope_scaling`'s original_max_position_embeddings field must be an integer, got {original_max_position_embeddings}"
-            )
