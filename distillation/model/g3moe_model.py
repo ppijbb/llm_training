@@ -980,7 +980,7 @@ class G3MoEPreTrainedModel(PreTrainedModel):
             **{k: v for k, v in kwargs.items() if k in inspect.signature(super().from_pretrained).parameters}
         )
         logging.set_verbosity_warning()
-        logging.getLogger().debug("G3MoE model skeleton loaded.")
+        logging.get_logger('transformers').debug("G3MoE model skeleton loaded.")
 
         def copy_mlp_weights(mlp, moe, gate_proj_weight, up_proj_weight, down_proj_weight):
             processing.set_description(f"Copying MLP weights to MoE experts : Processing layer {layer_idx}")
@@ -1003,9 +1003,9 @@ class G3MoEPreTrainedModel(PreTrainedModel):
             else:
                 raise Exception("MoE model has no MLP or shared MLP")
         
-        logging.getLogger().debug("Initializing MoE experts with MLP weights...")
+        logging.get_logger('transformers').debug("Initializing MoE experts with MLP weights...")
         if hasattr(model, 'model') and hasattr(model.model, 'layers') and hasattr(model.model.layers, 'moe'):
-          logging.getLogger().debug("G3MoE Pretrained model loaded.")
+          logging.get_logger('transformers').debug("G3MoE Pretrained model loaded.")
         elif hasattr(model, 'model') and hasattr(model.model, 'layers'):
             with torch.no_grad():
                 processing = tqdm(
@@ -1023,9 +1023,9 @@ class G3MoEPreTrainedModel(PreTrainedModel):
                     )
                     del decoder_layer.mlp
 
-            logging.getLogger().debug("MoE experts initialization completed.")
+            logging.get_logger('transformers').debug("MoE experts initialization completed.")
         else:
-            logging.getLogger().info("Model does not have expected structure. MoE experts not initialized from MLP weights.")
+            logging.get_logger('transformers').info("Model does not have expected structure. MoE experts not initialized from MLP weights.")
         logging.set_verbosity_info()
         return model
 
