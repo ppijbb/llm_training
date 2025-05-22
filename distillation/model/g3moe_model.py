@@ -980,11 +980,32 @@ class G3MoEPreTrainedModel(PreTrainedModel):
             **{k: v for k, v in kwargs.items() if k in inspect.signature(super().from_pretrained).parameters}
         )
         logging.set_verbosity_warning()
-        print("G3MoE model skeleton loaded.")
+        logging.getLogger().debug("G3MoE model skeleton loaded.")
 
-        print("Initializing MoE experts with MLP weights...")
+        def copy_mlp_weights(mlp, moe, gate_proj_weight, up_proj_weight, down_proj_weight):
+            processing.set_description(f"Copying MLP weights to MoE experts : Processing layer {layer_idx}")
+            if hasattr(moe, 'experts'):
+                for expert_idx, expert in enumerate(moe.experts):
+                    processing.set_description(f"Copying MLP weights to MoE experts : Processing layer {layer_idx} to expert {expert_idx}")
+                    expert.gate_proj.weight.copy_(gate_proj_weight)
+                    expert.up_proj.weight.copy_(up_proj_weight)
+                    expert.down_proj.weight.copy_(down_proj_weight)
+            
+            if hasattr(moe, 'shared_experts'):
+                processing.set_description(f"Copying MLP weights to MoE experts : Processing layer {layer_idx} to shared experts")
+                moe.shared_experts.gate_proj.weight.copy_(gate_proj_weight)
+                moe.shared_experts.up_proj.weight.copy_(up_proj_weight)
+                moe.shared_experts.down_proj.weight.copy_(down_proj_weight)
+            elif hasattr(moe, 'gate_proj'):
+                moe.gate_proj.weight.copy_(gate_proj_weight)
+                moe.up_proj.weight.copy_(up_proj_weight)
+                moe.down_proj.weight.copy_(down_proj_weight)
+            else:
+                raise Exception("MoE model has no MLP or shared MLP")
+        
+        logging.getLogger().debug("Initializing MoE experts with MLP weights...")
         if hasattr(model, 'model') and hasattr(model.model, 'layers') and hasattr(model.model.layers, 'moe'):
-          print("G3MoE Pretrained model loaded.")
+          logging.getLogger().debug("G3MoE Pretrained model loaded.")
         elif hasattr(model, 'model') and hasattr(model.model, 'layers'):
             with torch.no_grad():
                 processing = tqdm(
@@ -993,36 +1014,18 @@ class G3MoEPreTrainedModel(PreTrainedModel):
                     desc=f"Copying MLP weights to MoE experts : Start"
                 )
                 for layer_idx, decoder_layer in processing:
-                    processing.set_description(f"Copying MLP weights to MoE experts : Processing layer {layer_idx}")
-                    mlp = decoder_layer.mlp
-                    moe = decoder_layer.moe
-                    
-                    gate_proj_weight = mlp.gate_proj.weight
-                    up_proj_weight = mlp.up_proj.weight
-                    down_proj_weight = mlp.down_proj.weight
-                    
-                    if hasattr(moe, 'experts') and hasattr(moe, 'shared_experts'):
-                        for expert_idx, expert in enumerate(moe.experts):
-                            processing.set_description(f"Copying MLP weights to MoE experts : Processing layer {layer_idx} to expert {expert_idx}")
-                            expert.gate_proj.weight.copy_(gate_proj_weight)
-                            expert.up_proj.weight.copy_(up_proj_weight)
-                            expert.down_proj.weight.copy_(down_proj_weight)
-                    
-                        processing.set_description(f"Copying MLP weights to MoE experts : Processing layer {layer_idx} to shared experts")
-                        
-                        if  hasattr(moe, 'shared_experts'):
-                            moe.shared_experts.gate_proj.weight.copy_(gate_proj_weight)
-                            moe.shared_experts.up_proj.weight.copy_(up_proj_weight)
-                            moe.shared_experts.down_proj.weight.copy_(down_proj_weight)
-                    else:
-                        moe.gate_proj.weight.copy_(gate_proj_weight)
-                        moe.up_proj.weight.copy_(up_proj_weight)
-                        moe.down_proj.weight.copy_(down_proj_weight)
-                    
-                    # del decoder_layer.mlp
-            print("MoE experts initialization completed.")
+                    copy_mlp_weights(
+                        mlp=decoder_layer.mlp, 
+                        moe=decoder_layer.moe, 
+                        gate_proj_weight=decoder_layer.mlp.gate_proj.weight, 
+                        up_proj_weight=decoder_layer.mlp.up_proj.weight, 
+                        down_proj_weight=decoder_layer.mlp.down_proj.weight
+                    )
+                    del decoder_layer.mlp
+
+            logging.getLogger().debug("MoE experts initialization completed.")
         else:
-            print("Model does not have expected structure. MoE experts not initialized from MLP weights.")
+            logging.getLogger().info("Model does not have expected structure. MoE experts not initialized from MLP weights.")
         logging.set_verbosity_info()
         return model
 
