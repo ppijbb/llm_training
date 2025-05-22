@@ -509,14 +509,27 @@ class G3MoEGRINMoE(nn.Module):
             expert_layer = self.experts[expert_idx]
             # Find all token indices (in the flattened view) that selected this expert_idx as their top-1 choice
             tokens_for_this_expert = torch.where(top1_expert_indices_for_tokens == expert_idx)[0]
+            expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
 
             if tokens_for_this_expert.numel() > 0:
                 # Get the hidden states for these specific tokens
-                current_input_to_expert = hidden_states[tokens_for_this_expert]
-                
+                idx, top_x = torch.where(expert_mask[expert_idx])
+
+                if top_x.shape[0] == 0:
+                    continue
+
+                # in torch it is faster to index using lists than torch tensors
+                top_x_list = top_x.tolist()
+                idx_list = idx.tolist()
+
+                # Index the correct hidden states and compute the expert hidden state for
+                # the current expert. We need to make sure to multiply the output hidden
+                # states by `routing_weights` on the corresponding tokens (top-1 and top-2)
                 # Pass these tokens through the current expert_layer
-                expert_output = expert_layer(current_input_to_expert)
-                
+                # current_input_to_expert = hidden_states[tokens_for_this_expert]
+                # expert_output = expert_layer(current_input_to_expert)
+                current_state = hidden_states[None, top_x_list].reshape(-1, hidden_dim)
+                expert_output = expert_layer(current_state) * routing_weights[top_x_list, idx_list, None]
                 # Add the expert's output to the final_hidden_states for these tokens.
                 # The output is used directly, not scaled by routing_weights.
                 final_hidden_states.index_add_(0, tokens_for_this_expert, expert_output.to(hidden_states.dtype))
@@ -928,6 +941,10 @@ class G3MoEPreTrainedModel(PreTrainedModel):
             if module.padding_idx is not None:
                 module.weight.data[module.padding_idx].zero_()
         elif isinstance(module, G3MoETopkRouter):
+            module.weight.data.normal_(mean=0.0, std=std)
+        elif isinstance(module, G3MoEGRINMoE):
+            module.weight.data.normal_(mean=0.0, std=std)
+        elif isinstance(module, G3MoESharedExpertsLayer):
             module.weight.data.normal_(mean=0.0, std=std)
         elif isinstance(module, nn.Linear):
             module.weight.data.normal_(mean=0.0, std=std)
