@@ -233,7 +233,9 @@ class G3MoETopkRouter(nn.Module):
         self.topk_group = config.topk_group
         self.norm_topk_prob = config.norm_topk_prob
 
-        self.weight = nn.Parameter(torch.empty((self.n_routed_experts, config.hidden_size)))
+        # 적절한 초기화로 변경 (Xavier uniform 초기화)
+        self.weight = nn.Parameter(torch.zeros((self.n_routed_experts, config.hidden_size)))
+        nn.init.xavier_uniform_(self.weight)
         self.register_buffer("e_score_correction_bias", torch.zeros((self.n_routed_experts)))
 
     @torch.no_grad()
@@ -365,7 +367,7 @@ def sparsemixer(scores, top_k, jitter_eps, training):
     with torch.no_grad():
         # compute mask for sparsity
         mask_logits_threshold, max_ind = scores.max(dim=-1, keepdim=True)
-        factor = scores.abs().clamp(min=mask_logits_threshold)
+        factor = scores.abs().clamp(min=mask_logits_threshold.abs()).clamp(min=1e-8)  # 수치적 안정성 개선
         mask_logits_threshold = (
             (mask_logits_threshold - scores) / factor
         ) > (2 * jitter_eps)
@@ -413,7 +415,7 @@ def sparsemixer(scores, top_k, jitter_eps, training):
     with torch.no_grad():
         # compute mask for sparsity
         mask_logits_threshold, max_ind = masked_scores.max(dim=-1, keepdim=True)
-        factor = scores.abs().clamp(min=mask_logits_threshold)
+        factor = scores.abs().clamp(min=mask_logits_threshold.abs()).clamp(min=1e-8)  # 수치적 안정성 개선
         mask_logits_threshold = (
             (mask_logits_threshold - scores) / factor
         ) > (2 * jitter_eps)
@@ -472,16 +474,14 @@ class G3MoEGRINMoE(nn.Module):
         iterations += 1
         self.iter = iterations
 
-        # Gating mechanism
-        self.gate = nn.Linear(self.hidden_dim, self.num_experts, bias=False)
-        # Experts
-        self.experts = nn.ModuleList([G3MoEMLP(config) for _ in range(self.num_experts)])
-        self.shared_experts = G3MoEMLP(
-            config=config, intermediate_size=config.intermediate_size * config.n_shared_experts)
-        
-        # Jitter parameters - default to small values if not in config
         self.router_jitter_noise = getattr(config, 'router_jitter_noise', 0.01)
         self.input_jitter_noise = getattr(config, 'input_jitter_noise', 0.0)
+
+        # self.gate = nn.Linear(self.hidden_dim, self.num_experts, bias=False)
+        self.gate = G3MoETopkRouter(config)
+
+        self.experts = nn.ModuleList([G3MoEMLP(config) for _ in range(self.num_experts)])
+        self.shared_experts = G3MoEMLP(config=config, intermediate_size=config.intermediate_size * config.n_shared_experts)
     
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         residual = hidden_states
@@ -489,7 +489,6 @@ class G3MoEGRINMoE(nn.Module):
         if self.training and self.input_jitter_noise > 0:
             hidden_states *= torch.empty_like(hidden_states).uniform_(1.0 - self.input_jitter_noise, 1.0 + self.input_jitter_noise)
         hidden_states = hidden_states.view(-1, hidden_dim)
-        # Router logits: (batch * sequence_length, n_experts)
         router_logits = self.gate(hidden_states)
         routing_weights, selected_experts = sparsemixer(
             router_logits, 
@@ -500,41 +499,29 @@ class G3MoEGRINMoE(nn.Module):
         final_hidden_states = torch.zeros(
             (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
         )
-        # Get the indices of the top-1 expert for each token
-        # selected_experts from sparsemixer has shape (batch_size * sequence_length, top_k)
-        # We want the first column for the top-1 expert.
-        top1_expert_indices_for_tokens = selected_experts[:, 0]  # Shape: (batch_size * sequence_length)
-        # Iterate over each expert available in the model
+
+        top1_expert_indices_for_tokens = selected_experts[:, 0]
         for expert_idx in range(self.num_experts):
             expert_layer = self.experts[expert_idx]
-            # Find all token indices (in the flattened view) that selected this expert_idx as their top-1 choice
             tokens_for_this_expert = torch.where(top1_expert_indices_for_tokens == expert_idx)[0]
             expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
 
             if tokens_for_this_expert.numel() > 0:
-                # Get the hidden states for these specific tokens
                 idx, top_x = torch.where(expert_mask[expert_idx])
 
                 if top_x.shape[0] == 0:
                     continue
 
-                # in torch it is faster to index using lists than torch tensors
                 top_x_list = top_x.tolist()
                 idx_list = idx.tolist()
 
-                # Index the correct hidden states and compute the expert hidden state for
-                # the current expert. We need to make sure to multiply the output hidden
-                # states by `routing_weights` on the corresponding tokens (top-1 and top-2)
-                # Pass these tokens through the current expert_layer
-                # current_input_to_expert = hidden_states[tokens_for_this_expert]
-                # expert_output = expert_layer(current_input_to_expert)
                 current_state = hidden_states[None, top_x_list].reshape(-1, hidden_dim)
+                
                 expert_output = expert_layer(current_state) * routing_weights[top_x_list, idx_list, None]
-                # Add the expert's output to the final_hidden_states for these tokens.
-                # The output is used directly, not scaled by routing_weights.
                 final_hidden_states.index_add_(0, tokens_for_this_expert, expert_output.to(hidden_states.dtype))
-            
-        final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim) + self.shared_experts(residual)
+
+        final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+        final_hidden_states = final_hidden_states + self.shared_experts(residual)
         return final_hidden_states, router_logits
 
 
@@ -940,18 +927,10 @@ class G3MoEPreTrainedModel(PreTrainedModel):
             module.weight.data.normal_(mean=0.0, std=std)
             if module.padding_idx is not None:
                 module.weight.data[module.padding_idx].zero_()
-        elif isinstance(module, G3MoETopkRouter):
-            module.weight.data.normal_(mean=0.0, std=std)
-        elif isinstance(module, G3MoEGRINMoE):
-            module.weight.data.normal_(mean=0.0, std=std)
-        elif isinstance(module, G3MoESharedExpertsLayer):
-            module.weight.data.normal_(mean=0.0, std=std)
-        elif isinstance(module, nn.Linear):
-            module.weight.data.normal_(mean=0.0, std=std)
-            if module.bias is not None:
-                module.bias.data.zero_()
         elif isinstance(module, nn.Parameter):
             module.weight.data.normal_(mean=0.0, std=std)
+            if module.padding_idx is not None:
+                module.weight.data[module.padding_idx].zero_()
     
     @classmethod
     @restore_default_torch_dtype
@@ -981,7 +960,7 @@ class G3MoEPreTrainedModel(PreTrainedModel):
         if not isinstance(config, G3MoEConfig):
             config = G3MoEConfig(**config.to_dict())
 
-        print("Loading G3MoE model skeleton using super().from_pretrained...")
+        logging.get_logger('transformers').debug("Loading G3MoE model skeleton using super().from_pretrained...")
         logging.set_verbosity_error()
         model = super().from_pretrained(
             pretrained_model_name_or_path,
@@ -999,7 +978,7 @@ class G3MoEPreTrainedModel(PreTrainedModel):
         logging.set_verbosity_warning()
         logging.get_logger('transformers').debug("G3MoE model skeleton loaded.")
 
-        def copy_mlp_weights(mlp, moe, gate_proj_weight, up_proj_weight, down_proj_weight):
+        def copy_mlp_weights(mlp, moe, gate_proj_weight, up_proj_weight, down_proj_weight, layer_idx):
             processing.set_description(f"Copying MLP weights to MoE experts : Processing layer {layer_idx}")
             if hasattr(moe, 'experts'):
                 for expert_idx, expert in enumerate(moe.experts):
@@ -1036,7 +1015,8 @@ class G3MoEPreTrainedModel(PreTrainedModel):
                         moe=decoder_layer.moe, 
                         gate_proj_weight=decoder_layer.mlp.gate_proj.weight, 
                         up_proj_weight=decoder_layer.mlp.up_proj.weight, 
-                        down_proj_weight=decoder_layer.mlp.down_proj.weight
+                        down_proj_weight=decoder_layer.mlp.down_proj.weight,
+                        layer_idx=layer_idx
                     )
                     del decoder_layer.mlp
 
