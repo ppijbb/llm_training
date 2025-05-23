@@ -477,52 +477,104 @@ class G3MoEGRINMoE(nn.Module):
         self.router_jitter_noise = getattr(config, 'router_jitter_noise', 0.01)
         self.input_jitter_noise = getattr(config, 'input_jitter_noise', 0.0)
 
-        # self.gate = nn.Linear(self.hidden_dim, self.num_experts, bias=False)
-        self.gate = G3MoETopkRouter(config)
+        self.gate = nn.Linear(self.hidden_dim, self.num_experts, bias=False)
+        # self.gate = G3MoETopkRouter(config)
 
         self.experts = nn.ModuleList([G3MoEMLP(config) for _ in range(self.num_experts)])
         self.shared_experts = G3MoEMLP(config=config, intermediate_size=config.intermediate_size * config.n_shared_experts)
     
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """ """
         residual = hidden_states
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         if self.training and self.input_jitter_noise > 0:
             hidden_states *= torch.empty_like(hidden_states).uniform_(1.0 - self.input_jitter_noise, 1.0 + self.input_jitter_noise)
         hidden_states = hidden_states.view(-1, hidden_dim)
+        # router_logits: (batch * sequence_length, n_experts)
+        # print ( 'moe', self.iter, torch.norm(hidden_states).item())
         router_logits = self.gate(hidden_states)
+        
         routing_weights, selected_experts = sparsemixer(
             router_logits, 
             top_k=self.top_k, 
             jitter_eps=self.router_jitter_noise, 
             training=self.training,
         )
+
         final_hidden_states = torch.zeros(
             (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
         )
 
-        top1_expert_indices_for_tokens = selected_experts[:, 0]
+        # One hot encode the selected experts to create an expert mask
+        # this will be used to easily index which expert is going to be sollicitated
+        expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
+
+        # Loop over all available experts in the model and perform the computation on each expert
         for expert_idx in range(self.num_experts):
             expert_layer = self.experts[expert_idx]
-            tokens_for_this_expert = torch.where(top1_expert_indices_for_tokens == expert_idx)[0]
-            expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
+            idx, top_x = torch.where(expert_mask[expert_idx])
 
-            if tokens_for_this_expert.numel() > 0:
-                idx, top_x = torch.where(expert_mask[expert_idx])
+            if top_x.shape[0] == 0:
+                continue
 
-                if top_x.shape[0] == 0:
-                    continue
+            # in torch it is faster to index using lists than torch tensors
+            top_x_list = top_x.tolist()
+            idx_list = idx.tolist()
 
-                top_x_list = top_x.tolist()
-                idx_list = idx.tolist()
+            # Index the correct hidden states and compute the expert hidden state for
+            # the current expert. We need to make sure to multiply the output hidden
+            # states by `routing_weights` on the corresponding tokens (top-1 and top-2)
+            current_state = hidden_states[None, top_x_list].reshape(-1, hidden_dim)
+            current_hidden_states = expert_layer(current_state) * routing_weights[top_x_list, idx_list, None]
 
-                current_state = hidden_states[None, top_x_list].reshape(-1, hidden_dim)
-                
-                expert_output = expert_layer(current_state) * routing_weights[top_x_list, idx_list, None]
-                final_hidden_states.index_add_(0, tokens_for_this_expert, expert_output.to(hidden_states.dtype))
-
+            # However `index_add_` only support torch tensors for indexing so we'll use
+            # the `top_x` tensor here.
+            final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
         final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+        # print ( 'moe', self.iter, torch.norm(final_hidden_states).item())
         final_hidden_states = final_hidden_states + self.shared_experts(residual)
         return final_hidden_states, router_logits
+    
+    # def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    #     residual = hidden_states
+    #     batch_size, sequence_length, hidden_dim = hidden_states.shape
+    #     if self.training and self.input_jitter_noise > 0:
+    #         hidden_states *= torch.empty_like(hidden_states).uniform_(1.0 - self.input_jitter_noise, 1.0 + self.input_jitter_noise)
+    #     hidden_states = hidden_states.view(-1, hidden_dim)
+    #     router_logits, topk_weights = self.gate(hidden_states)
+    #     routing_weights, selected_experts = sparsemixer(
+    #         router_logits, 
+    #         top_k=self.top_k, 
+    #         jitter_eps=self.router_jitter_noise, 
+    #         training=self.training,
+    #     )
+    #     final_hidden_states = torch.zeros(
+    #         (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
+    #     )
+
+    #     top1_expert_indices_for_tokens = selected_experts[:, 0]
+    #     for expert_idx in range(self.num_experts):
+    #         expert_layer = self.experts[expert_idx]
+    #         tokens_for_this_expert = torch.where(top1_expert_indices_for_tokens == expert_idx)[0]
+    #         expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
+
+    #         if tokens_for_this_expert.numel() > 0:
+    #             idx, top_x = torch.where(expert_mask[expert_idx])
+
+    #             if top_x.shape[0] == 0:
+    #                 continue
+
+    #             top_x_list = top_x.tolist()
+    #             idx_list = idx.tolist()
+
+    #             current_state = hidden_states[None, top_x_list].reshape(-1, hidden_dim)
+    #             expert_weights = topk_weights[idx_list, top_x_list]
+    #             expert_output = expert_layer(current_state) * expert_weights * routing_weights[top_x_list, idx_list, None]
+    #             final_hidden_states.index_add_(0, tokens_for_this_expert, expert_output.to(hidden_states.dtype))
+
+    #     final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+    #     final_hidden_states = final_hidden_states + self.shared_experts(residual)
+    #     return final_hidden_states, router_logits
 
 
 class G3MoERMSNorm(nn.Module):
@@ -920,6 +972,7 @@ class G3MoEPreTrainedModel(PreTrainedModel):
         )
 
         if isinstance(module, (nn.Linear, nn.Conv2d)):
+            logging.get_logger('transformers').debug(f"Initializing {module} with {std}")
             module.weight.data.normal_(mean=0.0, std=std)
             if module.bias is not None:
                 module.bias.data.zero_()
@@ -978,31 +1031,10 @@ class G3MoEPreTrainedModel(PreTrainedModel):
         logging.set_verbosity_warning()
         logging.get_logger('transformers').debug("G3MoE model skeleton loaded.")
 
-        def copy_mlp_weights(mlp, moe, gate_proj_weight, up_proj_weight, down_proj_weight, layer_idx):
-            processing.set_description(f"Copying MLP weights to MoE experts : Processing layer {layer_idx}")
-            if hasattr(moe, 'experts'):
-                for expert_idx, expert in enumerate(moe.experts):
-                    processing.set_description(f"Copying MLP weights to MoE experts : Processing layer {layer_idx} to expert {expert_idx}")
-                    expert.gate_proj.weight.copy_(gate_proj_weight)
-                    expert.up_proj.weight.copy_(up_proj_weight)
-                    expert.down_proj.weight.copy_(down_proj_weight)
-            
-            if hasattr(moe, 'shared_experts'):
-                processing.set_description(f"Copying MLP weights to MoE experts : Processing layer {layer_idx} to shared experts")
-                moe.shared_experts.gate_proj.weight.copy_(gate_proj_weight)
-                moe.shared_experts.up_proj.weight.copy_(up_proj_weight)
-                moe.shared_experts.down_proj.weight.copy_(down_proj_weight)
-            elif hasattr(moe, 'gate_proj'):
-                moe.gate_proj.weight.copy_(gate_proj_weight)
-                moe.up_proj.weight.copy_(up_proj_weight)
-                moe.down_proj.weight.copy_(down_proj_weight)
-            else:
-                raise Exception("MoE model has no MLP or shared MLP")
-        
-        logging.get_logger('transformers').debug("Initializing MoE experts with MLP weights...")
         if hasattr(model, 'model') and hasattr(model.model, 'layers') and hasattr(model.model.layers, 'moe'):
           logging.get_logger('transformers').debug("G3MoE Pretrained model loaded.")
         elif hasattr(model, 'model') and hasattr(model.model, 'layers'):
+            logging.get_logger('transformers').debug("Initializing MoE experts with MLP weights...")
             with torch.no_grad():
                 processing = tqdm(
                     enumerate(model.model.layers), 
@@ -1010,14 +1042,26 @@ class G3MoEPreTrainedModel(PreTrainedModel):
                     desc=f"Copying MLP weights to MoE experts : Start"
                 )
                 for layer_idx, decoder_layer in processing:
-                    copy_mlp_weights(
-                        mlp=decoder_layer.mlp, 
-                        moe=decoder_layer.moe, 
-                        gate_proj_weight=decoder_layer.mlp.gate_proj.weight, 
-                        up_proj_weight=decoder_layer.mlp.up_proj.weight, 
-                        down_proj_weight=decoder_layer.mlp.down_proj.weight,
-                        layer_idx=layer_idx
-                    )
+                    print(decoder_layer)
+                    processing.set_description(f"Copying MLP weights to MoE experts : Processing layer {layer_idx}")
+                    if hasattr(decoder_layer.moe, 'experts') or hasattr(decoder_layer.moe, 'shared_experts'):
+                        for expert_idx, expert in enumerate(decoder_layer.moe.experts):
+                            processing.set_description(f"Copying MLP weights to MoE experts : Processing layer {layer_idx} to expert {expert_idx}")
+                            expert.gate_proj.weight.copy_(decoder_layer.mlp.gate_proj.weight)
+                            expert.up_proj.weight.copy_(decoder_layer.mlp.up_proj.weight)
+                            expert.down_proj.weight.copy_(decoder_layer.mlp.down_proj.weight)
+                        if hasattr(decoder_layer.moe, 'shared_experts'):
+                            processing.set_description(f"Copying MLP weights to MoE experts : Processing layer {layer_idx} to shared experts")
+                            decoder_layer.moe.shared_experts.gate_proj.weight.copy_(decoder_layer.mlp.gate_proj.weight)
+                            decoder_layer.moe.shared_experts.up_proj.weight.copy_(decoder_layer.mlp.up_proj.weight)
+                            decoder_layer.moe.shared_experts.down_proj.weight.copy_(decoder_layer.mlp.down_proj.weight)
+
+                    elif hasattr(decoder_layer.moe, 'gate_proj'):
+                        decoder_layer.moe.gate_proj.weight.copy_(decoder_layer.mlp.gate_proj.weight)
+                        decoder_layer.moe.up_proj.weight.copy_(decoder_layer.mlp.up_proj.weight)
+                        decoder_layer.moe.down_proj.weight.copy_(decoder_layer.mlp.down_proj.weight)
+                    else:
+                        raise Exception("MoE model has no MLP or shared MLP")
                     del decoder_layer.mlp
 
             logging.get_logger('transformers').debug("MoE experts initialization completed.")
