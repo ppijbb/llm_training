@@ -362,12 +362,12 @@ class mp(torch.autograd.Function):
 
 def sparsemixer(scores, top_k, jitter_eps, training):
     assert top_k == 2
-    
+
     ################ first expert ################
     with torch.no_grad():
         # compute mask for sparsity
         mask_logits_threshold, max_ind = scores.max(dim=-1, keepdim=True)
-        factor = scores.abs().clamp(min=mask_logits_threshold.abs()).clamp(min=1e-8)  # 수치적 안정성 개선
+        factor = scores.abs().clamp(min=mask_logits_threshold.abs())  # 수치적 안정성 개선
         mask_logits_threshold = (
             (mask_logits_threshold - scores) / factor
         ) > (2 * jitter_eps)
@@ -461,31 +461,38 @@ def sparsemixer(scores, top_k, jitter_eps, training):
     )
 
 iterations = 0
+class G3MoESparseMoeBlock(nn.Module):
+    """
+    This implementation is
+    strictly equivalent to standard MoE with full capacity (no
+    dropped tokens). It's faster since it formulates MoE operations
+    in terms of block-sparse operations to accomodate imbalanced
+    assignments of tokens to experts, whereas standard MoE either
+    (1) drop tokens at the cost of reduced performance or (2) set
+    capacity factor to number of experts and thus waste computation
+    and memory on padding.
+    """
 
-class G3MoEGRINMoE(nn.Module):
-    def __init__(self, config, **kwargs):
+    def __init__(self, config):
         super().__init__()
-        config = config
         self.hidden_dim = config.hidden_size
-        self.ffn_dim = config.hidden_size
+        self.ffn_dim = config.intermediate_size
         self.num_experts = config.n_routed_experts
         self.top_k = config.num_experts_per_tok
         global iterations
-        iterations += 1
+        iterations +=1
         self.iter = iterations
-
-        self.router_jitter_noise = getattr(config, 'router_jitter_noise', 0.01)
-        self.input_jitter_noise = getattr(config, 'input_jitter_noise', 0.0)
-
+        # gating
         self.gate = nn.Linear(self.hidden_dim, self.num_experts, bias=False)
-        # self.gate = G3MoETopkRouter(config)
 
         self.experts = nn.ModuleList([G3MoEMLP(config) for _ in range(self.num_experts)])
-        self.shared_experts = G3MoEMLP(config=config, intermediate_size=config.intermediate_size * config.n_shared_experts)
-    
+
+        # Jitter parameters
+        self.router_jitter_noise = config.router_jitter_noise
+        self.input_jitter_noise = config.input_jitter_noise
+        
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """ """
-        residual = hidden_states
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         if self.training and self.input_jitter_noise > 0:
             hidden_states *= torch.empty_like(hidden_states).uniform_(1.0 - self.input_jitter_noise, 1.0 + self.input_jitter_noise)
@@ -532,49 +539,177 @@ class G3MoEGRINMoE(nn.Module):
             final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
         final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
         # print ( 'moe', self.iter, torch.norm(final_hidden_states).item())
+        return final_hidden_states, router_logits
+
+
+class G3MoEHybridRouter(nn.Module):
+    """Hybrid Router: 하나의 linear layer에서 sigmoid와 sparsemixer 두 방식으로 routing"""
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        config = config.text_config if hasattr(config, 'text_config') else config
+        self.hidden_dim = config.hidden_size
+        self.num_experts = config.n_routed_experts
+        self.top_k = config.num_experts_per_tok
+        self.router_jitter_noise = getattr(config, 'router_jitter_noise', 0.01)
+
+        # Sigmoid routing 관련 파라미터들
+        self.routed_scaling_factor = config.routed_scaling_factor
+        self.n_group = config.n_group
+        self.topk_group = config.topk_group
+        self.norm_topk_prob = config.norm_topk_prob
+
+        # 하나의 공유 linear layer
+        self.weight = nn.Parameter(torch.zeros((self.num_experts, config.hidden_size)))
+        nn.init.xavier_uniform_(self.weight)
+        self.register_buffer("e_score_correction_bias", torch.zeros((self.num_experts)))
+
+    @torch.no_grad()
+    def get_topk_indices_sigmoid(self, scores):
+        """Sigmoid 방식의 topk 선택"""
+        scores_for_choice = scores.view(-1, self.num_experts) + self.e_score_correction_bias.unsqueeze(0)
+        group_scores = (
+            scores_for_choice.view(-1, self.n_group, self.num_experts // self.n_group)
+            .topk(2, dim=-1)[0]
+            .sum(dim=-1)
+        )
+        group_idx = torch.topk(group_scores, k=self.topk_group, dim=-1, sorted=False)[1]
+        group_mask = torch.zeros_like(group_scores)
+        group_mask.scatter_(1, group_idx, 1)
+        score_mask = (
+            group_mask.unsqueeze(-1)
+            .expand(-1, self.n_group, self.num_experts // self.n_group)
+            .reshape(-1, self.num_experts)
+        )
+        scores_for_choice = scores_for_choice.masked_fill(~score_mask.bool(), 0.0)
+        topk_indices = torch.topk(scores_for_choice, k=self.top_k, dim=-1, sorted=False)[1]
+        return topk_indices
+
+    def forward(self, hidden_states, training=True):
+        """
+        하나의 router_logits에서 두 가지 routing 방식 적용
+        Returns:
+            topk_indices: sigmoid 방식으로 선택된 expert indices
+            routing_weights: sparsemixer 방식으로 계산된 가중치
+            router_logits: raw logits
+        """
+        hidden_states = hidden_states.view(-1, self.hidden_dim)
+        router_logits = F.linear(hidden_states.type(torch.float32), self.weight.type(torch.float32))
+        
+        # 1. Sigmoid 방식으로 expert 선택
+        sigmoid_scores = router_logits.sigmoid()
+        topk_indices = self.get_topk_indices_sigmoid(sigmoid_scores)
+        
+        # 2. SparseMixer 방식으로 가중치 계산
+        routing_weights, selected_experts = sparsemixer(
+            router_logits, 
+            top_k=self.top_k, 
+            jitter_eps=self.router_jitter_noise, 
+            training=training,
+        )
+        return topk_indices, routing_weights, router_logits
+
+
+class G3MoEGRINMoE(nn.Module):
+    """Hybrid Router: 하나의 linear layer에서 sigmoid로 expert 선택, sparsemixer로 가중치 계산"""
+    def __init__(self, config, **kwargs):
+        super().__init__()
+        config = config
+        self.hidden_dim = config.hidden_size
+        self.ffn_dim = config.hidden_size
+        self.num_experts = config.n_routed_experts
+        self.top_k = config.num_experts_per_tok
+
+        global iterations
+        iterations += 1
+        self.iter = iterations
+        # self.router = G3MoEHybridRouter(config)
+        self.router = nn.Parameter(torch.zeros((self.num_experts, config.hidden_size)))
+        self.experts = nn.ModuleList([G3MoEMLP(config) for _ in range(self.num_experts)])
+        self.shared_experts = G3MoEMLP(config=config, intermediate_size=config.intermediate_size * config.n_shared_experts)
+        self.router_jitter_noise = getattr(config, 'router_jitter_noise', 0.01)
+        self.input_jitter_noise = getattr(config, 'input_jitter_noise', 0.0)   
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        residual = hidden_states
+        # batch_size, sequence_length, hidden_dim = hidden_states.shape
+        
+        # if self.training and self.input_jitter_noise > 0:
+        #     hidden_states *= torch.empty_like(hidden_states).uniform_(1.0 - self.input_jitter_noise, 1.0 + self.input_jitter_noise)
+
+        # topk_indices, routing_weights, router_logits = self.router(hidden_states, training=self.training)
+        # hidden_states = hidden_states.view(-1, hidden_dim)
+        # final_hidden_states = self._hybrid_routing(hidden_states, topk_indices, routing_weights, batch_size, sequence_length, hidden_dim)
+        # final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+        final_hidden_states, router_logits = self._sparse_routing(hidden_states)
         final_hidden_states = final_hidden_states + self.shared_experts(residual)
         return final_hidden_states, router_logits
     
-    # def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-    #     residual = hidden_states
-    #     batch_size, sequence_length, hidden_dim = hidden_states.shape
-    #     if self.training and self.input_jitter_noise > 0:
-    #         hidden_states *= torch.empty_like(hidden_states).uniform_(1.0 - self.input_jitter_noise, 1.0 + self.input_jitter_noise)
-    #     hidden_states = hidden_states.view(-1, hidden_dim)
-    #     router_logits, topk_weights = self.gate(hidden_states)
-    #     routing_weights, selected_experts = sparsemixer(
-    #         router_logits, 
-    #         top_k=self.top_k, 
-    #         jitter_eps=self.router_jitter_noise, 
-    #         training=self.training,
-    #     )
-    #     final_hidden_states = torch.zeros(
-    #         (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
-    #     )
+    def _sparse_routing(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        batch_size, sequence_length, hidden_dim = hidden_states.shape
+        if self.training and self.input_jitter_noise > 0:
+            hidden_states *= torch.empty_like(hidden_states).uniform_(1.0 - self.input_jitter_noise, 1.0 + self.input_jitter_noise)
+        hidden_states = hidden_states.view(-1, hidden_dim)
+        # router_logits: (batch * sequence_length, n_experts)
+        router_logits = F.linear(hidden_states.type(torch.float32), self.router.type(torch.float32))
+        routing_weights, selected_experts = sparsemixer(
+            router_logits, 
+            top_k=self.top_k, 
+            jitter_eps=self.router_jitter_noise, 
+            training=self.training,
+        )
 
-    #     top1_expert_indices_for_tokens = selected_experts[:, 0]
-    #     for expert_idx in range(self.num_experts):
-    #         expert_layer = self.experts[expert_idx]
-    #         tokens_for_this_expert = torch.where(top1_expert_indices_for_tokens == expert_idx)[0]
-    #         expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
+        final_hidden_states = torch.zeros(
+            (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
+        )
 
-    #         if tokens_for_this_expert.numel() > 0:
-    #             idx, top_x = torch.where(expert_mask[expert_idx])
+        # One hot encode the selected experts to create an expert mask
+        # this will be used to easily index which expert is going to be sollicitated
+        expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
 
-    #             if top_x.shape[0] == 0:
-    #                 continue
+        # Loop over all available experts in the model and perform the computation on each expert
+        for expert_idx in range(self.num_experts):
+            expert_layer = self.experts[expert_idx]
+            idx, top_x = torch.where(expert_mask[expert_idx])
 
-    #             top_x_list = top_x.tolist()
-    #             idx_list = idx.tolist()
+            if top_x.shape[0] == 0:
+                continue
 
-    #             current_state = hidden_states[None, top_x_list].reshape(-1, hidden_dim)
-    #             expert_weights = topk_weights[idx_list, top_x_list]
-    #             expert_output = expert_layer(current_state) * expert_weights * routing_weights[top_x_list, idx_list, None]
-    #             final_hidden_states.index_add_(0, tokens_for_this_expert, expert_output.to(hidden_states.dtype))
+            # in torch it is faster to index using lists than torch tensors
+            top_x_list = top_x.tolist()
+            idx_list = idx.tolist()
 
-    #     final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
-    #     final_hidden_states = final_hidden_states + self.shared_experts(residual)
-    #     return final_hidden_states, router_logits
+            # Index the correct hidden states and compute the expert hidden state for
+            # the current expert. We need to make sure to multiply the output hidden
+            # states by `routing_weights` on the corresponding tokens (top-1 and top-2)
+            current_state = hidden_states[None, top_x_list].reshape(-1, hidden_dim)
+            current_hidden_states = expert_layer(current_state) * routing_weights[top_x_list, idx_list, None]
+
+            # However `index_add_` only support torch tensors for indexing so we'll use
+            # the `top_x` tensor here.
+            final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
+        final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+        return final_hidden_states, router_logits
+    
+    def _hybrid_routing(self, hidden_states, topk_indices, routing_weights, batch_size, sequence_length, hidden_dim):
+        """하이브리드: sigmoid로 expert 선택, sparsemixer로 가중치 계산"""
+        final_hidden_states = torch.zeros(
+            (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
+        )
+        expert_mask = torch.nn.functional.one_hot(topk_indices, num_classes=self.num_experts).permute(2, 0, 1)
+        
+        for expert_idx in range(self.num_experts):
+            expert_layer = self.experts[expert_idx]
+            mask = expert_mask[expert_idx]
+            token_indices, weight_indices = torch.where(mask)
+            if token_indices.numel() > 0:
+                # sigmoid로 선택된 expert에 sparsemixer 가중치 적용
+                sparse_weights = routing_weights[token_indices, weight_indices]
+                expert_input = hidden_states[token_indices]
+                expert_output = expert_layer(expert_input)
+                weighted_output = expert_output * sparse_weights.unsqueeze(-1)
+                final_hidden_states.index_add_(0, token_indices, weighted_output)
+        return final_hidden_states
 
 
 class G3MoERMSNorm(nn.Module):
@@ -841,7 +976,7 @@ class G3MoEDecoderLayer(nn.Module):
         self.mlp = G3MoEMLP(config=config) # this layer is for loading pretrained base G3MoE model weights
         self.is_dense_replacement = layer_idx >= config.first_k_dense_replace
         if self.is_dense_replacement:
-            self.moe = G3MoEGRINMoE(config=config)
+            self.moe = G3MoESparseMoeBlock(config=config)
         else:
             self.moe = G3MoEMLP(config=config)
         self.input_layernorm = G3MoERMSNorm(self.hidden_size, eps=config.rms_norm_eps)
@@ -1042,19 +1177,19 @@ class G3MoEPreTrainedModel(PreTrainedModel):
                     desc=f"Copying MLP weights to MoE experts : Start"
                 )
                 for layer_idx, decoder_layer in processing:
-                    print(decoder_layer)
                     processing.set_description(f"Copying MLP weights to MoE experts : Processing layer {layer_idx}")
                     if hasattr(decoder_layer.moe, 'experts') or hasattr(decoder_layer.moe, 'shared_experts'):
-                        for expert_idx, expert in enumerate(decoder_layer.moe.experts):
-                            processing.set_description(f"Copying MLP weights to MoE experts : Processing layer {layer_idx} to expert {expert_idx}")
-                            expert.gate_proj.weight.copy_(decoder_layer.mlp.gate_proj.weight)
-                            expert.up_proj.weight.copy_(decoder_layer.mlp.up_proj.weight)
-                            expert.down_proj.weight.copy_(decoder_layer.mlp.down_proj.weight)
                         if hasattr(decoder_layer.moe, 'shared_experts'):
                             processing.set_description(f"Copying MLP weights to MoE experts : Processing layer {layer_idx} to shared experts")
                             decoder_layer.moe.shared_experts.gate_proj.weight.copy_(decoder_layer.mlp.gate_proj.weight)
                             decoder_layer.moe.shared_experts.up_proj.weight.copy_(decoder_layer.mlp.up_proj.weight)
                             decoder_layer.moe.shared_experts.down_proj.weight.copy_(decoder_layer.mlp.down_proj.weight)
+
+                        for expert_idx, expert in enumerate(decoder_layer.moe.experts):
+                            processing.set_description(f"Copying MLP weights to MoE experts : Processing layer {layer_idx} to expert {expert_idx}")
+                            expert.gate_proj.weight.copy_(decoder_layer.mlp.gate_proj.weight)
+                            expert.up_proj.weight.copy_(decoder_layer.mlp.up_proj.weight)
+                            expert.down_proj.weight.copy_(decoder_layer.mlp.down_proj.weight)
 
                     elif hasattr(decoder_layer.moe, 'gate_proj'):
                         decoder_layer.moe.gate_proj.weight.copy_(decoder_layer.mlp.gate_proj.weight)
