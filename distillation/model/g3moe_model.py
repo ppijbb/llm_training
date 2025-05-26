@@ -1296,6 +1296,7 @@ class G3MoETextModel(G3MoEPreTrainedModel):
 
     def __init__(self, config: G3MoETextConfig):
         super().__init__(config)
+        self.config = config if isinstance(config, G3MoETextConfig) else config.text_config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
