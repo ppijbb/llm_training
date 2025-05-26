@@ -461,7 +461,7 @@ def sparsemixer(scores, top_k, jitter_eps, training):
     )
 
 iterations = 0
-class G3MoESparseMoeBlock(nn.Module):
+class G3MoESparseGRINBlock(nn.Module):
     """
     This implementation is
     strictly equivalent to standard MoE with full capacity (no
@@ -976,7 +976,7 @@ class G3MoEDecoderLayer(nn.Module):
         self.mlp = G3MoEMLP(config=config) # this layer is for loading pretrained base G3MoE model weights
         self.is_dense_replacement = layer_idx >= config.first_k_dense_replace
         if self.is_dense_replacement:
-            self.moe = G3MoESparseMoeBlock(config=config)
+            self.moe = G3MoESparseGRINBlock(config=config)
         else:
             self.moe = G3MoEMLP(config=config)
         self.input_layernorm = G3MoERMSNorm(self.hidden_size, eps=config.rms_norm_eps)
