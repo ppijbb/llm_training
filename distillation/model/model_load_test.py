@@ -16,8 +16,8 @@ def format_parameters(number):
     else:
         return str(number)
 
-base_model_name = "google/gemma-3-4b-it"
-model_architecture = G3MoEForCausalLM
+base_model_name = "google/gemma-3-1b-it"
+model_architecture = Gemma3ForCausalLM
 base_config = Gemma3Config.from_pretrained(base_model_name)
 base_config = base_config.to_dict()
 # base_config['text_config'].update({
@@ -26,9 +26,9 @@ base_config = base_config.to_dict()
 base_config.update(
     {
         "n_shared_experts": 1,
-        "n_routed_experts": 15, # 256, 15, 6
+        "n_routed_experts": 16, # 256, 15, 6
         "n_group": 4,
-        "topk_group": 4,
+        "topk_group": 8,
         "num_experts_per_tok": 2,
         "first_k_dense_replace": 8,
         "router_aux_loss_coef": 0.001,
@@ -93,10 +93,11 @@ with torch.inference_mode():
             test_model.generate(
                 input_ids=test_input.to(test_model.device),
                 generation_config=GenerationConfig(
+                    device=test_model.device,
                     max_new_tokens=10,
                     do_sample=True,
-                    # top_p=0.9,
-                    # top_k=0,
+                    top_p=0.9,
+                    top_k=1,
                     temperature=0.8,
                     repetition_penalty=1.2,
                     length_penalty=1.0,

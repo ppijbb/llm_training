@@ -1713,6 +1713,7 @@ class G3MoEForCausalLM(G3MoEPreTrainedModel, GenerationMixin):
         position_ids=None,
         use_cache=True,
         logits_to_keep=None,
+        device='auto',
         **kwargs,
     ):
         # Overwritten: has a special cache type, `HybridCache`
@@ -1726,6 +1727,7 @@ class G3MoEForCausalLM(G3MoEPreTrainedModel, GenerationMixin):
             position_ids=position_ids,
             use_cache=use_cache,
             logits_to_keep=logits_to_keep,
+            device=device,
             **kwargs,
         )
 
@@ -2104,6 +2106,7 @@ class G3MoEForConditionalGeneration(G3MoEPreTrainedModel, GenerationMixin):
         use_cache=True,
         logits_to_keep=None,
         labels=None,
+        device='auto',
         **kwargs,
     ):
         # Overwritten -- custom `position_ids` and `pixel_values` handling
@@ -2117,6 +2120,7 @@ class G3MoEForConditionalGeneration(G3MoEPreTrainedModel, GenerationMixin):
             use_cache=use_cache,
             logits_to_keep=logits_to_keep,
             token_type_ids=token_type_ids,
+            device=device,
             **kwargs,
         )
 
