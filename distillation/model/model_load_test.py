@@ -29,6 +29,7 @@ base_config.update(
         "n_routed_experts": 16, # 256, 15, 6
         "n_group": 4,
         "topk_group": 8,
+        "num_key_value_heads": base_config['text_config']['num_attention_heads'],
         "num_experts_per_tok": 2,
         "first_k_dense_replace": 8,
         "router_aux_loss_coef": 0.001,
