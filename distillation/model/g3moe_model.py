@@ -699,15 +699,6 @@ class G3MoEGRINMoE(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         residual = hidden_states
-        # batch_size, sequence_length, hidden_dim = hidden_states.shape
-        
-        # if self.training and self.input_jitter_noise > 0:
-        #     hidden_states *= torch.empty_like(hidden_states).uniform_(1.0 - self.input_jitter_noise, 1.0 + self.input_jitter_noise)
-
-        # topk_indices, routing_weights, router_logits = self.router(hidden_states, training=self.training)
-        # hidden_states = hidden_states.view(-1, hidden_dim)
-        # final_hidden_states = self._hybrid_routing(hidden_states, topk_indices, routing_weights, batch_size, sequence_length, hidden_dim)
-        # final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
         final_hidden_states, router_logits = self._sparse_routing(hidden_states)
         with torch.no_grad():
             pretriained_residual = self.shared_experts(residual)
