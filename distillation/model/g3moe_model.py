@@ -669,6 +669,33 @@ class G3MoEGRINMoE(nn.Module):
         self.shared_experts = G3MoEMLP(config=config, intermediate_size=config.intermediate_size * config.n_shared_experts)
         self.router_jitter_noise = getattr(config, 'router_jitter_noise', 0.01)
         self.input_jitter_noise = getattr(config, 'input_jitter_noise', 0.0)   
+        
+        # shared_experts freeze 여부 (기본값은 True로 설정)
+        self.freeze_shared_experts = getattr(config, 'freeze_shared_experts', True)
+        if self.freeze_shared_experts:
+            self._freeze_shared_experts()
+
+    def _freeze_shared_experts(self):
+        """shared_experts의 파라미터들을 freeze"""
+        for param in self.shared_experts.parameters():
+            param.requires_grad = False
+        print(f"Shared experts frozen for layer {self.iter}")
+    
+    def _unfreeze_shared_experts(self):
+        """shared_experts의 파라미터들을 unfreeze"""
+        for param in self.shared_experts.parameters():
+            param.requires_grad = True
+        print(f"Shared experts unfrozen for layer {self.iter}")
+    
+    def freeze_shared_experts_manual(self):
+        """수동으로 shared_experts freeze"""
+        self._freeze_shared_experts()
+        self.freeze_shared_experts = True
+    
+    def unfreeze_shared_experts_manual(self):
+        """수동으로 shared_experts unfreeze"""
+        self._unfreeze_shared_experts()
+        self.freeze_shared_experts = False
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         residual = hidden_states
@@ -682,7 +709,9 @@ class G3MoEGRINMoE(nn.Module):
         # final_hidden_states = self._hybrid_routing(hidden_states, topk_indices, routing_weights, batch_size, sequence_length, hidden_dim)
         # final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
         final_hidden_states, router_logits = self._sparse_routing(hidden_states)
-        final_hidden_states = final_hidden_states + self.shared_experts(residual)
+        with torch.no_grad():
+            pretriained_residual = self.shared_experts(residual)
+        final_hidden_states = final_hidden_states + pretriained_residual
         return final_hidden_states, router_logits
     
     def _sparse_routing(self, hidden_states: torch.Tensor) -> torch.Tensor:
