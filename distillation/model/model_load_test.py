@@ -6,6 +6,8 @@ from g3moe_model import G3MoEForCausalLM
 from transformers import AutoTokenizer, GenerationConfig
 from transformers import Gemma3ForCausalLM, Gemma3Config
 import tensorrt
+import pprint
+
 print("version of tensorrt: " ,tensorrt.__version__)
 
 def format_parameters(number):
@@ -20,10 +22,7 @@ base_model_name = "google/gemma-3-1b-it"
 model_architecture = Gemma3ForCausalLM
 base_config = Gemma3Config.from_pretrained(base_model_name)
 base_config = base_config.to_dict()
-# base_config['text_config'].update({
-#     "num_attention_heads": 4
-# })
-base_config.update(
+base_config['text_config'].update(
     {
         "n_shared_experts": 1,
         "n_routed_experts": 16, # 256, 15, 6
@@ -44,11 +43,12 @@ base_config.update(
         "use_bfloat16": True,
     }
 )
-print(base_config)
 model_config = G3MoEConfig(**base_config)
+pprint.pprint(model_config)
+
 test_model = model_architecture.from_pretrained(
     pretrained_model_name_or_path=base_model_name,
-    config=model_config.text_config,
+    config=model_config,
     # attention_implementation="flash_attention_2"
     )#.to("cuda:1")
 tokenizer = AutoTokenizer.from_pretrained(base_model_name)

@@ -42,27 +42,26 @@ from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_u
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.processing_utils import Unpack
 from transformers.utils import (
-    add_start_docstrings,
     add_start_docstrings_to_model_forward,
-    is_torchdynamo_compiling,
-    logging,
     replace_return_docstrings,
+    logging,
     ModelOutput,
     auto_docstring,
     can_return_tuple,
-    is_torch_flex_attn_available,
+    add_start_docstrings,
     is_torchdynamo_compiling,
+    is_torch_flex_attn_available,
 )
 from transformers.modeling_utils import (
     restore_default_torch_dtype,
     SpecificPreTrainedModelType,
-    PretrainedConfig,
-    load_state_dict as hf_load_state_dict
+    PretrainedConfig
 )
 from transformers import logging
 from transformers.utils.deprecation import deprecate_kwarg
 from transformers import AutoModel, AutoConfig
 from g3moe_config import G3MoEConfig, G3MoETextConfig
+
 if is_torch_flex_attn_available():
     from torch.nn.attention.flex_attention import BlockMask
     from transformers.integrations.flex_attention import make_flex_block_causal_mask
