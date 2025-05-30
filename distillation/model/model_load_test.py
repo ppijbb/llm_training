@@ -3,7 +3,7 @@ from g2moe_config import G2MoEConfig
 from g2moe_model import G2MoEForCausalLM
 from g3moe_config import G3MoEConfig
 from g3moe_model import G3MoEForCausalLM
-from transformers import AutoTokenizer, GenerationConfig
+from transformers import AutoProcessor, GenerationConfig
 from transformers import Gemma3ForCausalLM, Gemma3Config
 import tensorrt
 import pprint
@@ -51,7 +51,7 @@ test_model = model_architecture.from_pretrained(
     config=model_config,
     # attention_implementation="flash_attention_2"
     )#.to("cuda:1")
-tokenizer = AutoTokenizer.from_pretrained(base_model_name)
+tokenizer = AutoProcessor.from_pretrained(base_model_name)
 
 test_text = """
 안녕하세요.<end_of_turn><eos>
