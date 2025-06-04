@@ -246,7 +246,7 @@ class G3MoETextScaledWordEmbedding(nn.Embedding):
 
 
 class G3MoEMLP(nn.Module):
-    def __init__(self, config: G3MoETextConfig, intermediate_size: int=None):
+    def __init__(self, config: G3MoETextConfig, intermediate_size: int=None, **kwargs):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
@@ -262,7 +262,7 @@ class G3MoEMLP(nn.Module):
 
 
 class G3MoETopkRouter(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, **kwargs):
         super().__init__()
         self.config = config
         config = config.text_config
@@ -315,18 +315,18 @@ class G3MoESharedExpertsLayer(nn.Module):
     A mixed expert module containing shared experts.
     """
 
-    def __init__(self, config):
+    def __init__(self, config, **kwargs):
         super().__init__()
         self.config = config
         self.experts = nn.ModuleList(
             [
-                G3MoEMLP(config)
+                G3MoEMLP(config, **kwargs)
                 for _ in range(config.n_routed_experts)
             ]
         )
-        self.gate = G3MoETopkRouter(config=config)
+        self.gate = G3MoETopkRouter(config=config, **kwargs)
         self.shared_experts = G3MoEMLP(
-            config=config, intermediate_size=config.intermediate_size * config.n_shared_experts)
+            config=config, intermediate_size=config.intermediate_size * config.n_shared_experts, **kwargs)
 
     def moe(self, hidden_states: torch.Tensor, topk_indices: torch.Tensor, topk_weights: torch.Tensor):
         r"""
@@ -513,7 +513,7 @@ class G3MoESparseGRINBlock(nn.Module):
     and memory on padding.
     """
 
-    def __init__(self, config):
+    def __init__(self, config, **kwargs):
         super().__init__()
         self.hidden_dim = config.hidden_size
         self.ffn_dim = config.intermediate_size
@@ -584,7 +584,7 @@ class G3MoESparseGRINBlock(nn.Module):
 
 class G3MoEHybridRouter(nn.Module):
     """Hybrid Router: 하나의 linear layer에서 sigmoid와 sparsemixer 두 방식으로 routing"""
-    def __init__(self, config):
+    def __init__(self, config, **kwargs):
         super().__init__()
         self.config = config
         config = config.text_config if hasattr(config, 'text_config') else config
@@ -773,7 +773,7 @@ class G3MoEGRINMoE(nn.Module):
 
 
 class G3MoERMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6):
+    def __init__(self, dim: int, eps: float = 1e-6, **kwargs):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.zeros(dim))
@@ -793,7 +793,7 @@ class G3MoERMSNorm(nn.Module):
 
 
 class G3MoERotaryEmbedding(nn.Module):
-    def __init__(self, config: G3MoETextConfig, device=None):
+    def __init__(self, config: G3MoETextConfig, device=None, **kwargs):
         super().__init__()
         # BC: "rope_type" was originally "type"
         if hasattr(config, "rope_scaling") and config.rope_scaling is not None:
@@ -910,7 +910,7 @@ def eager_attention_forward(
 class G3MoEAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config: G3MoETextConfig, layer_idx: int):
+    def __init__(self, config: G3MoETextConfig, layer_idx: int, **kwargs):
         super().__init__()
         self.is_sliding = bool((layer_idx + 1) % config.sliding_window_pattern)
         self.config = config
@@ -1007,12 +1007,12 @@ class G3MoEAttention(nn.Module):
 
 
 class G3MoEDecoderLayer(nn.Module):
-    def __init__(self, config: G3MoETextConfig, layer_idx: int):
+    def __init__(self, config: G3MoETextConfig, layer_idx: int, **kwargs):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
         self.layer_idx = layer_idx
-        self.self_attn = G3MoEAttention(config=config, layer_idx=layer_idx)
+        self.self_attn = G3MoEAttention(config=config, layer_idx=layer_idx, **kwargs)
         self.mlp = G3MoEMLP(config=config) # this layer is for loading pretrained base G3MoE model weights
         self.is_dense_replacement = layer_idx >= config.first_k_dense_replace
         if self.is_dense_replacement:
@@ -1124,7 +1124,6 @@ G3MoE_START_DOCSTRING = r"""
             [`~PreTrainedModel.from_pretrained`] method to load the model weights.
 """
 
-
 @add_start_docstrings(
     "The bare G3MoE Model outputting raw hidden-states without any specific head on top.",
     G3MoE_START_DOCSTRING,
@@ -1214,7 +1213,7 @@ class G3MoEPreTrainedModel(PreTrainedModel):
             token=token,
             revision=revision,
             use_safetensors=use_safetensors,
-            **{k: v for k, v in kwargs.items() if k in inspect.signature(super().from_pretrained).parameters}
+            **{k: v for k, v in kwargs.items()}
         )
         logging.set_verbosity_warning()
         logging.get_logger('transformers').debug("G3MoE model skeleton loaded.")
@@ -1332,7 +1331,6 @@ G3MoE_INPUTS_DOCSTRING = r"""
             the complete sequence length.
 """
 
-
 @add_start_docstrings(
     "The bare G3MoEText Model outputting raw hidden-states without any specific head on top.",
     G3MoE_START_DOCSTRING,
@@ -1347,7 +1345,7 @@ class G3MoETextModel(G3MoEPreTrainedModel):
 
     config_class = G3MoETextConfig
 
-    def __init__(self, config: G3MoETextConfig):
+    def __init__(self, config: G3MoETextConfig, **kwargs):
         super().__init__(config)
         self.config = config if isinstance(config, G3MoETextConfig) else config.text_config
         self.padding_idx = config.pad_token_id
@@ -1358,7 +1356,7 @@ class G3MoETextModel(G3MoEPreTrainedModel):
             config.vocab_size, config.hidden_size, self.padding_idx, embed_scale=self.config.hidden_size**0.5
         )
         self.layers = nn.ModuleList(
-            [G3MoEDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+            [G3MoEDecoderLayer(config, layer_idx, **kwargs) for layer_idx in range(config.num_hidden_layers)]
         )
         self.norm = G3MoERMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = G3MoERotaryEmbedding(config=config)
@@ -1597,7 +1595,6 @@ class G3MoETextModel(G3MoEPreTrainedModel):
         return causal_mask
 
 
-
 class G3MoEForCausalLM(G3MoEPreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
     _tp_plan = {"lm_head": "colwise_rep"}
@@ -1605,9 +1602,9 @@ class G3MoEForCausalLM(G3MoEPreTrainedModel, GenerationMixin):
     config_class = G3MoETextConfig
     base_model_prefix = "language_model"
 
-    def __init__(self, config: G3MoETextConfig):
+    def __init__(self, config: G3MoETextConfig, **kwargs):
         super().__init__(config)
-        self.model = G3MoETextModel(config)
+        self.model = G3MoETextModel(config, **kwargs)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
@@ -1801,13 +1798,13 @@ class G3MoEForCausalLM(G3MoEPreTrainedModel, GenerationMixin):
 class G3MoEModel(G3MoEPreTrainedModel):
     _checkpoint_conversion_mapping = {"language_model.model": "language_model"}
 
-    def __init__(self, config: G3MoEConfig):
+    def __init__(self, config: G3MoEConfig, **kwargs):
         super().__init__(config)
-        self.vision_tower = AutoModel.from_config(config=config.vision_config)
+        self.vision_tower = AutoModel.from_config(config=config.vision_config, **kwargs)
         self.multi_modal_projector = G3MoEMultiModalProjector(config)
         self.vocab_size = config.text_config.vocab_size
 
-        language_model = AutoModel.from_config(config=config.text_config)
+        language_model = AutoModel.from_config(config=config.text_config, **kwargs)
         self.language_model = language_model
 
         self.pad_token_id = self.config.pad_token_id if self.config.pad_token_id is not None else -1
@@ -2037,7 +2034,7 @@ class G3MoEModel(G3MoEPreTrainedModel):
 
 
 class G3MoEMultiModalProjector(nn.Module):
-    def __init__(self, config: G3MoEConfig):
+    def __init__(self, config: G3MoEConfig, **kwargs):
         super().__init__()
 
         self.mm_input_projection_weight = nn.Parameter(
@@ -2085,9 +2082,9 @@ class G3MoEForConditionalGeneration(G3MoEPreTrainedModel, GenerationMixin):
     }
     _tied_weights_keys = ["lm_head.weight"]  
   
-    def __init__(self, config: G3MoEConfig):
+    def __init__(self, config: G3MoEConfig, **kwargs):
         super().__init__(config)
-        self.model = G3MoEModel(config)
+        self.model = G3MoEModel(config, **kwargs)
         self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
         self.post_init()
 

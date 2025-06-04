@@ -1,7 +1,7 @@
 import torch
 from g2moe_config import G2MoEConfig
 from g2moe_model import G2MoEForCausalLM
-from g3moe_config import G3MoEConfig
+from g3moe_config import G3MoEConfig, G3MoETextConfig
 from g3moe_model import G3MoEForCausalLM
 from transformers import AutoProcessor, GenerationConfig
 from transformers import Gemma3ForCausalLM, Gemma3Config
@@ -18,14 +18,14 @@ def format_parameters(number):
     else:
         return str(number)
 
-base_model_name = "google/gemma-3-1b-it"
-model_architecture = Gemma3ForCausalLM
+base_model_name = "google/gemma-3-4b-it"
+model_architecture = G3MoEForCausalLM
 base_config = Gemma3Config.from_pretrained(base_model_name)
 base_config = base_config.to_dict()
 base_config['text_config'].update(
     {
         "n_shared_experts": 1,
-        "n_routed_experts": 16, # 256, 15, 6
+        "n_routed_experts": 2, # 256, 15, 6
         "n_group": 4,
         "topk_group": 8,
         "num_key_value_heads": base_config['text_config']['num_attention_heads'],
@@ -43,7 +43,8 @@ base_config['text_config'].update(
         "use_bfloat16": True,
     }
 )
-model_config = G3MoEConfig(**base_config)
+# base_config.update(base_config['text_config'])
+model_config = G3MoETextConfig(**base_config)
 pprint.pprint(model_config)
 
 test_model = model_architecture.from_pretrained(
