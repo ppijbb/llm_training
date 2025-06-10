@@ -138,7 +138,6 @@ funcy==2.0
 future==0.10.0
 galore-torch==1.0
 gast==0.6.0
-GDAL==3.8.4
 geopandas==1.0.1
 gin-config==0.5.0
 gitdb==4.0.12
@@ -149,7 +148,6 @@ google-auth
 google-auth-oauthlib
 google-pasta
 googleapis-common-protos
-graphsurgeon
 graphviz==0.20.3
 greenlet==3.1.1
 grpcio==1.70.0
@@ -276,7 +274,8 @@ notebook-shim==0.2.4
 numba==0.61.0
 numexpr==2.10.2
 numpy==1.26.4
-nvidia-pyindex==1.0.9
+--extra-index-url https://pypi.ngc.nvidia.com 
+nvidia-pyindex>=1.0.9
 oauth2client==4.1.3
 oauthenticator==17.3.0
 oauthlib==3.2.2
@@ -335,7 +334,6 @@ pyasn1-modules==0.4.1
 pybcj==1.0.3
 pybind11==2.13.6
 pybind11-global==2.13.6
-pycairo==1.27.0
 pycodestyle==2.12.1
 pycparser==2.22
 pycryptodomex==3.21.0
@@ -349,7 +347,6 @@ pygal==3.0.5
 pygame==2.6.1
 pyglet==2.1.3
 Pygments==2.19.1
-PyGObject==3.50.0
 PyJWT==2.10.1
 pyLDAvis==3.4.1
 pylev==1.4.0
@@ -500,7 +497,7 @@ threadpoolctl==3.5.0
 tifffile==2025.2.18
 timm==1.0.15
 tinycss2==1.4.0
-tokenizers==0.20.0
+tokenizers>=0.20.0
 toml==0.10.2
 tomli==2.2.1
 tomlkit==0.13.2
@@ -518,7 +515,7 @@ tqdm==4.67.1
 traitlets==5.14.3
 transformer_engine==1.13.0
 transformer_engine_cu12==1.13.0
-transformers @ git+https://github.com/huggingface/transformers.git
+transformers # @ git+https://github.com/huggingface/transformers.git
 triton==3.2.0
 trl==0.15.2
 trove-classifiers==2025.2.18.16
