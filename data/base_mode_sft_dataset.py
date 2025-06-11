@@ -33,8 +33,8 @@ def get_dataset(
     try:
         processed_dataset = dataset.map(
             processing, 
-            batched=True, 
-            num_proc=8 if not streaming else None,
+            batched=False, 
+            num_proc=1 if not streaming else None,
             fn_kwargs={
                 "tokenizer": tokenizer, 
                 "max_length": max_length,
@@ -70,50 +70,39 @@ def processing(
 ):
     """
     Applies the chat template directly to each conversation in the 'messages' column.
-
-    This simplified function assumes the tokenizer's `apply_chat_template` can
-    natively handle the dataset's message structure, including the nested list in
-    the 'content' field. It iterates through each conversation, applies the
-    template, and tokenizes the result. Malformed conversations that cause
-    an error during templating are skipped.
+    The apply_chat_template function handles both templating and tokenization.
     """
-    prompts = []
-    for conversation in examples["messages"]:
+    input_ids_list = []
+    
+    for index, conversation in enumerate(examples["messages"]):
         # A conversation should be a list of message dictionaries.
         # Skip any entries that are not lists (e.g., None or other malformed data).
         if not isinstance(conversation, list):
             continue
         
         try:
-            # Directly apply the chat template to the conversation.
-            # The tokenizer is expected to correctly process the format:
-            # [{'role': 'user', 'content': [{'type': 'text', 'text': '...'}]}]
-            prompt = tokenizer.apply_chat_template(
+            # apply_chat_template with tokenize=True returns token IDs directly
+            token_ids = tokenizer.apply_chat_template(
                 conversation,
-                tokenize=False,
-                add_generation_prompt=False  # Crucial for SFT
+                tokenize=True,
+                add_generation_prompt=False,  # Crucial for SFT
+                max_length=max_length,
+                truncation=True
             )
-            prompts.append(prompt)
-        except Exception:
+            assert token_ids is not None, f"Token IDs is None for conversation: {conversation}"
+            input_ids_list.append(token_ids)
+        except Exception as e:
             # If a conversation is malformed and causes an error during templating,
             # skip it and continue with the rest of the batch.
-            print(f"Skipping conversation due to error: {e}")
+            print(f"Skipping conversation due to error: [{index}] {e}")
             print(f"Conversation: {conversation}")
             continue
-    print(prompts)
-    # Tokenize the entire batch of valid, formatted prompt strings.
-    tokenized_outputs = tokenizer(
-        prompts,
-        truncation=True,
-        max_length=max_length,
-        padding=False,  # The DataCollator will handle padding.
-    )
-
-    # For language model fine-tuning, the `labels` are the `input_ids`.
-    # The trainer will handle shifting them for next-token prediction.
-    tokenized_outputs["labels"] = tokenized_outputs["input_ids"][:]
-
-    return tokenized_outputs
+    
+    # Return the tokenized results directly
+    return {
+        "input_ids": input_ids_list,
+        "labels": input_ids_list.copy()  # For language model fine-tuning, labels are the same as input_ids
+    }
 
 if __name__ == "__main__":  
     dataset = get_dataset(tokenizer=AutoProcessor.from_pretrained("google/gemma-3-4b-it"))
