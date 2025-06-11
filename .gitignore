@@ -13,4 +13,5 @@ saved_models/
 hf_cache/
 unsloth_training_checkpoints/
 *.jsonl
+.venv
 
