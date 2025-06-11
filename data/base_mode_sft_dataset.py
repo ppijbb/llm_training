@@ -29,38 +29,44 @@ def get_dataset(
     # Load dataset
     dataset = load_dataset(dataset_name, streaming=streaming)
     
-    # Process the dataset
-    try:
-        processed_dataset = dataset.map(
-            processing, 
-            batched=False, 
-            num_proc=1 if not streaming else None,
-            fn_kwargs={
-                "tokenizer": tokenizer, 
-                "max_length": max_length,
-                "text_only": text_only
-            },
-            remove_columns=dataset["train"].column_names if not streaming else None
-        )
-    except Exception as e:
-        print(f"Error during dataset processing: {e}")
-        print("Falling back to single-threaded processing...")
-        processed_dataset = dataset.map(
-            processing, 
-            batched=True,
-            fn_kwargs={
-                "tokenizer": tokenizer, 
-                "max_length": max_length,
-                "text_only": text_only
-            },
-            remove_columns=dataset["train"].column_names if not streaming else None
-        )
-    
-    # Split into train/test if not streaming
+    # Split into train/test first if not streaming
     if not streaming:
-        processed_dataset = processed_dataset.train_test_split(test_size=test_size)
+        dataset = dataset["train"].train_test_split(test_size=test_size)
     
-    return processed_dataset
+    # Process each split separately
+    processed_dataset = {}
+    for split_name, split_data in dataset.items():
+        try:
+            processed_split = split_data.map(
+                processing, 
+                batched=False, 
+                num_proc=1,
+                fn_kwargs={
+                    "tokenizer": tokenizer, 
+                    "max_length": max_length,
+                    "text_only": text_only
+                },
+                remove_columns=split_data.column_names
+            )
+            processed_dataset[split_name] = processed_split
+        except Exception as e:
+            print(f"Error during {split_name} processing: {e}")
+            print("Falling back to single-threaded processing...")
+            processed_split = split_data.map(
+                processing, 
+                batched=False,
+                fn_kwargs={
+                    "tokenizer": tokenizer, 
+                    "max_length": max_length,
+                    "text_only": text_only
+                },
+                # remove_columns=split_data.column_names
+            )
+            processed_dataset[split_name] = processed_split
+    
+    # Convert back to DatasetDict
+    from datasets import DatasetDict
+    return DatasetDict(processed_dataset)
 
 def processing(
     examples,
