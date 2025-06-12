@@ -27,7 +27,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Import custom modules  
 from models.g3moe_model import G3MoEForCausalLM, G3MoEConfig
-from models.g3moe_config import G3MoETextConfig
 from data.base_mode_sft_dataset import get_dataset
 
 
@@ -66,6 +65,31 @@ class ModelArguments:
     deepspeed_config: Optional[str] = field(
         default=None,
         metadata={"help": "Path to DeepSpeed configuration file"}
+    )
+    # G3MoE specific parameters
+    n_shared_experts: int = field(
+        default=1,
+        metadata={"help": "Number of shared experts in G3MoE"}
+    )
+    n_routed_experts: int = field(
+        default=2,
+        metadata={"help": "Number of routed experts in G3MoE (can be 2, 6, 15, 256)"}
+    )
+    n_group: int = field(
+        default=4,
+        metadata={"help": "Number of expert groups in G3MoE"}
+    )
+    topk_group: int = field(
+        default=8,
+        metadata={"help": "Top-k selection per group in G3MoE"}
+    )
+    num_experts_per_tok: int = field(
+        default=2,
+        metadata={"help": "Number of experts per token in G3MoE"}
+    )
+    rope_scaling_factor: float = field(
+        default=8.0,
+        metadata={"help": "RoPE scaling factor for long context"}
     )
 
 
@@ -144,44 +168,47 @@ def setup_model_and_tokenizer(model_args: ModelArguments):
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
     
-    # Load model configuration
-    try:
-        # Try to load as G3MoE config first
-        config = AutoConfig.from_pretrained(
-            model_args.model_name_or_path,
-            trust_remote_code=model_args.trust_remote_code
-        )
-        base_model_config = config.to_dict()
-        base_model_config['text_config'].update(
-            {
-                "n_shared_experts": 1,
-                "n_routed_experts": 2, # 256, 15, 6
-                "n_group": 4,
-                "topk_group": 8,
-                "num_key_value_heads": base_model_config['text_config']['num_attention_heads'],
-                "num_experts_per_tok": 2,
-                "first_k_dense_replace": 8,
-                "router_aux_loss_coef": 0.001,
-                "router_jitter_noise": 0.01,
-                "input_jitter_noise": 0.01,
-                "model_type": "g3moe_text",
-                "rope_scaling":{
-                    "rope_type": "linear",
-                    "factor": 8.0
-                },
-                # "intermediate_size": base_config['text_config']['hidden_size'],
-                "use_bfloat16": True,
-            }
-        )
-        config = G3MoETextConfig(**base_model_config)
-        print("Loaded G3MoE config")
-    except:
-        # Fallback to text config only
-        config = AutoConfig.from_pretrained(
-            model_args.model_name_or_path,
-            trust_remote_code=model_args.trust_remote_code
-        )
-        print("Loaded G3MoE text config")
+    # Load and configure G3MoE model configuration
+    print("Loading base model configuration...")
+    base_config = AutoConfig.from_pretrained(
+        model_args.model_name_or_path,
+        trust_remote_code=model_args.trust_remote_code
+    )
+    
+    # Convert to dict and update with G3MoE parameters
+    base_model_config = base_config.to_dict()
+    
+    # G3MoE configuration parameters (configurable via ModelArguments)
+    g3moe_params = {
+        "n_shared_experts": model_args.n_shared_experts,
+        "n_routed_experts": model_args.n_routed_experts,
+        "n_group": model_args.n_group,
+        "topk_group": model_args.topk_group,
+        "num_key_value_heads": base_model_config['text_config']['num_attention_heads'],
+        "num_experts_per_tok": model_args.num_experts_per_tok,
+        "first_k_dense_replace": 8,  # Fixed parameter
+        "router_aux_loss_coef": 0.001,  # Fixed parameter
+        "router_jitter_noise": 0.01,  # Fixed parameter
+        "input_jitter_noise": 0.01,  # Fixed parameter
+        "model_type": "g3moe_text",
+        "rope_scaling": {
+            "rope_type": "linear",
+            "factor": model_args.rope_scaling_factor
+        },
+        "use_bfloat16": True,
+    }
+    
+    # Update text_config with G3MoE parameters
+    base_model_config['text_config'].update(g3moe_params)
+    
+    # Create G3MoE configuration
+    config = G3MoEConfig(**base_model_config)
+    print("G3MoE configuration created successfully")
+    print(f"  - Shared experts: {g3moe_params['n_shared_experts']}")
+    print(f"  - Routed experts: {g3moe_params['n_routed_experts']}")
+    print(f"  - Expert groups: {g3moe_params['n_group']}")
+    print(f"  - Top-k per group: {g3moe_params['topk_group']}")
+    print(f"  - Experts per token: {g3moe_params['num_experts_per_tok']}")
     
     # Load model - use different device_map strategy based on DeepSpeed usage
     device_map = None
@@ -194,6 +221,8 @@ def setup_model_and_tokenizer(model_args: ModelArguments):
         device_map = "auto"
         print(f"Using auto device mapping for {torch.cuda.device_count()} GPUs")
     
+    # Load G3MoE model with the configured parameters
+    print("Loading G3MoE model...")
     try:
         model = G3MoEForCausalLM.from_pretrained(
             model_args.model_name_or_path,
@@ -202,10 +231,23 @@ def setup_model_and_tokenizer(model_args: ModelArguments):
             trust_remote_code=model_args.trust_remote_code,
             device_map=device_map,
         )
-        print("Loaded G3MoE model successfully")
+        print("✓ G3MoE model loaded successfully")
+        
+        # Print model info (similar to model_load_test.py)
+        def format_parameters(number):
+            if number >= 1_000_000_000:
+                return f"{number / 1_000_000_000:.2f}B"
+            elif number >= 1_000_000:
+                return f"{number / 1_000_000:.2f}M"
+            else:
+                return str(number)
+        
+        total_params = model.num_parameters()
+        print(f"  - Total parameters: {format_parameters(total_params)}")
+        
     except Exception as e:
-        print(f"Error loading G3MoE model: {e}")
-        print("This might be because the model is not yet available. Using base Gemma model...")
+        print(f"✗ Error loading G3MoE model: {e}")
+        print("Falling back to base Gemma model...")
         from transformers import AutoModelForCausalLM
         model = AutoModelForCausalLM.from_pretrained(
             model_args.model_name_or_path,
@@ -213,6 +255,7 @@ def setup_model_and_tokenizer(model_args: ModelArguments):
             trust_remote_code=model_args.trust_remote_code,
             device_map=device_map,
         )
+        print("✓ Base Gemma model loaded as fallback")
     
     # Setup LoRA if requested
     if model_args.use_lora:
@@ -222,7 +265,7 @@ def setup_model_and_tokenizer(model_args: ModelArguments):
             lora_alpha=model_args.lora_alpha,
             lora_dropout=model_args.lora_dropout,
             target_modules=[
-                "q_proj", "k_proj", "v_proj", "o_proj",
+                # "q_proj", "k_proj", "v_proj", "o_proj",
                 "gate_proj", "up_proj", "down_proj"
             ],
             bias="none",

@@ -110,6 +110,10 @@ def processing(
         "labels": input_ids_list.copy()  # For language model fine-tuning, labels are the same as input_ids
     }
 
-if __name__ == "__main__":  
-    dataset = get_dataset(tokenizer=AutoProcessor.from_pretrained("google/gemma-3-4b-it"))
+if __name__ == "__main__":
+    tokenizer = AutoProcessor.from_pretrained("google/gemma-3-4b-it")
+    with open("/home/conan_jung/workspace/llm_training/sft/config/chat_template.txt", "r") as f:
+        chat_template = f.read()
+    tokenizer.chat_template = chat_template
+    dataset = get_dataset(tokenizer=tokenizer)
     print(dataset)

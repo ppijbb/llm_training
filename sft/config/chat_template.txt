@@ -17,12 +17,12 @@
 {%- endif -%}
 {%- for message in loop_messages -%}
     {%- if (message['role'] == 'user') != (loop.index0 % 2 == 0) -%}
-        {{ raise_exception(\"Conversation roles must alternate user/assistant/user/assistant/...\") }}
+        {{ raise_exception("Conversation roles must alternate user/assistant/user/assistant/...") }}
     {%- endif -%}
     {%- if message['role'] == 'assistant' -%}
-        {%- set role = \"model\" -%}
+        {%- set role = "model" -%}
     {%- elif message['role'] == 'system' -%}
-        {%- set role = \"system\" -%}
+        {%- set role = "system" -%}
     {%- else -%}
         {%- set role = message['role'] -%}
     {%- endif -%}
@@ -39,7 +39,7 @@
             {%- endif -%}
         {%- endfor -%}
     {%- else -%}
-        {{ raise_exception(\"Invalid content type\") }}
+        {{ raise_exception("Invalid content type") }}
     {%- endif -%}
     {{ '<end_of_turn>
 ' }}

@@ -1097,8 +1097,9 @@ class G3MoEDecoderLayer(nn.Module):
         if self.layer_idx >= self.config.first_k_dense_replace:
             hidden_states, router_logits = self.moe(hidden_states)
         else:
-            hidden_states = self.moe(hidden_states)
-            router_logits = None
+            with torch.no_grad():
+                hidden_states = self.moe(hidden_states)
+                router_logits = None
         hidden_states = self.post_feedforward_layernorm(hidden_states)
         hidden_states = residual + hidden_states
         outputs = (hidden_states,)
@@ -1348,6 +1349,7 @@ class G3MoETextModel(G3MoEPreTrainedModel):
     def __init__(self, config: G3MoETextConfig, **kwargs):
         super().__init__(config)
         self.config = config if isinstance(config, G3MoETextConfig) else config.text_config
+        config = self.config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
@@ -1605,7 +1607,7 @@ class G3MoEForCausalLM(G3MoEPreTrainedModel, GenerationMixin):
     def __init__(self, config: G3MoETextConfig, **kwargs):
         super().__init__(config)
         self.model = G3MoETextModel(config, **kwargs)
-        self.vocab_size = config.vocab_size
+        self.vocab_size = self.config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
         # Initialize weights and apply final processing

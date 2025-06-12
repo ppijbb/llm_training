@@ -22,13 +22,12 @@ base_model_name = "google/gemma-3-4b-it"
 model_architecture = G3MoEForCausalLM
 base_config = Gemma3Config.from_pretrained(base_model_name)
 base_config = base_config.to_dict()
-base_config['text_config'].update(
-    {
+moe_config = {
         "n_shared_experts": 1,
         "n_routed_experts": 2, # 256, 15, 6
         "n_group": 4,
         "topk_group": 8,
-        "num_key_value_heads": base_config['text_config']['num_attention_heads'],
+        # "num_key_value_heads": base_config['text_config']['num_attention_heads'],
         "num_experts_per_tok": 2,
         "first_k_dense_replace": 8,
         "router_aux_loss_coef": 0.001,
@@ -42,9 +41,9 @@ base_config['text_config'].update(
         # "intermediate_size": base_config['text_config']['hidden_size'],
         "use_bfloat16": True,
     }
-)
-# base_config.update(base_config['text_config'])
-model_config = G3MoETextConfig(**base_config)
+base_config['text_config'].update(moe_config)
+base_config.update(base_config['text_config'])
+model_config = G3MoEConfig(**base_config)
 pprint.pprint(model_config)
 
 test_model = model_architecture.from_pretrained(
@@ -53,6 +52,8 @@ test_model = model_architecture.from_pretrained(
     # attention_implementation="flash_attention_2"
     )#.to("cuda:1")
 tokenizer = AutoProcessor.from_pretrained(base_model_name)
+with open("/home/conan_jung/workspace/llm_training/sft/config/chat_template.txt", "r") as f:
+    tokenizer.chat_template = f.read()
 
 test_text = """
 안녕하세요.<end_of_turn><eos>
