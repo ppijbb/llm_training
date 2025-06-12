@@ -21,7 +21,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # Default config file and GPU count
-CONFIG_FILE="${1:-$SCRIPT_DIR/config/g3moe_120k_deepspeed_config.json}"
+CONFIG_FILE="${1:-$SCRIPT_DIR/config/g3moe_deepspeed_config.json}"
 NUM_GPUS="${2:-1}"
 
 echo -e "${YELLOW}Project Root:${NC} $PROJECT_ROOT"
@@ -32,13 +32,13 @@ echo -e "${YELLOW}Number of GPUs:${NC} $NUM_GPUS"
 if [ ! -f "$CONFIG_FILE" ]; then
     echo -e "${RED}Error: Config file not found at $CONFIG_FILE${NC}"
     echo "Available configs:"
-    ls -la "$SCRIPT_DIR/config/"*.json
+    find "$SCRIPT_DIR/config" -name "*.json" -type f 2>/dev/null | sort || echo "  No config files found"
     exit 1
 fi
 
 # Check if DeepSpeed config is specified and exists
-DEEPSPEED_CONFIG=$(python3 -c "import json; config=json.load(open('$CONFIG_FILE')); print(config.get('deepspeed', ''))" 2>/dev/null || echo "")
-if [ -n "$DEEPSPEED_CONFIG" ] && [ "$DEEPSPEED_CONFIG" != "null" ]; then
+DEEPSPEED_CONFIG=$(python3 -c "import json; config=json.load(open('$CONFIG_FILE')); print(config['model_config'].get('deepspeed_config', ''))" 2>/dev/null || echo "")
+if [ -n "$DEEPSPEED_CONFIG" ] && [ "$DEEPSPEED_CONFIG" != "null" ] && [ "$DEEPSPEED_CONFIG" != "None" ]; then
     if [ ! -f "$DEEPSPEED_CONFIG" ]; then
         echo -e "${RED}Error: DeepSpeed config not found at $DEEPSPEED_CONFIG${NC}"
         exit 1
@@ -56,7 +56,7 @@ export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:1024
 export CUDA_LAUNCH_BLOCKING=0
 
 # Create output directory
-OUTPUT_DIR=$(python3 -c "import json; print(json.load(open('$CONFIG_FILE'))['output_dir'])")
+OUTPUT_DIR=$(python3 -c "import json; print(json.load(open('$CONFIG_FILE'))['training_config']['output_dir'])")
 mkdir -p "$OUTPUT_DIR"
 
 echo -e "${YELLOW}Output Directory:${NC} $OUTPUT_DIR"
@@ -106,10 +106,10 @@ cd "$PROJECT_ROOT"
 
 if [ "$NUM_GPUS" -eq 1 ]; then
     echo -e "${GREEN}Starting single-GPU DeepSpeed training...${NC}"
-    TRAIN_CMD="python3 $SCRIPT_DIR/custom_model_sft.py $CONFIG_FILE"
+    TRAIN_CMD="python3 $SCRIPT_DIR/custom_model_sft.py --config $CONFIG_FILE"
 else
     echo -e "${GREEN}Starting multi-GPU DeepSpeed training with $NUM_GPUS GPUs...${NC}"
-    TRAIN_CMD="torchrun --nproc_per_node=$NUM_GPUS $SCRIPT_DIR/custom_model_sft.py $CONFIG_FILE"
+    TRAIN_CMD="torchrun --nproc_per_node=$NUM_GPUS $SCRIPT_DIR/custom_model_sft.py --config $CONFIG_FILE"
 fi
 
 echo -e "${BLUE}Command:${NC} $TRAIN_CMD"

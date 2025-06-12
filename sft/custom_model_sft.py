@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-G3MoE SFT Training Script using TRL SFTTrainer with DeepSpeed Support
+G3MoE SFT Training Script using Config File
 """
 
 import os
@@ -8,14 +8,11 @@ import sys
 import json
 import torch
 import argparse
-from typing import Optional
-from dataclasses import dataclass, field
+from typing import Dict, Any
 from transformers import (
     AutoTokenizer,
     AutoProcessor,
     AutoConfig,
-    TrainingArguments,
-    HfArgumentParser,
     set_seed,
 )
 from trl import SFTTrainer, SFTConfig
@@ -26,141 +23,40 @@ import wandb
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Import custom modules  
-from models.g3moe_model import G3MoEForCausalLM, G3MoEConfig
+from models import G3MoEForCausalLM, G3MoEConfig
 from data.base_mode_sft_dataset import get_dataset
 
 
-@dataclass
-class ModelArguments:
-    """Arguments pertaining to which model/config/tokenizer we are going to fine-tune."""
-    
-    model_name_or_path: str = field(
-        default="google/gemma-3-4b-it",
-        metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models"}
-    )
-    tokenizer_name_or_path: Optional[str] = field(
-        default=None,
-        metadata={"help": "Path to tokenizer. If None, uses model_name_or_path"}
-    )
-    use_lora: bool = field(
-        default=True,
-        metadata={"help": "Whether to use LoRA for efficient fine-tuning"}
-    )
-    lora_r: int = field(
-        default=16,
-        metadata={"help": "LoRA rank"}
-    )
-    lora_alpha: int = field(
-        default=32,
-        metadata={"help": "LoRA alpha parameter"}
-    )
-    lora_dropout: float = field(
-        default=0.1,
-        metadata={"help": "LoRA dropout"}
-    )
-    trust_remote_code: bool = field(
-        default=True,
-        metadata={"help": "Trust remote code when loading model"}
-    )
-    deepspeed_config: Optional[str] = field(
-        default=None,
-        metadata={"help": "Path to DeepSpeed configuration file"}
-    )
-    # G3MoE specific parameters
-    n_shared_experts: int = field(
-        default=1,
-        metadata={"help": "Number of shared experts in G3MoE"}
-    )
-    n_routed_experts: int = field(
-        default=2,
-        metadata={"help": "Number of routed experts in G3MoE (can be 2, 6, 15, 256)"}
-    )
-    n_group: int = field(
-        default=4,
-        metadata={"help": "Number of expert groups in G3MoE"}
-    )
-    topk_group: int = field(
-        default=8,
-        metadata={"help": "Top-k selection per group in G3MoE"}
-    )
-    num_experts_per_tok: int = field(
-        default=2,
-        metadata={"help": "Number of experts per token in G3MoE"}
-    )
-    rope_scaling_factor: float = field(
-        default=8.0,
-        metadata={"help": "RoPE scaling factor for long context"}
-    )
-
-
-@dataclass
-class DataArguments:
-    """Arguments pertaining to what data we are going to input our model for training and eval."""
-    
-    dataset_name: str = field(
-        default="Gunulhona/open_m_3",
-        metadata={"help": "The name of the dataset to use"}
-    )
-    max_seq_length: int = field(
-        default=131072,
-        metadata={"help": "Maximum sequence length"}
-    )
-    test_size: float = field(
-        default=0.1,
-        metadata={"help": "Test size for dataset split"}
-    )
-    text_only: bool = field(
-        default=False,
-        metadata={"help": "Whether to use text-only mode"}
-    )
-    streaming: bool = field(
-        default=False,
-        metadata={"help": "Whether to use streaming dataset"}
-    )
-
-
-def load_deepspeed_config(config_path: str) -> dict:
-    """Load DeepSpeed configuration from JSON file"""
+def load_config(config_path: str) -> Dict[str, Any]:
+    """Load configuration from JSON file"""
     if not os.path.exists(config_path):
-        raise FileNotFoundError(f"DeepSpeed config file not found: {config_path}")
+        raise FileNotFoundError(f"Config file not found: {config_path}")
     
     with open(config_path, 'r') as f:
         config = json.load(f)
     
-    print(f"Loaded DeepSpeed config from: {config_path}")
+    print(f"✓ Config loaded from: {config_path}")
     return config
 
 
-def setup_deepspeed_environment():
-    """Setup environment variables for DeepSpeed optimization"""
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:1024"
-    os.environ["TOKENIZERS_PARALLELISM"] = "false"
-    
-    # Enable DeepSpeed optimizations
-    if "DEEPSPEED_ZERO_INIT" not in os.environ:
-        os.environ["DEEPSPEED_ZERO_INIT"] = "1"
-    
-    print("DeepSpeed environment variables set")
-
-
-def setup_model_and_tokenizer(model_args: ModelArguments):
+def setup_model_and_tokenizer(model_config: Dict[str, Any]):
     """Setup G3MoE model and tokenizer"""
     
     # Setup DeepSpeed environment if config is provided
-    if model_args.deepspeed_config:
+    if model_config.get("deepspeed_config"):
         setup_deepspeed_environment()
     
     # Load tokenizer
-    tokenizer_path = model_args.tokenizer_name_or_path or model_args.model_name_or_path
+    tokenizer_path = model_config.get("tokenizer_name_or_path") or model_config["model_name_or_path"]
     try:
         tokenizer = AutoProcessor.from_pretrained(
             tokenizer_path,
-            trust_remote_code=model_args.trust_remote_code
+            trust_remote_code=model_config["trust_remote_code"]
         )
     except:
         tokenizer = AutoTokenizer.from_pretrained(
             tokenizer_path,
-            trust_remote_code=model_args.trust_remote_code
+            trust_remote_code=model_config["trust_remote_code"]
         )
     
     # Ensure tokenizer has pad token
@@ -171,21 +67,22 @@ def setup_model_and_tokenizer(model_args: ModelArguments):
     # Load and configure G3MoE model configuration
     print("Loading base model configuration...")
     base_config = AutoConfig.from_pretrained(
-        model_args.model_name_or_path,
-        trust_remote_code=model_args.trust_remote_code
+        model_config["model_name_or_path"],
+        trust_remote_code=model_config["trust_remote_code"]
     )
     
     # Convert to dict and update with G3MoE parameters
     base_model_config = base_config.to_dict()
     
-    # G3MoE configuration parameters (configurable via ModelArguments)
-    g3moe_params = {
-        "n_shared_experts": model_args.n_shared_experts,
-        "n_routed_experts": model_args.n_routed_experts,
-        "n_group": model_args.n_group,
-        "topk_group": model_args.topk_group,
+    # G3MoE configuration parameters from config file
+    g3moe_params = model_config["g3moe_params"]
+    g3moe_config = {
+        "n_shared_experts": g3moe_params["n_shared_experts"],
+        "n_routed_experts": g3moe_params["n_routed_experts"],
+        "n_group": g3moe_params["n_group"],
+        "topk_group": g3moe_params["topk_group"],
         "num_key_value_heads": base_model_config['text_config']['num_attention_heads'],
-        "num_experts_per_tok": model_args.num_experts_per_tok,
+        "num_experts_per_tok": g3moe_params["num_experts_per_tok"],
         "first_k_dense_replace": 8,  # Fixed parameter
         "router_aux_loss_coef": 0.001,  # Fixed parameter
         "router_jitter_noise": 0.01,  # Fixed parameter
@@ -193,26 +90,26 @@ def setup_model_and_tokenizer(model_args: ModelArguments):
         "model_type": "g3moe_text",
         "rope_scaling": {
             "rope_type": "linear",
-            "factor": model_args.rope_scaling_factor
+            "factor": g3moe_params["rope_scaling_factor"]
         },
         "use_bfloat16": True,
     }
     
     # Update text_config with G3MoE parameters
-    base_model_config['text_config'].update(g3moe_params)
+    base_model_config['text_config'].update(g3moe_config)
     
     # Create G3MoE configuration
     config = G3MoEConfig(**base_model_config)
     print("G3MoE configuration created successfully")
-    print(f"  - Shared experts: {g3moe_params['n_shared_experts']}")
-    print(f"  - Routed experts: {g3moe_params['n_routed_experts']}")
-    print(f"  - Expert groups: {g3moe_params['n_group']}")
-    print(f"  - Top-k per group: {g3moe_params['topk_group']}")
-    print(f"  - Experts per token: {g3moe_params['num_experts_per_tok']}")
+    print(f"  - Shared experts: {g3moe_config['n_shared_experts']}")
+    print(f"  - Routed experts: {g3moe_config['n_routed_experts']}")
+    print(f"  - Expert groups: {g3moe_config['n_group']}")
+    print(f"  - Top-k per group: {g3moe_config['topk_group']}")
+    print(f"  - Experts per token: {g3moe_config['num_experts_per_tok']}")
     
     # Load model - use different device_map strategy based on DeepSpeed usage
     device_map = None
-    if model_args.deepspeed_config:
+    if model_config.get("deepspeed_config"):
         # With DeepSpeed, let DeepSpeed handle device placement
         device_map = None
         print("Using DeepSpeed - letting DeepSpeed handle device placement")
@@ -225,15 +122,15 @@ def setup_model_and_tokenizer(model_args: ModelArguments):
     print("Loading G3MoE model...")
     try:
         model = G3MoEForCausalLM.from_pretrained(
-            model_args.model_name_or_path,
+            model_config["model_name_or_path"],
             config=config,
             torch_dtype=torch.bfloat16,
-            trust_remote_code=model_args.trust_remote_code,
+            trust_remote_code=model_config["trust_remote_code"],
             device_map=device_map,
         )
         print("✓ G3MoE model loaded successfully")
         
-        # Print model info (similar to model_load_test.py)
+        # Print model info
         def format_parameters(number):
             if number >= 1_000_000_000:
                 return f"{number / 1_000_000_000:.2f}B"
@@ -250,20 +147,20 @@ def setup_model_and_tokenizer(model_args: ModelArguments):
         print("Falling back to base Gemma model...")
         from transformers import AutoModelForCausalLM
         model = AutoModelForCausalLM.from_pretrained(
-            model_args.model_name_or_path,
+            model_config["model_name_or_path"],
             torch_dtype=torch.bfloat16,
-            trust_remote_code=model_args.trust_remote_code,
+            trust_remote_code=model_config["trust_remote_code"],
             device_map=device_map,
         )
         print("✓ Base Gemma model loaded as fallback")
     
     # Setup LoRA if requested
-    if model_args.use_lora:
+    if model_config["use_lora"]:
         lora_config = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
-            r=model_args.lora_r,
-            lora_alpha=model_args.lora_alpha,
-            lora_dropout=model_args.lora_dropout,
+            r=model_config["lora_r"],
+            lora_alpha=model_config["lora_alpha"],
+            lora_dropout=model_config["lora_dropout"],
             target_modules=[
                 # "q_proj", "k_proj", "v_proj", "o_proj",
                 "gate_proj", "up_proj", "down_proj"
@@ -276,17 +173,17 @@ def setup_model_and_tokenizer(model_args: ModelArguments):
     return model, tokenizer
 
 
-def setup_dataset(data_args: DataArguments, tokenizer):
+def setup_dataset(data_config: Dict[str, Any], tokenizer):
     """Setup training dataset"""
     
-    print(f"Loading dataset: {data_args.dataset_name}")
+    print(f"Loading dataset: {data_config['dataset_name']}")
     dataset = get_dataset(
-        dataset_name=data_args.dataset_name,
+        dataset_name=data_config["dataset_name"],
         tokenizer=tokenizer,
-        max_length=data_args.max_seq_length,
-        test_size=data_args.test_size,
-        text_only=data_args.text_only,
-        streaming=data_args.streaming
+        max_length=data_config["max_seq_length"],
+        test_size=data_config["test_size"],
+        text_only=data_config["text_only"],
+        streaming=data_config["streaming"]
     )
     
     print(f"Dataset loaded:")
@@ -296,61 +193,78 @@ def setup_dataset(data_args: DataArguments, tokenizer):
     return dataset
 
 
-def setup_training_args_with_deepspeed(training_args: SFTConfig, model_args: ModelArguments):
-    """Setup training arguments with DeepSpeed configuration"""
+def setup_deepspeed_environment():
+    """Setup environment variables for DeepSpeed optimization"""
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:1024"
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
     
-    if model_args.deepspeed_config:
-        # Load DeepSpeed configuration
-        deepspeed_config = load_deepspeed_config(model_args.deepspeed_config)
-        
-        # Set DeepSpeed config in training arguments
-        training_args.deepspeed = model_args.deepspeed_config
-        
-        # Override some training arguments based on DeepSpeed config
-        if "gradient_accumulation_steps" in deepspeed_config:
-            training_args.gradient_accumulation_steps = deepspeed_config["gradient_accumulation_steps"]
-            print(f"Set gradient_accumulation_steps to {deepspeed_config['gradient_accumulation_steps']} from DeepSpeed config")
-        
-        if "train_micro_batch_size_per_gpu" in deepspeed_config:
-            training_args.per_device_train_batch_size = deepspeed_config["train_micro_batch_size_per_gpu"]
-            print(f"Set per_device_train_batch_size to {deepspeed_config['train_micro_batch_size_per_gpu']} from DeepSpeed config")
-        
-        # Enable gradient checkpointing if specified in DeepSpeed config
-        if deepspeed_config.get("activation_checkpointing", {}).get("partition_activations", False):
-            training_args.gradient_checkpointing = True
-            print("Enabled gradient checkpointing from DeepSpeed config")
-        
-        # Set FP16/BF16 based on DeepSpeed config
-        if "fp16" in deepspeed_config and deepspeed_config["fp16"]["enabled"]:
-            training_args.fp16 = True
-            training_args.bf16 = False
-            print("Enabled FP16 from DeepSpeed config")
-        elif "bf16" in deepspeed_config and deepspeed_config["bf16"]["enabled"]:
-            training_args.bf16 = True
-            training_args.fp16 = False
-            print("Enabled BF16 from DeepSpeed config")
-        
-        print(f"DeepSpeed configuration applied: {model_args.deepspeed_config}")
+    # Enable DeepSpeed optimizations
+    if "DEEPSPEED_ZERO_INIT" not in os.environ:
+        os.environ["DEEPSPEED_ZERO_INIT"] = "1"
+    
+    print("DeepSpeed environment variables set")
+
+
+def create_training_args(training_config: Dict[str, Any], deepspeed_config: str = None) -> SFTConfig:
+    """Create SFTConfig from training configuration"""
+    
+    # Create SFTConfig with all parameters
+    training_args = SFTConfig(
+        output_dir=training_config["output_dir"],
+        num_train_epochs=training_config["num_train_epochs"],
+        per_device_train_batch_size=training_config["per_device_train_batch_size"],
+        per_device_eval_batch_size=training_config["per_device_eval_batch_size"],
+        gradient_accumulation_steps=training_config["gradient_accumulation_steps"],
+        learning_rate=training_config["learning_rate"],
+        weight_decay=training_config["weight_decay"],
+        lr_scheduler_type=training_config["lr_scheduler_type"],
+        warmup_ratio=training_config["warmup_ratio"],
+        logging_steps=training_config["logging_steps"],
+        eval_steps=training_config["eval_steps"],
+        save_steps=training_config["save_steps"],
+        save_total_limit=training_config["save_total_limit"],
+        evaluation_strategy=training_config["evaluation_strategy"],
+        load_best_model_at_end=training_config["load_best_model_at_end"],
+        metric_for_best_model=training_config["metric_for_best_model"],
+        greater_is_better=training_config["greater_is_better"],
+        fp16=training_config["fp16"],
+        bf16=training_config["bf16"],
+        dataloader_pin_memory=training_config["dataloader_pin_memory"],
+        remove_unused_columns=training_config["remove_unused_columns"],
+        gradient_checkpointing=training_config["gradient_checkpointing"],
+        report_to=training_config["report_to"],
+        run_name=training_config["run_name"],
+        seed=training_config["seed"],
+    )
+    
+    # Add DeepSpeed config if provided
+    if deepspeed_config:
+        training_args.deepspeed = deepspeed_config
+        print(f"DeepSpeed config set: {deepspeed_config}")
     
     return training_args
 
 
 def main():
-    # Parse arguments
-    parser = HfArgumentParser((ModelArguments, DataArguments, SFTConfig))
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description="G3MoE SFT Training with Config File")
+    parser.add_argument(
+        "--config", 
+        type=str, 
+        default="sft/config/g3moe_training_config.json",
+        help="Path to training configuration JSON file"
+    )
+    args = parser.parse_args()
     
-    if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
-        # Load from JSON file
-        model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
-    else:
-        # Parse from command line
-        model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    # Load configuration
+    config = load_config(args.config)
     
-    # Setup training arguments with DeepSpeed if specified
-    training_args = setup_training_args_with_deepspeed(training_args, model_args)
+    model_config = config["model_config"]
+    data_config = config["data_config"]
+    training_config = config["training_config"]
     
     # Set seed
-    set_seed(training_args.seed)
+    set_seed(training_config["seed"])
     
     # Setup logging
     import logging
@@ -361,24 +275,26 @@ def main():
     )
     
     # Initialize wandb if needed
-    if training_args.report_to and "wandb" in training_args.report_to:
+    if training_config.get("report_to") and "wandb" in training_config["report_to"]:
         wandb.init(
             project="g3moe-sft",
-            name=training_args.run_name,
-            config={
-                **vars(model_args),
-                **vars(data_args),
-                **vars(training_args),
-            }
+            name=training_config["run_name"],
+            config=config
         )
     
     # Setup model and tokenizer
     print("Setting up model and tokenizer...")
-    model, tokenizer = setup_model_and_tokenizer(model_args)
+    model, tokenizer = setup_model_and_tokenizer(model_config)
     
     # Setup dataset
     print("Setting up dataset...")
-    dataset = setup_dataset(data_args, tokenizer)
+    dataset = setup_dataset(data_config, tokenizer)
+    
+    # Create training arguments
+    training_args = create_training_args(
+        training_config, 
+        model_config.get("deepspeed_config")
+    )
     
     # Setup trainer
     print("Setting up trainer...")
@@ -388,7 +304,7 @@ def main():
         train_dataset=dataset["train"],
         eval_dataset=dataset.get("test"),
         tokenizer=tokenizer,
-        max_seq_length=data_args.max_seq_length,
+        max_seq_length=data_config["max_seq_length"],
         dataset_text_field="input_ids",  # Since we're using pre-tokenized data
         packing=False,  # Don't pack sequences since we have labels
     )
@@ -397,20 +313,19 @@ def main():
     print("\n" + "="*50)
     print("TRAINING CONFIGURATION")
     print("="*50)
-    print(f"Model: {model_args.model_name_or_path}")
-    print(f"Dataset: {data_args.dataset_name}")
-    print(f"Max sequence length: {data_args.max_seq_length}")
-    print(f"Use LoRA: {model_args.use_lora}")
-    if model_args.use_lora:
-        print(f"LoRA rank: {model_args.lora_r}")
-    print(f"DeepSpeed config: {model_args.deepspeed_config or 'None'}")
-    print(f"Training steps: {training_args.max_steps if training_args.max_steps > 0 else 'N/A'}")
-    print(f"Training epochs: {training_args.num_train_epochs}")
-    print(f"Batch size per device: {training_args.per_device_train_batch_size}")
-    print(f"Gradient accumulation steps: {training_args.gradient_accumulation_steps}")
-    print(f"Learning rate: {training_args.learning_rate}")
-    print(f"FP16: {training_args.fp16}")
-    print(f"BF16: {training_args.bf16}")
+    print(f"Model: {model_config['model_name_or_path']}")
+    print(f"Dataset: {data_config['dataset_name']}")
+    print(f"Max sequence length: {data_config['max_seq_length']}")
+    print(f"Use LoRA: {model_config['use_lora']}")
+    if model_config['use_lora']:
+        print(f"LoRA rank: {model_config['lora_r']}")
+    print(f"DeepSpeed config: {model_config.get('deepspeed_config', 'None')}")
+    print(f"Training epochs: {training_config['num_train_epochs']}")
+    print(f"Batch size per device: {training_config['per_device_train_batch_size']}")
+    print(f"Gradient accumulation steps: {training_config['gradient_accumulation_steps']}")
+    print(f"Learning rate: {training_config['learning_rate']}")
+    print(f"FP16: {training_config['fp16']}")
+    print(f"BF16: {training_config['bf16']}")
     print("="*50)
     
     # Start training
@@ -428,34 +343,4 @@ def main():
 
 
 if __name__ == "__main__":
-    # Example usage with default arguments
-    if len(sys.argv) == 1:
-        print("Running with default arguments...")
-        sys.argv.extend([
-            "--model_name_or_path", "google/gemma-3-4b-it",
-            "--output_dir", "./g3moe_sft_output",
-            "--num_train_epochs", "3",
-            "--per_device_train_batch_size", "2",
-            "--per_device_eval_batch_size", "2",
-            "--gradient_accumulation_steps", "8",
-            "--learning_rate", "2e-5",
-            "--weight_decay", "0.01",
-            "--lr_scheduler_type", "cosine",
-            "--warmup_ratio", "0.1",
-            "--logging_steps", "10",
-            "--eval_steps", "500",
-            "--save_steps", "500",
-            "--save_total_limit", "3",
-            "--evaluation_strategy", "steps",
-            "--load_best_model_at_end", "True",
-            "--metric_for_best_model", "eval_loss",
-            "--greater_is_better", "False",
-            "--fp16", "False",
-            "--bf16", "True",
-            "--dataloader_pin_memory", "False",
-            "--remove_unused_columns", "False",
-            "--report_to", "wandb",
-            "--run_name", "g3moe-sft-run",
-        ])
-    
     main()

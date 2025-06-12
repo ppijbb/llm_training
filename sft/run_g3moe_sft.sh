@@ -20,7 +20,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # Default config file
-CONFIG_FILE="${1:-$SCRIPT_DIR/config/g3moe_sft_config.json}"
+CONFIG_FILE="${1:-$SCRIPT_DIR/config/g3moe_training_config.json}"
 
 echo -e "${YELLOW}Project Root:${NC} $PROJECT_ROOT"
 echo -e "${YELLOW}Config File:${NC} $CONFIG_FILE"
@@ -28,7 +28,8 @@ echo -e "${YELLOW}Config File:${NC} $CONFIG_FILE"
 # Check if config file exists
 if [ ! -f "$CONFIG_FILE" ]; then
     echo -e "${RED}Error: Config file not found at $CONFIG_FILE${NC}"
-    echo "Please provide a valid config file path as the first argument."
+    echo "Available config files:"
+    find "$SCRIPT_DIR/config" -name "*.json" -type f 2>/dev/null | sort || echo "  No config files found"
     exit 1
 fi
 
@@ -38,7 +39,7 @@ export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
 export TOKENIZERS_PARALLELISM=false
 
 # Create output directory
-OUTPUT_DIR=$(python3 -c "import json; print(json.load(open('$CONFIG_FILE'))['output_dir'])")
+OUTPUT_DIR=$(python3 -c "import json; print(json.load(open('$CONFIG_FILE'))['training_config']['output_dir'])")
 mkdir -p "$OUTPUT_DIR"
 
 echo -e "${YELLOW}Output Directory:${NC} $OUTPUT_DIR"
@@ -66,12 +67,12 @@ fi
 
 # Start training
 echo -e "${GREEN}Starting G3MoE SFT training...${NC}"
-echo "Command: python3 $SCRIPT_DIR/custom_model_sft.py $CONFIG_FILE"
+echo "Command: python3 $SCRIPT_DIR/custom_model_sft.py --config $CONFIG_FILE"
 
 cd "$PROJECT_ROOT"
 
 # Run training with error handling
-if python3 "$SCRIPT_DIR/custom_model_sft.py" "$CONFIG_FILE"; then
+if python3 "$SCRIPT_DIR/custom_model_sft.py" --config "$CONFIG_FILE"; then
     echo -e "${GREEN}Training completed successfully!${NC}"
     echo -e "${GREEN}Model saved to: $OUTPUT_DIR${NC}"
 else

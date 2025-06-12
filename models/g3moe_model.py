@@ -60,7 +60,7 @@ from transformers.modeling_utils import (
 from transformers import logging
 from transformers.utils.deprecation import deprecate_kwarg
 from transformers import AutoModel, AutoConfig
-from g3moe_config import G3MoEConfig, G3MoETextConfig
+from .g3moe_config import G3MoEConfig, G3MoETextConfig
 
 if is_torch_flex_attn_available():
     from torch.nn.attention.flex_attention import BlockMask
