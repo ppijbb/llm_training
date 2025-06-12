@@ -34,19 +34,14 @@ git clone <repository-url>
 cd llm_training
 ```
 
-2. Install Poetry (if not already installed):
+2. Install uv:
 ```bash
-curl -sSL https://install.python-poetry.org | python3 -
+pip install uv
 ```
 
 3. Install dependencies:
 ```bash
-poetry install
-```
-
-Alternatively, you can use pip with requirements.txt:
-```bash
-pip install -r requirements.txt
+uv pip install -r requirements.txt --no-build-isolation --index-strategy unsafe-best-match
 ```
 
 - if run on GCP VM, use local ssd
