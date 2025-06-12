@@ -80,6 +80,7 @@ deap==1.4.2
 debugpy==1.8.12
 decorator==5.2.1
 deepdish==0.3.7
+deepeval==3.0.8
 deepmerge==0.1.0
 defusedxml==0.7.1
 Deprecated==1.2.18

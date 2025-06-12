@@ -49,6 +49,18 @@ Alternatively, you can use pip with requirements.txt:
 pip install -r requirements.txt
 ```
 
+- if run on GCP VM, use local ssd
+
+    ```sh
+    sudo lsblk -o NAME,SIZE,TYPE,MOUNTPOINT | grep nvme0n1
+    sudo mkfs.ext4 -F /dev/nvme0n1
+    sudo mkdir -p /mnt/disks/local-ssd
+    sudo mount /dev/nvme0n1 /mnt/disks/local-ssd
+    sudo chmod a+w /mnt/disks/local-ssd
+    UUID=$(sudo blkid -s UUID -o value /dev/nvme0n1)
+    echo "UUID=$UUID /mnt/disks/local-ssd ext4 discard,defaults,nofail 0 2" | sudo tee -a /etc/fstab
+    ```
+
 ## Usage
 
 ### Model Inference
