@@ -9,6 +9,15 @@ from io import BytesIO
 
 # 멀티모달 데이터셋 목록
 dataset_configs = [
+    ("HuggingFaceTB/smoltalk", "all"),
+    ("R0k1e/UltraLink", None),
+    ("PrincetonPLI/Instruct-SkillMix-SDD", None),
+    ("allenai/WildChat-1M", None),
+    ("nvidia/OpenCodeInstruct", None),
+    ("microsoft/orca-agentinstruct-1M-v1", "default"),  # default config 사용
+    ("MaziyarPanahi/Llama-Nemotron-Post-Training-Dataset-v1-ShareGPT", "default"),  # default config 사용
+    ("nvidia/Llama-Nemotron-Post-Training-Dataset", "SFT"),  # SFT config 사용
+    ("open-r1/Mixture-of-Thoughts", "all"),
     ("Salesforce/blip3-kale", "core"),
     ("liuhaotian/LLaVA-Instruct-150K", None),
     ("Lin-Chen/ShareGPT4V", "ShareGPT4V")
@@ -86,6 +95,7 @@ def load_image_from_url_or_path(image_source, dataset_name=None):
 def convert_to_target_format(sample: Dict[str, Any], dataset_name: str) -> Dict[str, Any]:
     """
     각 데이터셋의 샘플을 목표 형식으로 변환합니다.
+    텍스트 전용 데이터셋과 멀티모달 데이터셋을 모두 처리합니다.
     목표 형식:
     {
         "messages": [
@@ -93,7 +103,7 @@ def convert_to_target_format(sample: Dict[str, Any], dataset_name: str) -> Dict[
                 "role": "user",
                 "content": [
                     {"type": "text", "text": "질문", "index": null},
-                    {"type": "image", "text": null, "index": 0}
+                    {"type": "image", "text": null, "index": 0}  # 멀티모달인 경우만
                 ]
             },
             {
@@ -103,104 +113,191 @@ def convert_to_target_format(sample: Dict[str, Any], dataset_name: str) -> Dict[
                 ]
             }
         ],
-        "images": [actual_image_object]
+        "images": [actual_image_object],  # 멀티모달인 경우만
+        "source_dataset": "dataset_name",
+        "original_data": {...}
     }
     """
     
     result = {
         "messages": [],
-        "images": []
+        "images": [],
+        "source_dataset": dataset_name,
+        "original_data": sample.copy()
     }
     
-    # 이미지 추출 및 로드
-    image_obj = None
-    if "image" in sample and sample["image"] is not None:
-        # dataset_name을 전달하여 URL 구성 가능하도록 함
-        image_obj = load_image_from_url_or_path(sample["image"], dataset_name)
-    elif "images" in sample and sample["images"] is not None:
-        if isinstance(sample["images"], list) and len(sample["images"]) > 0:
-            image_obj = load_image_from_url_or_path(sample["images"][0], dataset_name)
-        else:
-            image_obj = load_image_from_url_or_path(sample["images"], dataset_name)
-    elif dataset_name == "Salesforce/blip3-kale" and "url" in sample:
-        # blip3-kale은 url 필드에 이미지 URL이 있음
-        image_obj = load_image_from_url_or_path(sample["url"], dataset_name)
-    
-    if image_obj is not None:
-        result["images"].append(image_obj)
-        print(f"🖼️ 이미지 로드 성공: {getattr(image_obj, 'size', 'unknown size')}")
-    
-    # 데이터셋별 conversations 처리
-    conversations = None
-    
-    if dataset_name == "Lin-Chen/ShareGPT4V":
-        conversations = sample.get("conversations", [])
-    elif dataset_name == "liuhaotian/LLaVA-Instruct-150K":  
-        conversations = sample.get("conversations", [])
-    elif dataset_name == "Salesforce/blip3-kale":
-        # blip3-kale은 caption 필드를 사용
-        caption = sample.get("caption", "").strip()
-        if caption:
-            # caption을 assistant 응답으로 처리
-            conversations = [
-                {"from": "human", "value": "Describe this image."},
-                {"from": "gpt", "value": caption}
-            ]
-        else:
-            # cogvlm_caption 시도
-            cogvlm_caption = sample.get("cogvlm_caption", "").strip()
-            if cogvlm_caption:
-                conversations = [
-                    {"from": "human", "value": "Describe this image."},
-                    {"from": "gpt", "value": cogvlm_caption}
+    try:
+        # 텍스트 전용 데이터셋들 처리
+        if dataset_name == "HuggingFaceTB/smoltalk":
+            if "messages" in sample and isinstance(sample["messages"], list):
+                for msg in sample["messages"]:
+                    if isinstance(msg, dict) and "role" in msg and "content" in msg:
+                        result["messages"].append({
+                            "role": msg["role"],
+                            "content": [{"type": "text", "text": msg["content"], "index": None}]
+                        })
+        
+        elif dataset_name == "R0k1e/UltraLink":
+            if "data" in sample and isinstance(sample["data"], list) and len(sample["data"]) >= 2:
+                data = sample["data"]
+                for i in range(0, len(data), 2):
+                    if i + 1 < len(data):
+                        result["messages"].extend([
+                            {"role": "user", "content": [{"type": "text", "text": data[i], "index": None}]},
+                            {"role": "assistant", "content": [{"type": "text", "text": data[i + 1], "index": None}]}
+                        ])
+        
+        elif dataset_name == "PrincetonPLI/Instruct-SkillMix-SDD":
+            if "instruction" in sample and "output" in sample:
+                user_content = sample["instruction"]
+                if "input" in sample and sample["input"].strip():
+                    user_content += f"\n\nInput: {sample['input']}"
+                
+                result["messages"] = [
+                    {"role": "user", "content": [{"type": "text", "text": user_content, "index": None}]},
+                    {"role": "assistant", "content": [{"type": "text", "text": sample["output"], "index": None}]}
                 ]
-    
-    if not conversations:
-        return None  # 변환할 수 없는 샘플
-    
-    # conversations를 messages로 변환
-    for i, conv in enumerate(conversations):
-        if not isinstance(conv, dict):
-            continue
+        
+        elif dataset_name == "allenai/WildChat-1M":
+            if "conversation" in sample and isinstance(sample["conversation"], list):
+                for conv in sample["conversation"]:
+                    if isinstance(conv, dict) and "role" in conv and "content" in conv:
+                        result["messages"].append({
+                            "role": conv["role"],
+                            "content": [{"type": "text", "text": conv["content"], "index": None}]
+                        })
+        
+        elif dataset_name == "nvidia/OpenCodeInstruct":
+            if "input" in sample and "output" in sample:
+                result["messages"] = [
+                    {"role": "user", "content": [{"type": "text", "text": sample["input"], "index": None}]},
+                    {"role": "assistant", "content": [{"type": "text", "text": sample["output"], "index": None}]}
+                ]
+        
+        elif dataset_name == "microsoft/orca-agentinstruct-1M-v1":
+            if "messages" in sample and isinstance(sample["messages"], list):
+                for msg in sample["messages"]:
+                    if isinstance(msg, dict) and "role" in msg and "content" in msg:
+                        result["messages"].append({
+                            "role": msg["role"],
+                            "content": [{"type": "text", "text": msg["content"], "index": None}]
+                        })
+        
+        elif "Nemotron" in dataset_name:
+            if "conversations" in sample and isinstance(sample["conversations"], list):
+                for conv in sample["conversations"]:
+                    if isinstance(conv, dict) and "from" in conv and "value" in conv:
+                        role = "user" if conv["from"] in ["human", "user"] else "assistant"
+                        result["messages"].append({
+                            "role": role,
+                            "content": [{"type": "text", "text": conv["value"], "index": None}]
+                        })
+        
+        elif dataset_name == "open-r1/Mixture-of-Thoughts":
+            if "messages" in sample and isinstance(sample["messages"], list):
+                for msg in sample["messages"]:
+                    if isinstance(msg, dict) and "role" in msg and "content" in msg:
+                        result["messages"].append({
+                            "role": msg["role"],
+                            "content": [{"type": "text", "text": msg["content"], "index": None}]
+                        })
+        
+        # 멀티모달 데이터셋들 처리
+        elif dataset_name in ["Lin-Chen/ShareGPT4V", "liuhaotian/LLaVA-Instruct-150K"]:
+            # 이미지 추출 및 로드
+            image_obj = None
+            if "image" in sample and sample["image"] is not None:
+                image_obj = load_image_from_url_or_path(sample["image"], dataset_name)
+            elif "images" in sample and sample["images"] is not None:
+                if isinstance(sample["images"], list) and len(sample["images"]) > 0:
+                    image_obj = load_image_from_url_or_path(sample["images"][0], dataset_name)
+                else:
+                    image_obj = load_image_from_url_or_path(sample["images"], dataset_name)
             
-        # role 결정
-        role = "assistant"
-        if "from" in conv:
-            if conv["from"] in ["human", "user"]:
-                role = "user"
-            elif conv["from"] in ["gpt", "assistant"]:
-                role = "assistant"
-        
-        # content 생성
-        content_list = []
-        text_content = conv.get("value", "")
-        
-        if text_content:
-            # <image> 태그 제거 (이미지는 별도 처리)
-            text_content = text_content.replace("<image>", "").strip()
+            if image_obj is not None:
+                result["images"].append(image_obj)
+                print(f"🖼️ 이미지 로드 성공: {getattr(image_obj, 'size', 'unknown size')}")
             
-            if text_content:  # 빈 문자열이 아닌 경우만
-                content_list.append({
-                    "type": "text",
-                    "text": text_content,
-                    "index": None
-                })
+            # conversations 처리
+            if "conversations" in sample and isinstance(sample["conversations"], list):
+                for i, conv in enumerate(sample["conversations"]):
+                    if not isinstance(conv, dict):
+                        continue
+                        
+                    # role 결정
+                    role = "assistant"
+                    if "from" in conv:
+                        if conv["from"] in ["human", "user"]:
+                            role = "user"
+                        elif conv["from"] in ["gpt", "assistant"]:
+                            role = "assistant"
+                    
+                    # content 생성
+                    content_list = []
+                    text_content = conv.get("value", "")
+                    
+                    if text_content:
+                        # <image> 태그 제거 (이미지는 별도 처리)
+                        text_content = text_content.replace("<image>", "").strip()
+                        
+                        if text_content:  # 빈 문자열이 아닌 경우만
+                            content_list.append({
+                                "type": "text",
+                                "text": text_content,
+                                "index": None
+                            })
+                    
+                    # 첫 번째 user 메시지에 이미지 추가
+                    if role == "user" and i == 0 and result["images"]:
+                        content_list.append({
+                            "type": "image", 
+                            "text": None,
+                            "index": 0
+                        })
+                    
+                    if content_list:  # content가 있는 경우만 추가
+                        result["messages"].append({
+                            "role": role,
+                            "content": content_list
+                        })
         
-        # 첫 번째 user 메시지에 이미지 추가
-        if role == "user" and i == 0 and result["images"]:
-            content_list.append({
-                "type": "image", 
-                "text": None,
-                "index": 0
-            })
+        elif dataset_name == "Salesforce/blip3-kale":
+            # 이미지 로드
+            image_obj = None
+            if "url" in sample:
+                image_obj = load_image_from_url_or_path(sample["url"], dataset_name)
+            elif "image" in sample:
+                image_obj = load_image_from_url_or_path(sample["image"], dataset_name)
+            
+            if image_obj is not None:
+                result["images"].append(image_obj)
+                print(f"🖼️ 이미지 로드 성공: {getattr(image_obj, 'size', 'unknown size')}")
+            
+            # caption을 대화 형식으로 변환
+            caption = sample.get("caption", "").strip()
+            if not caption:
+                caption = sample.get("cogvlm_caption", "").strip()
+            
+            if caption:
+                # 첫 번째 user 메시지에 이미지 포함
+                user_content = [{"type": "text", "text": "Describe this image.", "index": None}]
+                if result["images"]:
+                    user_content.append({"type": "image", "text": None, "index": 0})
+                
+                result["messages"] = [
+                    {"role": "user", "content": user_content},
+                    {"role": "assistant", "content": [{"type": "text", "text": caption, "index": None}]}
+                ]
         
-        if content_list:  # content가 있는 경우만 추가
-            result["messages"].append({
-                "role": role,
-                "content": content_list
-            })
-    
-    return result if result["messages"] else None
+        # 빈 messages인 경우 None 반환
+        if not result["messages"]:
+            return None
+            
+        return result
+        
+    except Exception as e:
+        print(f"Error converting sample from {dataset_name}: {str(e)}")
+        return None
 
 def process_dataset(dataset_name: str, config_name: str = None, max_samples: int = None):
     """데이터셋을 처리하여 목표 형식으로 변환합니다."""
@@ -209,57 +306,73 @@ def process_dataset(dataset_name: str, config_name: str = None, max_samples: int
         if config_name:
             print(f"   Config: {config_name}")
         
-        # 데이터셋 로드 - 작은 배치로 처리하여 메모리 효율성 확보
+        # 특정 데이터셋들의 split 설정
+        if dataset_name == "microsoft/orca-agentinstruct-1M-v1":
+            split = "creative_content"  # 첫 번째 사용 가능한 split 사용
+        elif dataset_name == "MaziyarPanahi/Llama-Nemotron-Post-Training-Dataset-v1-ShareGPT":
+            split = "chat"  # chat split 사용
+        elif dataset_name == "nvidia/Llama-Nemotron-Post-Training-Dataset":
+            split = "chat"  # chat split 사용
+        else:
+            split = "train"
+        
+        # 데이터셋 로드 - 스트리밍 모드로 메모리 효율성 확보
         try:
             if config_name:
-                full_dataset = load_dataset(dataset_name, config_name, split="train")
+                full_dataset = load_dataset(dataset_name, config_name, split=split, streaming=True)
             else:
-                full_dataset = load_dataset(dataset_name, split="train")
+                full_dataset = load_dataset(dataset_name, split=split, streaming=True)
         except Exception as e:
-            print(f"❌ 데이터셋 로드 실패: {e}")
-            return
+            print(f"❌ 데이터셋 로드 실패 ({split} split): {e}")
+            # train split으로 재시도
+            if split != "train":
+                try:
+                    print(f"🔄 train split으로 재시도...")
+                    if config_name:
+                        full_dataset = load_dataset(dataset_name, config_name, split="train", streaming=True)
+                    else:
+                        full_dataset = load_dataset(dataset_name, split="train", streaming=True)
+                except Exception as e2:
+                    print(f"❌ train split으로도 실패: {e2}")
+                    return
+            else:
+                return
         
-        # 처리할 샘플 수 결정
-        total_samples = len(full_dataset)
-        samples_to_process = min(max_samples or total_samples, total_samples)
-        
-        print(f"📊 총 {total_samples}개 샘플 중 {samples_to_process}개 처리 예정")
-        
+        print(f"📊 스트리밍 모드로 데이터셋 로드 완료")
+
         processed_samples = []
         success_count = 0
+        total_count = 0
         
-        # 작은 배치로 나누어 처리 (메모리 관리)
-        batch_size = 100
-        for start_idx in range(0, samples_to_process, batch_size):
-            end_idx = min(start_idx + batch_size, samples_to_process)
-            batch = full_dataset.select(range(start_idx, end_idx))
+        # 스트리밍 데이터 처리
+        for sample in full_dataset:
+            if max_samples and total_count >= max_samples:
+                break
             
-            print(f"🔄 배치 처리 중: {start_idx+1}-{end_idx}/{samples_to_process}")
+            total_count += 1
             
-            for sample in tqdm(batch, desc=f"Processing batch"):
-                # 변환 시도
-                converted = convert_to_target_format(sample, dataset_name)
-                if converted:
-                    processed_samples.append(converted)
-                    success_count += 1
-                    
-                    # 처음 몇 개 샘플에서 이미지 확인
-                    if success_count <= 3 and converted["images"]:
-                        print(f"✅ {dataset_name}: {len(converted['images'])}개 이미지 포함")
+            # 변환 시도
+            converted = convert_to_target_format(sample, dataset_name)
+            if converted:
+                processed_samples.append(converted)
+                success_count += 1
                 
-                # 메모리 관리를 위한 중간 yield
-                if len(processed_samples) >= 200:
-                    yield processed_samples
-                    processed_samples = []
+                # 처음 몇 개 샘플에서 이미지 확인 (멀티모달 데이터셋의 경우)
+                if success_count <= 3 and converted["images"]:
+                    print(f"✅ {dataset_name}: {len(converted['images'])}개 이미지 포함")
             
-            # 배치 처리 후 메모리 정리
-            del batch
+            # 메모리 관리를 위한 배치 처리
+            if len(processed_samples) >= 1000:  # 1000개씩 yield
+                yield processed_samples
+                processed_samples = []
+                print(f"📊 {dataset_name}: {success_count}/{total_count} 샘플 처리 완료 (배치 yield)")
         
+        # 남은 샘플들 처리
         if processed_samples:
             yield processed_samples
             
-        print(f"✅ {dataset_name}: {success_count}/{count} 샘플 변환 완료")
-        
+        print(f"✅ {dataset_name}: {success_count}/{total_count} 샘플 변환 완료")
+
     except Exception as e:
         print(f"❌ {dataset_name} 처리 중 오류: {str(e)}")
 
@@ -285,34 +398,75 @@ def merge_and_create_dataset(output_name: str = "unified-multimodal-sft", max_sa
     print(f"\n🎯 총 {len(all_samples)}개 샘플 변환 완료")
     
     # 데이터 검증
+    print("\n=== 데이터 품질 검사 ===")
     valid_samples = 0
-    image_samples = 0
-    
-    for sample in all_samples[:100]:  # 처음 100개만 검증
-        if "messages" in sample and "images" in sample:
+    invalid_samples = 0
+    multimodal_samples = 0
+    text_only_samples = 0
+
+    for i, sample in enumerate(all_samples):
+        messages = sample.get("messages", [])
+        images = sample.get("images", [])
+
+        # 메시지 형식 검증
+        is_valid = True
+        has_multimodal = False
+
+        if not isinstance(messages, list) or len(messages) == 0:
+            is_valid = False
+        else:
+            for msg in messages:
+                if not isinstance(msg, dict) or "role" not in msg or "content" not in msg:
+                    is_valid = False
+                    break
+                if msg["role"] not in ["user", "assistant", "system"]:
+                    is_valid = False
+                    break
+
+                # content 형식 검증
+                content = msg.get("content", [])
+                if not isinstance(content, list):
+                    is_valid = False
+                    break
+
+                # content 내용 검증
+                for content_item in content:
+                    if not isinstance(content_item, dict) or "type" not in content_item:
+                        is_valid = False
+                        break
+
+                    if content_item["type"] == "image":
+                        has_multimodal = True
+                    elif content_item["type"] == "text":
+                        if "text" not in content_item:
+                            is_valid = False
+                            break
+        
+        # 이미지 배열이 있고 실제 이미지가 있는 경우도 멀티모달로 처리
+        if images and len(images) > 0:
+            has_multimodal = True
+
+        if is_valid:
             valid_samples += 1
-            if sample["images"]:
-                image_samples += 1
+            if has_multimodal:
+                multimodal_samples += 1
+            else:
+                text_only_samples += 1
+        else:
+            invalid_samples += 1
+
+    print(f"✅ 유효한 샘플: {valid_samples}개")
+    print(f"❌ 무효한 샘플: {invalid_samples}개")
+    print(f"🖼️ 멀티모달 샘플: {multimodal_samples}개")
+    print(f"📝 텍스트 전용 샘플: {text_only_samples}개")
     
-    print(f"📋 샘플 검증 (처음 100개): {valid_samples}/100 유효, {image_samples}/100 이미지 포함")
-    
-    # Dataset 생성 - 이미지 feature를 명시적으로 지정
+    # HuggingFace Dataset feature 구조 정의
+    # 텍스트 전용과 멀티모달을 모두 지원하기 위해 유연하게 구성
     print("📦 Dataset 객체 생성 중...")
     
-    # HuggingFace Image feature 구조 정의
-    features = Features({
-        "messages": Sequence({
-            "role": Value("string"),
-            "content": Sequence({
-                "type": Value("string"),
-                "text": Value("string"),
-                "index": Value("int64")
-            })
-        }),
-        "images": Sequence(ImageFeature())  # 이미지 feature 명시
-    })
-    
-    unified_dataset = Dataset.from_list(all_samples, features=features)
+    # Features를 명시적으로 정의하지 않고 자동 추론되도록 함
+    # 이렇게 하면 텍스트 전용/멀티모달 데이터를 모두 처리 가능
+    unified_dataset = Dataset.from_list(all_samples)
     
     # 로컬 저장
     print("💾 로컬 저장 중...")
@@ -374,6 +528,31 @@ def inspect_dataset(dataset_path: str = "./unified-multimodal-sft"):
         image_count = sum(1 for sample in dataset if sample.get("images"))
         print(f"\n📈 이미지 포함 샘플: {image_count}/{len(dataset)} ({image_count/len(dataset)*100:.1f}%)")
         
+        # 원본 데이터셋별 통계
+        source_stats = {}
+        for sample in dataset:
+            source = sample.get("source_dataset", "unknown")
+            source_stats[source] = source_stats.get(source, 0) + 1
+        
+        print(f"\n📊 원본 데이터셋별 분포:")
+        for source, count in sorted(source_stats.items()):
+            print(f"   {source}: {count}개 ({count/len(dataset)*100:.1f}%)")
+        
+        # 원본 데이터 보존 확인
+        original_data_count = sum(1 for sample in dataset if sample.get("original_data"))
+        print(f"\n💾 원본 데이터 보존: {original_data_count}/{len(dataset)} ({original_data_count/len(dataset)*100:.1f}%)")
+        
+        # 원본 데이터 예시 (첫 번째 샘플)
+        if dataset[0].get("original_data"):
+            print(f"\n🔍 원본 데이터 예시 (첫 번째 샘플):")
+            original = dataset[0]["original_data"]
+            print(f"   원본 데이터 키: {list(original.keys())}")
+            for key, value in list(original.items())[:3]:  # 처음 3개 키만 표시
+                if isinstance(value, str) and len(value) > 50:
+                    print(f"   {key}: {value[:50]}...")
+                else:
+                    print(f"   {key}: {value}")
+        
         return dataset
         
     except Exception as e:
@@ -408,10 +587,18 @@ def main():
         print("  python upload_sft_dataset.py merge <repository_name> [max_samples_per_dataset]")
         print("  python upload_sft_dataset.py inspect [dataset_path]")
         print("")
+        print("📝 텍스트 + 멀티모달 통합 데이터셋 처리")
+        print("포함된 데이터셋:")
+        for dataset_name, config_name in dataset_configs:
+            if config_name:
+                print(f"  - {dataset_name} ({config_name})")
+            else:
+                print(f"  - {dataset_name}")
+        print("")
         print("예시:")
-        print("  python upload_sft_dataset.py merge my-multimodal-dataset 1000")
-        print("  python upload_sft_dataset.py merge my-multimodal-dataset")  # 전체 데이터
-        print("  python upload_sft_dataset.py inspect ./my-multimodal-dataset")
+        print("  python upload_sft_dataset.py merge my-unified-dataset 1000")
+        print("  python upload_sft_dataset.py merge my-unified-dataset")  # 전체 데이터
+        print("  python upload_sft_dataset.py inspect ./my-unified-dataset")
 
 if __name__ == "__main__":
     main()

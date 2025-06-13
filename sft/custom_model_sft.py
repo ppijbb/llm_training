@@ -26,20 +26,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Import custom modules  
 from models import G3MoEForCausalLM, G3MoEConfig
-from data.base_mode_sft_dataset import get_dataset, process_vision_info, create_multimodal_collate_fn
-from training_utils import format_parameters
-
-
-def load_config(config_path: str) -> Dict[str, Any]:
-    """Load configuration from JSON file"""
-    if not os.path.exists(config_path):
-        raise FileNotFoundError(f"Config file not found: {config_path}")
-    
-    with open(config_path, 'r') as f:
-        config = json.load(f)
-    
-    print(f"✓ Config loaded from: {config_path}")
-    return config
+from data.base_model_sft_dataset import get_dataset, process_vision_info, create_multimodal_collate_fn
+from training_utils.utils import format_parameters, load_config, setup_deepspeed_environment
+from eval.callbacks import ModelEvalCallback
 
 
 def setup_model_and_tokenizer(model_config: Dict[str, Any]):
@@ -196,18 +185,6 @@ def setup_dataset(data_config: Dict[str, Any], tokenizer):
         print(f"  {split}: {len(data)} examples")
     
     return dataset
-
-
-def setup_deepspeed_environment():
-    """Setup environment variables for DeepSpeed optimization"""
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:1024"
-    os.environ["TOKENIZERS_PARALLELISM"] = "false"
-    
-    # Enable DeepSpeed optimizations
-    if "DEEPSPEED_ZERO_INIT" not in os.environ:
-        os.environ["DEEPSPEED_ZERO_INIT"] = "1"
-    
-    print("DeepSpeed environment variables set")
 
 
 def create_training_args(
