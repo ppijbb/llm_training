@@ -27,8 +27,27 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # Import custom modules  
 from models import G3MoEForCausalLM, G3MoEConfig
 from data.base_model_sft_dataset import get_dataset, process_vision_info, create_multimodal_collate_fn
+from data.simple_sft_dataset import get_simple_sft_dataset, create_simple_collate_fn, smoltalk_dataset, orca_mini_dataset
+
 from training_utils.utils import format_parameters, load_config, setup_deepspeed_environment
 from eval.callbacks import ModelEvalCallback
+
+
+def load_config(config_path: str):
+    """간단한 config 로더"""
+    with open(config_path, 'r') as f:
+        return json.load(f)
+
+def setup_deepspeed_environment():
+    """Setup environment variables for DeepSpeed optimization"""
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:1024"
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    
+    # Enable DeepSpeed optimizations
+    if "DEEPSPEED_ZERO_INIT" not in os.environ:
+        os.environ["DEEPSPEED_ZERO_INIT"] = "1"
+    
+    print("DeepSpeed environment variables set")
 
 
 def setup_model_and_tokenizer(model_config: Dict[str, Any]):
@@ -168,18 +187,30 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
 
 
 def setup_dataset(data_config: Dict[str, Any], tokenizer):
-    """Setup training dataset"""
+    """Setup training dataset"""    
+    dataset_name = data_config.get("dataset_name", "HuggingFaceTB/smoltalk")
+    max_samples = data_config.get("max_samples", 1000)
     
-    print(f"Loading dataset: {data_config['dataset_name']}")
-    dataset = get_dataset(
-        dataset_name=data_config["dataset_name"],
-        tokenizer=tokenizer,
-        max_length=data_config["max_seq_length"],
-        test_size=data_config["test_size"],
-        text_only=data_config["text_only"],
-        streaming=data_config["streaming"]
-    )
+    print(f"Loading simple SFT dataset: {dataset_name}")
     
+    # print(f"Loading dataset: {data_config['dataset_name']}")
+    # dataset = get_dataset(
+    #     dataset_name=data_config["dataset_name"],
+    #     tokenizer=tokenizer,
+    #     max_length=data_config["max_seq_length"],
+    #     test_size=data_config["test_size"],
+    #     text_only=data_config["text_only"],
+    #     streaming=data_config["streaming"]
+    # )
+        # 간단한 데이터셋 로더 사용
+    if "smoltalk" in dataset_name.lower():
+        dataset = smoltalk_dataset(tokenizer, max_samples=max_samples)
+    elif "orca" in dataset_name.lower():
+        dataset = orca_mini_dataset(tokenizer, max_samples=max_samples)
+    else:
+        # 기본값: smoltalk 사용
+        print(f"⚠️ 알 수 없는 데이터셋: {dataset_name}, SmolTalk으로 대체")
+        dataset = smoltalk_dataset(tokenizer, max_samples=max_samples)
     print(f"Dataset loaded:")
     for split, data in dataset.items():
         print(f"  {split}: {len(data)} examples")
@@ -284,8 +315,10 @@ def main():
     
     # Create multimodal data collator
     print("Creating multimodal data collator...")
-    collate_fn = create_multimodal_collate_fn(tokenizer)
-    
+    # collate_fn = create_multimodal_collate_fn(tokenizer)
+    print("Creating data collator...")
+    collate_fn = create_simple_collate_fn(tokenizer)
+
     # Setup trainer
     print("Setting up trainer...")
     trainer = SFTTrainer( 
