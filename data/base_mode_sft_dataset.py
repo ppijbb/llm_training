@@ -3,11 +3,77 @@ from transformers import AutoProcessor
 import torch
 import re
 import json
+from PIL import Image
+import io
+
+def create_multimodal_collate_fn(processor):
+    """
+    Create a collate function for multimodal data that handles both images and text.
+    Based on TRL documentation for VLM SFT training.
+    """
+    def collate_fn(examples):
+        # Extract messages from examples
+        messages_list = [example["messages"] for example in examples]
+        
+        # Apply chat template to get text
+        texts = []
+        images_list = []
+        
+        for messages in messages_list:
+            # Apply chat template
+            text = processor.apply_chat_template(
+                messages, 
+                tokenize=False, 
+                add_generation_prompt=False
+            ).strip()
+            texts.append(text)
+            
+            # Extract images from messages
+            images = process_vision_info(messages)
+            images_list.append(images)
+        
+        # Process texts and images together
+        batch = processor(
+            text=texts, 
+            images=images_list, 
+            return_tensors="pt", 
+            padding=True
+        )
+        
+        # The labels are the input_ids, and we mask the padding tokens in the loss computation
+        labels = batch["input_ids"].clone()
+        
+        # Get special token IDs for masking
+        pad_token_id = processor.tokenizer.pad_token_id
+        
+        # Mask padding tokens
+        if pad_token_id is not None:
+            labels[labels == pad_token_id] = -100
+        
+        # Mask image tokens if they exist
+        try:
+            # Try to get image token ID
+            if hasattr(processor.tokenizer, 'special_tokens_map') and 'boi_token' in processor.tokenizer.special_tokens_map:
+                image_token_id = processor.tokenizer.convert_tokens_to_ids(
+                    processor.tokenizer.special_tokens_map["boi_token"]
+                )
+                labels[labels == image_token_id] = -100
+            
+            # Mask image soft tokens (gemma specific)
+            labels[labels == 262144] = -100
+            
+        except Exception as e:
+            print(f"Warning: Could not mask image tokens: {e}")
+        
+        batch["labels"] = labels
+        return batch
+    
+    return collate_fn
 
 def get_dataset(
     dataset_name: str = "Gunulhona/open_m_3",
     tokenizer=None,
-    max_length: int = 2048,
+    max_length: int = 16384,
     test_size: float = 0.1,
     text_only: bool = False,
     streaming: bool = False
@@ -28,7 +94,7 @@ def get_dataset(
     
     # Load dataset
     dataset = load_dataset(dataset_name, streaming=streaming)
-    
+
     # Split into train/test first if not streaming
     if not streaming:
         dataset = dataset["train"].train_test_split(test_size=test_size)
@@ -93,7 +159,9 @@ def processing(
                 tokenize=True,
                 add_generation_prompt=False,  # Crucial for SFT
                 max_length=max_length,
-                truncation=True
+                truncation=True,
+                return_dict=True, 
+                return_tensors="pt"
             )
             assert token_ids is not None, f"Token IDs is None for conversation: {conversation}"
             input_ids_list.append(token_ids)
@@ -105,10 +173,8 @@ def processing(
             continue
     
     # Return the tokenized results directly
-    return {
-        "input_ids": input_ids_list,
-        "labels": input_ids_list.copy()  # For language model fine-tuning, labels are the same as input_ids
-    }
+    return [{k:v for k,v in data.items()} for data in input_ids_list]
+
 
 if __name__ == "__main__":
     tokenizer = AutoProcessor.from_pretrained("google/gemma-3-4b-it")

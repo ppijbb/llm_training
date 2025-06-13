@@ -9,6 +9,8 @@ import json
 import torch
 import argparse
 from typing import Dict, Any
+import io
+from PIL import Image
 from transformers import (
     AutoTokenizer,
     AutoProcessor,
@@ -24,7 +26,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Import custom modules  
 from models import G3MoEForCausalLM, G3MoEConfig
-from data.base_mode_sft_dataset import get_dataset
+from data.base_mode_sft_dataset import get_dataset, process_vision_info, create_multimodal_collate_fn
+from training_utils import format_parameters
 
 
 def load_config(config_path: str) -> Dict[str, Any]:
@@ -59,10 +62,20 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
             trust_remote_code=model_config["trust_remote_code"]
         )
     
+    with open("/home/conan_jung/workspace/llm_training/sft/config/chat_template.txt", "r") as f:
+        chat_template = f.read()
+    tokenizer.chat_template = chat_template
+    
+    # Set padding side for multimodal models
+    if hasattr(tokenizer, 'tokenizer'):
+        tokenizer.tokenizer.padding_side = "right"
+    else:
+        tokenizer.padding_side = "right"
+    
     # Ensure tokenizer has pad token
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-        tokenizer.pad_token_id = tokenizer.eos_token_id
+    # if tokenizer.pad_token is None:
+    #     tokenizer.pad_token = tokenizer.eos_token
+    #     tokenizer.pad_token_id = tokenizer.eos_token_id
     
     # Load and configure G3MoE model configuration
     print("Loading base model configuration...")
@@ -130,15 +143,7 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
         )
         print("✓ G3MoE model loaded successfully")
         
-        # Print model info
-        def format_parameters(number):
-            if number >= 1_000_000_000:
-                return f"{number / 1_000_000_000:.2f}B"
-            elif number >= 1_000_000:
-                return f"{number / 1_000_000:.2f}M"
-            else:
-                return str(number)
-        
+       
         total_params = model.num_parameters()
         print(f"  - Total parameters: {format_parameters(total_params)}")
         
@@ -169,7 +174,7 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
         )
         model = get_peft_model(model, lora_config)
         model.print_trainable_parameters()
-    
+
     return model, tokenizer
 
 
@@ -205,7 +210,10 @@ def setup_deepspeed_environment():
     print("DeepSpeed environment variables set")
 
 
-def create_training_args(training_config: Dict[str, Any], deepspeed_config: str = None) -> SFTConfig:
+def create_training_args(
+    training_config: Dict[str, Any], 
+    deepspeed_config: str = None
+) -> SFTConfig:
     """Create SFTConfig from training configuration"""
     
     # Create SFTConfig with all parameters
@@ -223,7 +231,7 @@ def create_training_args(training_config: Dict[str, Any], deepspeed_config: str 
         eval_steps=training_config["eval_steps"],
         save_steps=training_config["save_steps"],
         save_total_limit=training_config["save_total_limit"],
-        evaluation_strategy=training_config["evaluation_strategy"],
+        eval_strategy=training_config["eval_strategy"],
         load_best_model_at_end=training_config["load_best_model_at_end"],
         metric_for_best_model=training_config["metric_for_best_model"],
         greater_is_better=training_config["greater_is_better"],
@@ -235,6 +243,7 @@ def create_training_args(training_config: Dict[str, Any], deepspeed_config: str 
         report_to=training_config["report_to"],
         run_name=training_config["run_name"],
         seed=training_config["seed"],
+        dataset_kwargs={"skip_prepare_dataset": True}
     )
     
     # Add DeepSpeed config if provided
@@ -296,17 +305,19 @@ def main():
         model_config.get("deepspeed_config")
     )
     
+    # Create multimodal data collator
+    print("Creating multimodal data collator...")
+    collate_fn = create_multimodal_collate_fn(tokenizer)
+    
     # Setup trainer
     print("Setting up trainer...")
-    trainer = SFTTrainer(
+    trainer = SFTTrainer( 
         model=model,
         args=training_args,
-        train_dataset=dataset["train"],
-        eval_dataset=dataset.get("test"),
-        tokenizer=tokenizer,
-        max_seq_length=data_config["max_seq_length"],
-        dataset_text_field="input_ids",  # Since we're using pre-tokenized data
-        packing=False,  # Don't pack sequences since we have labels
+        train_dataset=dataset.get("train", None),
+        eval_dataset=dataset.get("test", None),
+        processing_class=tokenizer,
+        data_collator=collate_fn,
     )
     
     # Print training info

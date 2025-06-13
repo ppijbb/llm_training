@@ -13,7 +13,7 @@
     "text_only": false,
     "streaming": false,
     
-    "output_dir": "./outputs/g3moe_sft",
+    "output_dir": "/mnt/disks/local-ssd/training_logs/outputs",
     "overwrite_output_dir": true,
     "num_train_epochs": 10,
     "per_device_train_batch_size": 1,
@@ -31,11 +31,11 @@
     "warmup_steps": 0,
     
     "logging_steps": 5,
-    "logging_dir": "./outputs/g3moe_sft/logs",
+    "logging_dir": "/mnt/disks/local-ssd/training_logs/logs",
     "logging_first_step": true,
     "eval_steps": 100,
     "eval_delay": 0,
-    "evaluation_strategy": "steps",
+    "eval_strategy": "steps",
     "save_steps": 500,
     "save_strategy": "steps",
     "save_total_limit": 3,

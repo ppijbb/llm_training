@@ -25,7 +25,7 @@
     "streaming": false
   },
   "training_config": {
-    "output_dir": "./g3moe_sft_output",
+    "output_dir": "/mnt/disks/local-ssd/training_logs/outputs",
     "num_train_epochs": 3,
     "per_device_train_batch_size": 2,
     "per_device_eval_batch_size": 2,
@@ -38,7 +38,7 @@
     "eval_steps": 500,
     "save_steps": 500,
     "save_total_limit": 3,
-    "evaluation_strategy": "steps",
+    "eval_strategy": "steps",
     "load_best_model_at_end": true,
     "metric_for_best_model": "eval_loss",
     "greater_is_better": false,

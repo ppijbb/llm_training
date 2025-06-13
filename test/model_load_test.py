@@ -1,12 +1,16 @@
+import sys
+import os
 import torch
-from g2moe_config import G2MoEConfig
-from g2moe_model import G2MoEForCausalLM
-from g3moe_config import G3MoEConfig, G3MoETextConfig
-from g3moe_model import G3MoEForCausalLM
 from transformers import AutoProcessor, GenerationConfig
 from transformers import Gemma3ForCausalLM, Gemma3Config
 import tensorrt
 import pprint
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from models import (#G2MoEConfig, G2MoEForCausalLM, G2MoETextConfig,
+                    G3MoEConfig, G3MoEForCausalLM, G3MoETextConfig)
+
+
 
 print("version of tensorrt: " ,tensorrt.__version__)
 
@@ -46,11 +50,11 @@ base_config.update(base_config['text_config'])
 model_config = G3MoEConfig(**base_config)
 pprint.pprint(model_config)
 
-test_model = model_architecture.from_pretrained(
-    pretrained_model_name_or_path=base_model_name,
-    config=model_config,
-    # attention_implementation="flash_attention_2"
-    )#.to("cuda:1")
+# test_model = model_architecture.from_pretrained(
+#     pretrained_model_name_or_path=base_model_name,
+#     config=model_config,
+#     # attention_implementation="flash_attention_2"
+#     )#.to("cuda:1")
 tokenizer = AutoProcessor.from_pretrained(base_model_name)
 with open("/home/conan_jung/workspace/llm_training/sft/config/chat_template.txt", "r") as f:
     tokenizer.chat_template = f.read()
@@ -85,6 +89,7 @@ test_input = tokenizer.apply_chat_template(
     tokenize=True,
     add_generation_prompt=True,
     return_tensors="pt",
+    return_dict=True,
 )
 
 print(test_model)
