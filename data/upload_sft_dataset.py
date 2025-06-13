@@ -1,11 +1,14 @@
 from datasets import load_dataset, concatenate_datasets, Dataset, Features, Value, Sequence, Image as ImageFeature
 import json
 from typing import List, Dict, Any
-from tqdm import tqdm
+from tqdm.auto import tqdm
 import os
 import requests
 from PIL import Image
 from io import BytesIO
+from huggingface_hub.utils import disable_progress_bars
+
+disable_progress_bars()  # 진행 표시줄 비활성화
 
 # 멀티모달 데이터셋 목록
 dataset_configs = [
@@ -67,17 +70,14 @@ def load_image_from_url_or_path(image_source, dataset_name=None):
                 if dataset_name:
                     constructed_url = construct_image_url(image_source, dataset_name)
                     if constructed_url:
-                        print(f"🔗 URL 구성 시도: {constructed_url}")
                         try:
                             response = requests.get(constructed_url, timeout=15)
                             response.raise_for_status()
                             image = Image.open(BytesIO(response.content))
-                            print(f"✅ 구성된 URL에서 이미지 로드 성공: {image.size}")
                             return image.convert('RGB')
                         except:
-                            print(f"⚠️ 구성된 URL에서 로드 실패: {constructed_url}")
+                            pass  # 조용히 실패 처리
                 
-                print(f"⚠️ 이미지를 로드할 수 없음: {image_source}")
                 return None
         
         # bytes 데이터인 경우
@@ -89,7 +89,6 @@ def load_image_from_url_or_path(image_source, dataset_name=None):
             return None
         
     except Exception as e:
-        print(f"⚠️ 이미지 로드 실패: {e}")
         return None
 
 def convert_to_target_format(sample: Dict[str, Any], dataset_name: str) -> Dict[str, Any]:
@@ -216,7 +215,6 @@ def convert_to_target_format(sample: Dict[str, Any], dataset_name: str) -> Dict[
             
             if image_obj is not None:
                 result["images"].append(image_obj)
-                print(f"🖼️ 이미지 로드 성공: {getattr(image_obj, 'size', 'unknown size')}")
             
             # conversations 처리
             if "conversations" in sample and isinstance(sample["conversations"], list):
@@ -271,7 +269,6 @@ def convert_to_target_format(sample: Dict[str, Any], dataset_name: str) -> Dict[
             
             if image_obj is not None:
                 result["images"].append(image_obj)
-                print(f"🖼️ 이미지 로드 성공: {getattr(image_obj, 'size', 'unknown size')}")
             
             # caption을 대화 형식으로 변환
             caption = sample.get("caption", "").strip()
@@ -302,21 +299,17 @@ def convert_to_target_format(sample: Dict[str, Any], dataset_name: str) -> Dict[
 def process_dataset(dataset_name: str, config_name: str = None, max_samples: int = None):
     """데이터셋을 처리하여 목표 형식으로 변환합니다."""
     try:
-        print(f"\n🔄 처리 중: {dataset_name}")
-        if config_name:
-            print(f"   Config: {config_name}")
-        
         # 특정 데이터셋들의 split 설정
         if dataset_name == "microsoft/orca-agentinstruct-1M-v1":
-            split = "creative_content"  # 첫 번째 사용 가능한 split 사용
+            split = "creative_content"
         elif dataset_name == "MaziyarPanahi/Llama-Nemotron-Post-Training-Dataset-v1-ShareGPT":
-            split = "chat"  # chat split 사용
+            split = "chat"
         elif dataset_name == "nvidia/Llama-Nemotron-Post-Training-Dataset":
-            split = "chat"  # chat split 사용
+            split = "chat"
         else:
             split = "train"
         
-        # 데이터셋 로드 - 스트리밍 모드로 메모리 효율성 확보
+        # 데이터셋 로드
         try:
             if config_name:
                 full_dataset = load_dataset(dataset_name, config_name, split=split, streaming=True)
@@ -337,12 +330,17 @@ def process_dataset(dataset_name: str, config_name: str = None, max_samples: int
                     return
             else:
                 return
-        
-        print(f"📊 스트리밍 모드로 데이터셋 로드 완료")
 
         processed_samples = []
         success_count = 0
         total_count = 0
+        
+        # 진행 상황 표시를 위한 tqdm 설정
+        desc = f"{dataset_name.split('/')[-1]}"
+        if config_name:
+            desc += f"({config_name})"
+        
+        progress_bar = tqdm(desc=desc, unit="samples")
         
         # 스트리밍 데이터 처리
         for sample in full_dataset:
@@ -350,6 +348,7 @@ def process_dataset(dataset_name: str, config_name: str = None, max_samples: int
                 break
             
             total_count += 1
+            progress_bar.update(1)
             
             # 변환 시도
             converted = convert_to_target_format(sample, dataset_name)
@@ -357,21 +356,23 @@ def process_dataset(dataset_name: str, config_name: str = None, max_samples: int
                 processed_samples.append(converted)
                 success_count += 1
                 
-                # 처음 몇 개 샘플에서 이미지 확인 (멀티모달 데이터셋의 경우)
-                if success_count <= 3 and converted["images"]:
-                    print(f"✅ {dataset_name}: {len(converted['images'])}개 이미지 포함")
+                # 이미지 로드 성공 시 진행바에 표시
+                if converted["images"] and success_count <= 3:
+                    progress_bar.set_postfix({"images": f"{len(converted['images'])}개"})
             
             # 메모리 관리를 위한 배치 처리
-            if len(processed_samples) >= 1000:  # 1000개씩 yield
+            if len(processed_samples) >= 1000:
                 yield processed_samples
                 processed_samples = []
-                print(f"📊 {dataset_name}: {success_count}/{total_count} 샘플 처리 완료 (배치 yield)")
+                progress_bar.set_postfix({"processed": f"{success_count}/{total_count}"})
+        
+        progress_bar.close()
         
         # 남은 샘플들 처리
         if processed_samples:
             yield processed_samples
             
-        print(f"✅ {dataset_name}: {success_count}/{total_count} 샘플 변환 완료")
+        tqdm.write(f"✅ {dataset_name}: {success_count}/{total_count} 샘플 변환 완료")
 
     except Exception as e:
         print(f"❌ {dataset_name} 처리 중 오류: {str(e)}")
@@ -381,102 +382,68 @@ def merge_and_create_dataset(output_name: str = "unified-multimodal-sft", max_sa
     print("🚀 멀티모달 데이터셋 병합 시작...")
     
     all_samples = []
-    
-    for dataset_name, config_name in dataset_configs:
+    dataset_progress = tqdm(dataset_configs, desc="데이터셋 처리", unit="dataset")
+
+    for dataset_name, config_name in dataset_progress:
+        dataset_progress.set_description(f"처리중: {dataset_name.split('/')[-1]}")
         try:
             for batch in process_dataset(dataset_name, config_name, max_samples_per_dataset):
                 all_samples.extend(batch)
-                print(f"📊 현재까지 수집된 샘플 수: {len(all_samples)}")
+                dataset_progress.set_postfix({"총 샘플": len(all_samples)})
         except Exception as e:
             print(f"❌ {dataset_name} 처리 실패: {str(e)}")
             continue
-    
+
+    dataset_progress.close()
+
     if not all_samples:
         print("❌ 변환된 샘플이 없습니다.")
         return None
     
-    print(f"\n🎯 총 {len(all_samples)}개 샘플 변환 완료")
+    tqdm.write(f"\n🎯 총 {len(all_samples)}개 샘플 변환 완료")
     
-    # 데이터 검증
-    print("\n=== 데이터 품질 검사 ===")
+    # 데이터 검증 (샘플링해서 빠르게)
+    sample_size = min(1000, len(all_samples))
     valid_samples = 0
-    invalid_samples = 0
-    multimodal_samples = 0
-    text_only_samples = 0
-
-    for i, sample in enumerate(all_samples):
-        messages = sample.get("messages", [])
-        images = sample.get("images", [])
-
-        # 메시지 형식 검증
-        is_valid = True
-        has_multimodal = False
-
-        if not isinstance(messages, list) or len(messages) == 0:
-            is_valid = False
-        else:
-            for msg in messages:
-                if not isinstance(msg, dict) or "role" not in msg or "content" not in msg:
-                    is_valid = False
-                    break
-                if msg["role"] not in ["user", "assistant", "system"]:
-                    is_valid = False
-                    break
-
-                # content 형식 검증
-                content = msg.get("content", [])
-                if not isinstance(content, list):
-                    is_valid = False
-                    break
-
-                # content 내용 검증
-                for content_item in content:
-                    if not isinstance(content_item, dict) or "type" not in content_item:
-                        is_valid = False
-                        break
-
-                    if content_item["type"] == "image":
-                        has_multimodal = True
-                    elif content_item["type"] == "text":
-                        if "text" not in content_item:
-                            is_valid = False
-                            break
-        
-        # 이미지 배열이 있고 실제 이미지가 있는 경우도 멀티모달로 처리
-        if images and len(images) > 0:
-            has_multimodal = True
-
-        if is_valid:
+    image_samples = 0
+    
+    validation_progress = tqdm(range(sample_size), desc="데이터 검증", leave=False)
+    for i in validation_progress:
+        sample = all_samples[i]
+        if "messages" in sample and "images" in sample:
             valid_samples += 1
-            if has_multimodal:
-                multimodal_samples += 1
-            else:
-                text_only_samples += 1
-        else:
-            invalid_samples += 1
-
-    print(f"✅ 유효한 샘플: {valid_samples}개")
-    print(f"❌ 무효한 샘플: {invalid_samples}개")
-    print(f"🖼️ 멀티모달 샘플: {multimodal_samples}개")
-    print(f"📝 텍스트 전용 샘플: {text_only_samples}개")
+            if sample["images"]:
+                image_samples += 1
     
-    # HuggingFace Dataset feature 구조 정의
-    # 텍스트 전용과 멀티모달을 모두 지원하기 위해 유연하게 구성
-    print("📦 Dataset 객체 생성 중...")
+    tqdm.write(f"📋 샘플 검증 ({sample_size}개): {valid_samples}/{sample_size} 유효, {image_samples}/{sample_size} 이미지 포함")
     
-    # Features를 명시적으로 정의하지 않고 자동 추론되도록 함
-    # 이렇게 하면 텍스트 전용/멀티모달 데이터를 모두 처리 가능
+    # Dataset 생성
+    tqdm.write("📦 Dataset 객체 생성 중...")
     unified_dataset = Dataset.from_list(all_samples)
-    
+
     # 로컬 저장
-    print("💾 로컬 저장 중...")
+    tqdm.write("💾 로컬 저장 중...")
     unified_dataset.save_to_disk(f"./{output_name}")
     
     # 허깅페이스 업로드 시도
     try:
-        print("🚀 허깅페이스 업로드 시도...")
-        unified_dataset.push_to_hub(output_name, private=False)
-        print(f"✅ 성공적으로 {output_name}으로 업로드!")
+        tqdm.write("🚀 허깅페이스 업로드 시도...")
+        
+        # 업로드 전 데이터셋 정보 확인
+        tqdm.write(f"   - 총 샘플 수: {len(unified_dataset):,}")
+        tqdm.write(f"   - 컬럼: {list(unified_dataset.column_names)}")
+        
+        # push_to_hub 호출 - 더 나은 파라미터와 함께
+        unified_dataset.push_to_hub(
+            output_name, 
+            private=False,
+            max_shard_size="1GB",  # 샤드 크기 제한
+            commit_message=f"Upload unified SFT dataset with {len(unified_dataset):,} samples"
+        )
+        
+        tqdm.write(f"✅ 성공적으로 {output_name}으로 업로드!")
+        tqdm.write(f"🔗 https://huggingface.co/datasets/{output_name}")
+        
     except Exception as e:
         print(f"⚠️ 업로드 실패: {str(e)}")
         print("💾 로컬 저장은 완료되었습니다.")
@@ -602,3 +569,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
