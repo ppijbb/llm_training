@@ -26,7 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Import custom modules  
 from models import G3MoEForCausalLM, G3MoEConfig
-from data.base_model_sft_dataset import get_dataset, process_vision_info, create_multimodal_collate_fn
+from data.base_model_sft_dataset import get_dataset, create_multimodal_collate_fn
 from data.simple_sft_dataset import get_simple_sft_dataset, create_simple_collate_fn, smoltalk_dataset, orca_mini_dataset
 
 from training_utils.utils import format_parameters, load_config, setup_deepspeed_environment
@@ -57,28 +57,56 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
     if model_config.get("deepspeed_config"):
         setup_deepspeed_environment()
     
-    # Load tokenizer
+    # Load tokenizer - 안정적인 로딩 로직
     tokenizer_path = model_config.get("tokenizer_name_or_path") or model_config["model_name_or_path"]
+    print(f"토크나이저 로딩 시도: {tokenizer_path}")
+    
+    tokenizer = None
     try:
+        print("  - AutoProcessor 시도...")
         tokenizer = AutoProcessor.from_pretrained(
             tokenizer_path,
             trust_remote_code=model_config["trust_remote_code"]
         )
-    except:
-        tokenizer = AutoTokenizer.from_pretrained(
-            tokenizer_path,
-            trust_remote_code=model_config["trust_remote_code"]
-        )
+        print("  ✅ AutoProcessor 로드 성공")
+    except Exception as e:
+        print(f"  ❌ AutoProcessor 실패: {e}")
+        try:
+            print("  - AutoTokenizer 시도...")
+            tokenizer = AutoTokenizer.from_pretrained(
+                tokenizer_path,
+                trust_remote_code=model_config["trust_remote_code"]
+            )
+            print("  ✅ AutoTokenizer 로드 성공")
+        except Exception as e2:
+            print(f"  ❌ AutoTokenizer도 실패: {e2}")
+            raise RuntimeError(f"토크나이저 로딩 실패: {e2}")
     
-    with open("/home/conan_jung/workspace/llm_training/sft/config/chat_template.txt", "r") as f:
-        chat_template = f.read()
-    tokenizer.chat_template = chat_template
+    # Set chat template with error handling
+    try:
+        with open("/home/conan_jung/workspace/llm_training/sft/config/chat_template.txt", "r") as f:
+            chat_template = f.read()
+        
+        # AutoProcessor인 경우 tokenizer 속성에 설정
+        if hasattr(tokenizer, 'tokenizer'):
+            tokenizer.tokenizer.chat_template = chat_template
+            print("  ✅ 채팅 템플릿을 tokenizer.tokenizer에 설정")
+        else:
+            tokenizer.chat_template = chat_template
+            print("  ✅ 채팅 템플릿을 tokenizer에 설정")
+        
+        print(f"  - 템플릿 길이: {len(chat_template)}")
+    except Exception as e:
+        print(f"  ⚠️ 채팅 템플릿 설정 실패: {e}")
+        print("  - 기본 템플릿으로 계속 진행")
     
     # Set padding side for multimodal models
     if hasattr(tokenizer, 'tokenizer'):
         tokenizer.tokenizer.padding_side = "right"
+        print("  ✅ tokenizer.tokenizer.padding_side = 'right' 설정")
     else:
         tokenizer.padding_side = "right"
+        print("  ✅ tokenizer.padding_side = 'right' 설정")
     
     # Ensure tokenizer has pad token
     # if tokenizer.pad_token is None:
@@ -97,12 +125,22 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
     
     # G3MoE configuration parameters from config file
     g3moe_params = model_config["g3moe_params"]
+    
+    # Handle different model config structures (Gemma vs others)
+    if 'text_config' in base_model_config:
+        # Multi-modal model with text_config
+        text_config = base_model_config['text_config']
+        num_attention_heads = text_config['num_attention_heads']
+    else:
+        # Direct text model config
+        text_config = base_model_config
+        num_attention_heads = base_model_config['num_attention_heads']
+    
     g3moe_config = {
         "n_shared_experts": g3moe_params["n_shared_experts"],
         "n_routed_experts": g3moe_params["n_routed_experts"],
         "n_group": g3moe_params["n_group"],
         "topk_group": g3moe_params["topk_group"],
-        "num_key_value_heads": base_model_config['text_config']['num_attention_heads'],
         "num_experts_per_tok": g3moe_params["num_experts_per_tok"],
         "first_k_dense_replace": 8,  # Fixed parameter
         "router_aux_loss_coef": 0.001,  # Fixed parameter
@@ -115,12 +153,16 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
         },
         "use_bfloat16": True,
     }
-    
-    # Update text_config with G3MoE parameters
-    base_model_config['text_config'].update(g3moe_config)
-    
+    base_model_config["text_config"].update(g3moe_config)
     # Create G3MoE configuration
-    config = G3MoEConfig(**base_model_config)
+    config = G3MoEConfig(
+        text_config=base_model_config["text_config"],
+        vision_config=base_model_config["vision_config"],
+        boi_token_index=base_model_config["boi_token_index"],
+        eoi_token_index=base_model_config["eoi_token_index"],
+        image_token_index=base_model_config["image_token_index"],
+        initializer_range=base_model_config["initializer_range"],
+    )
     print("G3MoE configuration created successfully")
     print(f"  - Shared experts: {g3moe_config['n_shared_experts']}")
     print(f"  - Routed experts: {g3moe_config['n_routed_experts']}")
@@ -141,47 +183,35 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
     
     # Load G3MoE model with the configured parameters
     print("Loading G3MoE model...")
-    try:
-        model = G3MoEForCausalLM.from_pretrained(
-            model_config["model_name_or_path"],
-            config=config,
-            torch_dtype=torch.bfloat16,
-            trust_remote_code=model_config["trust_remote_code"],
-            device_map=device_map,
-        )
-        print("✓ G3MoE model loaded successfully")
-        
-       
-        total_params = model.num_parameters()
-        print(f"  - Total parameters: {format_parameters(total_params)}")
-        
-    except Exception as e:
-        print(f"✗ Error loading G3MoE model: {e}")
-        print("Falling back to base Gemma model...")
-        from transformers import AutoModelForCausalLM
-        model = AutoModelForCausalLM.from_pretrained(
-            model_config["model_name_or_path"],
-            torch_dtype=torch.bfloat16,
-            trust_remote_code=model_config["trust_remote_code"],
-            device_map=device_map,
-        )
-        print("✓ Base Gemma model loaded as fallback")
     
+    model = G3MoEForCausalLM.from_pretrained(
+        model_config["model_name_or_path"],
+        config=config,
+        torch_dtype=torch.bfloat16,
+        trust_remote_code=model_config["trust_remote_code"],
+        device_map=device_map,
+    )
+    print("✓ G3MoE model loaded successfully")
+    
+    
+    total_params = model.num_parameters()
+    print(f"  - Total parameters: {format_parameters(total_params)}")
+
     # Setup LoRA if requested
-    if model_config["use_lora"]:
-        lora_config = LoraConfig(
-            task_type=TaskType.CAUSAL_LM,
-            r=model_config["lora_r"],
-            lora_alpha=model_config["lora_alpha"],
-            lora_dropout=model_config["lora_dropout"],
-            target_modules=[
-                # "q_proj", "k_proj", "v_proj", "o_proj",
-                "gate_proj", "up_proj", "down_proj"
-            ],
-            bias="none",
-        )
-        model = get_peft_model(model, lora_config)
-        model.print_trainable_parameters()
+    # if model_config["use_lora"]:
+    #     lora_config = LoraConfig(
+    #         task_type=TaskType.CAUSAL_LM,
+    #         r=model_config["lora_r"],
+    #         lora_alpha=model_config["lora_alpha"],
+    #         lora_dropout=model_config["lora_dropout"],
+    #         target_modules=[
+    #             # "q_proj", "k_proj", "v_proj", "o_proj",
+    #             "gate_proj", "up_proj", "down_proj"
+    #         ],
+    #         bias="none",
+    #     )
+    #     model = get_peft_model(model, lora_config)
+    #     model.print_trainable_parameters()
 
     return model, tokenizer
 
@@ -190,8 +220,19 @@ def setup_dataset(data_config: Dict[str, Any], tokenizer):
     """Setup training dataset"""    
     dataset_name = data_config.get("dataset_name", "HuggingFaceTB/smoltalk")
     max_samples = data_config.get("max_samples", 1000)
+    max_seq_length = data_config.get("max_seq_length", 131072)
+    test_size = data_config.get("test_size", 0.1)
     
     print(f"Loading simple SFT dataset: {dataset_name}")
+    print(f"  - Max samples: {max_samples}")
+    print(f"  - Max sequence length: {max_seq_length}")
+    print(f"  - Test size: {test_size}")
+    print(f"  - 토크나이저 타입: {type(tokenizer)}")
+    print(f"  - 토크나이저에 chat_template 있음: {hasattr(tokenizer, 'chat_template')}")
+    if hasattr(tokenizer, 'chat_template') and tokenizer.chat_template:
+        print(f"  - chat_template 길이: {len(str(tokenizer.chat_template))}")
+    else:
+        print(f"  - ⚠️ chat_template이 설정되지 않음!")
     
     # print(f"Loading dataset: {data_config['dataset_name']}")
     # dataset = get_dataset(
@@ -202,20 +243,45 @@ def setup_dataset(data_config: Dict[str, Any], tokenizer):
     #     text_only=data_config["text_only"],
     #     streaming=data_config["streaming"]
     # )
+    try:
         # 간단한 데이터셋 로더 사용
-    if "smoltalk" in dataset_name.lower():
-        dataset = smoltalk_dataset(tokenizer, max_samples=max_samples)
-    elif "orca" in dataset_name.lower():
-        dataset = orca_mini_dataset(tokenizer, max_samples=max_samples)
-    else:
-        # 기본값: smoltalk 사용
-        print(f"⚠️ 알 수 없는 데이터셋: {dataset_name}, SmolTalk으로 대체")
-        dataset = smoltalk_dataset(tokenizer, max_samples=max_samples)
-    print(f"Dataset loaded:")
-    for split, data in dataset.items():
-        print(f"  {split}: {len(data)} examples")
-    
-    return dataset
+        if "smoltalk" in dataset_name.lower():
+            dataset = smoltalk_dataset(tokenizer, max_samples=max_samples)
+        elif "orca" in dataset_name.lower():
+            dataset = orca_mini_dataset(tokenizer, max_samples=max_samples)
+        else:
+            # 일반적인 데이터셋 로더 시도
+            print(f"일반 데이터셋 로더 시도: {dataset_name}")
+            dataset = get_simple_sft_dataset(
+                dataset_name=dataset_name,
+                tokenizer=tokenizer,
+                max_length=max_seq_length,
+                max_samples=max_samples,
+                test_size=test_size
+            )
+        
+        print(f"Dataset loaded:")
+        for split, data in dataset.items():
+            print(f"  {split}: {len(data)} examples")
+        
+        # 빈 데이터셋 체크
+        if len(dataset.get("train", [])) == 0:
+            raise ValueError("훈련 데이터셋이 비어있습니다!")
+        
+        return dataset
+        
+    except Exception as e:
+        print(f"❌ 데이터셋 로딩 실패: {e}")
+        print("🔄 대안 데이터셋으로 재시도 (SmolTalk)")
+        try:
+            dataset = smoltalk_dataset(tokenizer, max_samples=max_samples)
+            print(f"대안 데이터셋 로드 성공:")
+            for split, data in dataset.items():
+                print(f"  {split}: {len(data)} examples")
+            return dataset
+        except Exception as e2:
+            print(f"❌ 대안 데이터셋도 실패: {e2}")
+            raise RuntimeError(f"모든 데이터셋 로딩 시도가 실패했습니다: {e2}")
 
 
 def create_training_args(
@@ -321,11 +387,31 @@ def main():
 
     # Setup trainer
     print("Setting up trainer...")
+    
+    # 데이터셋 검증
+    train_dataset = dataset.get("train", None)
+    eval_dataset = dataset.get("test", None)
+    
+    if train_dataset is None or len(train_dataset) == 0:
+        raise ValueError(f"훈련 데이터셋이 비어있습니다! 데이터셋 로딩을 확인하세요.")
+    
+    print(f"✅ 데이터셋 검증 완료:")
+    print(f"  - 훈련 데이터: {len(train_dataset)} 샘플")
+    if eval_dataset is not None:
+        print(f"  - 평가 데이터: {len(eval_dataset)} 샘플")
+    else:
+        print(f"  - 평가 데이터: 없음")
+    
+    # SFTTrainer에서 사용할 수 있도록 데이터셋 형태를 한번 더 확인
+    print("데이터셋 샘플 확인:")
+    print(f"  - 첫 번째 훈련 샘플 키: {list(train_dataset[0].keys())}")
+    print(f"  - 첫 번째 샘플 input_ids 길이: {len(train_dataset[0]['input_ids'])}")
+    
     trainer = SFTTrainer( 
         model=model,
         args=training_args,
-        train_dataset=dataset.get("train", None),
-        eval_dataset=dataset.get("test", None),
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
         processing_class=tokenizer,
         data_collator=collate_fn,
     )

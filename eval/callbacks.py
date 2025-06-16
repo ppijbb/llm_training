@@ -1,3 +1,4 @@
+from typing import List, Dict
 from deepeval.metrics import BaseMetric
 from deepeval.evaluate.execute import execute_test_cases
 from deepeval.dataset import EvaluationDataset

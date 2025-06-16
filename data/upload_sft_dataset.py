@@ -7,8 +7,24 @@ import requests
 from PIL import Image
 from io import BytesIO
 from huggingface_hub.utils import disable_progress_bars
+import concurrent.futures
+from functools import partial
+import threading
+import time
+from urllib.parse import urlparse
+import hashlib
 
 disable_progress_bars()  # 진행 표시줄 비활성화
+
+# 이미지 캐시 및 세션 설정
+image_cache = {}
+cache_lock = threading.Lock()
+
+# 세션 풀 생성 (재사용 가능한 연결)
+session = requests.Session()
+session.headers.update({
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+})
 
 # 멀티모달 데이터셋 목록
 dataset_configs = [
@@ -42,9 +58,26 @@ def construct_image_url(image_path, dataset_name):
     
     return None
 
+def get_image_cache_key(image_url):
+    """이미지 URL에서 캐시 키 생성"""
+    return hashlib.md5(image_url.encode()).hexdigest()
+
+def download_image_with_retry(image_url, max_retries=3, timeout=10):
+    """재시도 로직이 있는 이미지 다운로드"""
+    for attempt in range(max_retries):
+        try:
+            response = session.get(image_url, timeout=timeout)
+            response.raise_for_status()
+            return response.content
+        except Exception as e:
+            if attempt == max_retries - 1:
+                return None
+            time.sleep(0.5 * (2 ** attempt))  # 지수 백오프
+    return None
+
 def load_image_from_url_or_path(image_source, dataset_name=None):
     """
-    URL이나 경로에서 실제 이미지를 로드합니다.
+    URL이나 경로에서 실제 이미지를 로드합니다. (캐시 및 최적화 포함)
     """
     try:
         # 이미 PIL Image 객체인 경우
@@ -55,41 +88,91 @@ def load_image_from_url_or_path(image_source, dataset_name=None):
         if isinstance(image_source, str):
             # HTTP/HTTPS URL인 경우
             if image_source.startswith('http://') or image_source.startswith('https://'):
-                response = requests.get(image_source, timeout=15)
-                response.raise_for_status()
-                image = Image.open(BytesIO(response.content))
-                return image.convert('RGB')
+                # 캐시 확인
+                cache_key = get_image_cache_key(image_source)
+                with cache_lock:
+                    if cache_key in image_cache:
+                        return image_cache[cache_key]
+                
+                # 이미지 다운로드
+                image_data = download_image_with_retry(image_source)
+                if image_data:
+                    image = Image.open(BytesIO(image_data))
+                    image = image.convert('RGB')
+                    
+                    # 메모리 사용량 제한을 위한 이미지 크기 조정
+                    max_size = (1024, 1024)
+                    if image.size[0] > max_size[0] or image.size[1] > max_size[1]:
+                        image.thumbnail(max_size, Image.Resampling.LANCZOS)
+                    
+                    # 캐시에 저장 (최근 100개만 유지)
+                    with cache_lock:
+                        if len(image_cache) >= 100:
+                            # 가장 오래된 항목 제거
+                            oldest_key = next(iter(image_cache))
+                            del image_cache[oldest_key]
+                        image_cache[cache_key] = image
+                    
+                    return image
+                return None
             
             # 로컬 파일 경로인 경우
             elif os.path.exists(image_source):
                 image = Image.open(image_source)
-                return image.convert('RGB')
+                image = image.convert('RGB')
+                # 크기 조정
+                max_size = (1024, 1024)
+                if image.size[0] > max_size[0] or image.size[1] > max_size[1]:
+                    image.thumbnail(max_size, Image.Resampling.LANCZOS)
+                return image
             
             # 파일명만 있는 경우 - URL 구성 시도
             else:
                 if dataset_name:
                     constructed_url = construct_image_url(image_source, dataset_name)
                     if constructed_url:
-                        try:
-                            response = requests.get(constructed_url, timeout=15)
-                            response.raise_for_status()
-                            image = Image.open(BytesIO(response.content))
-                            return image.convert('RGB')
-                        except:
-                            pass  # 조용히 실패 처리
-                
+                        return load_image_from_url_or_path(constructed_url, dataset_name)
                 return None
         
         # bytes 데이터인 경우
         elif isinstance(image_source, bytes):
             image = Image.open(BytesIO(image_source))
-            return image.convert('RGB')
+            image = image.convert('RGB')
+            # 크기 조정
+            max_size = (1024, 1024)
+            if image.size[0] > max_size[0] or image.size[1] > max_size[1]:
+                image.thumbnail(max_size, Image.Resampling.LANCZOS)
+            return image
             
         else:
             return None
         
     except Exception as e:
         return None
+
+def process_image_batch(image_sources_with_info, max_workers=8):
+    """이미지 배치를 병렬로 처리"""
+    results = []
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # 모든 이미지 로드 작업을 동시에 시작
+        future_to_info = {
+            executor.submit(load_image_from_url_or_path, img_source, dataset_name): (img_source, dataset_name, idx)
+            for idx, (img_source, dataset_name) in enumerate(image_sources_with_info)
+        }
+        
+        # 결과 수집
+        for future in concurrent.futures.as_completed(future_to_info):
+            img_source, dataset_name, idx = future_to_info[future]
+            try:
+                result = future.result()
+                results.append((idx, result))
+            except Exception as e:
+                results.append((idx, None))
+    
+    # 원래 순서대로 정렬
+    results.sort(key=lambda x: x[0])
+    return [result for _, result in results]
 
 def convert_to_target_format(sample: Dict[str, Any], dataset_name: str) -> Dict[str, Any]:
     """
@@ -296,8 +379,52 @@ def convert_to_target_format(sample: Dict[str, Any], dataset_name: str) -> Dict[
         print(f"Error converting sample from {dataset_name}: {str(e)}")
         return None
 
-def process_dataset(dataset_name: str, config_name: str = None, max_samples: int = None):
-    """데이터셋을 처리하여 목표 형식으로 변환합니다."""
+def process_samples_batch(samples_batch, dataset_name, max_workers=8):
+    """샘플 배치를 병렬로 처리"""
+    # 이미지가 있는 샘플들을 먼저 식별
+    image_samples = []
+    non_image_samples = []
+    
+    for i, sample in enumerate(samples_batch):
+        has_image = False
+        
+        # 이미지가 있는 데이터셋인지 확인
+        if dataset_name in ["Lin-Chen/ShareGPT4V", "liuhaotian/LLaVA-Instruct-150K", "Salesforce/blip3-kale"]:
+            if ("image" in sample and sample["image"]) or ("images" in sample and sample["images"]) or ("url" in sample and sample["url"]):
+                has_image = True
+        
+        if has_image:
+            image_samples.append((i, sample))
+        else:
+            non_image_samples.append((i, sample))
+    
+    # 이미지가 없는 샘플들을 먼저 빠르게 처리
+    results = [None] * len(samples_batch)
+    
+    for i, sample in non_image_samples:
+        converted = convert_to_target_format(sample, dataset_name)
+        results[i] = converted
+    
+    # 이미지가 있는 샘플들을 병렬로 처리
+    if image_samples:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_idx = {
+                executor.submit(convert_to_target_format, sample, dataset_name): i
+                for i, sample in image_samples
+            }
+            
+            for future in concurrent.futures.as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                try:
+                    result = future.result()
+                    results[idx] = result
+                except Exception as e:
+                    results[idx] = None
+    
+    return [r for r in results if r is not None]
+
+def process_dataset(dataset_name: str, config_name: str = None, max_samples: int = None, num_workers: int = 8):
+    """데이터셋을 처리하여 목표 형식으로 변환합니다. (병렬 처리 추가)"""
     try:
         # 특정 데이터셋들의 split 설정
         if dataset_name == "microsoft/orca-agentinstruct-1M-v1":
@@ -331,9 +458,10 @@ def process_dataset(dataset_name: str, config_name: str = None, max_samples: int
             else:
                 return
 
-        processed_samples = []
         success_count = 0
         total_count = 0
+        batch_size = max(8, num_workers)  # 배치 크기를 워커 수에 맞춤
+        current_batch = []
         
         # 진행 상황 표시를 위한 tqdm 설정
         desc = f"{dataset_name.split('/')[-1]}"
@@ -347,39 +475,43 @@ def process_dataset(dataset_name: str, config_name: str = None, max_samples: int
             if max_samples and total_count >= max_samples:
                 break
             
+            current_batch.append(sample)
             total_count += 1
-            progress_bar.update(1)
             
-            # 변환 시도
-            converted = convert_to_target_format(sample, dataset_name)
-            if converted:
-                processed_samples.append(converted)
-                success_count += 1
+            # 배치가 찼거나 마지막 샘플인 경우 처리
+            if len(current_batch) >= batch_size or (max_samples and total_count >= max_samples):
+                # 배치 처리
+                batch_results = process_samples_batch(current_batch, dataset_name, num_workers)
                 
-                # 이미지 로드 성공 시 진행바에 표시
-                if converted["images"] and success_count <= 3:
-                    progress_bar.set_postfix({"images": f"{len(converted['images'])}개"})
-            
-            # 메모리 관리를 위한 배치 처리
-            if len(processed_samples) >= 1000:
-                yield processed_samples
-                processed_samples = []
-                progress_bar.set_postfix({"processed": f"{success_count}/{total_count}"})
+                if batch_results:
+                    success_count += len(batch_results)
+                    yield batch_results
+                
+                progress_bar.update(len(current_batch))
+                progress_bar.set_postfix({
+                    "processed": f"{success_count}/{total_count}",
+                    "success_rate": f"{success_count/total_count*100:.1f}%"
+                })
+                
+                current_batch = []
+        
+        # 남은 배치 처리
+        if current_batch:
+            batch_results = process_samples_batch(current_batch, dataset_name, num_workers)
+            if batch_results:
+                success_count += len(batch_results)
+                yield batch_results
+            progress_bar.update(len(current_batch))
         
         progress_bar.close()
-        
-        # 남은 샘플들 처리
-        if processed_samples:
-            yield processed_samples
-            
-        tqdm.write(f"✅ {dataset_name}: {success_count}/{total_count} 샘플 변환 완료")
+        tqdm.write(f"✅ {dataset_name}: {success_count}/{total_count} 샘플 변환 완료 (성공률: {success_count/total_count*100:.1f}%)")
 
     except Exception as e:
         print(f"❌ {dataset_name} 처리 중 오류: {str(e)}")
 
-def merge_and_create_dataset(output_name: str = "unified-multimodal-sft", max_samples_per_dataset: int = None):
-    """모든 멀티모달 데이터셋을 병합하고 목표 형식으로 생성합니다."""
-    print("🚀 멀티모달 데이터셋 병합 시작...")
+def merge_and_create_dataset(output_name: str = "unified-multimodal-sft", max_samples_per_dataset: int = None, num_workers: int = 16):
+    """모든 멀티모달 데이터셋을 병합하고 목표 형식으로 생성합니다. (병렬 처리 추가)"""
+    print(f"🚀 멀티모달 데이터셋 병합 시작... (워커 수: {num_workers})")
     
     all_samples = []
     dataset_progress = tqdm(dataset_configs, desc="데이터셋 처리", unit="dataset")
@@ -387,7 +519,7 @@ def merge_and_create_dataset(output_name: str = "unified-multimodal-sft", max_sa
     for dataset_name, config_name in dataset_progress:
         dataset_progress.set_description(f"처리중: {dataset_name.split('/')[-1]}")
         try:
-            for batch in process_dataset(dataset_name, config_name, max_samples_per_dataset):
+            for batch in process_dataset(dataset_name, config_name, max_samples_per_dataset, num_workers):
                 all_samples.extend(batch)
                 dataset_progress.set_postfix({"총 샘플": len(all_samples)})
         except Exception as e:
@@ -416,6 +548,10 @@ def merge_and_create_dataset(output_name: str = "unified-multimodal-sft", max_sa
                 image_samples += 1
     
     tqdm.write(f"📋 샘플 검증 ({sample_size}개): {valid_samples}/{sample_size} 유효, {image_samples}/{sample_size} 이미지 포함")
+    
+    # 캐시 정리
+    with cache_lock:
+        image_cache.clear()
     
     # Dataset 생성
     tqdm.write("📦 Dataset 객체 생성 중...")
@@ -534,14 +670,16 @@ def main():
         if sys.argv[1] == "merge":
             if len(sys.argv) < 3:
                 print("❌ 리포지토리 이름이 필요합니다!")
-                print("사용법: python upload_sft_dataset.py merge <repository_name> [max_samples_per_dataset]")
+                print("사용법: python upload_sft_dataset.py merge <repository_name> [max_samples_per_dataset] [num_workers]")
                 return
             
             repository_name = sys.argv[2]
             max_samples = int(sys.argv[3]) if len(sys.argv) > 3 else None
+            num_workers = int(sys.argv[4]) if len(sys.argv) > 4 else 16
             
             print(f"🎯 타겟 리포지토리: {repository_name}")
-            dataset = merge_and_create_dataset(output_name=repository_name, max_samples_per_dataset=max_samples)
+            print(f"🔧 워커 수: {num_workers}")
+            dataset = merge_and_create_dataset(output_name=repository_name, max_samples_per_dataset=max_samples, num_workers=num_workers)
             if dataset:
                 print("🎉 병합 완료!")
                 
@@ -551,10 +689,10 @@ def main():
             
     else:
         print("사용법:")
-        print("  python upload_sft_dataset.py merge <repository_name> [max_samples_per_dataset]")
+        print("  python upload_sft_dataset.py merge <repository_name> [max_samples_per_dataset] [num_workers]")
         print("  python upload_sft_dataset.py inspect [dataset_path]")
         print("")
-        print("📝 텍스트 + 멀티모달 통합 데이터셋 처리")
+        print("📝 텍스트 + 멀티모달 통합 데이터셋 처리 (병렬 처리 지원)")
         print("포함된 데이터셋:")
         for dataset_name, config_name in dataset_configs:
             if config_name:
@@ -563,8 +701,9 @@ def main():
                 print(f"  - {dataset_name}")
         print("")
         print("예시:")
-        print("  python upload_sft_dataset.py merge my-unified-dataset 1000")
-        print("  python upload_sft_dataset.py merge my-unified-dataset")  # 전체 데이터
+        print("  python upload_sft_dataset.py merge my-unified-dataset 1000 32  # 32개 워커 사용")
+        print("  python upload_sft_dataset.py merge my-unified-dataset 1000     # 기본 16개 워커")
+        print("  python upload_sft_dataset.py merge my-unified-dataset          # 전체 데이터, 기본 워커")
         print("  python upload_sft_dataset.py inspect ./my-unified-dataset")
 
 if __name__ == "__main__":

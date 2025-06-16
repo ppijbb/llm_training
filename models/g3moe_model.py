@@ -702,8 +702,8 @@ class G3MoEGRINMoE(nn.Module):
         final_hidden_states, router_logits = self._sparse_routing(hidden_states)
         with torch.no_grad():
             pretriained_residual = self.shared_experts(residual)
-        final_hidden_states = final_hidden_states + pretriained_residual
-        return final_hidden_states, router_logits
+        final_hidden_states = (final_hidden_states + pretriained_residual).requires_grad_(True)
+        return final_hidden_states, router_logits.requires_grad_(True)
     
     def _sparse_routing(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size, sequence_length, hidden_dim = hidden_states.shape
@@ -1100,7 +1100,7 @@ class G3MoEDecoderLayer(nn.Module):
             with torch.no_grad():
                 hidden_states = self.moe(hidden_states)
                 router_logits = None
-        hidden_states = self.post_feedforward_layernorm(hidden_states)
+        hidden_states = self.post_feedforward_layernorm(hidden_states).requires_grad_(True)
         hidden_states = residual + hidden_states
         outputs = (hidden_states,)
         if output_attentions:
@@ -1607,8 +1607,9 @@ class G3MoEForCausalLM(G3MoEPreTrainedModel, GenerationMixin):
     def __init__(self, config: G3MoETextConfig, **kwargs):
         super().__init__(config)
         self.model = G3MoETextModel(config, **kwargs)
+        self.config = self.config if isinstance(self.config, self.config_class) else self.config.text_config
         self.vocab_size = self.config.vocab_size
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -1719,11 +1720,11 @@ class G3MoEForCausalLM(G3MoEPreTrainedModel, GenerationMixin):
             if outputs.router_logits is not None:
                 aux_loss = load_balancing_loss_func(
                     outputs.router_logits,
-                    self.num_experts,
-                    self.num_experts_per_tok,
+                    self.model.config.n_routed_experts,
+                    self.model.config.num_experts_per_tok,
                     attention_mask,
                 )
-                loss += self.router_aux_loss_coef * aux_loss
+                loss += self.model.config.router_aux_loss_coef * aux_loss
 
         return G3MoECausalLMOutputWithPast(
             loss=loss,
