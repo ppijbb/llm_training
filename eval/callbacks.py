@@ -3,13 +3,56 @@ from deepeval.metrics import BaseMetric
 from deepeval.evaluate.execute import execute_test_cases
 from deepeval.dataset import EvaluationDataset
 from deepeval.integrations.hugging_face import DeepEvalHuggingFaceCallback
+from deepeval.dataset import EvaluationDataset, Golden
+from deepeval.metrics import GEval
+from deepeval.test_case import LLMTestCaseParams
 from transformers import (
-        TrainerCallback,
-        ProgressCallback,
         Trainer,
         TrainingArguments,
         TrainerState,
-        TrainerControl,
+        TrainerControl
+    )
+
+
+def get_model_eval_callback(
+    trainer: Trainer,
+    evaluation_dataset: EvaluationDataset = None,
+    metrics: List[BaseMetric] = None,
+    tokenizer_args: Dict = None,
+    aggregation_method: str = "avg",
+    show_table: bool = False,
+): 
+    if evaluation_dataset is None:
+        evaluation_dataset = EvaluationDataset(
+            golden_dataset=Golden(
+                dataset_name="",
+                dataset_config_name="",
+            )
+        )
+    if metrics is None:
+        metrics = [ GEval(
+            name="Correctness",
+            criteria="Determine whether the actual output is factually correct based on the expected output.",
+            # NOTE: you can only provide either criteria or evaluation_steps, and not both
+            evaluation_steps=[
+                "Check whether the facts in 'actual output' contradicts any facts in 'expected output'",
+                "You should also heavily penalize omission of detail",
+                "Vague language, or contradicting OPINIONS, are OK"
+            ],
+            evaluation_params=[LLMTestCaseParams.INPUT, LLMTestCaseParams.ACTUAL_OUTPUT, LLMTestCaseParams.EXPECTED_OUTPUT],
+        )]
+    if tokenizer_args is None:
+        tokenizer_args = {}
+    if aggregation_method is None:
+        aggregation_method = "avg"
+
+    return ModelEvalCallback(
+        trainer=trainer,
+        evaluation_dataset=evaluation_dataset,
+        metrics=metrics,
+        tokenizer_args=tokenizer_args,
+        aggregation_method=aggregation_method,
+        show_table=show_table,
     )
 
 

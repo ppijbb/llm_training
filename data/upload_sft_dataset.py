@@ -13,6 +13,8 @@ import threading
 import time
 from urllib.parse import urlparse
 import hashlib
+import gc
+import datetime
 
 disable_progress_bars()  # 진행 표시줄 비활성화
 
@@ -468,7 +470,8 @@ def process_dataset(dataset_name: str, config_name: str = None, max_samples: int
         if config_name:
             desc += f"({config_name})"
         
-        progress_bar = tqdm(desc=desc, unit="samples")
+        # leave=False를 추가하여 완료 후 진행 막대가 사라지도록 함
+        progress_bar = tqdm(desc=desc, unit="samples", leave=False)
         
         # 스트리밍 데이터 처리
         for sample in full_dataset:
@@ -504,62 +507,127 @@ def process_dataset(dataset_name: str, config_name: str = None, max_samples: int
             progress_bar.update(len(current_batch))
         
         progress_bar.close()
-        tqdm.write(f"✅ {dataset_name}: {success_count}/{total_count} 샘플 변환 완료 (성공률: {success_count/total_count*100:.1f}%)")
+        
+        # 완료 메시지를 반환값으로 변경하여 나중에 한 번에 출력하도록 함
+        yield f"✅ {dataset_name}: {success_count}/{total_count} 샘플 변환 완료 (성공률: {success_count/total_count*100:.1f}%)" if total_count > 0 else f"ℹ️ {dataset_name}: 처리할 샘플 없음"
 
     except Exception as e:
-        print(f"❌ {dataset_name} 처리 중 오류: {str(e)}")
+        yield f"❌ {dataset_name} 처리 중 오류: {str(e)}"
 
-def merge_and_create_dataset(output_name: str = "unified-multimodal-sft", max_samples_per_dataset: int = None, num_workers: int = 16):
-    """모든 멀티모달 데이터셋을 병합하고 목표 형식으로 생성합니다. (병렬 처리 추가)"""
+def merge_and_create_dataset(
+    output_name: str = "unified-multimodal-sft", 
+    max_samples_per_dataset: int = None, 
+    num_workers: int = 16, 
+    local_path: str = "./",
+    private: bool = False
+):
+    """
+    모든 멀티모달 데이터셋을 병합하고 목표 형식으로 생성합니다.
+    메모리 문제를 해결하기 위해 중간 결과를 디스크에 저장하는 방식을 사용합니다.
+    """
     print(f"🚀 멀티모달 데이터셋 병합 시작... (워커 수: {num_workers})")
     
-    all_samples = []
-    dataset_progress = tqdm(dataset_configs, desc="데이터셋 처리", unit="dataset")
+    # 1. 임시 저장 공간 설정
+    staging_dir = f"{local_path}/{output_name}_staging".replace("//", "/")
+    images_dir = os.path.join(staging_dir, "images")
+    os.makedirs(images_dir, exist_ok=True)
+    jsonl_path = os.path.join(staging_dir, "data.jsonl")
+    
+    tqdm.write(f"📂 임시 저장 경로: {staging_dir}")
 
-    for dataset_name, config_name in dataset_progress:
-        dataset_progress.set_description(f"처리중: {dataset_name.split('/')[-1]}")
-        try:
-            for batch in process_dataset(dataset_name, config_name, max_samples_per_dataset, num_workers):
-                all_samples.extend(batch)
-                dataset_progress.set_postfix({"총 샘플": len(all_samples)})
-        except Exception as e:
-            print(f"❌ {dataset_name} 처리 실패: {str(e)}")
-            continue
+    # JSON 직렬화를 위한 datetime 핸들러
+    def datetime_handler(x):
+        if isinstance(x, datetime.datetime):
+            return x.isoformat()
+        raise TypeError(f"Object of type {type(x).__name__} is not JSON serializable")
+
+    total_samples = 0
+    image_counter = 0
+    completion_messages = []
+
+    # 2. 데이터를 JSONL과 이미지 파일로 디스크에 저장
+    with open(jsonl_path, "w", encoding="utf-8") as f:
+        dataset_progress = tqdm(dataset_configs, desc="데이터셋 처리", unit="dataset")
+
+        for dataset_name, config_name in dataset_progress:
+            dataset_progress.set_description(f"처리중: {dataset_name.split('/')[-1]}")
+            try:
+                for result in process_dataset(dataset_name, config_name, max_samples_per_dataset, num_workers):
+                    if isinstance(result, list): # 배치 결과
+                        for sample in result:
+                            # 이미지 처리: PIL 객체를 파일로 저장하고 경로로 대체
+                            image_paths = []
+                            if sample.get("images"):
+                                for img in sample["images"]:
+                                    if hasattr(img, 'save'):
+                                        image_filename = f"{image_counter:08d}.png"
+                                        # 상대 경로로 저장
+                                        img_save_path = os.path.join(images_dir, image_filename)
+                                        img.save(img_save_path, "PNG")
+                                        image_paths.append(os.path.join("images", image_filename))
+                                        image_counter += 1
+                            
+                            sample["images"] = image_paths
+                            # original_data는 python 객체로 유지하고, 전체를 한번에 직렬화
+                            
+                            f.write(json.dumps(
+                                sample, 
+                                ensure_ascii=False, 
+                                default=datetime_handler
+                            ) + "\n")
+                            total_samples += 1
+                        
+                        dataset_progress.set_postfix({"총 샘플": total_samples})
+
+                    elif isinstance(result, str): # 완료 메시지
+                        completion_messages.append(result)
+            except Exception as e:
+                tqdm.write(f"❌ {dataset_name} 처리 실패: {str(e)}")
+                continue
+
+            # 데이터셋 처리 후 메모리 최적화
+            with cache_lock:
+                image_cache.clear()
+            gc.collect()
+            tqdm.write(f"🧠 {dataset_name.split('/')[-1]} 처리 후 메모리 최적화 완료.")
 
     dataset_progress.close()
 
-    if not all_samples:
+    tqdm.write("\n" + "="*20 + " 처리 결과 요약 " + "="*20)
+    for msg in completion_messages:
+        tqdm.write(msg)
+    tqdm.write("="*55)
+
+    if total_samples == 0:
         print("❌ 변환된 샘플이 없습니다.")
         return None
     
-    tqdm.write(f"\n🎯 총 {len(all_samples)}개 샘플 변환 완료")
+    tqdm.write(f"\n🎯 총 {total_samples}개 샘플 변환 완료 및 임시 저장 완료")
     
-    # 데이터 검증 (샘플링해서 빠르게)
-    sample_size = min(1000, len(all_samples))
-    valid_samples = 0
-    image_samples = 0
+    # 3. 디스크에 저장된 데이터를 메모리 효율적으로 로드
+    tqdm.write("📦 임시 파일로부터 Dataset 객체 생성 중...")
     
-    validation_progress = tqdm(range(sample_size), desc="데이터 검증", leave=False)
-    for i in validation_progress:
-        sample = all_samples[i]
-        if "messages" in sample and "images" in sample:
-            valid_samples += 1
-            if sample["images"]:
-                image_samples += 1
+    # 데이터셋의 최종 스키마(구조) 정의
+    features = Features({
+        'messages': Sequence({'role': Value('string'), 'content': Sequence({'type': Value('string'), 'text': Value('string'), 'index': Value('int64')})}),
+        'images': Sequence(ImageFeature()),
+        'source_dataset': Value('string'),
+        'original_data': Value('string')
+    })
     
-    tqdm.write(f"📋 샘플 검증 ({sample_size}개): {valid_samples}/{sample_size} 유효, {image_samples}/{sample_size} 이미지 포함")
+    # JSONL 파일을 로드하고, 이미지 경로를 실제 이미지로 변환하도록 설정
+    unified_dataset = load_dataset("json", data_files=jsonl_path, features=features)["train"]
+    unified_dataset = unified_dataset.cast_column("images", Sequence(ImageFeature(decode=True)))
     
     # 캐시 정리
     with cache_lock:
         image_cache.clear()
     
-    # Dataset 생성
-    tqdm.write("📦 Dataset 객체 생성 중...")
-    unified_dataset = Dataset.from_list(all_samples)
-
     # 로컬 저장
-    tqdm.write("💾 로컬 저장 중...")
-    unified_dataset.save_to_disk(f"./{output_name}")
+    tqdm.write("💾 로컬 저장 중 (최종 Arrow 포맷)...")
+    final_save_path = f"{local_path}/{output_name}"
+    unified_dataset.save_to_disk(final_save_path)
+    tqdm.write(f"   - 최종 데이터셋 경로: {final_save_path}")
     
     # 허깅페이스 업로드 시도
     try:
@@ -572,7 +640,7 @@ def merge_and_create_dataset(output_name: str = "unified-multimodal-sft", max_sa
         # push_to_hub 호출 - 더 나은 파라미터와 함께
         unified_dataset.push_to_hub(
             output_name, 
-            private=False,
+            private=private,
             max_shard_size="1GB",  # 샤드 크기 제한
             commit_message=f"Upload unified SFT dataset with {len(unified_dataset):,} samples"
         )
@@ -676,10 +744,19 @@ def main():
             repository_name = sys.argv[2]
             max_samples = int(sys.argv[3]) if len(sys.argv) > 3 else None
             num_workers = int(sys.argv[4]) if len(sys.argv) > 4 else 16
+            local_path = sys.argv[5] if len(sys.argv) > 5 else "./"
+            private = bool(sys.argv[6]) if len(sys.argv) > 6 else False
+            
             
             print(f"🎯 타겟 리포지토리: {repository_name}")
             print(f"🔧 워커 수: {num_workers}")
-            dataset = merge_and_create_dataset(output_name=repository_name, max_samples_per_dataset=max_samples, num_workers=num_workers)
+            dataset = merge_and_create_dataset(
+                output_name=repository_name,
+                max_samples_per_dataset=max_samples,
+                num_workers=num_workers,
+                private=private,
+                local_path=local_path
+            )
             if dataset:
                 print("🎉 병합 완료!")
                 

@@ -31,7 +31,7 @@ from data.base_model_sft_dataset import get_dataset, create_multimodal_collate_f
 from data.simple_sft_dataset import get_simple_sft_dataset, create_simple_collate_fn, smoltalk_dataset, orca_mini_dataset
 
 from training_utils.utils import format_parameters, load_config, setup_deepspeed_environment
-from eval.callbacks import ModelEvalCallback
+from eval.callbacks import get_model_eval_callback
 
 
 def load_config(config_path: str):
@@ -224,7 +224,7 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
 def setup_dataset(data_config: Dict[str, Any], tokenizer):
     """Setup training dataset"""    
     dataset_name = data_config.get("dataset_name", "HuggingFaceTB/smoltalk")
-    max_samples = data_config.get("max_samples", 1000)
+    max_samples = data_config.get("max_samples", 10000)
     max_seq_length = data_config.get("max_seq_length", 131072)
     test_size = data_config.get("test_size", 0.1)
     
@@ -420,7 +420,7 @@ def main():
         processing_class=tokenizer,
         data_collator=collate_fn,
     )
-    
+    trainer.add_callback(get_model_eval_callback(trainer=trainer))
     # Print training info
     print("\n" + "="*50)
     print("TRAINING CONFIGURATION")
