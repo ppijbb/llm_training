@@ -702,8 +702,12 @@ class G3MoEGRINMoE(nn.Module):
         final_hidden_states, router_logits = self._sparse_routing(hidden_states)
         with torch.no_grad():
             pretriained_residual = self.shared_experts(residual)
-        final_hidden_states = (final_hidden_states + pretriained_residual).requires_grad_(True)
-        return final_hidden_states, router_logits.requires_grad_(True)
+        final_hidden_states = (final_hidden_states + pretriained_residual)
+        if self.training:
+            final_hidden_states = final_hidden_states.requires_grad_(True)
+            if router_logits is not None:
+                router_logits = router_logits.requires_grad_(True)
+        return final_hidden_states, router_logits
     
     def _sparse_routing(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size, sequence_length, hidden_dim = hidden_states.shape
@@ -1100,7 +1104,11 @@ class G3MoEDecoderLayer(nn.Module):
             with torch.no_grad():
                 hidden_states = self.moe(hidden_states)
                 router_logits = None
-        hidden_states = self.post_feedforward_layernorm(hidden_states).requires_grad_(True)
+        hidden_states = self.post_feedforward_layernorm(hidden_states)
+        if self.training:
+            hidden_states = hidden_states.requires_grad_(True)
+            if router_logits is not None:
+                router_logits = router_logits.requires_grad_(True)
         hidden_states = residual + hidden_states
         outputs = (hidden_states,)
         if output_attentions:

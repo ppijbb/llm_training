@@ -11,6 +11,7 @@ import argparse
 from typing import Dict, Any
 import io
 from PIL import Image
+from transformers.utils.import_utils import is_flash_attn_2_available
 from transformers import (
     AutoTokenizer,
     AutoProcessor,
@@ -190,6 +191,9 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
         torch_dtype=torch.bfloat16,
         trust_remote_code=model_config["trust_remote_code"],
         device_map=device_map,
+        low_cpu_mem_usage=True,
+        # load_in_4bit=True,
+        _attn_implementation="flash_attention_2" if is_flash_attn_2_available() else "sdpa"
     )
     print("✓ G3MoE model loaded successfully")
     
@@ -198,20 +202,21 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
     print(f"  - Total parameters: {format_parameters(total_params)}")
 
     # Setup LoRA if requested
-    # if model_config["use_lora"]:
-    #     lora_config = LoraConfig(
-    #         task_type=TaskType.CAUSAL_LM,
-    #         r=model_config["lora_r"],
-    #         lora_alpha=model_config["lora_alpha"],
-    #         lora_dropout=model_config["lora_dropout"],
-    #         target_modules=[
-    #             # "q_proj", "k_proj", "v_proj", "o_proj",
-    #             "gate_proj", "up_proj", "down_proj"
-    #         ],
-    #         bias="none",
-    #     )
-    #     model = get_peft_model(model, lora_config)
-    #     model.print_trainable_parameters()
+    if model_config["use_lora"]:
+        lora_config = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            r=model_config["lora_r"],
+            lora_alpha=model_config["lora_alpha"],
+            lora_dropout=model_config["lora_dropout"],
+            target_modules=[
+                # "q_proj", "k_proj", "v_proj", "o_proj",
+                "gate_proj", "up_proj", "down_proj"
+            ],
+            bias="none",
+        )
+        model.enable_input_require_grads()
+        model = get_peft_model(model, lora_config)
+        model.print_trainable_parameters()
 
     return model, tokenizer
 

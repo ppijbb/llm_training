@@ -7,14 +7,15 @@
     "lora_r": 16,
     "lora_alpha": 32,
     "lora_dropout": 0.1,
-    "deepspeed_config": "sft/config/deepspeed_zero2.json",
+    "deepspeed_config": "sft/config/deepspeed_cpu_offload.json",
     "g3moe_params": {
       "n_shared_experts": 1,
-      "n_routed_experts": 2,
+      "n_routed_experts": 3,
       "n_group": 4,
       "topk_group": 8,
       "num_experts_per_tok": 2,
-      "rope_scaling_factor": 8.0
+      "rope_scaling_factor": 8.0,
+      "first_k_dense_replace": 18
     }
   },
   "data_config": {
@@ -29,7 +30,7 @@
     "num_train_epochs": 5,
     "per_device_train_batch_size": 1,
     "per_device_eval_batch_size": 1,
-    "gradient_accumulation_steps": 32,
+    "gradient_accumulation_steps": 64,
     "learning_rate": 5e-5,
     "weight_decay": 0.01,
     "lr_scheduler_type": "cosine",
