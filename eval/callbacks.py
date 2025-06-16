@@ -22,13 +22,18 @@ def get_model_eval_callback(
     aggregation_method: str = "avg",
     show_table: bool = False,
 ): 
+
+    
     if evaluation_dataset is None:
-        evaluation_dataset = EvaluationDataset(
-            golden_dataset=Golden(
-                dataset_name="",
-                dataset_config_name="",
-            )
-        )
+        first_golden = Golden(input="...")
+        second_golden = Golden(input="...")
+        evaluation_dataset = EvaluationDataset(goldens=[first_golden, second_golden])
+        # evaluation_dataset = EvaluationDataset(
+        #     golden_dataset=Golden(
+        #         dataset_name="",
+        #         dataset_config_name="",
+        #     )
+        # )
     if metrics is None:
         metrics = [ GEval(
             name="Correctness",

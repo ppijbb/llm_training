@@ -420,7 +420,7 @@ def main():
         processing_class=tokenizer,
         data_collator=collate_fn,
     )
-    trainer.add_callback(get_model_eval_callback(trainer=trainer))
+    # trainer.add_callback(get_model_eval_callback(trainer=trainer))
     # Print training info
     print("\n" + "="*50)
     print("TRAINING CONFIGURATION")
