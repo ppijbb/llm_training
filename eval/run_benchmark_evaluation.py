@@ -27,7 +27,6 @@ from models import G3MoEForCausalLM, G3MoEConfig
 
 class G3MoEModelForDeepEval(DeepEvalBaseLLM):
     def __init__(self, model_path: str, training_config_path: str = None):
-        super().__init__()
         # LoRA 모델의 경우 training_config_path가 필수임을 확인
         if os.path.exists(os.path.join(model_path, 'adapter_config.json')) and not training_config_path:
             raise ValueError("LoRA 모델을 평가하려면 --training_config_path 인자가 반드시 필요합니다.")
@@ -37,6 +36,7 @@ class G3MoEModelForDeepEval(DeepEvalBaseLLM):
         self.model = None
         self.tokenizer = None
         self.actual_tokenizer = None
+        super().__init__()
 
     def load_model(self):
         if self.model is not None:
