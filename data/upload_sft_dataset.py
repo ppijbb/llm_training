@@ -1,12 +1,12 @@
 from datasets import load_dataset, concatenate_datasets, Dataset, Features, Value, Sequence, Image as ImageFeature
 import json
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional, cast
 from tqdm.auto import tqdm
 import os
 import requests
 from PIL import Image
 from io import BytesIO
-from huggingface_hub.utils import disable_progress_bars
+from huggingface_hub.utils.tqdm import disable_progress_bars
 import concurrent.futures
 from functools import partial
 import threading
@@ -15,6 +15,8 @@ from urllib.parse import urlparse
 import hashlib
 import gc
 import datetime
+import argparse
+import sys
 
 disable_progress_bars()  # 진행 표시줄 비활성화
 
@@ -176,7 +178,7 @@ def process_image_batch(image_sources_with_info, max_workers=8):
     results.sort(key=lambda x: x[0])
     return [result for _, result in results]
 
-def convert_to_target_format(sample: Dict[str, Any], dataset_name: str) -> Dict[str, Any]:
+def convert_to_target_format(sample: Dict[str, Any], dataset_name: str) -> Optional[Dict[str, Any]]:
     """
     각 데이터셋의 샘플을 목표 형식으로 변환합니다.
     텍스트 전용 데이터셋과 멀티모달 데이터셋을 모두 처리합니다.
@@ -203,7 +205,7 @@ def convert_to_target_format(sample: Dict[str, Any], dataset_name: str) -> Dict[
     }
     """
     
-    result = {
+    result: Dict[str, Any] = {
         "messages": [],
         "images": [],
         "source_dataset": dataset_name,
@@ -233,12 +235,12 @@ def convert_to_target_format(sample: Dict[str, Any], dataset_name: str) -> Dict[
         
         elif dataset_name == "PrincetonPLI/Instruct-SkillMix-SDD":
             if "instruction" in sample and "output" in sample:
-                user_content = sample["instruction"]
+                user_content_str = sample["instruction"]
                 if "input" in sample and sample["input"].strip():
-                    user_content += f"\n\nInput: {sample['input']}"
+                    user_content_str += f"\n\nInput: {sample['input']}"
                 
                 result["messages"] = [
-                    {"role": "user", "content": [{"type": "text", "text": user_content, "index": None}]},
+                    {"role": "user", "content": [{"type": "text", "text": user_content_str, "index": None}]},
                     {"role": "assistant", "content": [{"type": "text", "text": sample["output"], "index": None}]}
                 ]
         
@@ -362,7 +364,7 @@ def convert_to_target_format(sample: Dict[str, Any], dataset_name: str) -> Dict[
             
             if caption:
                 # 첫 번째 user 메시지에 이미지 포함
-                user_content = [{"type": "text", "text": "Describe this image.", "index": None}]
+                user_content: List[Dict[str, Any]] = [{"type": "text", "text": "Describe this image.", "index": None}]
                 if result["images"]:
                     user_content.append({"type": "image", "text": None, "index": 0})
                 
@@ -401,7 +403,7 @@ def process_samples_batch(samples_batch, dataset_name, max_workers=8):
             non_image_samples.append((i, sample))
     
     # 이미지가 없는 샘플들을 먼저 빠르게 처리
-    results = [None] * len(samples_batch)
+    results: List[Optional[Dict[str, Any]]] = [None] * len(samples_batch)
     
     for i, sample in non_image_samples:
         converted = convert_to_target_format(sample, dataset_name)
@@ -425,7 +427,7 @@ def process_samples_batch(samples_batch, dataset_name, max_workers=8):
     
     return [r for r in results if r is not None]
 
-def process_dataset(dataset_name: str, config_name: str = None, max_samples: int = None, num_workers: int = 8):
+def process_dataset(dataset_name: str, config_name: Optional[str] = None, max_samples: Optional[int] = None, num_workers: int = 8):
     """데이터셋을 처리하여 목표 형식으로 변환합니다. (병렬 처리 추가)"""
     try:
         # 특정 데이터셋들의 split 설정
@@ -516,10 +518,9 @@ def process_dataset(dataset_name: str, config_name: str = None, max_samples: int
 
 def merge_and_create_dataset(
     output_name: str = "unified-multimodal-sft", 
-    max_samples_per_dataset: int = None, 
+    max_samples_per_dataset: Optional[int] = None, 
     num_workers: int = 16, 
     local_path: str = "./",
-    private: bool = False
 ):
     """
     모든 멀티모달 데이터셋을 병합하고 목표 형식으로 생성합니다.
@@ -570,6 +571,12 @@ def merge_and_create_dataset(
                             sample["images"] = image_paths
                             # original_data는 python 객체로 유지하고, 전체를 한번에 직렬화
                             
+                            # original_data를 안전하게 JSON 문자열로 변환
+                            try:
+                                sample["original_data"] = json.dumps(sample["original_data"], ensure_ascii=False, default=str)
+                            except (TypeError, OverflowError):
+                                sample["original_data"] = "{}" # 변환 실패 시 빈 객체로
+
                             f.write(json.dumps(
                                 sample, 
                                 ensure_ascii=False, 
@@ -606,67 +613,158 @@ def merge_and_create_dataset(
     
     # 3. 디스크에 저장된 데이터를 메모리 효율적으로 로드
     tqdm.write("📦 임시 파일로부터 Dataset 객체 생성 중...")
-    
+
     # 데이터셋의 최종 스키마(구조) 정의
     features = Features({
-        'messages': Sequence({'role': Value('string'), 'content': Sequence({'type': Value('string'), 'text': Value('string'), 'index': Value('int64')})}),
-        'images': Sequence(ImageFeature()),
+        'messages': Sequence(
+            Features({
+                'role': Value('string'),
+                'content': Sequence(
+                    Features({
+                        'type': Value('string'),
+                        'text': Value('string'),
+                        'index': Value('int64')
+                    })
+                )
+            })
+        ),
+        'images': Sequence(Value('string')), # 먼저 문자열로 로드
         'source_dataset': Value('string'),
         'original_data': Value('string')
     })
     
-    # JSONL 파일을 로드하고, 이미지 경로를 실제 이미지로 변환하도록 설정
-    unified_dataset = load_dataset("json", data_files=jsonl_path, features=features)["train"]
-    unified_dataset = unified_dataset.cast_column("images", Sequence(ImageFeature(decode=True)))
-    
+    # 로컬 저장
+    tqdm.write("💾 로컬 저장 중 (최종 Arrow 포맷)...")
+    final_save_path = f"{local_path}/{output_name}"
+
+    # 1. JSONL에서 텍스트 데이터와 이미지 경로 우선 로드 (스키마 없이 자동 추론)
+    dataset = cast(Dataset, load_dataset("json", data_files=jsonl_path))
+
+    # 2. 이미지 경로를 실제 이미지 객체로 변환 (상대 경로 기준 설정)
+    staging_dir = os.path.dirname(jsonl_path)
+    def resolve_and_load_images(example):
+        if example['images']:
+            # 절대 경로로 변환
+            absolute_paths = [os.path.join(staging_dir, p) for p in example['images']]
+            # 이미지 로드 (오류 발생 시 None)
+            example['images'] = [path if os.path.exists(path) else None for path in absolute_paths]
+        return example
+
+    # 이미지 경로를 변환하고, None인 이미지를 필터링
+    dataset = dataset.map(resolve_and_load_images)
+    dataset = dataset.filter(lambda example: not (example.get('images') and None in example['images']))
+
+    # 최종적으로 Image Feature로 캐스팅
+    unified_dataset = dataset.cast_column("images", Sequence(ImageFeature()))
+
     # 캐시 정리
     with cache_lock:
         image_cache.clear()
     
-    # 로컬 저장
-    tqdm.write("💾 로컬 저장 중 (최종 Arrow 포맷)...")
-    final_save_path = f"{local_path}/{output_name}"
     unified_dataset.save_to_disk(final_save_path)
     tqdm.write(f"   - 최종 데이터셋 경로: {final_save_path}")
     
-    # 허깅페이스 업로드 시도
+    return final_save_path
+
+def upload_dataset_to_hub(dataset_path: str, repo_id: str, private: bool = False):
+    """로컬에 저장된 데이터셋을 허깅페이스 허브에 업로드합니다."""
     try:
-        tqdm.write("🚀 허깅페이스 업로드 시도...")
+        tqdm.write(f"🚀 '{repo_id}'으로 허깅페이스 업로드 시도...")
         
-        # 업로드 전 데이터셋 정보 확인
-        tqdm.write(f"   - 총 샘플 수: {len(unified_dataset):,}")
-        tqdm.write(f"   - 컬럼: {list(unified_dataset.column_names)}")
+        # 디스크에서 데이터셋 로드 (DatasetDict vs Dataset 자동 감지)
+        tqdm.write(f"   - 로컬 경로 '{dataset_path}'에서 데이터셋을 안정적으로 로드합니다...")
         
-        # push_to_hub 호출 - 더 나은 파라미터와 함께
-        unified_dataset.push_to_hub(
-            output_name, 
+        # DatasetDict인지 Dataset인지 확인
+        if os.path.exists(os.path.join(dataset_path, "dataset_dict.json")):
+            # DatasetDict 형태로 저장된 경우
+            from datasets import DatasetDict
+            dataset_dict = DatasetDict.load_from_disk(dataset_path)
+            if "train" in dataset_dict:
+                dataset = dataset_dict["train"]
+                tqdm.write(f"   - DatasetDict에서 train split 로드 완료.")
+            else:
+                # 첫 번째 split 사용
+                split_name = list(dataset_dict.keys())[0]
+                dataset = dataset_dict[split_name]
+                tqdm.write(f"   - DatasetDict에서 '{split_name}' split 로드 완료.")
+        else:
+            # 일반 Dataset 형태로 저장된 경우
+            dataset = Dataset.load_from_disk(dataset_path)
+            tqdm.write(f"   - Dataset 로드 완료.")
+
+        # 업로드 전 데이터셋 무결성 검사
+        tqdm.write(f"   - 데이터셋 무결성 검사...")
+        required_columns = ['images', 'messages', 'source_dataset']
+        missing_columns = [col for col in required_columns if col not in dataset.column_names]
+
+        if missing_columns:
+            print(f"❌ 업로드 중단: 데이터셋에 필수 컬럼이 누락되었습니다!")
+            print(f"   - 필수 컬럼: {required_columns}")
+            print(f"   - 현재 컬럼: {list(dataset.column_names)}")
+            print(f"   - 누락된 컬럼: {missing_columns}")
+            print(f"   - 데이터셋을 다시 생성하거나 경로를 확인해주세요.")
+            return
+
+        tqdm.write(f"   - ✅ 무결성 검사 통과. (총 샘플: {len(dataset):,}, 컬럼: {list(dataset.column_names)})")
+        
+        # push_to_hub 호출
+        dataset.push_to_hub(
+            repo_id, 
             private=private,
-            max_shard_size="1GB",  # 샤드 크기 제한
-            commit_message=f"Upload unified SFT dataset with {len(unified_dataset):,} samples"
+            max_shard_size="1GB",
+            commit_message=f"Upload unified SFT dataset with {len(dataset):,} samples"
         )
         
-        tqdm.write(f"✅ 성공적으로 {output_name}으로 업로드!")
-        tqdm.write(f"🔗 https://huggingface.co/datasets/{output_name}")
+        tqdm.write(f"✅ 성공적으로 '{repo_id}'으로 업로드 완료!")
+        tqdm.write(f"🔗 https://huggingface.co/datasets/{repo_id}")
         
     except Exception as e:
         print(f"⚠️ 업로드 실패: {str(e)}")
-        print("💾 로컬 저장은 완료되었습니다.")
-    
-    return unified_dataset
+        # 사용자가 staging 디렉토리를 사용했는지 확인하여 더 구체적인 안내 제공
+        if dataset_path.endswith("_staging"):
+            # len("_staging") == 8
+            corrected_path = dataset_path[:-8] if dataset_path.endswith("_staging") else dataset_path
+            print("\n" + "="*70)
+            print("🚨 오류 원인 분석: 임시 폴더 경로를 사용하셨습니다!")
+            print(f"   입력하신 '{os.path.basename(dataset_path)}' 폴더는 데이터 생성용 임시 폴더입니다.")
+            print(f"   업로드에는 최종 데이터셋 폴더를 사용해야 합니다.")
+            print(f"   올바른 경로: '{corrected_path}'")
+            print("="*70)
+            print(f"\n👉 아래 명령어를 복사하여 다시 시도해 보세요:")
+            print(f"   python {sys.argv[0]} upload {corrected_path} {repo_id}")
+        else:
+            print("   - 데이터셋 경로가 올바른지, Hugging Face 토큰이 유효한지 확인해주세요.")
+            print("   - (터미널에서 `huggingface-cli login` 명령어로 로그인할 수 있습니다)")
 
 def inspect_dataset(dataset_path: str = "./unified-multimodal-sft"):
     """생성된 데이터셋 검사"""
     try:
         print(f"🔍 데이터셋 검사: {dataset_path}")
         
-        dataset = Dataset.load_from_disk(dataset_path)
-        print(f"📊 총 샘플 수: {len(dataset)}")
+        # DatasetDict인지 Dataset인지 확인
+        if os.path.exists(os.path.join(dataset_path, "dataset_dict.json")):
+            # DatasetDict 형태로 저장된 경우
+            from datasets import DatasetDict
+            dataset_dict = DatasetDict.load_from_disk(dataset_path)
+            if "train" in dataset_dict:
+                dataset = cast(Dataset, dataset_dict["train"])
+                print(f"📊 DatasetDict에서 train split 로드 - 총 샘플 수: {len(dataset)}")
+            else:
+                # 첫 번째 split 사용
+                split_name = list(dataset_dict.keys())[0]
+                dataset = cast(Dataset, dataset_dict[split_name])
+                print(f"📊 DatasetDict에서 '{split_name}' split 로드 - 총 샘플 수: {len(dataset)}")
+        else:
+            # 일반 Dataset 형태로 저장된 경우
+            dataset = cast(Dataset, Dataset.load_from_disk(dataset_path))
+            print(f"📊 총 샘플 수: {len(dataset)}")
         
         # 구조 검사
         sample_with_image = None
         sample_without_image = None
         
-        for sample in dataset:
+        for sample_any in dataset:
+            sample = cast(Dict[str, Any], sample_any)
             if sample.get("images") and not sample_with_image:
                 sample_with_image = sample
             elif not sample.get("images") and not sample_without_image:
@@ -696,12 +794,13 @@ def inspect_dataset(dataset_path: str = "./unified-multimodal-sft"):
                         print(f"     Content {j+1}: {content_type} - index: {content.get('index')}")
         
         # 통계
-        image_count = sum(1 for sample in dataset if sample.get("images"))
+        image_count = sum(1 for s in dataset if cast(Dict[str, Any], s).get("images"))
         print(f"\n📈 이미지 포함 샘플: {image_count}/{len(dataset)} ({image_count/len(dataset)*100:.1f}%)")
         
         # 원본 데이터셋별 통계
-        source_stats = {}
-        for sample in dataset:
+        source_stats: Dict[str, int] = {}
+        for s in dataset:
+            sample = cast(Dict[str, Any], s)
             source = sample.get("source_dataset", "unknown")
             source_stats[source] = source_stats.get(source, 0) + 1
         
@@ -710,20 +809,26 @@ def inspect_dataset(dataset_path: str = "./unified-multimodal-sft"):
             print(f"   {source}: {count}개 ({count/len(dataset)*100:.1f}%)")
         
         # 원본 데이터 보존 확인
-        original_data_count = sum(1 for sample in dataset if sample.get("original_data"))
+        original_data_count = sum(1 for s in dataset if cast(Dict[str, Any], s).get("original_data"))
         print(f"\n💾 원본 데이터 보존: {original_data_count}/{len(dataset)} ({original_data_count/len(dataset)*100:.1f}%)")
         
         # 원본 데이터 예시 (첫 번째 샘플)
-        if dataset[0].get("original_data"):
-            print(f"\n🔍 원본 데이터 예시 (첫 번째 샘플):")
-            original = dataset[0]["original_data"]
-            print(f"   원본 데이터 키: {list(original.keys())}")
-            for key, value in list(original.items())[:3]:  # 처음 3개 키만 표시
-                if isinstance(value, str) and len(value) > 50:
-                    print(f"   {key}: {value[:50]}...")
-                else:
-                    print(f"   {key}: {value}")
-        
+        if len(dataset) > 0:
+            first_sample = cast(Dict[str, Any], dataset[0])
+            if first_sample.get("original_data"):
+                print(f"\n🔍 원본 데이터 예시 (첫 번째 샘플):")
+                try:
+                    original_str = first_sample["original_data"]
+                    original = json.loads(original_str)
+                    print(f"   원본 데이터 키: {list(original.keys())}")
+                    for key, value in list(original.items())[:3]:  # 처음 3개 키만 표시
+                        if isinstance(value, str) and len(value) > 50:
+                            print(f"   {key}: {value[:50]}...")
+                        else:
+                            print(f"   {key}: {value}")
+                except (json.JSONDecodeError, TypeError):
+                     print(f"   원본 데이터 (raw): {first_sample['original_data'][:100]}...")
+
         return dataset
         
     except Exception as e:
@@ -732,56 +837,52 @@ def inspect_dataset(dataset_path: str = "./unified-multimodal-sft"):
 
 def main():
     """메인 함수"""
-    import sys
-    
-    if len(sys.argv) > 1:
-        if sys.argv[1] == "merge":
-            if len(sys.argv) < 3:
-                print("❌ 리포지토리 이름이 필요합니다!")
-                print("사용법: python upload_sft_dataset.py merge <repository_name> [max_samples_per_dataset] [num_workers]")
-                return
-            
-            repository_name = sys.argv[2]
-            max_samples = int(sys.argv[3]) if len(sys.argv) > 3 else None
-            num_workers = int(sys.argv[4]) if len(sys.argv) > 4 else 16
-            local_path = sys.argv[5] if len(sys.argv) > 5 else "./"
-            private = bool(sys.argv[6]) if len(sys.argv) > 6 else False
-            
-            
-            print(f"🎯 타겟 리포지토리: {repository_name}")
-            print(f"🔧 워커 수: {num_workers}")
-            dataset = merge_and_create_dataset(
-                output_name=repository_name,
-                max_samples_per_dataset=max_samples,
-                num_workers=num_workers,
-                private=private,
-                local_path=local_path
-            )
-            if dataset:
-                print("🎉 병합 완료!")
-                
-        elif sys.argv[1] == "inspect":
-            dataset_path = sys.argv[2] if len(sys.argv) > 2 else "./unified-multimodal-sft"
-            inspect_dataset(dataset_path)
-            
-    else:
-        print("사용법:")
-        print("  python upload_sft_dataset.py merge <repository_name> [max_samples_per_dataset] [num_workers]")
-        print("  python upload_sft_dataset.py inspect [dataset_path]")
-        print("")
-        print("📝 텍스트 + 멀티모달 통합 데이터셋 처리 (병렬 처리 지원)")
-        print("포함된 데이터셋:")
-        for dataset_name, config_name in dataset_configs:
-            if config_name:
-                print(f"  - {dataset_name} ({config_name})")
-            else:
-                print(f"  - {dataset_name}")
-        print("")
-        print("예시:")
-        print("  python upload_sft_dataset.py merge my-unified-dataset 1000 32  # 32개 워커 사용")
-        print("  python upload_sft_dataset.py merge my-unified-dataset 1000     # 기본 16개 워커")
-        print("  python upload_sft_dataset.py merge my-unified-dataset          # 전체 데이터, 기본 워커")
-        print("  python upload_sft_dataset.py inspect ./my-unified-dataset")
+    parser = argparse.ArgumentParser(description="텍스트 + 멀티모달 통합 데이터셋 처리 및 업로드 스크립트")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # merge 명령어
+    parser_merge = subparsers.add_parser("merge", help="여러 데이터셋을 병합하여 로컬에 저장합니다.")
+    parser_merge.add_argument("output_name", type=str, help="생성할 데이터셋의 로컬 폴더 이름")
+    parser_merge.add_argument("--max_samples", type=int, default=None, help="데이터셋별 최대 샘플 수")
+    parser_merge.add_argument("--num_workers", type=int, default=16, help="데이터 처리 워커 수")
+    parser_merge.add_argument("--local_path", type=str, default="./", help="데이터셋을 저장할 로컬 경로")
+
+    # upload 명령어
+    parser_upload = subparsers.add_parser("upload", help="로컬에 저장된 데이터셋을 허깅페이스 허브에 업로드합니다.")
+    parser_upload.add_argument("dataset_path", type=str, help="업로드할 로컬 데이터셋 경로")
+    parser_upload.add_argument("repo_id", type=str, help="허깅페이스 허브 리포지토리 ID (예: username/repo-name)")
+    parser_upload.add_argument("--private", action="store_true", help="리포지토리를 비공개로 설정")
+
+    # inspect 명령어
+    parser_inspect = subparsers.add_parser("inspect", help="로컬 데이터셋의 정보를 확인합니다.")
+    parser_inspect.add_argument("dataset_path", nargs="?", default="./unified-multimodal-sft", help="검사할 데이터셋 경로")
+
+    args = parser.parse_args()
+
+    if args.command == "merge":
+        print(f"🎯 타겟 로컬 경로: {os.path.join(args.local_path, args.output_name)}")
+        print(f"🔧 워커 수: {args.num_workers}")
+        final_path = merge_and_create_dataset(
+            output_name=args.output_name,
+            max_samples_per_dataset=args.max_samples,
+            num_workers=args.num_workers,
+            local_path=args.local_path
+        )
+        if final_path:
+            print("\n🎉 병합 완료!")
+            print(f"✅ 데이터셋이 '{final_path}'에 저장되었습니다.")
+            print(f"\n👉 이제 다음 명령어로 허브에 업로드할 수 있습니다:")
+            print(f"   python {sys.argv[0]} upload {final_path} <your_hf_username>/{args.output_name}")
+
+    elif args.command == "upload":
+        upload_dataset_to_hub(
+            dataset_path=args.dataset_path,
+            repo_id=args.repo_id,
+            private=args.private
+        )
+
+    elif args.command == "inspect":
+        inspect_dataset(args.dataset_path)
 
 if __name__ == "__main__":
     main()

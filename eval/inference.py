@@ -9,7 +9,7 @@ import json
 import torch
 import argparse
 from transformers import AutoTokenizer, AutoProcessor, AutoConfig
-from peft import PeftModel
+from peft.peft_model import PeftModel
 
 # 상위 디렉토리를 경로에 추가하여 사용자 정의 모듈 임포트
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

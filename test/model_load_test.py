@@ -1,7 +1,9 @@
 import sys
 import os
 import torch
-from transformers import AutoProcessor, GenerationConfig, AutoModelForImageTextToText, BitsAndBytesConfig
+from transformers import AutoProcessor, AutoModelForImageTextToText
+from transformers.generation.configuration_utils import GenerationConfig
+from transformers.utils.quantization_config import BitsAndBytesConfig
 from transformers import Gemma3ForCausalLM, Gemma3Config
 from transformers.utils.import_utils import is_flash_attn_2_available
 from transformers.image_utils import load_image
@@ -27,7 +29,7 @@ def format_parameters(number):
         return str(number)
 
 base_model_name = "google/gemma-3-4b-it"
-model_architecture = G3MoEForCausalLM
+model_architecture = G3MoEForCausalLM ## G3MoEForCausalLM
 base_config = Gemma3Config.from_pretrained(base_model_name)
 base_config = base_config.to_dict()
 moe_config = {
@@ -37,7 +39,7 @@ moe_config = {
         "topk_group": 8,
         # "num_key_value_heads": base_config['text_config']['num_attention_heads'],
         "num_experts_per_tok": 2,
-        "first_k_dense_replace": 8,
+        "first_k_dense_replace": 40,
         "router_aux_loss_coef": 0.001,
         "router_jitter_noise": 0.01,
         "input_jitter_noise": 0.01,
@@ -58,13 +60,13 @@ test_model = model_architecture.from_pretrained(
     pretrained_model_name_or_path=base_model_name,
     # config=model_config,
     torch_dtype=torch.bfloat16,
-    attn_implementation="sdpa",
-    quantization_config=BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_use_double_quant=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16,
-        bnb_4bit_quant_storage=torch.bfloat16)
+    # attn_implementation="sdpa",
+    # quantization_config=BitsAndBytesConfig(
+    #     load_in_4bit=True,
+    #     bnb_4bit_use_double_quant=True,
+    #     bnb_4bit_quant_type="nf4",
+    #     bnb_4bit_compute_dtype=torch.bfloat16,
+    #     bnb_4bit_quant_storage=torch.bfloat16)
     )# .to("cuda")
 tokenizer = AutoProcessor.from_pretrained(base_model_name)
 with open("/home/conan_jung/workspace/llm_training/sft/config/chat_template.txt", "r") as f:

@@ -1,4 +1,4 @@
-from typing import List, Dict
+from typing import List, Dict, Optional
 from deepeval.metrics import BaseMetric
 from deepeval.evaluate.execute import execute_test_cases
 from deepeval.dataset import EvaluationDataset
@@ -16,9 +16,9 @@ from transformers import (
 
 def get_model_eval_callback(
     trainer: Trainer,
-    evaluation_dataset: EvaluationDataset = None,
-    metrics: List[BaseMetric] = None,
-    tokenizer_args: Dict = None,
+    evaluation_dataset: Optional[EvaluationDataset] = None,
+    metrics: Optional[List[BaseMetric]] = None,
+    tokenizer_args: Optional[Dict] = None,
     aggregation_method: str = "avg",
     show_table: bool = False,
 ): 
@@ -72,9 +72,9 @@ class ModelEvalCallback(DeepEvalHuggingFaceCallback):
     def __init__(
         self, 
         trainer: Trainer,
-        evaluation_dataset: EvaluationDataset = None,
-        metrics: List[BaseMetric] = None,
-        tokenizer_args: Dict = None,
+        evaluation_dataset: Optional[EvaluationDataset] = None,
+        metrics: Optional[List[BaseMetric]] = None,
+        tokenizer_args: Optional[Dict] = None,
         aggregation_method: str = "avg",
         show_table: bool = False,
         *args, 
