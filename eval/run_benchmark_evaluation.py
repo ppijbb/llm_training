@@ -7,30 +7,47 @@ import sys
 import json
 import torch
 import argparse
+
 from typing import List, Any
 from PIL import Image
 import requests
 import re
 from tqdm import tqdm
-
+import outlines
 from transformers import AutoTokenizer, AutoProcessor, AutoConfig
-from peft import PeftModel
+from transformers.generation.configuration_utils import GenerationConfig
+from peft.peft_model import PeftModel
 from deepeval.models.base_model import DeepEvalBaseLLM
-from deepeval.benchmarks import MMLU, HellaSwag
+from deepeval.benchmarks.mmlu.mmlu import MMLU
+from deepeval.benchmarks.hellaswag.hellaswag import HellaSwag
 from datasets import load_dataset
 
 # 상위 디렉토리를 경로에 추가하여 사용자 정의 모듈 임포트
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# Disable torch.compile COMPLETELY to avoid data-dependent branching issues
+os.environ["TORCH_COMPILE_DISABLE"] = "1"
+os.environ["TORCHDYNAMO_DISABLE"] = "1"
+torch._dynamo.config.suppress_errors = True
+torch._dynamo.config.capture_dynamic_output_shape_ops = False
+torch.compiler.disable()
+
+# Additional safety: reset any existing dynamo state
+torch._dynamo.reset()
+
 from models import G3MoEForCausalLM, G3MoEConfig
 
 
 class G3MoEModelForDeepEval(DeepEvalBaseLLM):
-    def __init__(self, model_path: str, training_config_path: str = None):
+    def __init__(
+        self, 
+        model_path: str, 
+        training_config_path: str | None = None
+    ):
         # LoRA 모델의 경우 training_config_path가 필수임을 확인
         if os.path.exists(os.path.join(model_path, 'adapter_config.json')) and not training_config_path:
             raise ValueError("LoRA 모델을 평가하려면 --training_config_path 인자가 반드시 필요합니다.")
-            
+        
         self.model_path = model_path
         self.training_config_path = training_config_path
         self.model = None
@@ -42,6 +59,12 @@ class G3MoEModelForDeepEval(DeepEvalBaseLLM):
         if self.model is not None:
             return self.model
 
+        # Force disable torch.compile before model loading
+        torch._dynamo.reset()
+        torch.compiler.disable()
+        os.environ["TORCH_COMPILE_DISABLE"] = "1" 
+        os.environ["TORCHDYNAMO_DISABLE"] = "1"
+        
         print(f"모델 로딩 시작: {self.model_path}")
         
         try:
@@ -76,36 +99,59 @@ class G3MoEModelForDeepEval(DeepEvalBaseLLM):
             g3moe_params = train_config["model_config"]["g3moe_params"]
 
             base_config = AutoConfig.from_pretrained(base_model_path, trust_remote_code=True)
-            base_model_config = base_config.to_dict()
+            
+            # [MODIFIED]
+            # v--
+            # 베이스 모델의 설정을 복사하여 사용
+            final_config_dict = base_config.to_dict()
 
-            g3moe_update_config = {
-                "n_shared_experts": g3moe_params["n_shared_experts"],
-                "n_routed_experts": g3moe_params["n_routed_experts"],
-                "n_group": g3moe_params["n_group"],
-                "topk_group": g3moe_params["topk_group"],
-                "num_experts_per_tok": g3moe_params["num_experts_per_tok"],
+            # g3moe 훈련 파라미터로 덮어쓰기
+            g3moe_update_params = {
+                "n_shared_experts": g3moe_params.get("n_shared_experts"),
+                "n_routed_experts": g3moe_params.get("n_routed_experts"),
+                "n_group": g3moe_params.get("n_group"),
+                "topk_group": g3moe_params.get("topk_group"),
+                "num_experts_per_tok": g3moe_params.get("num_experts_per_tok"),
                 "first_k_dense_replace": g3moe_params.get("first_k_dense_replace", 8),
-                "router_aux_loss_coef": 0.001,
-                "router_jitter_noise": 0.01,
-                "input_jitter_noise": 0.01,
-                "model_type": "g3moe_text",
-                "rope_scaling": { "rope_type": "linear", "factor": g3moe_params["rope_scaling_factor"] },
-                "use_bfloat16": True,
+                "router_aux_loss_coef": g3moe_params.get("router_aux_loss_coef", 0.001),
+                "router_jitter_noise": g3moe_params.get("router_jitter_noise", 0.01),
+                "input_jitter_noise": g3moe_params.get("input_jitter_noise", 0.01),
+                "rope_scaling": { "rope_type": "linear", "factor": g3moe_params.get("rope_scaling_factor", 1.0) },
+                "use_bfloat16": True, # 평가 시에는 bfloat16 사용을 권장
             }
             
-            if "text_config" in base_model_config:
-                base_model_config["text_config"].update(g3moe_update_config)
-                config = G3MoEConfig(**base_model_config)
+            # G3MoEConfig는 text_config, vision_config 등을 인자로 받음
+            # 베이스 모델 설정에 text_config가 이미 있는지 확인
+            if "text_config" in final_config_dict:
+                # Gemma, G3MoE 같은 모델은 text_config 내에 설정이 있음
+                final_config_dict["text_config"].update(g3moe_update_params)
             else:
-                base_model_config.update(g3moe_update_config)
-                config = G3MoEConfig(**base_model_config)
+                # LLaMA 같은 모델은 최상위 레벨에 설정이 있음
+                # text_config를 새로 만들어줌
+                text_config_dict = final_config_dict.copy()
+                text_config_dict.update(g3moe_update_params)
+                final_config_dict["text_config"] = text_config_dict
 
+            # G3MoEConfig가 멀티모달 관련 파라미터를 요구할 수 있으므로, 없으면 기본값 설정
+            final_config_dict.setdefault("vision_config", None)
+            final_config_dict.setdefault("boi_token_index", None)
+            final_config_dict.setdefault("eoi_token_index", None)
+            final_config_dict.setdefault("image_token_index", None)
+            
+            config = G3MoEConfig(**final_config_dict)
+            # --^
+            # [MODIFIED]
+            
+            # Disable torch.compile at model creation time
+            torch._dynamo.reset()
+            torch.compiler.disable()
             base_model = G3MoEForCausalLM.from_pretrained(
                 base_model_path,
                 config=config,
                 torch_dtype=torch_dtype,
                 trust_remote_code=True,
                 device_map=device_map,
+                # attn_implementation="flash_attention_2",
             )
             self.model = PeftModel.from_pretrained(base_model, self.model_path)
             print("✅ 훈련 설정을 반영한 LoRA 모델 로드 완료")
@@ -116,36 +162,56 @@ class G3MoEModelForDeepEval(DeepEvalBaseLLM):
                 torch_dtype=torch_dtype,
                 trust_remote_code=True,
                 device_map=device_map,
+                # attn_implementation="flash_attention_2",
             )
             print("✅ 전체 모델 로드 완료")
 
         self.model.eval()
         return self.model
 
-    def generate(self, prompt: str) -> str:
+    @torch.inference_mode()
+    def generate(self, prompt: str, *args, **kwargs) -> str:
         if self.model is None:
             self.load_model()
         
         messages = [{"role": "user", "content": prompt}]
         
-        input_ids = self.actual_tokenizer.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=True,
-            return_tensors="pt"
-        ).to(self.model.device)
-
-        with torch.no_grad():
-            outputs = self.model.generate(
-                input_ids=input_ids,
-                max_new_tokens=512,
-                eos_token_id=self.actual_tokenizer.eos_token_id,
-                pad_token_id=self.actual_tokenizer.pad_token_id,
-                do_sample=False,
+        if "schema" in kwargs:
+            prompt = self.actual_tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                return_dict=False
             )
-        
-        response_ids = outputs[0][input_ids.shape[1]:]
-        response = self.actual_tokenizer.decode(response_ids, skip_special_tokens=True)
+            schema = kwargs["schema"]
+            generator = outlines.models.transformers(self.model, schema=schema)
+            response = generator.generate.json(prompt)
+        else:
+            input_ids = self.actual_tokenizer.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=True,
+                return_tensors="pt",
+                return_dict=True
+            ).to(self.model.device)
+            # print(input_ids)
+            # del input_ids["pixel_values"]
+            # Get the input length for later slicing
+            input_length = input_ids["input_ids"].shape[1]
+            generator = self.model
+            outputs = generator.generate(
+                **input_ids,
+                generation_config=GenerationConfig(
+                    max_new_tokens=512,
+                    eos_token_id=self.actual_tokenizer.eos_token_id,
+                    pad_token_id=self.actual_tokenizer.pad_token_id,
+                    do_sample=False,
+
+                ),
+            )
+            
+            response_ids = outputs[0][input_length:]
+            response = self.actual_tokenizer.decode(response_ids, skip_special_tokens=True)
         return response
 
     async def a_generate(self, prompt: str) -> str:
@@ -154,6 +220,7 @@ class G3MoEModelForDeepEval(DeepEvalBaseLLM):
     def get_model_name(self):
         return self.model_path
 
+@torch.inference_mode()
 def run_mme_evaluation(model, tokenizer):
     """
     MME 벤치마크를 수동으로 실행하여 모델의 비전-언어 능력을 평가합니다.
@@ -193,8 +260,7 @@ def run_mme_evaluation(model, tokenizer):
             
             inputs = tokenizer(text=[prompt], images=[image], return_tensors="pt").to(device)
 
-            with torch.no_grad():
-                generated_ids = model.generate(**inputs, max_new_tokens=10, do_sample=False)
+            generated_ids = model.generate(**inputs, max_new_tokens=10, do_sample=False)
             
             response_text = tokenizer.decode(generated_ids[0])
             cleaned_prompt = tokenizer.decode(inputs['input_ids'][0], skip_special_tokens=True)

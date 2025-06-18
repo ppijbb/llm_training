@@ -15,11 +15,13 @@ from transformers.utils.import_utils import is_flash_attn_2_available
 from transformers import (
     AutoTokenizer,
     AutoProcessor,
-    AutoConfig,
-    set_seed,
+    AutoConfig
 )
+from transformers.trainer_utils import set_seed
 from trl import SFTTrainer, SFTConfig
-from peft import LoraConfig, get_peft_model, TaskType
+from peft.tuners.lora.config import LoraConfig
+from peft.mapping import get_peft_model
+from peft.utils.peft_types import TaskType
 import wandb
 
 # Add parent directory to path to import custom modules
@@ -163,6 +165,11 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
         eoi_token_index=base_model_config["eoi_token_index"],
         image_token_index=base_model_config["image_token_index"],
         initializer_range=base_model_config["initializer_range"],
+        **{
+            k:v for k,v in base_model_config.items() 
+            if k not in ["text_config", "vision_config", "boi_token_index",
+                         "eoi_token_index", "image_token_index", "initializer_range"]
+        }
     )
     print("G3MoE configuration created successfully")
     print(f"  - Shared experts: {g3moe_config['n_shared_experts']}")
@@ -291,7 +298,7 @@ def setup_dataset(data_config: Dict[str, Any], tokenizer):
 
 def create_training_args(
     training_config: Dict[str, Any], 
-    deepspeed_config: str = None
+    deepspeed_config: str | None = None 
 ) -> SFTConfig:
     """Create SFTConfig from training configuration"""
     

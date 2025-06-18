@@ -32,31 +32,37 @@ from tqdm.auto import tqdm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+# Add dynamo import for torch.compile compatibility
+import torch._dynamo
 
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, HybridCache, StaticCache
-from transformers.generation import GenerationMixin
+from transformers.generation.utils import GenerationMixin
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
-from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast, ModelOutput
+from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.processing_utils import Unpack
-from transformers.utils import (
+from transformers.utils import logging
+from transformers.utils.doc import (
     add_start_docstrings_to_model_forward,
     replace_return_docstrings,
-    logging,
-    ModelOutput,
-    auto_docstring,
-    can_return_tuple,
     add_start_docstrings,
+)
+from transformers.utils.generic import (
+    ModelOutput,
+    can_return_tuple,
+)
+from transformers.utils.args_doc import auto_docstring
+from transformers.utils.import_utils import (
     is_torchdynamo_compiling,
     is_torch_flex_attn_available,
 )
 from transformers.modeling_utils import (
     restore_default_torch_dtype,
     SpecificPreTrainedModelType,
-    PretrainedConfig
 )
+from transformers.configuration_utils import PretrainedConfig
 from transformers import logging
 from transformers.utils.deprecation import deprecate_kwarg
 from transformers import AutoModel, AutoConfig
@@ -73,8 +79,8 @@ _CONFIG_FOR_DOC = "G3MoEConfig"
 
 
 def load_balancing_loss_func(
-    gate_logits: torch.Tensor, num_experts: torch.Tensor = None, top_k=2, attention_mask: Optional[torch.Tensor] = None
-) -> float:
+    gate_logits: torch.Tensor, num_experts: int, top_k=2, attention_mask: Optional[torch.Tensor] = None
+) -> torch.Tensor:
     r"""
     Computes auxiliary load balancing loss as in Switch Transformer - implemented in Pytorch.
     See Switch Transformer (https://arxiv.org/abs/2101.03961) for more details. This function implements the loss
@@ -93,7 +99,7 @@ def load_balancing_loss_func(
         The auxiliary loss.
     """
     if gate_logits is None or not isinstance(gate_logits, tuple):
-        return 0
+        return torch.tensor(0.0)
 
     if isinstance(gate_logits, tuple):
         compute_device = gate_logits[0].device
@@ -222,7 +228,7 @@ class G3MoECausalLMOutputWithPast(ModelOutput):
     """
 
     loss: Optional[torch.FloatTensor] = None
-    logits: torch.FloatTensor = None
+    logits: Optional[torch.FloatTensor] = None
     past_key_values: Optional[Union[List[torch.FloatTensor], Cache]] = None
     hidden_states: Optional[Tuple[torch.FloatTensor]] = None
     attentions: Optional[Tuple[torch.FloatTensor]] = None
@@ -242,11 +248,11 @@ class G3MoETextScaledWordEmbedding(nn.Embedding):
         self.register_buffer("embed_scale", torch.tensor(embed_scale), persistent=False)
 
     def forward(self, input_ids: torch.Tensor):
-        return super().forward(input_ids) * self.embed_scale.to(self.weight.dtype)
+        return super().forward(input_ids) * self.embed_scale
 
 
 class G3MoEMLP(nn.Module):
-    def __init__(self, config: G3MoETextConfig, intermediate_size: int=None, **kwargs):
+    def __init__(self, config: G3MoETextConfig, intermediate_size: Optional[int]=None, **kwargs):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
@@ -492,8 +498,8 @@ def sparsemixer(scores, top_k, jitter_eps, training):
     else:
         multiplier_top2 = multiplier_top2_o
     
-    multiplier = torch.concat((multiplier, multiplier_top2), dim=-1)
-    selected_experts = torch.concat((selected_experts, selected_experts_top2), dim=-1)
+    multiplier = torch.cat((multiplier, multiplier_top2), dim=-1)
+    selected_experts = torch.cat((selected_experts, selected_experts_top2), dim=-1)
     
     return (
         multiplier, 
@@ -531,7 +537,8 @@ class G3MoESparseGRINBlock(nn.Module):
         self.router_jitter_noise = config.router_jitter_noise
         self.input_jitter_noise = config.input_jitter_noise
         
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    @torch._dynamo.disable  # Disable torch.compile for this method due to data-dependent branching
+    def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """ """
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         if self.training and self.input_jitter_noise > 0:
@@ -561,22 +568,22 @@ class G3MoESparseGRINBlock(nn.Module):
             expert_layer = self.experts[expert_idx]
             idx, top_x = torch.where(expert_mask[expert_idx])
 
-            if top_x.shape[0] == 0:
-                continue
+            # Use torch.where to handle empty tensor case in a compile-friendly way
+            has_tokens = top_x.numel() > 0
+            if has_tokens:
+                # in torch it is faster to index using lists than torch tensors
+                top_x_list = top_x.tolist()
+                idx_list = idx.tolist()
 
-            # in torch it is faster to index using lists than torch tensors
-            top_x_list = top_x.tolist()
-            idx_list = idx.tolist()
+                # Index the correct hidden states and compute the expert hidden state for
+                # the current expert. We need to make sure to multiply the output hidden
+                # states by `routing_weights` on the corresponding tokens (top-1 and top-2)
+                current_state = hidden_states[None, top_x_list].reshape(-1, hidden_dim)
+                current_hidden_states = expert_layer(current_state) * routing_weights[top_x_list, idx_list, None]
 
-            # Index the correct hidden states and compute the expert hidden state for
-            # the current expert. We need to make sure to multiply the output hidden
-            # states by `routing_weights` on the corresponding tokens (top-1 and top-2)
-            current_state = hidden_states[None, top_x_list].reshape(-1, hidden_dim)
-            current_hidden_states = expert_layer(current_state) * routing_weights[top_x_list, idx_list, None]
-
-            # However `index_add_` only support torch tensors for indexing so we'll use
-            # the `top_x` tensor here.
-            final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
+                # However `index_add_` only support torch tensors for indexing so we'll use
+                # the `top_x` tensor here.
+                final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
         final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
         # print ( 'moe', self.iter, torch.norm(final_hidden_states).item())
         return final_hidden_states, router_logits
@@ -697,7 +704,8 @@ class G3MoEGRINMoE(nn.Module):
         self._unfreeze_shared_experts()
         self.freeze_shared_experts = False
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    @torch._dynamo.disable  # Disable torch.compile for this method due to data-dependent branching
+    def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         residual = hidden_states
         final_hidden_states, router_logits = self._sparse_routing(hidden_states)
         with torch.no_grad():
@@ -709,7 +717,8 @@ class G3MoEGRINMoE(nn.Module):
                 router_logits = router_logits.requires_grad_(True)
         return final_hidden_states, router_logits
     
-    def _sparse_routing(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    @torch._dynamo.disable  # Disable torch.compile for this method due to data-dependent branching
+    def _sparse_routing(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         if self.training and self.input_jitter_noise > 0:
             hidden_states *= torch.empty_like(hidden_states).uniform_(1.0 - self.input_jitter_noise, 1.0 + self.input_jitter_noise)
@@ -736,22 +745,22 @@ class G3MoEGRINMoE(nn.Module):
             expert_layer = self.experts[expert_idx]
             idx, top_x = torch.where(expert_mask[expert_idx])
 
-            if top_x.shape[0] == 0:
-                continue
+            # Use torch.where to handle empty tensor case in a compile-friendly way
+            has_tokens = top_x.numel() > 0
+            if has_tokens:
+                # in torch it is faster to index using lists than torch tensors
+                top_x_list = top_x.tolist()
+                idx_list = idx.tolist()
 
-            # in torch it is faster to index using lists than torch tensors
-            top_x_list = top_x.tolist()
-            idx_list = idx.tolist()
+                # Index the correct hidden states and compute the expert hidden state for
+                # the current expert. We need to make sure to multiply the output hidden
+                # states by `routing_weights` on the corresponding tokens (top-1 and top-2)
+                current_state = hidden_states[None, top_x_list].reshape(-1, hidden_dim)
+                current_hidden_states = expert_layer(current_state) * routing_weights[top_x_list, idx_list, None]
 
-            # Index the correct hidden states and compute the expert hidden state for
-            # the current expert. We need to make sure to multiply the output hidden
-            # states by `routing_weights` on the corresponding tokens (top-1 and top-2)
-            current_state = hidden_states[None, top_x_list].reshape(-1, hidden_dim)
-            current_hidden_states = expert_layer(current_state) * routing_weights[top_x_list, idx_list, None]
-
-            # However `index_add_` only support torch tensors for indexing so we'll use
-            # the `top_x` tensor here.
-            final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
+                # However `index_add_` only support torch tensors for indexing so we'll use
+                # the `top_x` tensor here.
+                final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
         final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
         return final_hidden_states, router_logits
     
