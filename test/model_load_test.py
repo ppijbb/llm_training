@@ -7,6 +7,7 @@ from transformers.utils.quantization_config import BitsAndBytesConfig
 from transformers import Gemma3ForCausalLM, Gemma3Config
 from transformers.utils.import_utils import is_flash_attn_2_available
 from transformers.image_utils import load_image
+from peft.peft_model import PeftModel
 import tensorrt
 import pprint
 from torch.nn.attention import SDPBackend, sdpa_kernel
@@ -16,8 +17,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from models import (#G2MoEConfig, G2MoEForCausalLM, G2MoETextConfig,
                     G3MoEConfig, G3MoEForCausalLM, G3MoETextConfig)
 
+os.environ["TORCH_COMPILE_DISABLE"] = "1"
+os.environ["TORCHDYNAMO_DISABLE"] = "1"
+torch._dynamo.config.suppress_errors = True
+torch._dynamo.config.capture_dynamic_output_shape_ops = False
+torch.compiler.disable()
 
-
+# Additional safety: reset any existing dynamo state
+torch._dynamo.reset()
 print("version of tensorrt: " ,tensorrt.__version__)
 
 def format_parameters(number):
@@ -34,12 +41,12 @@ base_config = Gemma3Config.from_pretrained(base_model_name)
 base_config = base_config.to_dict()
 moe_config = {
         "n_shared_experts": 1,
-        "n_routed_experts": 3, # 256, 15, 6
+        "n_routed_experts": 5, # 256, 15, 6
         "n_group": 4,
         "topk_group": 8,
         # "num_key_value_heads": base_config['text_config']['num_attention_heads'],
         "num_experts_per_tok": 2,
-        "first_k_dense_replace": 40,
+        "first_k_dense_replace": 18,
         "router_aux_loss_coef": 0.001,
         "router_jitter_noise": 0.01,
         "input_jitter_noise": 0.01,
@@ -58,7 +65,7 @@ pprint.pprint(model_config)
 # BitsAndBytesConfig int-4 config
 test_model = model_architecture.from_pretrained(
     pretrained_model_name_or_path=base_model_name,
-    # config=model_config,
+    config=model_config,
     torch_dtype=torch.bfloat16,
     # attn_implementation="sdpa",
     # quantization_config=BitsAndBytesConfig(
@@ -67,7 +74,8 @@ test_model = model_architecture.from_pretrained(
     #     bnb_4bit_quant_type="nf4",
     #     bnb_4bit_compute_dtype=torch.bfloat16,
     #     bnb_4bit_quant_storage=torch.bfloat16)
-    )# .to("cuda")
+    ).to("cuda")
+test_model = PeftModel.from_pretrained(test_model, "/mnt/disks/local-ssd/training_logs/outputs/")
 tokenizer = AutoProcessor.from_pretrained(base_model_name)
 with open("/home/conan_jung/workspace/llm_training/sft/config/chat_template.txt", "r") as f:
     tokenizer.chat_template = f.read()
@@ -95,7 +103,7 @@ test_input = tokenizer.apply_chat_template(
             "role": "user",
             "content": [
                 {"type": "text", "text": "What animal is on the candy? Name this animal in Korean."},
-                {"type": "image", "url": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/p-blog/candy.JPG"}                
+                # {"type": "image", "url": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/p-blog/candy.JPG"}                
             ]
         }
     ],
@@ -109,12 +117,14 @@ test_input = tokenizer.apply_chat_template(
 image1 = load_image("https://cdn.britannica.com/61/93061-050-99147DCE/Statue-of-Liberty-Island-New-York-Bay.jpg")
 image2 = load_image("https://huggingface.co/spaces/merve/chameleon-7b/resolve/main/bee.jpg")
 
-inputs = tokenizer(text=test_input, images=[image1], return_tensors="pt")
+inputs = tokenizer(text=test_input,#  images=[image1],
+ return_tensors="pt")
 inputs = inputs.to(test_model.device)
 
 print(test_model)
 # print(test_model.config)
 print(format_parameters(test_model.num_parameters()))
+
 
 with torch.inference_mode():
     torch._dynamo.config.capture_dynamic_output_shape_ops = True

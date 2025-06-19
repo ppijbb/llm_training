@@ -16,6 +16,7 @@ from tqdm import tqdm
 import outlines
 from transformers import AutoTokenizer, AutoProcessor, AutoConfig
 from transformers.generation.configuration_utils import GenerationConfig
+from transformers.generation.stopping_criteria import StopStringCriteria, StoppingCriteriaList, MaxLengthCriteria
 from peft.peft_model import PeftModel
 from deepeval.models.base_model import DeepEvalBaseLLM
 from deepeval.benchmarks.mmlu.mmlu import MMLU
@@ -186,6 +187,7 @@ class G3MoEModelForDeepEval(DeepEvalBaseLLM):
             schema = kwargs["schema"]
             generator = outlines.models.transformers(self.model, schema=schema)
             response = generator.generate.json(prompt)
+            print(response)
         else:
             input_ids = self.actual_tokenizer.apply_chat_template(
                 messages,
@@ -202,16 +204,25 @@ class G3MoEModelForDeepEval(DeepEvalBaseLLM):
             outputs = generator.generate(
                 **input_ids,
                 generation_config=GenerationConfig(
-                    max_new_tokens=512,
                     eos_token_id=self.actual_tokenizer.eos_token_id,
                     pad_token_id=self.actual_tokenizer.pad_token_id,
                     do_sample=False,
-
                 ),
+                stopping_criteria=StoppingCriteriaList([
+                    StopStringCriteria(
+                        tokenizer=self.actual_tokenizer,
+                        stop_strings=["<end_of_turn>"]
+                    )
+                    MaxLengthCriteria(
+                        max_length=128,
+                        max_position_embeddings=128
+                    )
+                ])
             )
             
             response_ids = outputs[0][input_length:]
-            response = self.actual_tokenizer.decode(response_ids, skip_special_tokens=True)
+            response = self.actual_tokenizer.decode(response_ids, skip_special_tokens=False).strip()
+            print("Response: ", response)
         return response
 
     async def a_generate(self, prompt: str) -> str:
