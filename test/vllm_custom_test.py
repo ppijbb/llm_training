@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 # Check dependencies
 try:
-    from vllm import LLM, SamplingParams, EngineArgs
+    from vllm import LLMEngine, SamplingParams, EngineArgs
     VLLM_AVAILABLE = True
 except ImportError:
     VLLM_AVAILABLE = False
@@ -35,7 +35,10 @@ try:
         AutoModel.register(G3MoETextConfig, G3MoEForCausalLM)
         AutoModelForCausalLM.register(G3MoETextConfig, G3MoEForCausalLM)
         ModelRegistry.register_model(model_arch="G3MoEForCausalLM", model_cls=G3MoEForCausalLM)
-except ImportError:
+        print("vllm registered")
+except ImportError as e:
+    import traceback
+    traceback.print_exc()
     G3MOE_AVAILABLE = False
 
 logging.basicConfig(level=logging.INFO)
@@ -81,8 +84,9 @@ def save_g3moe_for_vllm(save_path: str) -> bool:
                 "use_bfloat16": True,
             }
         )
-        config = G3MoEConfig(text_config=text_config)
-        model = G3MoEForCausalLM(config.text_config)
+        # config = G3MoEConfig(text_config=text_config)
+        config = text_config
+        model = G3MoEForCausalLM(config)
         model.init_weights()
         
         # Save model and config
@@ -142,13 +146,15 @@ def test_vllm_inference(model_path: str) -> bool:
         logger.info("Testing vLLM inference...")
 
         # Load model with vLLM
-        llm = LLM(
-            **dict(
+        llm = LLMEngine.from_engine_args(
+            EngineArgs(
                 model=model_path,
                 model_impl="transformers",
                 trust_remote_code=True,
                 max_model_len=512,
-                gpu_memory_utilization=0.7,)
+                gpu_memory_utilization=0.7,
+                dtype="bfloat16",
+            )
         )
         
         # Test generation

@@ -102,8 +102,9 @@ test_input = tokenizer.apply_chat_template(
         {
             "role": "user",
             "content": [
-                {"type": "text", "text": "What animal is on the candy? Name this animal in Korean."},
-                # {"type": "image", "url": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/p-blog/candy.JPG"}                
+                {"type": "text", "text": "Describe this image in Korean."},
+                {"type": "image", "url": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/p-blog/candy.JPG"}                
+                # {"type": "image", "url": "https://huggingface.co/spaces/merve/chameleon-7b/resolve/main/bee.jpg"}
             ]
         }
     ],
@@ -117,8 +118,7 @@ test_input = tokenizer.apply_chat_template(
 image1 = load_image("https://cdn.britannica.com/61/93061-050-99147DCE/Statue-of-Liberty-Island-New-York-Bay.jpg")
 image2 = load_image("https://huggingface.co/spaces/merve/chameleon-7b/resolve/main/bee.jpg")
 
-inputs = tokenizer(text=test_input,#  images=[image1],
- return_tensors="pt")
+inputs = tokenizer(text=test_input, images=[image1], return_tensors="pt")
 inputs = inputs.to(test_model.device)
 
 print(test_model)
@@ -138,7 +138,7 @@ with torch.inference_mode():
                 do_sample=True,
                 top_p=0.9,
                 top_k=1,
-                temperature=0.8,
+                temperature=0.7,
                 repetition_penalty=1.2,
                 length_penalty=1.0,
                 # num_beams=1,

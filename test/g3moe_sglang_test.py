@@ -66,11 +66,11 @@ def save_g3moe_for_sglang_v2(save_path: str) -> bool:
             "freeze_shared_experts": False,
             "hidden_activation": "gelu",  # SGLang 최적화
             "use_cache": True,
-            "tie_word_embeddings": False,
+            "tie_word_embeddings": True,
             "attention_bias": False,
             "cache_implementation": "static",  # SGLang 호환
-            "torch_dtype": "float16",
-            "transformers_version": "4.36.0",
+            "torch_dtype": "bfloat16",
+            "transformers_version": "4.52.0",
         }
         
         # 모델 생성 및 저장

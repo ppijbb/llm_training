@@ -1,4 +1,4 @@
-from datasets import load_dataset, concatenate_datasets, Dataset, Features, Value, Sequence, Image as ImageFeature
+from datasets import load_dataset, concatenate_datasets, Dataset, Features, Value, Sequence, Image as ImageFeature, load_from_disk, DatasetDict
 import json
 from typing import List, Dict, Any, Optional, cast
 from tqdm.auto import tqdm
@@ -516,6 +516,36 @@ def process_dataset(dataset_name: str, config_name: Optional[str] = None, max_sa
     except Exception as e:
         yield f"❌ {dataset_name} 처리 중 오류: {str(e)}"
 
+def generate_cleaned_records(file_path: str):
+    """
+    Reads a JSONL file line-by-line, cleans the data, and yields records.
+    This generator approach is highly memory-efficient.
+    """
+    with open(file_path, 'r', encoding='utf-8') as f:
+        # tqdm will show processing speed (it/s) without a total count,
+        # which avoids reading the file twice.
+        for line in tqdm(f, desc="Streaming and cleaning records"):
+            try:
+                record = json.loads(line)
+                
+                # Clean the 'messages' field in-place for efficiency
+                if 'messages' in record and isinstance(record['messages'], list):
+                    for message in record['messages']:
+                        if 'content' in message and isinstance(message['content'], list):
+                            for content_item in message['content']:
+                                # Fix 1: Ensure 'index' is always an integer (None -> -1)
+                                if content_item.get('index') is None:
+                                    content_item['index'] = -1
+                                
+                                # Fix 2: Ensure 'text' is always a string (None -> "")
+                                if content_item.get('text') is None:
+                                    content_item['text'] = ""
+
+                yield record
+
+            except (json.JSONDecodeError, TypeError):
+                print(f"Skipping malformed line: {line.strip()}")
+
 def merge_and_create_dataset(
     output_name: str = "unified-multimodal-sft", 
     max_samples_per_dataset: Optional[int] = None, 
@@ -569,7 +599,6 @@ def merge_and_create_dataset(
                                         image_counter += 1
                             
                             sample["images"] = image_paths
-                            # original_data는 python 객체로 유지하고, 전체를 한번에 직렬화
                             
                             # original_data를 안전하게 JSON 문자열로 변환
                             try:
@@ -637,8 +666,15 @@ def merge_and_create_dataset(
     tqdm.write("💾 로컬 저장 중 (최종 Arrow 포맷)...")
     final_save_path = f"{local_path}/{output_name}"
 
-    # 1. JSONL에서 텍스트 데이터와 이미지 경로 우선 로드 (스키마 없이 자동 추론)
-    dataset = cast(Dataset, load_dataset("json", data_files=jsonl_path))
+    # 1. 제너레이터를 사용하여 스트리밍 방식으로 데이터 로드 및 정제
+    tqdm.write("   - 스트리밍 방식으로 데이터 로드 및 정제 중...")
+    iterable_dataset = Dataset.from_generator(
+        generate_cleaned_records,
+        features=features,
+        gen_kwargs={"file_path": jsonl_path},
+    )
+    # IterableDataset을 일반 Dataset으로 변환하여 .map()과 .filter() 사용
+    dataset = Dataset.from_list(list(tqdm(iterable_dataset, desc="Converting to standard dataset")))
 
     # 2. 이미지 경로를 실제 이미지 객체로 변환 (상대 경로 기준 설정)
     staging_dir = os.path.dirname(jsonl_path)
@@ -650,11 +686,13 @@ def merge_and_create_dataset(
             example['images'] = [path if os.path.exists(path) else None for path in absolute_paths]
         return example
 
-    # 이미지 경로를 변환하고, None인 이미지를 필터링
-    dataset = dataset.map(resolve_and_load_images)
-    dataset = dataset.filter(lambda example: not (example.get('images') and None in example['images']))
+    # 이미지 경로를 변환하고, None인 이미지를 필터링 (다중 처리로 가속)
+    tqdm.write(f"   - 이미지 경로 변환 중 (워커: {num_workers})...")
+    dataset = dataset.map(resolve_and_load_images, num_proc=num_workers)
+    dataset = dataset.filter(lambda example: not (example.get('images') and None in example['images']), num_proc=num_workers)
 
     # 최종적으로 Image Feature로 캐스팅
+    tqdm.write("   - 이미지 데이터 타입 변환 중...")
     unified_dataset = dataset.cast_column("images", Sequence(ImageFeature()))
 
     # 캐시 정리
@@ -666,75 +704,114 @@ def merge_and_create_dataset(
     
     return final_save_path
 
-def upload_dataset_to_hub(dataset_path: str, repo_id: str, private: bool = False):
-    """로컬에 저장된 데이터셋을 허깅페이스 허브에 업로드합니다."""
+def upload_dataset_to_hub(dataset_path: str, repo_id: str, private: bool = False, num_workers: Optional[int] = None):
+    """
+    로컬에 저장된 데이터셋을 허깅페이스 허브에 업로드합니다.
+    - 1차: 지정된 경로에서 직접 데이터셋 로드를 시도합니다. (메모리 효율적인 방식)
+    - 2차 (폴백): 1차 시도 실패 시, 경로 내 'data.jsonl'을 찾아 스트리밍 방식으로 처리 후 업로드합니다.
+    """
+    if num_workers is None:
+        num_workers = os.cpu_count() or 4
+        
     try:
-        tqdm.write(f"🚀 '{repo_id}'으로 허깅페이스 업로드 시도...")
+        tqdm.write(f"🚀 '{repo_id}'으로 업로드 시도 (1차: 메모리 효율적 로드 방식)...")
         
-        # 디스크에서 데이터셋 로드 (DatasetDict vs Dataset 자동 감지)
-        tqdm.write(f"   - 로컬 경로 '{dataset_path}'에서 데이터셋을 안정적으로 로드합니다...")
+        # keep_in_memory=False를 사용하여 메모리 사용량 최소화
+        dataset_obj = load_from_disk(dataset_path, keep_in_memory=False)
         
-        # DatasetDict인지 Dataset인지 확인
-        if os.path.exists(os.path.join(dataset_path, "dataset_dict.json")):
-            # DatasetDict 형태로 저장된 경우
-            from datasets import DatasetDict
-            dataset_dict = DatasetDict.load_from_disk(dataset_path)
-            if "train" in dataset_dict:
-                dataset = dataset_dict["train"]
-                tqdm.write(f"   - DatasetDict에서 train split 로드 완료.")
-            else:
-                # 첫 번째 split 사용
-                split_name = list(dataset_dict.keys())[0]
-                dataset = dataset_dict[split_name]
-                tqdm.write(f"   - DatasetDict에서 '{split_name}' split 로드 완료.")
+        # DatasetDict인 경우 'train' split을 우선적으로 사용
+        if isinstance(dataset_obj, DatasetDict):
+            split_name = "train" if "train" in dataset_obj else list(dataset_obj.keys())[0]
+            dataset = dataset_obj[split_name]
+            tqdm.write(f"   - DatasetDict에서 '{split_name}' split 로드 완료.")
         else:
-            # 일반 Dataset 형태로 저장된 경우
-            dataset = Dataset.load_from_disk(dataset_path)
+            dataset = dataset_obj
             tqdm.write(f"   - Dataset 로드 완료.")
 
-        # 업로드 전 데이터셋 무결성 검사
-        tqdm.write(f"   - 데이터셋 무결성 검사...")
         required_columns = ['images', 'messages', 'source_dataset']
         missing_columns = [col for col in required_columns if col not in dataset.column_names]
-
         if missing_columns:
-            print(f"❌ 업로드 중단: 데이터셋에 필수 컬럼이 누락되었습니다!")
-            print(f"   - 필수 컬럼: {required_columns}")
-            print(f"   - 현재 컬럼: {list(dataset.column_names)}")
-            print(f"   - 누락된 컬럼: {missing_columns}")
-            print(f"   - 데이터셋을 다시 생성하거나 경로를 확인해주세요.")
+            raise ValueError(f"필수 컬럼 누락: {missing_columns}")
+
+        tqdm.write(f"   - ✅ 무결성 검사 통과. (총 샘플: {len(dataset):,})")
+        
+    except Exception as e:
+        tqdm.write(f"\n⚠️ 1차 업로드 방식 실패: {e}")
+        tqdm.write("🔄 'data.jsonl'을 이용한 폴백(fallback) 업로드를 시도합니다...")
+
+        jsonl_path = os.path.join(dataset_path, "data.jsonl")
+        
+        if not os.path.exists(jsonl_path):
+            tqdm.write(f"❌ 폴백 업로드 실패: '{jsonl_path}' 파일을 찾을 수 없습니다.")
             return
 
-        tqdm.write(f"   - ✅ 무결성 검사 통과. (총 샘플: {len(dataset):,}, 컬럼: {list(dataset.column_names)})")
-        
-        # push_to_hub 호출
+        try:
+            # data.jsonl로부터 데이터셋을 메모리 효율적으로 재생성하는 폴백 로직
+            tqdm.write("   - 1단계: JSONL 파일로부터 데이터셋 로드 (스트리밍)...")
+            dataset = load_dataset("json", data_files=jsonl_path, split="train", keep_in_memory=False)
+            assert isinstance(dataset, Dataset)
+
+            def clean_record(example):
+                if 'messages' in example and isinstance(example['messages'], list):
+                    for message in example['messages']:
+                        if 'content' in message and isinstance(message['content'], list):
+                            for content_item in message['content']:
+                                if content_item.get('index') is None:
+                                    content_item['index'] = -1
+                                if content_item.get('text') is None:
+                                    content_item['text'] = ""
+                return example
+
+            tqdm.write(f"   - 2단계: 데이터 정제 (워커: {num_workers})...")
+            dataset = dataset.map(clean_record, num_proc=num_workers)
+            
+            def resolve_and_load_images(example):
+                if example.get('images'):
+                    absolute_paths = [os.path.join(dataset_path, p) for p in example['images']]
+                    try:
+                        example['images'] = [Image.open(path).convert("RGB") for path in absolute_paths if os.path.exists(path)]
+                    except Exception:
+                        example['images'] = [] # 로드 실패 시 빈 리스트로 처리
+                return example
+
+            final_features = Features({
+                'messages': dataset.features['messages'],
+                'images': Sequence(ImageFeature()),
+                'source_dataset': dataset.features['source_dataset'],
+                'original_data': dataset.features['original_data']
+            })
+
+            tqdm.write(f"   - 3단계: 이미지 로드 및 변환 (워커: {num_workers})...")
+            dataset = dataset.map(
+                resolve_and_load_images, 
+                num_proc=num_workers, 
+                features=final_features
+            )
+            
+            dataset = dataset.filter(lambda ex: not (ex.get('images') and None in ex['images']), num_proc=num_workers)
+            
+            tqdm.write(f"   - ✅ 폴백 데이터셋 생성 완료. (총 샘플: {len(dataset):,})")
+
+        except Exception as fallback_e:
+            import traceback
+            traceback.print_exc()
+            tqdm.write(f"\n❌ 폴백 업로드 방식도 최종 실패했습니다: {fallback_e}")
+            return
+    
+    # 최종 업로드 실행
+    try:
+        tqdm.write(f"🚀 '{repo_id}'으로 최종 업로드 실행...")
         dataset.push_to_hub(
             repo_id, 
             private=private,
             max_shard_size="1GB",
             commit_message=f"Upload unified SFT dataset with {len(dataset):,} samples"
         )
-        
         tqdm.write(f"✅ 성공적으로 '{repo_id}'으로 업로드 완료!")
         tqdm.write(f"🔗 https://huggingface.co/datasets/{repo_id}")
-        
-    except Exception as e:
-        print(f"⚠️ 업로드 실패: {str(e)}")
-        # 사용자가 staging 디렉토리를 사용했는지 확인하여 더 구체적인 안내 제공
-        if dataset_path.endswith("_staging"):
-            # len("_staging") == 8
-            corrected_path = dataset_path[:-8] if dataset_path.endswith("_staging") else dataset_path
-            print("\n" + "="*70)
-            print("🚨 오류 원인 분석: 임시 폴더 경로를 사용하셨습니다!")
-            print(f"   입력하신 '{os.path.basename(dataset_path)}' 폴더는 데이터 생성용 임시 폴더입니다.")
-            print(f"   업로드에는 최종 데이터셋 폴더를 사용해야 합니다.")
-            print(f"   올바른 경로: '{corrected_path}'")
-            print("="*70)
-            print(f"\n👉 아래 명령어를 복사하여 다시 시도해 보세요:")
-            print(f"   python {sys.argv[0]} upload {corrected_path} {repo_id}")
-        else:
-            print("   - 데이터셋 경로가 올바른지, Hugging Face 토큰이 유효한지 확인해주세요.")
-            print("   - (터미널에서 `huggingface-cli login` 명령어로 로그인할 수 있습니다)")
+    except Exception as upload_e:
+        tqdm.write(f"\n❌ 최종 업로드 실패: {upload_e}")
+        tqdm.write("   - Hugging Face 토큰이 유효한지 (`huggingface-cli login`) 확인해주세요.")
 
 def inspect_dataset(dataset_path: str = "./unified-multimodal-sft"):
     """생성된 데이터셋 검사"""
@@ -852,6 +929,7 @@ def main():
     parser_upload.add_argument("--dataset_path", type=str, help="업로드할 로컬 데이터셋 경로")
     parser_upload.add_argument("--repo_id", type=str, help="허깅페이스 허브 리포지토리 ID (예: username/repo-name)")
     parser_upload.add_argument("--private", action="store_true", help="리포지토리를 비공개로 설정")
+    parser_upload.add_argument("--num_workers", type=int, default=None, help="이미지 처리 워커 수 (기본값: CPU 코어 수)")
 
     # inspect 명령어
     parser_inspect = subparsers.add_parser("inspect", help="로컬 데이터셋의 정보를 확인합니다.")
@@ -878,7 +956,8 @@ def main():
         upload_dataset_to_hub(
             dataset_path=args.dataset_path,
             repo_id=args.repo_id,
-            private=args.private
+            private=args.private,
+            num_workers=args.num_workers
         )
 
     elif args.command == "inspect":
