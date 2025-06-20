@@ -842,15 +842,15 @@ def main():
 
     # merge 명령어
     parser_merge = subparsers.add_parser("merge", help="여러 데이터셋을 병합하여 로컬에 저장합니다.")
-    parser_merge.add_argument("output_name", type=str, help="생성할 데이터셋의 로컬 폴더 이름")
+    parser_merge.add_argument("--output_name", type=str, help="생성할 데이터셋의 로컬 폴더 이름")
     parser_merge.add_argument("--max_samples", type=int, default=None, help="데이터셋별 최대 샘플 수")
     parser_merge.add_argument("--num_workers", type=int, default=16, help="데이터 처리 워커 수")
     parser_merge.add_argument("--local_path", type=str, default="./", help="데이터셋을 저장할 로컬 경로")
 
     # upload 명령어
     parser_upload = subparsers.add_parser("upload", help="로컬에 저장된 데이터셋을 허깅페이스 허브에 업로드합니다.")
-    parser_upload.add_argument("dataset_path", type=str, help="업로드할 로컬 데이터셋 경로")
-    parser_upload.add_argument("repo_id", type=str, help="허깅페이스 허브 리포지토리 ID (예: username/repo-name)")
+    parser_upload.add_argument("--dataset_path", type=str, help="업로드할 로컬 데이터셋 경로")
+    parser_upload.add_argument("--repo_id", type=str, help="허깅페이스 허브 리포지토리 ID (예: username/repo-name)")
     parser_upload.add_argument("--private", action="store_true", help="리포지토리를 비공개로 설정")
 
     # inspect 명령어

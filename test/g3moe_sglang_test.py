@@ -64,7 +64,7 @@ def save_g3moe_for_sglang_v2(save_path: str) -> bool:
             "max_position_embeddings": 4096,
             "norm_topk_prob": True,
             "freeze_shared_experts": False,
-            "hidden_activation": "swiglu",  # SGLang 최적화
+            "hidden_activation": "gelu",  # SGLang 최적화
             "use_cache": True,
             "tie_word_embeddings": False,
             "attention_bias": False,
@@ -111,6 +111,7 @@ def save_g3moe_for_sglang_v2(save_path: str) -> bool:
             "architectures": ["G3MoEForCausalLM"],
             "auto_map": {
                 "AutoConfig": "g3moe_config.G3MoETextConfig",
+                "AutoModel": "g3moe_model.G3MoEForCausalLM",
                 "AutoModelForCausalLM": "g3moe_model.G3MoEForCausalLM"
             },
             # SGLang v0.4+ 특정 설정
@@ -203,7 +204,6 @@ def test_sglang_local_mode_v2(model_path: str) -> bool:
                 trust_remote_code=True,
                 mem_fraction_static=0.8,
             )
-            sgl.set_default_backend(engine)
             
             # 올바른 함수 정의 (v0.4+ 스타일)
             @sgl.function
@@ -221,7 +221,7 @@ def test_sglang_local_mode_v2(model_path: str) -> bool:
             logger.info("Generating text with G3MoE (v0.4+ API)...")
             for i, prompt in enumerate(test_prompts):
                 try:
-                    state = generate_text.run(prompt=prompt)
+                    state = generate_text.run(prompt=prompt, backend=engine)
                     response = state["response"]
                     logger.info(f"Prompt {i+1}: {prompt}")
                     logger.info(f"Response: {response}")
