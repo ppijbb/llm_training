@@ -17,6 +17,9 @@ import gc
 import datetime
 import argparse
 import sys
+import pandas as pd
+import tempfile
+import shutil
 
 disable_progress_bars()  # 진행 표시줄 비활성화
 
@@ -182,20 +185,20 @@ def convert_to_target_format(sample: Dict[str, Any], dataset_name: str) -> Optio
     """
     각 데이터셋의 샘플을 목표 형식으로 변환합니다.
     텍스트 전용 데이터셋과 멀티모달 데이터셋을 모두 처리합니다.
-    목표 형식:
+    목표 형식 (index 필드 완전 제거):
     {
         "messages": [
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": "질문", "index": null},
-                    {"type": "image", "text": null, "index": 0}  # 멀티모달인 경우만
+                    {"type": "text", "text": "질문"},
+                    {"type": "image", "text": null}  # 멀티모달인 경우만
                 ]
             },
             {
                 "role": "assistant", 
                 "content": [
-                    {"type": "text", "text": "답변", "index": null}
+                    {"type": "text", "text": "답변"}
                 ]
             }
         ],
@@ -220,7 +223,7 @@ def convert_to_target_format(sample: Dict[str, Any], dataset_name: str) -> Optio
                     if isinstance(msg, dict) and "role" in msg and "content" in msg:
                         result["messages"].append({
                             "role": msg["role"],
-                            "content": [{"type": "text", "text": msg["content"], "index": None}]
+                            "content": [{"type": "text", "text": str(msg["content"])}]
                         })
         
         elif dataset_name == "R0k1e/UltraLink":
@@ -229,19 +232,19 @@ def convert_to_target_format(sample: Dict[str, Any], dataset_name: str) -> Optio
                 for i in range(0, len(data), 2):
                     if i + 1 < len(data):
                         result["messages"].extend([
-                            {"role": "user", "content": [{"type": "text", "text": data[i], "index": None}]},
-                            {"role": "assistant", "content": [{"type": "text", "text": data[i + 1], "index": None}]}
+                            {"role": "user", "content": [{"type": "text", "text": str(data[i])}]},
+                            {"role": "assistant", "content": [{"type": "text", "text": str(data[i + 1])}]}
                         ])
         
         elif dataset_name == "PrincetonPLI/Instruct-SkillMix-SDD":
             if "instruction" in sample and "output" in sample:
-                user_content_str = sample["instruction"]
-                if "input" in sample and sample["input"].strip():
+                user_content_str = str(sample["instruction"])
+                if "input" in sample and sample["input"] and str(sample["input"]).strip():
                     user_content_str += f"\n\nInput: {sample['input']}"
                 
                 result["messages"] = [
-                    {"role": "user", "content": [{"type": "text", "text": user_content_str, "index": None}]},
-                    {"role": "assistant", "content": [{"type": "text", "text": sample["output"], "index": None}]}
+                    {"role": "user", "content": [{"type": "text", "text": user_content_str}]},
+                    {"role": "assistant", "content": [{"type": "text", "text": str(sample["output"])}]}
                 ]
         
         elif dataset_name == "allenai/WildChat-1M":
@@ -250,14 +253,14 @@ def convert_to_target_format(sample: Dict[str, Any], dataset_name: str) -> Optio
                     if isinstance(conv, dict) and "role" in conv and "content" in conv:
                         result["messages"].append({
                             "role": conv["role"],
-                            "content": [{"type": "text", "text": conv["content"], "index": None}]
+                            "content": [{"type": "text", "text": str(conv["content"])}]
                         })
         
         elif dataset_name == "nvidia/OpenCodeInstruct":
             if "input" in sample and "output" in sample:
                 result["messages"] = [
-                    {"role": "user", "content": [{"type": "text", "text": sample["input"], "index": None}]},
-                    {"role": "assistant", "content": [{"type": "text", "text": sample["output"], "index": None}]}
+                    {"role": "user", "content": [{"type": "text", "text": str(sample["input"])}]},
+                    {"role": "assistant", "content": [{"type": "text", "text": str(sample["output"])}]}
                 ]
         
         elif dataset_name == "microsoft/orca-agentinstruct-1M-v1":
@@ -266,7 +269,7 @@ def convert_to_target_format(sample: Dict[str, Any], dataset_name: str) -> Optio
                     if isinstance(msg, dict) and "role" in msg and "content" in msg:
                         result["messages"].append({
                             "role": msg["role"],
-                            "content": [{"type": "text", "text": msg["content"], "index": None}]
+                            "content": [{"type": "text", "text": str(msg["content"])}]
                         })
         
         elif "Nemotron" in dataset_name:
@@ -276,7 +279,7 @@ def convert_to_target_format(sample: Dict[str, Any], dataset_name: str) -> Optio
                         role = "user" if conv["from"] in ["human", "user"] else "assistant"
                         result["messages"].append({
                             "role": role,
-                            "content": [{"type": "text", "text": conv["value"], "index": None}]
+                            "content": [{"type": "text", "text": str(conv["value"])}]
                         })
         
         elif dataset_name == "open-r1/Mixture-of-Thoughts":
@@ -285,7 +288,7 @@ def convert_to_target_format(sample: Dict[str, Any], dataset_name: str) -> Optio
                     if isinstance(msg, dict) and "role" in msg and "content" in msg:
                         result["messages"].append({
                             "role": msg["role"],
-                            "content": [{"type": "text", "text": msg["content"], "index": None}]
+                            "content": [{"type": "text", "text": str(msg["content"])}]
                         })
         
         # 멀티모달 데이터셋들 처리
@@ -319,7 +322,7 @@ def convert_to_target_format(sample: Dict[str, Any], dataset_name: str) -> Optio
                     
                     # content 생성
                     content_list = []
-                    text_content = conv.get("value", "")
+                    text_content = str(conv.get("value", ""))
                     
                     if text_content:
                         # <image> 태그 제거 (이미지는 별도 처리)
@@ -328,16 +331,14 @@ def convert_to_target_format(sample: Dict[str, Any], dataset_name: str) -> Optio
                         if text_content:  # 빈 문자열이 아닌 경우만
                             content_list.append({
                                 "type": "text",
-                                "text": text_content,
-                                "index": None
+                                "text": text_content
                             })
                     
                     # 첫 번째 user 메시지에 이미지 추가
                     if role == "user" and i == 0 and result["images"]:
                         content_list.append({
                             "type": "image", 
-                            "text": None,
-                            "index": 0
+                            "text": None
                         })
                     
                     if content_list:  # content가 있는 경우만 추가
@@ -358,19 +359,19 @@ def convert_to_target_format(sample: Dict[str, Any], dataset_name: str) -> Optio
                 result["images"].append(image_obj)
             
             # caption을 대화 형식으로 변환
-            caption = sample.get("caption", "").strip()
+            caption = str(sample.get("caption", "")).strip()
             if not caption:
-                caption = sample.get("cogvlm_caption", "").strip()
+                caption = str(sample.get("cogvlm_caption", "")).strip()
             
             if caption:
                 # 첫 번째 user 메시지에 이미지 포함
-                user_content: List[Dict[str, Any]] = [{"type": "text", "text": "Describe this image.", "index": None}]
+                user_content: List[Dict[str, Any]] = [{"type": "text", "text": "Describe this image."}]
                 if result["images"]:
-                    user_content.append({"type": "image", "text": None, "index": 0})
+                    user_content.append({"type": "image", "text": None})
                 
                 result["messages"] = [
                     {"role": "user", "content": user_content},
-                    {"role": "assistant", "content": [{"type": "text", "text": caption, "index": None}]}
+                    {"role": "assistant", "content": [{"type": "text", "text": caption}]}
                 ]
         
         # 빈 messages인 경우 None 반환
@@ -380,7 +381,8 @@ def convert_to_target_format(sample: Dict[str, Any], dataset_name: str) -> Optio
         return result
         
     except Exception as e:
-        print(f"Error converting sample from {dataset_name}: {str(e)}")
+        # 오류가 발생하면 None 반환하여 건너뛰기
+        print(f"샘플 변환 중 오류 (건너뛰기): {dataset_name} - {str(e)}")
         return None
 
 def process_samples_batch(samples_batch, dataset_name, max_workers=8):
@@ -549,7 +551,7 @@ def generate_cleaned_records(file_path: str):
 def merge_and_create_dataset(
     output_name: str = "unified-multimodal-sft", 
     max_samples_per_dataset: Optional[int] = None, 
-    num_workers: int = 16, 
+    num_workers: int = 8,  # 더 적은 워커 수로 메모리 절약
     local_path: str = "./",
 ):
     """
@@ -704,114 +706,248 @@ def merge_and_create_dataset(
     
     return final_save_path
 
-def upload_dataset_to_hub(dataset_path: str, repo_id: str, private: bool = False, num_workers: Optional[int] = None):
+
+
+def upload_dataset_to_hub(dataset_path: str, repo_id: str, private: bool = False, num_workers: Optional[int] = None, chunk_size: Optional[int] = None):
     """
     로컬에 저장된 데이터셋을 허깅페이스 허브에 업로드합니다.
-    - 1차: 지정된 경로에서 직접 데이터셋 로드를 시도합니다. (메모리 효율적인 방식)
-    - 2차 (폴백): 1차 시도 실패 시, 경로 내 'data.jsonl'을 찾아 스트리밍 방식으로 처리 후 업로드합니다.
+    메모리 효율적인 스트리밍 방식 사용
     """
     if num_workers is None:
-        num_workers = os.cpu_count() or 4
+        num_workers = min(4, os.cpu_count() or 4)  # 워커 수 제한
+    
+    if chunk_size is None:
+        chunk_size = min(200, num_workers * 25)  # 더 작은 청크 크기
         
+    jsonl_path = os.path.join(dataset_path, "data.jsonl")
+    
+    if not os.path.exists(jsonl_path):
+        print(f"❌ JSONL 파일 없음: {jsonl_path}")
+        return False
+
+    print(f"🚀 데이터셋 업로드: {repo_id}")
+    print(f"📊 청크 크기: {chunk_size}, 워커 수: {num_workers}")
+    
     try:
-        tqdm.write(f"🚀 '{repo_id}'으로 업로드 시도 (1차: 메모리 효율적 로드 방식)...")
+        # 메모리 효율적인 스트리밍 방식으로 데이터셋 생성
+        def data_generator():
+            with open(jsonl_path, 'r', encoding='utf-8') as f:
+                for line_num, line in enumerate(f):
+                    try:
+                        record = json.loads(line.strip())
+                        
+                        # messages를 JSON 문자열로 변환하여 PyArrow 충돌 방지
+                        if 'messages' in record:
+                            record['messages_json'] = json.dumps(record['messages'], ensure_ascii=False)
+                            del record['messages']
+                        
+                        # original_data 안전하게 처리
+                        if 'original_data' in record and not isinstance(record['original_data'], str):
+                            record['original_data'] = json.dumps(record['original_data'], ensure_ascii=False, default=str)
+                        
+                        # 이미지를 단순한 문자열로 처리
+                        if 'images' not in record or not record['images']:
+                            record['images'] = ""  # 빈 문자열
+                        elif isinstance(record['images'], list):
+                            # 리스트면 JSON 문자열로 변환
+                            record['images'] = json.dumps([str(img) if img else "" for img in record['images']], ensure_ascii=False)
+                        else:
+                            record['images'] = str(record['images']) if record['images'] else ""
+                        
+                        yield record
+                        
+                        # 메모리 정리를 위해 주기적으로 가비지 컬렉션
+                        if line_num % 500 == 0:
+                            gc.collect()
+                            
+                    except Exception as e:
+                        print(f"   라인 {line_num} 건너뛰기: {e}")
+                        continue
         
-        # keep_in_memory=False를 사용하여 메모리 사용량 최소화
-        dataset_obj = load_from_disk(dataset_path, keep_in_memory=False)
+        # 가장 단순한 스키마로 변경 - 모든 복잡한 타입 제거
+        from datasets import Features, Value
+        features = Features({
+            'images': Value('string'),  # 문자열로 단순화
+            'source_dataset': Value('string'),
+            'original_data': Value('string'),
+            'messages_json': Value('string')
+        })
         
-        # DatasetDict인 경우 'train' split을 우선적으로 사용
-        if isinstance(dataset_obj, DatasetDict):
-            split_name = "train" if "train" in dataset_obj else list(dataset_obj.keys())[0]
-            dataset = dataset_obj[split_name]
-            tqdm.write(f"   - DatasetDict에서 '{split_name}' split 로드 완료.")
-        else:
-            dataset = dataset_obj
-            tqdm.write(f"   - Dataset 로드 완료.")
-
-        required_columns = ['images', 'messages', 'source_dataset']
-        missing_columns = [col for col in required_columns if col not in dataset.column_names]
-        if missing_columns:
-            raise ValueError(f"필수 컬럼 누락: {missing_columns}")
-
-        tqdm.write(f"   - ✅ 무결성 검사 통과. (총 샘플: {len(dataset):,})")
+        print("📦 스트리밍 방식으로 데이터셋 생성 중...")
+        # 스트리밍 방식으로 데이터셋 생성 (메모리 효율적)
+        iterable_dataset = Dataset.from_generator(
+            data_generator,
+            features=features
+        )
+        
+        # IterableDataset을 일반 Dataset으로 변환
+        print("📦 IterableDataset을 Dataset으로 변환 중...")
+        dataset = Dataset.from_list(list(tqdm(iterable_dataset, desc="Converting to Dataset")))
+        
+        print(f"✅ 데이터셋 생성: {len(dataset)} 샘플")
+        
+        # 작은 배치 크기로 처리하여 메모리 사용량 최소화
+        small_batch_size = min(50, chunk_size // 4)
+        
+        # 3. messages 구조 복원 (작은 배치로)
+        def restore_messages_batch(batch):
+            restored_messages = []
+            for messages_json in batch['messages_json']:
+                try:
+                    restored_messages.append(json.loads(messages_json))
+                except:
+                    restored_messages.append([])
+            
+            batch['messages'] = restored_messages
+            del batch['messages_json']
+            return batch
+        
+        print("🔄 메시지 구조 복원 중...")
+        dataset = dataset.map(
+            restore_messages_batch, 
+            batched=True, 
+            batch_size=small_batch_size
+        )
+        
+        # 중간 가비지 컬렉션
+        gc.collect()
+        
+        # 4. 데이터 정제 - index 제거 및 null 처리 (작은 배치로)
+        def clean_batch(batch):
+            cleaned_messages = []
+            cleaned_images = []
+            
+            for i, messages in enumerate(batch['messages']):
+                try:
+                    if isinstance(messages, list):
+                        cleaned_message_list = []
+                        for message in messages:
+                            if isinstance(message, dict) and 'content' in message:
+                                if isinstance(message['content'], list):
+                                    cleaned_content_list = []
+                                    for content_item in message['content']:
+                                        if isinstance(content_item, dict):
+                                            # index 필드 완전 제거
+                                            cleaned_content = {
+                                                'type': content_item.get('type', 'text'),
+                                                'text': content_item.get('text', '') or ""
+                                            }
+                                            # index 필드는 아예 추가하지 않음
+                                            cleaned_content_list.append(cleaned_content)
+                                    
+                                    if cleaned_content_list:  # 빈 content가 아닌 경우만 추가
+                                        cleaned_message = {
+                                            'role': message.get('role', 'user'),
+                                            'content': cleaned_content_list
+                                        }
+                                        cleaned_message_list.append(cleaned_message)
+                        
+                        cleaned_messages.append(cleaned_message_list)
+                    else:
+                        cleaned_messages.append([])  # 빈 리스트로 대체
+                        
+                except Exception as e:
+                    # null 문제나 기타 문제가 있으면 빈 리스트로 처리
+                    print(f"메시지 정제 중 오류 (건너뛰기): {e}")
+                    cleaned_messages.append([])
+                
+                # 이미지를 문자열로 정리
+                try:
+                    if i < len(batch['images']):
+                        img_data = batch['images'][i]
+                        if not img_data or img_data == "null":
+                            cleaned_images.append("")
+                        else:
+                            cleaned_images.append(str(img_data))
+                    else:
+                        cleaned_images.append("")
+                except Exception as e:
+                    # 이미지 처리 중 문제가 있으면 빈 문자열로 처리
+                    print(f"이미지 정제 중 오류 (건너뛰기): {e}")
+                    cleaned_images.append("")
+            
+            batch['messages'] = cleaned_messages
+            batch['images'] = cleaned_images
+            return batch
+        
+        print("🧹 데이터 정제 중...")
+        dataset = dataset.map(
+            clean_batch, 
+            batched=True, 
+            batch_size=small_batch_size
+        )
+        
+        # 중간 가비지 컬렉션
+        gc.collect()
+        
+        # 5. 이미지 처리 - 경로를 문자열로 유지 (작은 배치로)
+        def process_images_batch(batch):
+            processed_images = []
+            images_dir = os.path.join(dataset_path, "images")
+            
+            for img_data in batch['images']:
+                try:
+                    if img_data and img_data != "":
+                        # JSON 문자열인 경우 파싱해서 경로 확인
+                        if img_data.startswith('[') and img_data.endswith(']'):
+                            img_paths = json.loads(img_data)
+                            valid_paths = []
+                            for img_path in img_paths:
+                                if img_path and img_path != "":
+                                    full_path = os.path.join(images_dir, os.path.basename(img_path)) if not os.path.isabs(img_path) else img_path
+                                    if os.path.exists(full_path):
+                                        valid_paths.append(full_path)
+                            processed_images.append(json.dumps(valid_paths, ensure_ascii=False) if valid_paths else "")
+                        else:
+                            # 단일 경로인 경우
+                            full_path = os.path.join(images_dir, os.path.basename(img_data)) if not os.path.isabs(img_data) else img_data
+                            if os.path.exists(full_path):
+                                processed_images.append(full_path)
+                            else:
+                                processed_images.append("")
+                    else:
+                        processed_images.append("")
+                except Exception as e:
+                    print(f"이미지 처리 오류 (건너뛰기): {e}")
+                    processed_images.append("")
+            
+            batch['images'] = processed_images
+            return batch
+        
+        print("📷 이미지 경로 처리 중...")
+        dataset = dataset.map(
+            process_images_batch, 
+            batched=True, 
+            batch_size=small_batch_size
+        )
+        
+        # 최종 가비지 컬렉션
+        gc.collect()
+        
+        # 6. 최종 업로드 (작은 샤드 크기로)
+        max_shard_size = "100MB"  # 고정된 작은 샤드 크기
+        print(f"🚀 '{repo_id}'로 업로드 (샤드 크기: {max_shard_size})...")
+        
+        dataset.push_to_hub(
+            repo_id,
+            private=private,
+            max_shard_size=max_shard_size,
+            commit_message=f"Upload dataset: {len(dataset)} samples"
+        )
+        
+        print(f"✅ 업로드 성공!")
+        print(f"📊 샘플 수: {len(dataset):,}")
+        print(f"🔗 https://huggingface.co/datasets/{repo_id}")
+        return True
         
     except Exception as e:
-        tqdm.write(f"\n⚠️ 1차 업로드 방식 실패: {e}")
-        tqdm.write("🔄 'data.jsonl'을 이용한 폴백(fallback) 업로드를 시도합니다...")
-
-        jsonl_path = os.path.join(dataset_path, "data.jsonl")
-        
-        if not os.path.exists(jsonl_path):
-            tqdm.write(f"❌ 폴백 업로드 실패: '{jsonl_path}' 파일을 찾을 수 없습니다.")
-            return
-
-        try:
-            # data.jsonl로부터 데이터셋을 메모리 효율적으로 재생성하는 폴백 로직
-            tqdm.write("   - 1단계: JSONL 파일로부터 데이터셋 로드 (스트리밍)...")
-            dataset = load_dataset("json", data_files=jsonl_path, split="train", keep_in_memory=False)
-            assert isinstance(dataset, Dataset)
-
-            def clean_record(example):
-                if 'messages' in example and isinstance(example['messages'], list):
-                    for message in example['messages']:
-                        if 'content' in message and isinstance(message['content'], list):
-                            for content_item in message['content']:
-                                if content_item.get('index') is None:
-                                    content_item['index'] = -1
-                                if content_item.get('text') is None:
-                                    content_item['text'] = ""
-                return example
-
-            tqdm.write(f"   - 2단계: 데이터 정제 (워커: {num_workers})...")
-            dataset = dataset.map(clean_record, num_proc=num_workers)
-            
-            def resolve_and_load_images(example):
-                if example.get('images'):
-                    absolute_paths = [os.path.join(dataset_path, p) for p in example['images']]
-                    try:
-                        example['images'] = [Image.open(path).convert("RGB") for path in absolute_paths if os.path.exists(path)]
-                    except Exception:
-                        example['images'] = [] # 로드 실패 시 빈 리스트로 처리
-                return example
-
-            final_features = Features({
-                'messages': dataset.features['messages'],
-                'images': Sequence(ImageFeature()),
-                'source_dataset': dataset.features['source_dataset'],
-                'original_data': dataset.features['original_data']
-            })
-
-            tqdm.write(f"   - 3단계: 이미지 로드 및 변환 (워커: {num_workers})...")
-            dataset = dataset.map(
-                resolve_and_load_images, 
-                num_proc=num_workers, 
-                features=final_features
-            )
-            
-            dataset = dataset.filter(lambda ex: not (ex.get('images') and None in ex['images']), num_proc=num_workers)
-            
-            tqdm.write(f"   - ✅ 폴백 데이터셋 생성 완료. (총 샘플: {len(dataset):,})")
-
-        except Exception as fallback_e:
-            import traceback
-            traceback.print_exc()
-            tqdm.write(f"\n❌ 폴백 업로드 방식도 최종 실패했습니다: {fallback_e}")
-            return
-    
-    # 최종 업로드 실행
-    try:
-        tqdm.write(f"🚀 '{repo_id}'으로 최종 업로드 실행...")
-        dataset.push_to_hub(
-            repo_id, 
-            private=private,
-            max_shard_size="1GB",
-            commit_message=f"Upload unified SFT dataset with {len(dataset):,} samples"
-        )
-        tqdm.write(f"✅ 성공적으로 '{repo_id}'으로 업로드 완료!")
-        tqdm.write(f"🔗 https://huggingface.co/datasets/{repo_id}")
-    except Exception as upload_e:
-        tqdm.write(f"\n❌ 최종 업로드 실패: {upload_e}")
-        tqdm.write("   - Hugging Face 토큰이 유효한지 (`huggingface-cli login`) 확인해주세요.")
+        import traceback
+        traceback.print_exc()
+        print(f"❌ 업로드 실패: {e}")
+        return False
+    finally:
+        # 최종 메모리 정리
+        gc.collect()
 
 def inspect_dataset(dataset_path: str = "./unified-multimodal-sft"):
     """생성된 데이터셋 검사"""
@@ -912,6 +1048,8 @@ def inspect_dataset(dataset_path: str = "./unified-multimodal-sft"):
         print(f"❌ 검사 중 오류: {str(e)}")
         return None
 
+
+
 def main():
     """메인 함수"""
     parser = argparse.ArgumentParser(description="텍스트 + 멀티모달 통합 데이터셋 처리 및 업로드 스크립트")
@@ -929,7 +1067,8 @@ def main():
     parser_upload.add_argument("--dataset_path", type=str, help="업로드할 로컬 데이터셋 경로")
     parser_upload.add_argument("--repo_id", type=str, help="허깅페이스 허브 리포지토리 ID (예: username/repo-name)")
     parser_upload.add_argument("--private", action="store_true", help="리포지토리를 비공개로 설정")
-    parser_upload.add_argument("--num_workers", type=int, default=None, help="이미지 처리 워커 수 (기본값: CPU 코어 수)")
+    parser_upload.add_argument("--num_workers", type=int, default=None, help="처리 워커 수 (기본값: CPU 코어 수)")
+    parser_upload.add_argument("--chunk_size", type=int, default=None, help="메모리 처리 청크 크기 (기본값: 동적 계산)")
 
     # inspect 명령어
     parser_inspect = subparsers.add_parser("inspect", help="로컬 데이터셋의 정보를 확인합니다.")
@@ -957,7 +1096,8 @@ def main():
             dataset_path=args.dataset_path,
             repo_id=args.repo_id,
             private=args.private,
-            num_workers=args.num_workers
+            num_workers=args.num_workers,
+            chunk_size=args.chunk_size
         )
 
     elif args.command == "inspect":
