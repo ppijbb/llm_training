@@ -736,25 +736,12 @@ def upload_dataset_to_hub(dataset_path: str, repo_id: str, private: bool = False
                     try:
                         record = json.loads(line.strip())
                         
-                        # messages를 JSON 문자열로 변환하여 PyArrow 충돌 방지
-                        if 'messages' in record:
-                            record['messages_json'] = json.dumps(record['messages'], ensure_ascii=False)
-                            del record['messages']
+                        # 모든 데이터를 하나의 JSON 문자열로 통합
+                        unified_record = {
+                            'data': json.dumps(record, ensure_ascii=False, default=str)
+                        }
                         
-                        # original_data 안전하게 처리
-                        if 'original_data' in record and not isinstance(record['original_data'], str):
-                            record['original_data'] = json.dumps(record['original_data'], ensure_ascii=False, default=str)
-                        
-                        # 이미지를 단순한 문자열로 처리
-                        if 'images' not in record or not record['images']:
-                            record['images'] = ""  # 빈 문자열
-                        elif isinstance(record['images'], list):
-                            # 리스트면 JSON 문자열로 변환
-                            record['images'] = json.dumps([str(img) if img else "" for img in record['images']], ensure_ascii=False)
-                        else:
-                            record['images'] = str(record['images']) if record['images'] else ""
-                        
-                        yield record
+                        yield unified_record
                         
                         # 메모리 정리를 위해 주기적으로 가비지 컬렉션
                         if line_num % 500 == 0:
@@ -764,13 +751,10 @@ def upload_dataset_to_hub(dataset_path: str, repo_id: str, private: bool = False
                         print(f"   라인 {line_num} 건너뛰기: {e}")
                         continue
         
-        # 가장 단순한 스키마로 변경 - 모든 복잡한 타입 제거
+        # 극도로 단순한 스키마 - 모든 필드를 문자열로
         from datasets import Features, Value
         features = Features({
-            'images': Value('string'),  # 문자열로 단순화
-            'source_dataset': Value('string'),
-            'original_data': Value('string'),
-            'messages_json': Value('string')
+            'data': Value('string')  # 모든 데이터를 하나의 JSON 문자열로
         })
         
         print("📦 스트리밍 방식으로 데이터셋 생성 중...")
@@ -789,137 +773,9 @@ def upload_dataset_to_hub(dataset_path: str, repo_id: str, private: bool = False
         # 작은 배치 크기로 처리하여 메모리 사용량 최소화
         small_batch_size = min(50, chunk_size // 4)
         
-        # 3. messages 구조 복원 (작은 배치로)
-        def restore_messages_batch(batch):
-            restored_messages = []
-            for messages_json in batch['messages_json']:
-                try:
-                    restored_messages.append(json.loads(messages_json))
-                except:
-                    restored_messages.append([])
-            
-            batch['messages'] = restored_messages
-            del batch['messages_json']
-            return batch
-        
-        print("🔄 메시지 구조 복원 중...")
-        dataset = dataset.map(
-            restore_messages_batch, 
-            batched=True, 
-            batch_size=small_batch_size
-        )
-        
-        # 중간 가비지 컬렉션
-        gc.collect()
-        
-        # 4. 데이터 정제 - index 제거 및 null 처리 (작은 배치로)
-        def clean_batch(batch):
-            cleaned_messages = []
-            cleaned_images = []
-            
-            for i, messages in enumerate(batch['messages']):
-                try:
-                    if isinstance(messages, list):
-                        cleaned_message_list = []
-                        for message in messages:
-                            if isinstance(message, dict) and 'content' in message:
-                                if isinstance(message['content'], list):
-                                    cleaned_content_list = []
-                                    for content_item in message['content']:
-                                        if isinstance(content_item, dict):
-                                            # index 필드 완전 제거
-                                            cleaned_content = {
-                                                'type': content_item.get('type', 'text'),
-                                                'text': content_item.get('text', '') or ""
-                                            }
-                                            # index 필드는 아예 추가하지 않음
-                                            cleaned_content_list.append(cleaned_content)
-                                    
-                                    if cleaned_content_list:  # 빈 content가 아닌 경우만 추가
-                                        cleaned_message = {
-                                            'role': message.get('role', 'user'),
-                                            'content': cleaned_content_list
-                                        }
-                                        cleaned_message_list.append(cleaned_message)
-                        
-                        cleaned_messages.append(cleaned_message_list)
-                    else:
-                        cleaned_messages.append([])  # 빈 리스트로 대체
-                        
-                except Exception as e:
-                    # null 문제나 기타 문제가 있으면 빈 리스트로 처리
-                    print(f"메시지 정제 중 오류 (건너뛰기): {e}")
-                    cleaned_messages.append([])
-                
-                # 이미지를 문자열로 정리
-                try:
-                    if i < len(batch['images']):
-                        img_data = batch['images'][i]
-                        if not img_data or img_data == "null":
-                            cleaned_images.append("")
-                        else:
-                            cleaned_images.append(str(img_data))
-                    else:
-                        cleaned_images.append("")
-                except Exception as e:
-                    # 이미지 처리 중 문제가 있으면 빈 문자열로 처리
-                    print(f"이미지 정제 중 오류 (건너뛰기): {e}")
-                    cleaned_images.append("")
-            
-            batch['messages'] = cleaned_messages
-            batch['images'] = cleaned_images
-            return batch
-        
-        print("🧹 데이터 정제 중...")
-        dataset = dataset.map(
-            clean_batch, 
-            batched=True, 
-            batch_size=small_batch_size
-        )
-        
-        # 중간 가비지 컬렉션
-        gc.collect()
-        
-        # 5. 이미지 처리 - 경로를 문자열로 유지 (작은 배치로)
-        def process_images_batch(batch):
-            processed_images = []
-            images_dir = os.path.join(dataset_path, "images")
-            
-            for img_data in batch['images']:
-                try:
-                    if img_data and img_data != "":
-                        # JSON 문자열인 경우 파싱해서 경로 확인
-                        if img_data.startswith('[') and img_data.endswith(']'):
-                            img_paths = json.loads(img_data)
-                            valid_paths = []
-                            for img_path in img_paths:
-                                if img_path and img_path != "":
-                                    full_path = os.path.join(images_dir, os.path.basename(img_path)) if not os.path.isabs(img_path) else img_path
-                                    if os.path.exists(full_path):
-                                        valid_paths.append(full_path)
-                            processed_images.append(json.dumps(valid_paths, ensure_ascii=False) if valid_paths else "")
-                        else:
-                            # 단일 경로인 경우
-                            full_path = os.path.join(images_dir, os.path.basename(img_data)) if not os.path.isabs(img_data) else img_data
-                            if os.path.exists(full_path):
-                                processed_images.append(full_path)
-                            else:
-                                processed_images.append("")
-                    else:
-                        processed_images.append("")
-                except Exception as e:
-                    print(f"이미지 처리 오류 (건너뛰기): {e}")
-                    processed_images.append("")
-            
-            batch['images'] = processed_images
-            return batch
-        
-        print("📷 이미지 경로 처리 중...")
-        dataset = dataset.map(
-            process_images_batch, 
-            batched=True, 
-            batch_size=small_batch_size
-        )
+        # 이제 모든 데이터가 단순한 JSON 문자열로 저장되어 있으므로 
+        # 복잡한 변환 과정이 필요 없음
+        print("✅ 단순 스키마로 데이터 변환 과정 생략")
         
         # 최종 가비지 컬렉션
         gc.collect()

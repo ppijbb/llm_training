@@ -24,7 +24,7 @@ except ImportError:
     VLLM_AVAILABLE = False
 
 try:
-    from models.g3moe_model import G3MoEForCausalLM
+    from models.g3moe_model import G3MoEForCausalLM, G3MoEModel
     from models.g3moe_config import G3MoETextConfig, G3MoEConfig
     G3MOE_AVAILABLE = True
     if VLLM_AVAILABLE:
@@ -32,10 +32,9 @@ try:
         from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
         # AutoConfig.register("g3moe", G3MoEConfig)
         AutoConfig.register("g3moe_text", G3MoETextConfig)
-        AutoModel.register(G3MoETextConfig, G3MoEForCausalLM)
+        # AutoModel.register(G3MoETextConfig, G3MoEModel)
         AutoModelForCausalLM.register(G3MoETextConfig, G3MoEForCausalLM)
         ModelRegistry.register_model(model_arch="G3MoEForCausalLM", model_cls=G3MoEForCausalLM)
-        print("vllm registered")
 except ImportError as e:
     import traceback
     traceback.print_exc()
@@ -96,7 +95,7 @@ def save_g3moe_for_vllm(save_path: str) -> bool:
         # Save tokenizer
         tokenizer = AutoTokenizer.from_pretrained("gpt2")
         tokenizer.save_pretrained(save_path)
-        
+        ModelRegistry.register_model(model_arch="G3MoEForCausalLM", model_cls=G3MoEForCausalLM)
         # Copy model files
         models_dir = os.path.join(os.path.dirname(__file__), '..', 'models')
         for file in ['g3moe_config.py', 'g3moe_model.py', '__init__.py']:
@@ -141,7 +140,7 @@ def test_vllm_inference(model_path: str) -> bool:
     if not os.path.exists(model_path):
         logger.error(f"Model path not found: {model_path}")
         return False
-    
+    ModelRegistry.register_model(model_arch="G3MoEForCausalLM", model_cls=G3MoEForCausalLM)
     try:
         logger.info("Testing vLLM inference...")
 
