@@ -49,7 +49,10 @@ dataset_configs = [
     ("Lin-Chen/ShareGPT4V", "ShareGPT4V")
 ]
 
-def construct_image_url(image_path, dataset_name):
+def construct_image_url(
+    image_path,
+    dataset_name
+):
     """데이터셋별로 이미지 경로를 실제 URL로 변환"""
     if dataset_name == "Lin-Chen/ShareGPT4V":
         # ShareGPT4V는 COCO 이미지를 사용
@@ -82,7 +85,10 @@ def download_image_with_retry(image_url, max_retries=3, timeout=10):
             time.sleep(0.5 * (2 ** attempt))  # 지수 백오프
     return None
 
-def load_image_from_url_or_path(image_source, dataset_name=None):
+def load_image_from_url_or_path(
+    image_source,
+    dataset_name=None
+):
     """
     URL이나 경로에서 실제 이미지를 로드합니다. (캐시 및 최적화 포함)
     """
@@ -157,7 +163,10 @@ def load_image_from_url_or_path(image_source, dataset_name=None):
     except Exception as e:
         return None
 
-def process_image_batch(image_sources_with_info, max_workers=8):
+def process_image_batch(
+    image_sources_with_info,
+    max_workers=8
+):
     """이미지 배치를 병렬로 처리"""
     results = []
     
@@ -181,7 +190,10 @@ def process_image_batch(image_sources_with_info, max_workers=8):
     results.sort(key=lambda x: x[0])
     return [result for _, result in results]
 
-def convert_to_target_format(sample: Dict[str, Any], dataset_name: str) -> Optional[Dict[str, Any]]:
+def convert_to_target_format(
+    sample: Dict[str, Any], 
+    dataset_name: str
+) -> Optional[Dict[str, Any]]:
     """
     각 데이터셋의 샘플을 목표 형식으로 변환합니다.
     텍스트 전용 데이터셋과 멀티모달 데이터셋을 모두 처리합니다.
@@ -385,7 +397,11 @@ def convert_to_target_format(sample: Dict[str, Any], dataset_name: str) -> Optio
         print(f"샘플 변환 중 오류 (건너뛰기): {dataset_name} - {str(e)}")
         return None
 
-def process_samples_batch(samples_batch, dataset_name, max_workers=8):
+def process_samples_batch(
+    samples_batch, 
+    dataset_name, 
+    max_workers=8
+):
     """샘플 배치를 병렬로 처리"""
     # 이미지가 있는 샘플들을 먼저 식별
     image_samples = []
@@ -429,7 +445,12 @@ def process_samples_batch(samples_batch, dataset_name, max_workers=8):
     
     return [r for r in results if r is not None]
 
-def process_dataset(dataset_name: str, config_name: Optional[str] = None, max_samples: Optional[int] = None, num_workers: int = 8):
+def process_dataset(
+    dataset_name: str,
+    config_name: Optional[str] = None,
+    max_samples: Optional[int] = None,
+    num_workers: int = 8
+):
     """데이터셋을 처리하여 목표 형식으로 변환합니다. (병렬 처리 추가)"""
     try:
         # 특정 데이터셋들의 split 설정
@@ -578,7 +599,7 @@ def merge_and_create_dataset(
     image_counter = 0
     completion_messages = []
 
-    # 2. 데이터를 JSONL과 이미지 파일로 디스크에 저장
+    # 2. 데이터를 JSONL과 이미지 파일로 디스크에 저장 (이미지 경로 보존)
     with open(jsonl_path, "w", encoding="utf-8") as f:
         dataset_progress = tqdm(dataset_configs, desc="데이터셋 처리", unit="dataset")
 
@@ -588,15 +609,16 @@ def merge_and_create_dataset(
                 for result in process_dataset(dataset_name, config_name, max_samples_per_dataset, num_workers):
                     if isinstance(result, list): # 배치 결과
                         for sample in result:
-                            # 이미지 처리: PIL 객체를 파일로 저장하고 경로로 대체
+                            # 이미지 처리: PIL 객체를 파일로 저장하되 상대경로만 저장
                             image_paths = []
                             if sample.get("images"):
                                 for img in sample["images"]:
                                     if hasattr(img, 'save'):
                                         image_filename = f"{image_counter:08d}.png"
-                                        # 상대 경로로 저장
+                                        # 이미지 파일 저장
                                         img_save_path = os.path.join(images_dir, image_filename)
                                         img.save(img_save_path, "PNG")
+                                        # 상대 경로만 저장 (staging_dir 기준)
                                         image_paths.append(os.path.join("images", image_filename))
                                         image_counter += 1
                             
@@ -659,14 +681,14 @@ def merge_and_create_dataset(
                 )
             })
         ),
-        'images': Sequence(Value('string')), # 먼저 문자열로 로드
+        'images': Sequence(Value('string')), # 먼저 문자열 경로로 로드
         'source_dataset': Value('string'),
         'original_data': Value('string')
     })
     
     # 로컬 저장
     tqdm.write("💾 로컬 저장 중 (최종 Arrow 포맷)...")
-    final_save_path = f"{local_path}/{output_name}"
+    final_save_path = f"{local_path}/{output_name}".replace("//", "/")
 
     # 1. 제너레이터를 사용하여 스트리밍 방식으로 데이터 로드 및 정제
     tqdm.write("   - 스트리밍 방식으로 데이터 로드 및 정제 중...")
@@ -679,17 +701,27 @@ def merge_and_create_dataset(
     dataset = Dataset.from_list(list(tqdm(iterable_dataset, desc="Converting to standard dataset")))
 
     # 2. 이미지 경로를 실제 이미지 객체로 변환 (상대 경로 기준 설정)
-    staging_dir = os.path.dirname(jsonl_path)
+    staging_dir_abs = os.path.abspath(staging_dir)
     def resolve_and_load_images(example):
         if example['images']:
-            # 절대 경로로 변환
-            absolute_paths = [os.path.join(staging_dir, p) for p in example['images']]
-            # 이미지 로드 (오류 발생 시 None)
-            example['images'] = [path if os.path.exists(path) else None for path in absolute_paths]
+            # 절대 경로로 변환하고 이미지 로드
+            loaded_images = []
+            for img_path in example['images']:
+                full_path = os.path.join(staging_dir_abs, img_path)
+                if os.path.exists(full_path):
+                    try:
+                        img = Image.open(full_path)
+                        loaded_images.append(img.convert('RGB'))
+                    except Exception as e:
+                        print(f"이미지 로드 실패: {full_path} - {e}")
+                        loaded_images.append(None)
+                else:
+                    loaded_images.append(None)
+            example['images'] = loaded_images
         return example
 
     # 이미지 경로를 변환하고, None인 이미지를 필터링 (다중 처리로 가속)
-    tqdm.write(f"   - 이미지 경로 변환 중 (워커: {num_workers})...")
+    tqdm.write(f"   - 이미지 로드 중 (워커: {num_workers})...")
     dataset = dataset.map(resolve_and_load_images, num_proc=num_workers)
     dataset = dataset.filter(lambda example: not (example.get('images') and None in example['images']), num_proc=num_workers)
 
@@ -706,12 +738,20 @@ def merge_and_create_dataset(
     
     return final_save_path
 
-
-
-def upload_dataset_to_hub(dataset_path: str, repo_id: str, private: bool = False, num_workers: Optional[int] = None, chunk_size: Optional[int] = None):
+def upload_dataset_to_hub(
+    dataset_path: str,
+    repo_id: str,
+    private: bool = False,
+    num_workers: Optional[int] = None,
+    chunk_size: Optional[int] = None,
+    single_repo: bool = False
+):
     """
     로컬에 저장된 데이터셋을 허깅페이스 허브에 업로드합니다.
     메모리 효율적인 스트리밍 방식 사용
+    
+    Args:
+        single_repo: True면 하나의 리포지토리에 순차적으로 추가, False면 청크별 리포지토리 생성
     """
     if num_workers is None:
         num_workers = min(4, os.cpu_count() or 4)  # 워커 수 제한
@@ -729,19 +769,30 @@ def upload_dataset_to_hub(dataset_path: str, repo_id: str, private: bool = False
     print(f"📊 청크 크기: {chunk_size}, 워커 수: {num_workers}")
     
     try:
-        # 메모리 효율적인 스트리밍 방식으로 데이터셋 생성
+        # 이미지를 포함한 데이터셋 생성
         def data_generator():
+            staging_dir_abs = os.path.dirname(jsonl_path)
             with open(jsonl_path, 'r', encoding='utf-8') as f:
                 for line_num, line in enumerate(f):
                     try:
                         record = json.loads(line.strip())
                         
-                        # 모든 데이터를 하나의 JSON 문자열로 통합
-                        unified_record = {
-                            'data': json.dumps(record, ensure_ascii=False, default=str)
-                        }
+                        # 이미지 경로를 실제 이미지로 변환
+                        if 'images' in record and isinstance(record['images'], list):
+                            loaded_images = []
+                            for img_path in record['images']:
+                                if img_path and isinstance(img_path, str):
+                                    full_path = os.path.join(staging_dir_abs, img_path)
+                                    if os.path.exists(full_path):
+                                        try:
+                                            img = Image.open(full_path)
+                                            loaded_images.append(img.convert('RGB'))
+                                        except Exception as e:
+                                            print(f"이미지 로드 실패: {full_path} - {e}")
+                                            continue
+                            record['images'] = loaded_images
                         
-                        yield unified_record
+                        yield record
                         
                         # 메모리 정리를 위해 주기적으로 가비지 컬렉션
                         if line_num % 500 == 0:
@@ -751,10 +802,24 @@ def upload_dataset_to_hub(dataset_path: str, repo_id: str, private: bool = False
                         print(f"   라인 {line_num} 건너뛰기: {e}")
                         continue
         
-        # 극도로 단순한 스키마 - 모든 필드를 문자열로
-        from datasets import Features, Value
+        # 이미지를 포함한 데이터셋 스키마
+        from datasets import Features, Value, Sequence, Image as ImageFeature
         features = Features({
-            'data': Value('string')  # 모든 데이터를 하나의 JSON 문자열로
+            'messages': Sequence(
+                Features({
+                    'role': Value('string'),
+                    'content': Sequence(
+                        Features({
+                            'type': Value('string'),
+                            'text': Value('string'),
+                            'index': Value('int64')
+                        })
+                    )
+                })
+            ),
+            'images': Sequence(ImageFeature()),
+            'source_dataset': Value('string'),
+            'original_data': Value('string')
         })
         
         print("📦 스트리밍 방식으로 데이터셋 생성 중...")
@@ -764,37 +829,140 @@ def upload_dataset_to_hub(dataset_path: str, repo_id: str, private: bool = False
             features=features
         )
         
-        # IterableDataset을 일반 Dataset으로 변환
-        print("📦 IterableDataset을 Dataset으로 변환 중...")
-        dataset = Dataset.from_list(list(tqdm(iterable_dataset, desc="Converting to Dataset")))
+        # 메모리 효율적인 청크 단위 처리
+        print("📦 청크 단위로 데이터셋 변환 및 업로드 중...")
         
-        print(f"✅ 데이터셋 생성: {len(dataset)} 샘플")
+        CHUNK_SIZE = 10000  # 1만 개씩 처리
+        chunk_datasets = []
+        current_chunk = []
+        chunk_num = 0
         
-        # 작은 배치 크기로 처리하여 메모리 사용량 최소화
-        small_batch_size = min(50, chunk_size // 4)
+        for record in tqdm(iterable_dataset, desc="Processing records"):
+            current_chunk.append(record)
+            
+            if len(current_chunk) >= CHUNK_SIZE:
+                # 청크를 Dataset으로 변환하고 임시 저장
+                chunk_dataset = Dataset.from_list(current_chunk)
+                temp_chunk_path = f"/mnt/disks/data/tmp/chunk_{chunk_num}"
+                chunk_dataset.save_to_disk(temp_chunk_path)
+                chunk_datasets.append(temp_chunk_path)
+                
+                print(f"   청크 {chunk_num}: {len(current_chunk)}개 저장 완료")
+                current_chunk = []
+                chunk_num += 1
+                
+                # 메모리 정리
+                del chunk_dataset
+                gc.collect()
         
-        # 이제 모든 데이터가 단순한 JSON 문자열로 저장되어 있으므로 
-        # 복잡한 변환 과정이 필요 없음
-        print("✅ 단순 스키마로 데이터 변환 과정 생략")
+        # 마지막 청크 처리
+        if current_chunk:
+            chunk_dataset = Dataset.from_list(current_chunk)
+            temp_chunk_path = f"/mnt/disks/data/tmp/chunk_{chunk_num}"
+            chunk_dataset.save_to_disk(temp_chunk_path)
+            chunk_datasets.append(temp_chunk_path)
+            print(f"   청크 {chunk_num}: {len(current_chunk)}개 저장 완료")
+            del chunk_dataset
+            gc.collect()
         
-        # 최종 가비지 컬렉션
-        gc.collect()
+        # 하나의 리포지토리에 청크들을 순차적으로 이어서 추가
+        print(f"📤 총 {len(chunk_datasets)}개 청크를 하나의 리포지토리에 순차 추가...")
         
-        # 6. 최종 업로드 (작은 샤드 크기로)
-        max_shard_size = "100MB"  # 고정된 작은 샤드 크기
-        print(f"🚀 '{repo_id}'로 업로드 (샤드 크기: {max_shard_size})...")
+        accumulated_dataset = None
+        successful_chunks = 0
+        failed_uploads = []
         
-        dataset.push_to_hub(
-            repo_id,
-            private=private,
-            max_shard_size=max_shard_size,
-            commit_message=f"Upload dataset: {len(dataset)} samples"
-        )
+        for i, chunk_path in enumerate(chunk_datasets):
+            chunk_dataset = Dataset.load_from_disk(chunk_path)
+            
+            print(f"   청크 {i+1}/{len(chunk_datasets)} 처리 중...")
+            
+            try:
+                # 첫 번째 청크이거나 accumulated_dataset이 None인 경우
+                if accumulated_dataset is None:
+                    accumulated_dataset = chunk_dataset
+                    print(f"     첫 번째 청크 ({len(chunk_dataset)}개 샘플) 준비")
+                else:
+                    # 기존 데이터에 새 청크 추가
+                    print(f"     기존 {len(accumulated_dataset)}개에 {len(chunk_dataset)}개 추가 중...")
+                    from datasets import concatenate_datasets
+                    accumulated_dataset = concatenate_datasets([accumulated_dataset, chunk_dataset])
+                    print(f"     총 {len(accumulated_dataset)}개 샘플로 확장")
+                
+                successful_chunks += 1
+                
+                # 10개 청크마다 또는 마지막 청크일 때 업로드
+                should_upload = (i + 1) % 10 == 0 or i == len(chunk_datasets) - 1
+                
+                if should_upload:
+                    print(f"     📤 중간 업로드 ({successful_chunks}개 청크, {len(accumulated_dataset)}개 샘플)...")
+                    
+                    # 재시도 로직으로 업로드
+                    upload_success = False
+                    for attempt in range(3):
+                        try:
+                            if attempt > 0:
+                                wait_time = 30 * (2 ** attempt)
+                                print(f"       재시도 {attempt+1}/3... {wait_time}초 대기 후")
+                                time.sleep(wait_time)
+                            
+                            accumulated_dataset.push_to_hub(
+                                repo_id,  # 항상 같은 리포지토리에 업로드
+                                private=private,
+                                max_shard_size="100MB",
+                                commit_message=f"Add chunks 1-{successful_chunks}: {len(accumulated_dataset)} total samples with images",
+                                embed_external_files=True  # 이미지 포함
+                            )
+                            print(f"       ✅ 업로드 성공! (총 {len(accumulated_dataset)}개 샘플)")
+                            upload_success = True
+                            break
+                            
+                        except Exception as e:
+                            print(f"       시도 {attempt+1} 실패: {e}")
+                            if "429" in str(e) or "Too Many Requests" in str(e):
+                                if attempt < 2:
+                                    print(f"       429 에러 - 추가 대기...")
+                                    time.sleep(60 * (attempt + 1))
+                                continue
+                    
+                    if not upload_success:
+                        print(f"       ❌ 업로드 최종 실패")
+                        failed_uploads.append((i, f"chunks_1_to_{successful_chunks}"))
+                        break  # 업로드 실패 시 중단
+                
+            except Exception as e:
+                print(f"   ❌ 청크 {i+1} 처리 실패: {e}")
+                failed_uploads.append((i, f"chunk_{i+1}", chunk_path))
+                # 실패한 청크는 건너뛰고 계속 진행
+            
+            # 메모리 정리
+            del chunk_dataset
+            gc.collect()
+            
+            # 성공한 청크 임시 파일 정리
+            shutil.rmtree(chunk_path, ignore_errors=True)
+            
+            # API 제한 회피를 위한 대기
+            if i < len(chunk_datasets) - 1:
+                wait_time = 5  # 5초 대기
+                print(f"     다음 청크까지 {wait_time}초 대기...")
+                time.sleep(wait_time)
         
-        print(f"✅ 업로드 성공!")
-        print(f"📊 샘플 수: {len(dataset):,}")
-        print(f"🔗 https://huggingface.co/datasets/{repo_id}")
-        return True
+        # 최종 결과 리포트
+        print(f"\n🎉 업로드 완료!")
+        if accumulated_dataset:
+            print(f"✅ 최종 데이터셋: {len(accumulated_dataset):,}개 샘플")
+            print(f"📋 리포지토리: https://huggingface.co/datasets/{repo_id}")
+        
+        print(f"✅ 처리된 청크: {successful_chunks}/{len(chunk_datasets)}개")
+        print(f"❌ 실패: {len(failed_uploads)}개")
+        
+        if failed_uploads:
+            print(f"\n🔄 실패한 항목들:")
+            for chunk_idx, description, *extra in failed_uploads:
+                print(f"   - {description}")
+        
+        return len(failed_uploads) == 0  # 모든 청크가 성공했으면 True
         
     except Exception as e:
         import traceback
@@ -805,7 +973,9 @@ def upload_dataset_to_hub(dataset_path: str, repo_id: str, private: bool = False
         # 최종 메모리 정리
         gc.collect()
 
-def inspect_dataset(dataset_path: str = "./unified-multimodal-sft"):
+def inspect_dataset(
+    dataset_path: str = "./unified-multimodal-sft"
+):
     """생성된 데이터셋 검사"""
     try:
         print(f"🔍 데이터셋 검사: {dataset_path}")
@@ -905,7 +1075,6 @@ def inspect_dataset(dataset_path: str = "./unified-multimodal-sft"):
         return None
 
 
-
 def main():
     """메인 함수"""
     parser = argparse.ArgumentParser(description="텍스트 + 멀티모달 통합 데이터셋 처리 및 업로드 스크립트")
@@ -925,6 +1094,7 @@ def main():
     parser_upload.add_argument("--private", action="store_true", help="리포지토리를 비공개로 설정")
     parser_upload.add_argument("--num_workers", type=int, default=None, help="처리 워커 수 (기본값: CPU 코어 수)")
     parser_upload.add_argument("--chunk_size", type=int, default=None, help="메모리 처리 청크 크기 (기본값: 동적 계산)")
+    parser_upload.add_argument("--single_repo", action="store_true", help="하나의 리포지토리에 순차적으로 추가")
 
     # inspect 명령어
     parser_inspect = subparsers.add_parser("inspect", help="로컬 데이터셋의 정보를 확인합니다.")
@@ -953,7 +1123,8 @@ def main():
             repo_id=args.repo_id,
             private=args.private,
             num_workers=args.num_workers,
-            chunk_size=args.chunk_size
+            chunk_size=args.chunk_size,
+            single_repo=args.single_repo
         )
 
     elif args.command == "inspect":
