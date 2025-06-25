@@ -18,9 +18,10 @@ class TorchMoECallback:
         entropy_threshold: float = 0.1,
         window_size: int = 1000,
         logger: Optional[Any] = None,
-        log_to_console: bool = True,
+        log_to_console: bool = False,
         save_detailed_logs: bool = False,
-        log_dir: str = "./moe_logs"
+        log_dir: str = "./moe_logs",
+        debug_logging: bool = False
     ):
         self.log_every_n_steps = log_every_n_steps
         self.log_heatmap_every = log_heatmap_every
@@ -32,6 +33,7 @@ class TorchMoECallback:
         self.log_to_console = log_to_console
         self.save_detailed_logs = save_detailed_logs
         self.log_dir = log_dir
+        self.debug_logging = debug_logging
         
         # 내부 상태
         self.step = 0
@@ -47,6 +49,11 @@ class TorchMoECallback:
         if save_detailed_logs:
             import os
             os.makedirs(log_dir, exist_ok=True)
+    
+    def _log_debug(self, message: str):
+        """내부 디버그 메시지 로깅"""
+        if self.debug_logging and self.log_to_console:
+            print(f"[MoE Debug] {message}")
     
     def register_model(self, model: torch.nn.Module):
         """모델에 hooks 등록"""
@@ -65,15 +72,25 @@ class TorchMoECallback:
     
     def _is_moe_layer(self, module):
         """MoE 레이어 감지"""
-        # 일반적인 MoE 레이어 패턴들
-        moe_indicators = [
+        # 실제 사용 중인 MoE 레이어 클래스들
+        moe_class_names = [
+            'G3MoESharedExpertsLayer', 'G3MoESparseGRINBlock', 'G3MoEGRINMoE',
+            'GRINMoESparseMoeBlock', 'G2MoEGRINMoeLayer',
+            # 일반적인 패턴들도 유지
             'gate', 'router', 'expert', 'moe',
             'SparseMLP', 'MixtralSparseMoeBlock', 'SwitchTransformerMLP'
         ]
         
         module_name = module.__class__.__name__
-        return any(indicator in module_name for indicator in moe_indicators) or \
-               hasattr(module, 'gate') or hasattr(module, 'router')
+        is_moe = (any(cls_name in module_name for cls_name in moe_class_names) or 
+                  hasattr(module, 'gate') or hasattr(module, 'router') or
+                  hasattr(module, 'experts'))
+        
+        # 디버깅 정보
+        if is_moe:
+            self._log_debug(f"Detected MoE layer: {module_name}")
+            
+        return is_moe
     
     def _create_hook_fn(self, layer_name):
         """특정 레이어용 hook 함수 생성"""
@@ -82,6 +99,11 @@ class TorchMoECallback:
                 routing_info = self._extract_routing_info(module, input, output)
                 if routing_info:
                     self.layer_outputs[layer_name] = routing_info
+                    if self.step % 100 == 0:  # 100스텝마다 디버깅
+                        self._log_debug(f"{layer_name}: extracted {list(routing_info.keys())}")
+                else:
+                    if self.step % 100 == 0:
+                        self._log_debug(f"{layer_name}: no routing info extracted")
             except Exception as e:
                 if self.log_to_console:
                     print(f"Warning: Failed to extract routing info from {layer_name}: {e}")
@@ -90,6 +112,21 @@ class TorchMoECallback:
     def _extract_routing_info(self, module, input, output):
         """모듈에서 라우팅 정보 추출"""
         routing_info = {}
+        
+        # 실제 G3MoE/GRIN 모델 구조에 맞춘 추출
+        # output이 (hidden_states, router_logits) 튜플인 경우
+        if isinstance(output, tuple) and len(output) == 2:
+            hidden_states, router_logits = output
+            if router_logits is not None:
+                # router_logits에서 routing_probs와 expert_assignments 계산
+                routing_probs = torch.nn.functional.softmax(router_logits, dim=-1)
+                expert_assignments = routing_probs.argmax(dim=-1)
+                
+                routing_info.update({
+                    'routing_probs': routing_probs,
+                    'expert_assignments': expert_assignments,
+                    'gate_logits': router_logits
+                })
         
         # 다양한 MoE 구현에서 라우팅 정보 추출
         # 1. 속성으로 저장된 경우
@@ -108,14 +145,13 @@ class TorchMoECallback:
                 routing_info['gate_logits'] = getattr(module, attr)
                 break
         
-        # 2. output에서 추출 (tuple 형태로 반환되는 경우)
-        if isinstance(output, tuple) and len(output) > 1:
+        # 2. 기존 output에서 추출 (다른 MoE 구현용)
+        if isinstance(output, tuple) and len(output) >= 3:
             # (hidden_states, routing_weights, selected_experts) 형태
-            if len(output) >= 3:
-                routing_info.update({
-                    'routing_probs': output[1] if output[1] is not None else None,
-                    'expert_assignments': output[2] if output[2] is not None else None
-                })
+            routing_info.update({
+                'routing_probs': output[1] if output[1] is not None else None,
+                'expert_assignments': output[2] if output[2] is not None else None
+            })
         
         # 3. gate/router 서브모듈에서 추출
         if hasattr(module, 'gate'):
@@ -125,11 +161,25 @@ class TorchMoECallback:
                     routing_info['routing_probs'] = getattr(gate, attr)
                     break
         
+        # 4. combine_weights 형태로만 제공되는 경우
+        cw = getattr(module, 'combine_weights', None)
+        if cw is None and isinstance(output, tuple) and len(output) >= 3:
+            cw = output[2]
+        if cw is not None:
+            routing_info['routing_probs'] = cw
+            routing_info['expert_assignments'] = cw.argmax(dim=-1)
+        
         # num_experts 정보 추출
         if hasattr(module, 'num_experts'):
             routing_info['num_experts'] = module.num_experts
         elif hasattr(module, 'gate') and hasattr(module.gate, 'num_experts'):
             routing_info['num_experts'] = module.gate.num_experts
+        elif hasattr(module, 'config') and hasattr(module.config, 'n_routed_experts'):
+            routing_info['num_experts'] = module.config.n_routed_experts
+        elif hasattr(module, 'config') and hasattr(module.config, 'num_local_experts'):
+            routing_info['num_experts'] = module.config.num_local_experts
+        elif len(getattr(module, 'experts', [])) > 0:
+            routing_info['num_experts'] = len(module.experts)
         
         return routing_info if routing_info else None
     
@@ -142,10 +192,13 @@ class TorchMoECallback:
         self.step += 1
         
         if not self.layer_outputs:
+            self._log_debug(f"Step {self.step}: no routing info captured.")
             return
         
         # 메트릭 계산
         step_metrics = self._calculate_step_metrics()
+        # wrapper용 last_metrics 저장
+        self.last_metrics = step_metrics
         
         # 로깅
         if self.step % self.log_every_n_steps == 0:
@@ -271,9 +324,9 @@ class TorchMoECallback:
                     
                     plt.figure(figsize=(12, 6))
                     sns.heatmap(usage_matrix.T.numpy(), 
-                               cmap='YlOrRd', 
-                               xticklabels=False,
-                               yticklabels=True)
+                                cmap='YlOrRd', 
+                                xticklabels=False,
+                                yticklabels=True)
                     plt.title(f'{layer_name} Expert Usage Distribution')
                     plt.xlabel('Time Steps')
                     plt.ylabel('Expert Index')
@@ -289,8 +342,7 @@ class TorchMoECallback:
                     
                     plt.close()
         except ImportError:
-            if self.log_to_console:
-                print("matplotlib/seaborn not available for heatmap logging")
+            self._log_debug("matplotlib/seaborn not available for heatmap logging")
     
     def _check_alerts(self, metrics):
         """경고 상황 체크"""
@@ -394,7 +446,7 @@ class TorchMoECallback:
         
         return summary
 
-from transformers import TrainerCallback, TrainerControl, TrainerState
+from transformers.trainer_callback import TrainerCallback, TrainerControl, TrainerState
 from transformers.training_args import TrainingArguments
 from typing import Dict, Any
 
@@ -418,8 +470,7 @@ class TransformersMoECallbackWrapper(TrainerCallback):
             self.torch_callback.register_model(model)
             self._model_registered = True
             
-            if self.torch_callback.log_to_console:
-                print(f"MoE monitoring registered for model with {len(self.torch_callback.hooks)} MoE layers")
+            self.torch_callback._log_debug(f"MoE monitoring registered for model with {len(self.torch_callback.hooks)} MoE layers")
     
     def on_step_begin(
         self, 
@@ -450,7 +501,7 @@ class TransformersMoECallbackWrapper(TrainerCallback):
                 for metric_name, value in layer_metrics.items():
                     if torch.is_tensor(value) and value.numel() == 1:
                         moe_metrics[f'moe_{layer_name}_{metric_name}'] = value.item()
-                    elif isinstance(value, (int, float)):
+                    elif isinstance(value, (int,  float)):
                         moe_metrics[f'moe_{layer_name}_{metric_name}'] = value
             
             logs.update(moe_metrics)

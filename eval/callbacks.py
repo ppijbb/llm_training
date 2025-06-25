@@ -80,7 +80,12 @@ class ModelEvalCallback(DeepEvalHuggingFaceCallback):
         *args, 
         **kwargs
     )->None:
-        super().__init__(evaluation_dataset, metrics, trainer)
+        super().__init__(
+            trainer=trainer, 
+            evaluation_dataset=evaluation_dataset, 
+            metrics=metrics,
+            tokenizer_args=tokenizer_args,
+            show_table=show_table)
     
     def _calculate_metric_scores(self) -> Dict[str, List[float]]:
         return super()._calculate_metric_scores()

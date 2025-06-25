@@ -34,6 +34,7 @@ from data.simple_sft_dataset import get_simple_sft_dataset, create_simple_collat
 
 from training_utils.utils import format_parameters, load_config, setup_deepspeed_environment
 from eval.callbacks import get_model_eval_callback
+from moe_monitoring_callback import create_moe_callback_for_transformers
 
 
 def load_config(config_path: str):
@@ -376,7 +377,18 @@ def main():
             name=training_config["run_name"],
             config=config
         )
-    
+    moe_monitoring_callback = create_moe_callback_for_transformers(
+        log_every_n_steps=50,       # 50 스텝마다 로그 기록
+        logger=wandb,               # 사용할 로거 지정 (wandb)
+        log_to_console=True,        # 콘솔에도 주요 메트릭 출력
+        
+        # === 고급 설정 (선택사항) ===
+        log_heatmap_every=500,      # 500 스텝마다 Expert 사용률 히트맵 로깅
+        alert_threshold_imbalance=4.0, # 특정 Expert 사용률이 평균의 4배를 초과하면 경고
+        unused_expert_threshold=0.25,  # 25% 이상의 Expert가 미사용되면 경고
+        entropy_threshold=0.1,         # 라우팅 엔트로피가 0.1 미만이면 경고
+        save_detailed_logs=False       # 상세 JSON 로그 저장 여부
+    )
     # Setup model and tokenizer
     print("Setting up model and tokenizer...")
     model, tokenizer = setup_model_and_tokenizer(model_config)
@@ -426,8 +438,9 @@ def main():
         eval_dataset=eval_dataset,
         processing_class=tokenizer,
         data_collator=collate_fn,
+        callbacks=[moe_monitoring_callback]
     )
-    # trainer.add_callback(get_model_eval_callback(trainer=trainer))
+    trainer.add_callback(get_model_eval_callback(trainer=trainer, evaluation_dataset=eval_dataset))
     # Print training info
     print("\n" + "="*50)
     print("TRAINING CONFIGURATION")
