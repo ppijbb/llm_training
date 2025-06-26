@@ -53,7 +53,7 @@ class TorchMoECallback:
     def _log_debug(self, message: str):
         """내부 디버그 메시지 로깅"""
         if self.debug_logging and self.log_to_console:
-            print(f"[MoE Debug] {message}")
+            self._log_debug(f"[MoE Debug] {message}")
     
     def register_model(self, model: torch.nn.Module):
         """모델에 hooks 등록"""
@@ -106,7 +106,7 @@ class TorchMoECallback:
                         self._log_debug(f"{layer_name}: no routing info extracted")
             except Exception as e:
                 if self.log_to_console:
-                    print(f"Warning: Failed to extract routing info from {layer_name}: {e}")
+                    self._log_debug(f"Warning: Failed to extract routing info from {layer_name}: {e}")
         return hook_fn
     
     def _extract_routing_info(self, module, input, output):
@@ -216,7 +216,8 @@ class TorchMoECallback:
         # 상세 로그 저장
         if self.save_detailed_logs:
             self._save_detailed_log(step_metrics)
-    
+
+    @torch.no_grad()
     def _calculate_step_metrics(self):
         """현재 step의 메트릭 계산"""
         metrics = {}
@@ -229,6 +230,9 @@ class TorchMoECallback:
             num_experts = routing_info.get('num_experts', 8)  # 기본값
             
             if expert_assignments is not None:
+                if expert_assignments.is_cuda: # GPU tensor인 경우에만
+                    expert_assignments = expert_assignments.clamp(0, num_experts - 1)
+                
                 # Expert 사용 분포
                 if expert_assignments.dim() > 1:
                     expert_assignments = expert_assignments.flatten()
@@ -302,10 +306,10 @@ class TorchMoECallback:
         
         # 콘솔 출력
         if self.log_to_console:
-            print(f"Step {self.step} MoE Metrics:")
+            self._log_debug(f"Step {self.step} MoE Metrics:")
             for key, value in log_data.items():
                 if 'avg_' in key or 'total_' in key:
-                    print(f"  {key}: {value:.4f}")
+                    self._log_debug(f"  {key}: {value:.4f}")
     
     def _log_heatmaps(self):
         """Expert 사용률 히트맵 로깅"""
@@ -400,7 +404,7 @@ class TorchMoECallback:
             })
             
             if self.log_to_console:
-                print(f"⚠️  MoE Alert at step {self.step}: {alert['message']}")
+                self._log_debug(f"⚠️  MoE Alert at step {self.step}: {alert['message']}")
             
             if self.logger and hasattr(self.logger, 'log'):
                 self.logger.log({
@@ -469,7 +473,6 @@ class TransformersMoECallbackWrapper(TrainerCallback):
         if model is not None and not self._model_registered:
             self.torch_callback.register_model(model)
             self._model_registered = True
-            
             self.torch_callback._log_debug(f"MoE monitoring registered for model with {len(self.torch_callback.hooks)} MoE layers")
     
     def on_step_begin(
@@ -516,15 +519,15 @@ class TransformersMoECallbackWrapper(TrainerCallback):
         """훈련 종료"""
         summary = self.torch_callback.get_summary()
         if self.torch_callback.log_to_console:
-            print("\n" + "="*50)
-            print("MoE Training Summary:")
-            print(f"Total steps: {summary['total_steps']}")
-            print(f"Total alerts: {summary['total_alerts']}")
+            self.torch_callback._log_debug("\n" + "="*50)
+            self.torch_callback._log_debug("MoE Training Summary:")
+            self.torch_callback._log_debug(f"Total steps: {summary['total_steps']}")
+            self.torch_callback._log_debug(f"Total alerts: {summary['total_alerts']}")
             if summary['alert_types']:
-                print("Alert breakdown:")
+                self.torch_callback._log_debug("Alert breakdown:")
                 for alert_type, count in summary['alert_types'].items():
-                    print(f"  {alert_type}: {count}")
-            print("="*50)
+                    self.torch_callback._log_debug(f"  {alert_type}: {count}")
+            self.torch_callback._log_debug("="*50)
         
         # 정리
         self.torch_callback.cleanup()

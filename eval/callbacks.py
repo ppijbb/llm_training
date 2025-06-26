@@ -18,38 +18,54 @@ def get_model_eval_callback(
     trainer: Trainer,
     evaluation_dataset: Optional[EvaluationDataset] = None,
     metrics: Optional[List[BaseMetric]] = None,
-    tokenizer_args: Optional[Dict] = None,
+    tokenizer_args: Optional[Dict] = {},
     aggregation_method: str = "avg",
     show_table: bool = False,
 ): 
-
     
     if evaluation_dataset is None:
-        first_golden = Golden(input="...")
-        second_golden = Golden(input="...")
-        evaluation_dataset = EvaluationDataset(goldens=[first_golden, second_golden])
         # evaluation_dataset = EvaluationDataset(
-        #     golden_dataset=Golden(
-        #         dataset_name="",
-        #         dataset_config_name="",
-        #     )
+        #     goldens=[
+        #         Golden(input="..."),
+        #         Golden(input="...")
+        #     ]
         # )
+        from deepeval.benchmarks import MMLU
+        from deepeval.benchmarks.mmlu.task import MMLUTask
+        from deepeval.metrics import HallucinationMetric, AnswerRelevancyMetric
+        from deepeval.test_case import ArenaTestCase, LLMTestCase
+        from deepeval.metrics import ArenaGEval
+        # mmlu = MMLU(tasks=[MMLUTask.HIGH_SCHOOL_EUROPEAN_HISTORY], n_shots=0)
+        # evaluation_dataset = EvaluationDataset(
+        #     goldens=mmlu.load_benchmark_dataset(task=MMLUTask.HIGH_SCHOOL_EUROPEAN_HISTORY)
+        # )
+        # print("Golden dataset: ","\n",  evaluation_dataset.goldens, "\n")
+        evaluation_dataset = EvaluationDataset(
+            test_cases=[
+                LLMTestCase(
+                    name="GPT-4",
+                    input="What is the capital of France?",
+                    actual_output="Paris",
+                ),
+                LLMTestCase(
+                    name="Claude",
+                    input="What is the capital of France?",
+                    actual_output="Paris is the capital of France.",
+                )
+            ]
+        )
+        evaluation_dataset.alias = evaluation_dataset._alias
     if metrics is None:
-        metrics = [ GEval(
-            name="Correctness",
-            criteria="Determine whether the actual output is factually correct based on the expected output.",
-            # NOTE: you can only provide either criteria or evaluation_steps, and not both
-            evaluation_steps=[
-                "Check whether the facts in 'actual output' contradicts any facts in 'expected output'",
-                "You should also heavily penalize omission of detail",
-                "Vague language, or contradicting OPINIONS, are OK"
-            ],
-            evaluation_params=[LLMTestCaseParams.INPUT, LLMTestCaseParams.ACTUAL_OUTPUT, LLMTestCaseParams.EXPECTED_OUTPUT],
-        )]
-    if tokenizer_args is None:
-        tokenizer_args = {}
-    if aggregation_method is None:
-        aggregation_method = "avg"
+        metrics = [
+             ArenaGEval(
+                name="Friendly",
+                criteria="Choose the winter of the more friendly contestant based on the input and actual output",
+                evaluation_params=[
+                    LLMTestCaseParams.INPUT,
+                    LLMTestCaseParams.ACTUAL_OUTPUT,
+                ],
+            )
+        ]
 
     return ModelEvalCallback(
         trainer=trainer,
