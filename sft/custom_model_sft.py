@@ -146,10 +146,10 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
         "n_group": g3moe_params["n_group"],
         "topk_group": g3moe_params["topk_group"],
         "num_experts_per_tok": g3moe_params["num_experts_per_tok"],
-        "first_k_dense_replace": 8,  # Fixed parameter
-        "router_aux_loss_coef": 0.001,  # Fixed parameter
-        "router_jitter_noise": 0.01,  # Fixed parameter
-        "input_jitter_noise": 0.01,  # Fixed parameter
+        "first_k_dense_replace": g3moe_params["first_k_dense_replace"],
+        "router_aux_loss_coef": g3moe_params["router_aux_loss_coef"],
+        "router_jitter_noise": g3moe_params["router_jitter_noise"],
+        "input_jitter_noise": g3moe_params["input_jitter_noise"],
         "model_type": "g3moe_text",
         "rope_scaling": {
             "rope_type": "linear",
@@ -232,7 +232,7 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
 def setup_dataset(data_config: Dict[str, Any], tokenizer):
     """Setup training dataset"""    
     dataset_name = data_config.get("dataset_name", "HuggingFaceTB/smoltalk")
-    max_samples = data_config.get("max_samples", 10000)
+    max_samples = data_config.get("max_samples", 100000)
     max_seq_length = data_config.get("max_seq_length", 131072)
     test_size = data_config.get("test_size", 0.1)
     
@@ -437,10 +437,10 @@ def main():
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         processing_class=tokenizer,
-        data_collator=collate_fn,
-        callbacks=[moe_monitoring_callback]
+        data_collator=collate_fn
     )
-    trainer.add_callback(get_model_eval_callback(trainer=trainer, evaluation_dataset=eval_dataset))
+    trainer.add_callback(moe_monitoring_callback)
+    trainer.add_callback(get_model_eval_callback(trainer=trainer))
     # Print training info
     print("\n" + "="*50)
     print("TRAINING CONFIGURATION")

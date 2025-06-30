@@ -215,6 +215,7 @@ class G3MoETextConfig(PretrainedConfig):
         router_aux_loss_coef=0.001,
         router_jitter_noise=0.01,
         input_jitter_noise=0.01,
+        router_z_loss_coef=1e-4,
         freeze_shared_experts=True,
         hidden_activation="gelu_pytorch_tanh",
         max_position_embeddings=131_072,
@@ -267,6 +268,7 @@ class G3MoETextConfig(PretrainedConfig):
         self.router_aux_loss_coef = router_aux_loss_coef
         self.router_jitter_noise = router_jitter_noise
         self.input_jitter_noise = input_jitter_noise
+        self.router_z_loss_coef = router_z_loss_coef
         self.freeze_shared_experts = freeze_shared_experts
         self.initializer_range = initializer_range
         self.rms_norm_eps = rms_norm_eps

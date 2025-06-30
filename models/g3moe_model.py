@@ -79,7 +79,11 @@ _CONFIG_FOR_DOC = "G3MoEConfig"
 
 
 def load_balancing_loss_func(
-    gate_logits: torch.Tensor, num_experts: int, top_k=2, attention_mask: Optional[torch.Tensor] = None
+    gate_logits: torch.Tensor, 
+    num_experts: int, 
+    top_k: int = 2, 
+    attention_mask: Optional[torch.Tensor] = None, 
+    router_z_loss_coef: Optional[float] = None
 ) -> torch.Tensor:
     r"""
     Computes auxiliary load balancing loss as in Switch Transformer - implemented in Pytorch.
@@ -95,6 +99,8 @@ def load_balancing_loss_func(
             shape [batch_size X sequence_length] if not None.
         num_experts (`int`, *optional*):
             Number of experts
+        router_z_loss_coef (`float`, *optional*):
+            Coefficient for the z-loss term in the load balancing loss.
     Returns:
         The auxiliary loss.
     """
@@ -148,6 +154,10 @@ def load_balancing_loss_func(
         )
 
     overall_loss = torch.sum(tokens_per_expert * router_prob_per_expert.unsqueeze(0))
+    if router_z_loss_coef is not None:
+        log_z = torch.logsumexp(concatenated_gate_logits, dim=-1)
+        z_loss = torch.square(log_z).mean()
+        overall_loss += router_z_loss_coef * z_loss
     return overall_loss * num_experts
 
 
@@ -548,6 +558,10 @@ class G3MoESparseGRINBlock(nn.Module):
         # print ( 'moe', self.iter, torch.norm(hidden_states).item())
         router_logits = self.gate(hidden_states)
         
+        if self.training:
+            # Add noise for exploration to prevent expert starvation
+            router_logits = router_logits + torch.randn_like(router_logits) * 1e-3
+
         routing_weights, selected_experts = sparsemixer(
             router_logits, 
             top_k=self.top_k, 
@@ -1735,11 +1749,13 @@ class G3MoEForCausalLM(G3MoEPreTrainedModel, GenerationMixin):
         if labels is not None:
             loss = self.loss_function(logits, labels, self.vocab_size, **loss_kwargs)
             if outputs.router_logits is not None:
+                # Add router z-loss to prevent router from being too confident
                 aux_loss = load_balancing_loss_func(
                     outputs.router_logits,
                     self.model.config.n_routed_experts,
                     self.model.config.num_experts_per_tok,
                     attention_mask,
+                    router_z_loss_coef=self.model.config.router_z_loss_coef,
                 )
                 loss += self.model.config.router_aux_loss_coef * aux_loss
 
