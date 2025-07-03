@@ -275,3 +275,14 @@ moe_callback.cleanup()
 ```
 
 이 가이드를 통해 MoE 모델의 훈련 과정을 효과적으로 모니터링하고 안정성을 높이는 데 도움이 되기를 바랍니다. 
+
+MoE 모니터링 지표 Good vs. Bad 요약
+지표 (Metric)	✅ 좋음 (Good)	❌ 나쁨 (Bad)
+1. avg_expert_cv<br/>(사용량 불균형도)	0.1 이하로 낮고 안정적일 때	0.5를 초과하고 계속 오를 때
+2. total_unused_experts<br/>(놀고 있는 전문가 수)	항상 0을 유지할 때	1 이상일 때 (매우 심각)
+3. avg_routing_entropy<br/>(라우팅 다양성)	1.5 이상으로 높고 안정적일 때<br/>(전문가 8개 기준)	0.5 미만으로 계속 떨어질 때
+4. usage_heatmap<br/>(사용량 히트맵)	모든 행의 색상이 균일할 때	특정 행만 진한 줄무늬가 보일 때
+5. 콘솔 경고 (Alert)<br/>(문제 알림)	경고가 전혀 없을 때	imbalance나 entropy 경고가 나타날 때
+핵심 요약:
+가장 먼저 볼 것: avg_expert_cv가 낮은지, total_unused_experts가 0인지 확인하세요. 이 두 가지만 만족해도 훈련은 비교적 안정적인 것입니다.
+추가 확인: avg_routing_entropy가 높게 유지되는지 보면, 모델이 더 건강하게 학습하고 있는지 알 수 있습니다.
