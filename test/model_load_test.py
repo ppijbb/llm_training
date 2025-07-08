@@ -75,7 +75,7 @@ test_model = model_architecture.from_pretrained(
     #     bnb_4bit_compute_dtype=torch.bfloat16,
     #     bnb_4bit_quant_storage=torch.bfloat16)
     ).to("cuda")
-test_model = PeftModel.from_pretrained(test_model, "/mnt/disks/local-ssd/training_logs/outputs/")
+# test_model = PeftModel.from_pretrained(test_model, "/mnt/disks/local-ssd/training_logs/outputs/")
 tokenizer = AutoProcessor.from_pretrained(base_model_name)
 with open("/home/conan_jung/workspace/llm_training/sft/config/chat_template.txt", "r") as f:
     tokenizer.chat_template = f.read()
@@ -103,13 +103,13 @@ test_input = tokenizer.apply_chat_template(
             "role": "user",
             "content": [
                 {"type": "text", "text": "Describe this image in Korean."},
-                {"type": "image", "url": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/p-blog/candy.JPG"}                
-                # {"type": "image", "url": "https://huggingface.co/spaces/merve/chameleon-7b/resolve/main/bee.jpg"}
+                # {"type": "image", "url": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/p-blog/candy.JPG"}                
+                {"type": "image", "url": "https://huggingface.co/spaces/merve/chameleon-7b/resolve/main/bee.jpg"}
             ]
         }
     ],
     # tokenize=True,
-    # add_generation_prompt=True,
+    add_generation_prompt=True,
     # return_tensors="pt",
     # return_dict=True,
 )
@@ -118,7 +118,10 @@ test_input = tokenizer.apply_chat_template(
 image1 = load_image("https://cdn.britannica.com/61/93061-050-99147DCE/Statue-of-Liberty-Island-New-York-Bay.jpg")
 image2 = load_image("https://huggingface.co/spaces/merve/chameleon-7b/resolve/main/bee.jpg")
 
-inputs = tokenizer(text=test_input, images=[image1], return_tensors="pt")
+inputs = tokenizer(
+    text=test_input,
+    images=[image2],
+    return_tensors="pt")
 inputs = inputs.to(test_model.device)
 
 print(test_model)

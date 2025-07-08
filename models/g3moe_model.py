@@ -1190,7 +1190,22 @@ class G3MoEPreTrainedModel(PreTrainedModel):
 
         if isinstance(module, (nn.Linear, nn.Conv2d)):
             logging.get_logger('transformers').debug(f"Initializing {module} with {std}")
-            module.weight.data.normal_(mean=0.0, std=std)
+            
+            # Check if this is a gate layer by examining the module's name in the model
+            is_gate_layer = False
+            for name, mod in self.named_modules():
+                if mod is module and 'gate' in name:
+                    is_gate_layer = True
+                    break
+            
+            if is_gate_layer:
+                # Apply Xavier uniform initialization for gate layers
+                nn.init.xavier_uniform_(module.weight)
+                logging.get_logger('transformers').debug(f"Applied Xavier uniform initialization to gate layer: {name}")
+            else:
+                # Apply standard normal initialization for other layers
+                module.weight.data.normal_(mean=0.0, std=std)
+                
             if module.bias is not None:
                 module.bias.data.zero_()
         elif isinstance(module, nn.Embedding):

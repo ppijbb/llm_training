@@ -400,28 +400,89 @@ def merge_and_create_dataset_url(
     
     return final_save_path
 
+def upload_dataset_to_hub_url(
+    dataset_path: str,
+    repo_id: str,
+    private: bool = False,
+    max_shard_size: str = "2GB"
+):
+    """
+    로컬에 저장된 URL 기반 데이터셋을 허깅페이스 허브에 업로드합니다.
+    """
+    try:
+        print(f"🚀 데이터셋 업로드 시작: {dataset_path} -> {repo_id}")
+
+        if not os.path.exists(dataset_path):
+             print(f"❌ 데이터셋 경로를 찾을 수 없습니다: {dataset_path}")
+             return False
+
+        dataset = load_from_disk(dataset_path)
+        print(f"✅ 데이터셋 로드 완료: {len(dataset)}개 샘플")
+
+        print(f"📤 허브에 업로드 중... (샤드 크기: {max_shard_size})")
+        dataset.push_to_hub(
+            repo_id=repo_id,
+            private=private,
+            commit_message=f"Upload URL-based dataset from {os.path.basename(dataset_path)}",
+            max_shard_size=max_shard_size
+        )
+
+        print(f"\n🎉 업로드 완료!")
+        print(f"✅ 데이터셋이 '{repo_id}' 리포지토리에 업로드되었습니다.")
+        print(f"🔗 https://huggingface.co/datasets/{repo_id}")
+        return True
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print(f"❌ 업로드 중 오류 발생: {e}")
+        return False
+
 def main():
     """메인 함수"""
-    parser = argparse.ArgumentParser(description="URL 방식 멀티모달 통합 데이터셋 처리 스크립트")
-    parser.add_argument("--output_name", type=str, default="unified-multimodal-sft-url", help="생성할 데이터셋의 로컬 폴더 이름")
-    parser.add_argument("--max_samples", type=int, default=None, help="데이터셋별 최대 샘플 수")
-    parser.add_argument("--local_path", type=str, default="./", help="데이터셋을 저장할 로컬 경로")
+    parser = argparse.ArgumentParser(description="URL 방식 멀티모달 통합 데이터셋 처리 및 업로드 스크립트")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # merge 명령어
+    parser_merge = subparsers.add_parser("merge", help="여러 데이터셋을 병합하여 URL 기반 데이터셋을 로컬에 저장합니다.")
+    parser_merge.add_argument("--output_name", type=str, default="unified-multimodal-sft-url", help="생성할 데이터셋의 로컬 폴더 이름")
+    parser_merge.add_argument("--max_samples", type=int, default=None, help="데이터셋별 최대 샘플 수")
+    parser_merge.add_argument("--local_path", type=str, default="./", help="데이터셋을 저장할 로컬 경로")
+
+    # upload 명령어
+    parser_upload = subparsers.add_parser("upload", help="로컬에 저장된 URL 기반 데이터셋을 허깅페이스 허브에 업로드합니다.")
+    parser_upload.add_argument("dataset_path", type=str, help="업로드할 로컬 데이터셋 경로")
+    parser_upload.add_argument("repo_id", type=str, help="허깅페이스 허브 리포지토리 ID (예: username/repo-name)")
+    parser_upload.add_argument("--private", action="store_true", help="리포지토리를 비공개로 설정")
+    parser_upload.add_argument("--max_shard_size", type=str, default="2GB", help="업로드 시 최대 샤드 크기 (예: '500MB', '2GB')")
 
     args = parser.parse_args()
 
-    print(f"🎯 URL 방식 처리 시작")
-    print(f"🎯 타겟 로컬 경로: {os.path.join(args.local_path, args.output_name)}")
-    
-    final_path = merge_and_create_dataset_url(
-        output_name=args.output_name,
-        max_samples_per_dataset=args.max_samples,
-        local_path=args.local_path
-    )
-    
-    if final_path:
-        print("\n🎉 URL 방식 병합 완료!")
-        print(f"✅ 데이터셋이 '{final_path}'에 저장되었습니다.")
-        print(f"📝 이미지는 URL로 저장되어 실제 학습 시 다운로드됩니다.")
+    if args.command == "merge":
+        print(f"🎯 URL 방식 처리 시작")
+        final_output_name = args.output_name or "unified-multimodal-sft-url"
+        print(f"🎯 타겟 로컬 경로: {os.path.join(args.local_path, final_output_name)}")
+        
+        final_path = merge_and_create_dataset_url(
+            output_name=final_output_name,
+            max_samples_per_dataset=args.max_samples,
+            local_path=args.local_path
+        )
+        
+        if final_path:
+            print("\n🎉 URL 방식 병합 완료!")
+            print(f"✅ 데이터셋이 '{final_path}'에 저장되었습니다.")
+            print(f"📝 이미지는 URL로 저장되어 실제 학습 시 다운로드됩니다.")
+            print(f"\n👉 이제 다음 명령어로 허브에 업로드할 수 있습니다:")
+            print(f"   python {sys.argv[0]} upload {final_path} <your_hf_username>/{final_output_name}")
+
+    elif args.command == "upload":
+        upload_dataset_to_hub_url(
+            dataset_path=args.dataset_path,
+            repo_id=args.repo_id,
+            private=args.private,
+            max_shard_size=args.max_shard_size
+        )
 
 if __name__ == "__main__":
     main() 

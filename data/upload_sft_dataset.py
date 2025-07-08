@@ -21,6 +21,11 @@ import pandas as pd
 import tempfile
 import shutil
 
+# PNG 텍스트 청크 크기 제한 증가 (Decompressed data too large 오류 해결)
+# 일부 이미지에 매우 큰 메타데이터가 포함된 경우를 처리하기 위함
+from PIL import PngImagePlugin
+PngImagePlugin.MAX_TEXT_CHUNK = 100 * 1024 * 1024 # 100MB로 제한 증가
+
 disable_progress_bars()  # 진행 표시줄 비활성화
 
 # 이미지 캐시 및 세션 설정
@@ -675,8 +680,7 @@ def merge_and_create_dataset(
                 'content': Sequence(
                     Features({
                         'type': Value('string'),
-                        'text': Value('string'),
-                        'index': Value('int64')
+                        'text': Value('string')
                     })
                 )
             })
@@ -744,7 +748,8 @@ def upload_dataset_to_hub(
     private: bool = False,
     num_workers: Optional[int] = None,
     chunk_size: Optional[int] = None,
-    single_repo: bool = False
+    single_repo: bool = False,
+    start_chunk_num: int = 0
 ):
     """
     로컬에 저장된 데이터셋을 허깅페이스 허브에 업로드합니다.
@@ -811,8 +816,7 @@ def upload_dataset_to_hub(
                     'content': Sequence(
                         Features({
                             'type': Value('string'),
-                            'text': Value('string'),
-                            'index': Value('int64')
+                            'text': Value('string')
                         })
                     )
                 })
@@ -841,8 +845,14 @@ def upload_dataset_to_hub(
             current_chunk.append(record)
             
             if len(current_chunk) >= CHUNK_SIZE:
+                if chunk_num < start_chunk_num:
+                    print(f"   건너뛰기: 청크 {chunk_num} (시작 번호: {start_chunk_num})")
+                    current_chunk = []
+                    chunk_num += 1
+                    continue
+
                 # 청크를 Dataset으로 변환하고 임시 저장
-                chunk_dataset = Dataset.from_list(current_chunk)
+                chunk_dataset = Dataset.from_list(current_chunk, features=features)
                 temp_chunk_path = f"/mnt/disks/data/tmp/chunk_{chunk_num}"
                 chunk_dataset.save_to_disk(temp_chunk_path)
                 chunk_datasets.append(temp_chunk_path)
@@ -857,25 +867,40 @@ def upload_dataset_to_hub(
         
         # 마지막 청크 처리
         if current_chunk:
-            chunk_dataset = Dataset.from_list(current_chunk)
-            temp_chunk_path = f"/mnt/disks/data/tmp/chunk_{chunk_num}"
-            chunk_dataset.save_to_disk(temp_chunk_path)
-            chunk_datasets.append(temp_chunk_path)
-            print(f"   청크 {chunk_num}: {len(current_chunk)}개 저장 완료")
+            if chunk_num >= start_chunk_num:
+                chunk_dataset = Dataset.from_list(current_chunk, features=features)
+                temp_chunk_path = f"/mnt/disks/data/tmp/chunk_{chunk_num}"
+                chunk_dataset.save_to_disk(temp_chunk_path)
+                chunk_datasets.append(temp_chunk_path)
+                print(f"   청크 {chunk_num}: {len(current_chunk)}개 저장 완료")
             del chunk_dataset
             gc.collect()
         
         # 하나의 리포지토리에 청크들을 순차적으로 이어서 추가
-        print(f"📤 총 {len(chunk_datasets)}개 청크를 하나의 리포지토리에 순차 추가...")
+        print(f"📤 총 {len(chunk_datasets)}개 신규 청크와 기존 청크를 하나의 리포지토리에 순차 추가...")
         
+        all_chunk_paths_to_process = []
+        temp_chunk_dir = "/mnt/disks/data/tmp"
+        if start_chunk_num > 0:
+            print(f"기존 청크 (0 ~ {start_chunk_num - 1})를 처리 목록에 추가 중...")
+            for i in range(start_chunk_num):
+                path = os.path.join(temp_chunk_dir, f"chunk_{i}")
+                if os.path.exists(path):
+                    all_chunk_paths_to_process.append(path)
+                else:
+                    print(f"  [경고] 기존 청크를 찾을 수 없어 건너뜁니다: {path}")
+
+        all_chunk_paths_to_process.extend(chunk_datasets)
+        print(f"✅ 총 {len(all_chunk_paths_to_process)}개의 청크를 처리합니다.")
+
         accumulated_dataset = None
         successful_chunks = 0
         failed_uploads = []
         
-        for i, chunk_path in enumerate(chunk_datasets):
+        for i, chunk_path in enumerate(all_chunk_paths_to_process):
             chunk_dataset = Dataset.load_from_disk(chunk_path)
             
-            print(f"   청크 {i+1}/{len(chunk_datasets)} 처리 중...")
+            print(f"   청크 {i+1}/{len(all_chunk_paths_to_process)} 처리 중... ({os.path.basename(chunk_path)})")
             
             try:
                 # 첫 번째 청크이거나 accumulated_dataset이 None인 경우
@@ -892,7 +917,7 @@ def upload_dataset_to_hub(
                 successful_chunks += 1
                 
                 # 10개 청크마다 또는 마지막 청크일 때 업로드
-                should_upload = (i + 1) % 10 == 0 or i == len(chunk_datasets) - 1
+                should_upload = (i + 1) % 10 == 0 or i == len(all_chunk_paths_to_process) - 1
                 
                 if should_upload:
                     print(f"     📤 중간 업로드 ({successful_chunks}개 청크, {len(accumulated_dataset)}개 샘플)...")
@@ -943,7 +968,7 @@ def upload_dataset_to_hub(
             shutil.rmtree(chunk_path, ignore_errors=True)
             
             # API 제한 회피를 위한 대기
-            if i < len(chunk_datasets) - 1:
+            if i < len(all_chunk_paths_to_process) - 1:
                 wait_time = 5  # 5초 대기
                 print(f"     다음 청크까지 {wait_time}초 대기...")
                 time.sleep(wait_time)
@@ -954,7 +979,7 @@ def upload_dataset_to_hub(
             print(f"✅ 최종 데이터셋: {len(accumulated_dataset):,}개 샘플")
             print(f"📋 리포지토리: https://huggingface.co/datasets/{repo_id}")
         
-        print(f"✅ 처리된 청크: {successful_chunks}/{len(chunk_datasets)}개")
+        print(f"✅ 처리된 청크: {successful_chunks}/{len(all_chunk_paths_to_process)}개")
         print(f"❌ 실패: {len(failed_uploads)}개")
         
         if failed_uploads:
@@ -1095,6 +1120,7 @@ def main():
     parser_upload.add_argument("--num_workers", type=int, default=None, help="처리 워커 수 (기본값: CPU 코어 수)")
     parser_upload.add_argument("--chunk_size", type=int, default=None, help="메모리 처리 청크 크기 (기본값: 동적 계산)")
     parser_upload.add_argument("--single_repo", action="store_true", help="하나의 리포지토리에 순차적으로 추가")
+    parser_upload.add_argument("--start_chunk_num", type=int, default=0, help="업로드를 시작할 청크 번호. 이 번호 이전의 청크는 생성/처리를 건너뜁니다.")
 
     # inspect 명령어
     parser_inspect = subparsers.add_parser("inspect", help="로컬 데이터셋의 정보를 확인합니다.")
@@ -1124,7 +1150,8 @@ def main():
             private=args.private,
             num_workers=args.num_workers,
             chunk_size=args.chunk_size,
-            single_repo=args.single_repo
+            single_repo=args.single_repo,
+            start_chunk_num=args.start_chunk_num
         )
 
     elif args.command == "inspect":
