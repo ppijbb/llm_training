@@ -134,8 +134,14 @@ def load_balancing_loss_func(
         return torch.tensor(0.0)
 
     if isinstance(gate_logits, tuple):
+        # Add a check for empty tuple
+        if not gate_logits:
+            return torch.tensor(0.0)
         compute_device = gate_logits[0].device
         concatenated_gate_logits = torch.cat([layer_gate.to(compute_device) for layer_gate in gate_logits], dim=0)
+    else:
+        # handle tensor input
+        concatenated_gate_logits = gate_logits
 
     routing_weights = torch.nn.functional.softmax(concatenated_gate_logits, dim=-1)
 
@@ -304,6 +310,7 @@ class G3MoEMLP(nn.Module):
 
 
 class G3MoETopkRouter(nn.Module):
+
     def __init__(self, config, **kwargs):
         super().__init__()
         self.config = config
@@ -631,6 +638,8 @@ class G3MoESparseGRINBlock(nn.Module):
 
 class G3MoEHybridRouter(nn.Module):
     """Hybrid Router: 하나의 linear layer에서 sigmoid와 sparsemixer 두 방식으로 routing"""
+    e_score_correction_bias: torch.Tensor
+    
     def __init__(self, config, **kwargs):
         super().__init__()
         self.config = config
@@ -699,7 +708,6 @@ class G3MoEHybridRouter(nn.Module):
 
 class G3MoEGRINMoE(nn.Module):
     """Hybrid Router: 하나의 linear layer에서 sigmoid로 expert 선택, sparsemixer로 가중치 계산"""
-    expert_load_ema: torch.Tensor
 
     def __init__(self, config, **kwargs):
         super().__init__()
@@ -723,6 +731,11 @@ class G3MoEGRINMoE(nn.Module):
         self.ema_alpha = getattr(config, "ema_alpha", 0.99)
         self.balancing_strength = getattr(config, "balancing_strength", 0.01)
         self.register_buffer("expert_load_ema", torch.zeros(self.num_experts))
+        
+        # Enhanced Expert Utilization
+        self.register_buffer("expert_specialization_ema", torch.zeros(self.num_experts, self.hidden_dim))
+        self.routing_temperature = nn.Parameter(torch.ones(1))
+        self.specialization_strength = getattr(config, "specialization_strength", 0.01)
         
         # shared_experts freeze 여부 (기본값은 True로 설정)
         self.freeze_shared_experts = getattr(config, 'freeze_shared_experts', True)
@@ -772,6 +785,19 @@ class G3MoEGRINMoE(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_dim)
         # router_logits: (batch * sequence_length, n_experts)
         router_logits = F.linear(hidden_states.type(torch.float32), self.router.type(torch.float32))
+
+        # ---- Enhanced Routing Logic ----
+        if self.training:
+            # Add specialization bonus based on hidden state similarity to expert's specialization
+            with torch.no_grad():
+                normalized_hidden = F.normalize(hidden_states, dim=-1)
+                normalized_ema = F.normalize(self.expert_specialization_ema.to(hidden_states.device), dim=-1)
+                specialization_bonus = torch.matmul(normalized_hidden, normalized_ema.T)
+            router_logits += specialization_bonus * self.specialization_strength
+
+        # Apply temperature scaling
+        router_logits /= self.routing_temperature
+        # ---- End of Enhanced Routing Logic ----
 
         # ---- Adaptive filter logic for load balancing (applied during training) ----
         if self.training:
@@ -834,6 +860,14 @@ class G3MoEGRINMoE(nn.Module):
                 # However `index_add_` only support torch tensors for indexing so we'll use
                 # the `top_x` tensor here.
                 final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
+                
+                # --- Update Specialization EMA ---
+                if self.training:
+                    with torch.no_grad():
+                        current_mean_hidden = hidden_states[top_x_list].mean(dim=0)
+                        self.expert_specialization_ema[expert_idx].mul_(self.ema_alpha).add_(current_mean_hidden, alpha=1.0 - self.ema_alpha)
+                # --- End Update Specialization EMA ---
+
         final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
         return final_hidden_states, router_logits
     
@@ -1031,9 +1065,11 @@ class G3MoEAttention(nn.Module):
         position_embeddings: torch.Tensor,
         attention_mask: Optional[torch.Tensor],
         past_key_value: Optional[Cache] = None,
+        output_attentions: bool = False, # Added default value
+        use_cache: bool = False, # Added default value
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Cache]]:
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
         
@@ -1061,7 +1097,10 @@ class G3MoEAttention(nn.Module):
             
             # Here we need to slice as we use a static cache by default, but FA2 does not support it
             if attention_mask is not None and self.config._attn_implementation == "flash_attention_2":
-                seq_len = attention_mask.shape[-1]
+                if hasattr(past_key_value, "get_seq_length"):
+                    seq_len = past_key_value.get_seq_length()
+                else:
+                    seq_len = key_states.shape[-1]
                 key_states, value_states = key_states[:, :, :seq_len, :], value_states[:, :, :seq_len, :]
         
         attention_interface: Callable = eager_attention_forward
@@ -1086,12 +1125,13 @@ class G3MoEAttention(nn.Module):
             dropout=self.attention_dropout if self.training else 0.0,
             scaling=self.scaling,
             sliding_window=self.sliding_window,
+            output_attentions=output_attentions,
             **kwargs,
         )
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
-        return attn_output, attn_weights
+        return attn_output, attn_weights, past_key_value
 
 
 class G3MoEDecoderLayer(nn.Module):
@@ -1181,17 +1221,18 @@ class G3MoEDecoderLayer(nn.Module):
                 position_embeddings = position_embeddings_local
             else:
                 position_embeddings = position_embeddings_global
-            hidden_states, self_attn_weights = self.self_attn(
-                hidden_states=hidden_states,
-                position_embeddings=position_embeddings,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_value=past_key_value,
-                output_attentions=output_attentions,
-                use_cache=use_cache,
-                cache_position=cache_position,
-                **kwargs,
-            )
+
+        hidden_states, self_attn_weights, past_key_value = self.self_attn(
+            hidden_states=hidden_states,
+            position_embeddings=position_embeddings,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            **kwargs,
+        )
         
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = residual + hidden_states
@@ -1380,6 +1421,49 @@ class G3MoEPreTrainedModel(PreTrainedModel):
             logging.get_logger('transformers').info("Model does not have expected structure. MoE experts not initialized from MLP weights.")
         logging.set_verbosity_info()
         return model
+
+    def get_parameter_groups(self):
+        """
+        Returns a list of parameter groups for the optimizer, which allows to apply different
+        learning rates to different parts of the model. This is particularly useful for MoE models
+        where components like routers and experts can benefit from different learning schedules.
+        """
+        
+        router_params = []
+        expert_params = []
+        shared_expert_params = []
+        attention_params = []
+        other_params = []
+
+        for name, param in self.named_parameters():
+            if not param.requires_grad:
+                continue
+
+            if 'gate.weight' in name or 'router' in name:
+                router_params.append(param)
+            elif 'shared_experts' in name:
+                shared_expert_params.append(param)
+            elif 'experts' in name:
+                expert_params.append(param)
+            elif 'self_attn' in name:
+                attention_params.append(param)
+            else:
+                other_params.append(param)
+        
+        # In a training script, you can assign different learning rates to these groups.
+        # For example:
+        # optimizer_grouped_parameters = [
+        #     {'params': model.get_parameter_groups()['router'], 'lr': 1e-4},
+        #     {'params': model.get_parameter_groups()['expert'], 'lr': 5e-5},
+        #     ...
+        # ]
+        return {
+            'router': router_params,
+            'expert': expert_params,
+            'shared_expert': shared_expert_params,
+            'attention': attention_params,
+            'other': other_params,
+        }
 
 G3MoE_INPUTS_DOCSTRING = r"""
     Args:

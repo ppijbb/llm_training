@@ -240,6 +240,7 @@ class G3MoETextConfig(PretrainedConfig):
         ema_alpha=0.99,
         balancing_strength=0.01,
         ortho_loss_coef=0.01,
+        specialization_strength=0.01,
         # 하이브리드 positional embedding 관련 추가 인자
         no_rope_layers=None,
         no_rope_layer_interval: int = 0,
@@ -284,6 +285,7 @@ class G3MoETextConfig(PretrainedConfig):
         self.ema_alpha = ema_alpha
         self.balancing_strength = balancing_strength
         self.ortho_loss_coef = ortho_loss_coef
+        self.specialization_strength = specialization_strength
         self.initializer_range = initializer_range
         self.rms_norm_eps = rms_norm_eps
         self.use_cache = use_cache
