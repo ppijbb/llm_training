@@ -77,6 +77,32 @@ logger = logging.get_logger(__name__)
 _CONFIG_FOR_DOC = "G3MoEConfig"
 
 
+def calculate_ortho_loss_for_experts(expert_weights: List[torch.Tensor]) -> torch.Tensor:
+    """
+    Calculates the orthogonalization loss for a set of expert weights from a single MoE layer.
+    This loss encourages functional diversity among experts by penalizing similarity
+    in their weight spaces. The loss is the squared Frobenius norm
+    of (VV' - I) where V is the matrix of normalized expert weights.
+    """
+    if not expert_weights:
+        return torch.tensor(0.0, device=expert_weights[0].device)
+
+    flattened_weights = [w.view(-1) for w in expert_weights]
+    V = torch.stack(flattened_weights)
+
+    # Normalize rows to be unit vectors, preventing weights from collapsing to zero
+    V = F.normalize(V, p=2, dim=1)
+    
+    # Gram matrix: V @ V.T
+    gram_matrix = torch.matmul(V, V.t())
+    
+    # Target: identity matrix
+    identity = torch.eye(gram_matrix.size(0), device=gram_matrix.device, dtype=gram_matrix.dtype)
+    
+    # Loss: squared Frobenius norm of (VV' - I)
+    ortho_loss = torch.pow(torch.norm(gram_matrix - identity, p='fro'), 2)
+    return ortho_loss
+
 
 def load_balancing_loss_func(
     gate_logits: torch.Tensor, 
@@ -1815,6 +1841,21 @@ class G3MoEForCausalLM(G3MoEPreTrainedModel, GenerationMixin):
         aux_loss = None
         if labels is not None:
             loss = self.loss_function(logits, labels, self.vocab_size, **loss_kwargs)
+
+            # Orthogonalization loss for expert weights to encourage functional diversity
+            if self.training and self.model.config.ortho_loss_coef > 0:
+                ortho_loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
+                num_moe_layers = 0
+                for layer in self.model.layers:
+                    if layer.is_dense_replacement and hasattr(layer.moe, "experts"):
+                        num_moe_layers += 1
+                        expert_weights = [expert.down_proj.weight for expert in layer.moe.experts]
+                        ortho_loss += calculate_ortho_loss_for_experts(expert_weights)
+
+                if num_moe_layers > 0:
+                    ortho_loss = ortho_loss / num_moe_layers  # Average over layers
+                    loss += self.model.config.ortho_loss_coef * ortho_loss
+
             if outputs.router_logits is not None:
                 # Add router z-loss to prevent router from being too confident
                 aux_loss = load_balancing_loss_func(
