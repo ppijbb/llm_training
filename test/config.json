@@ -40,8 +40,12 @@
       "rope_local_base_freq": 10000.0,
       "rope_scaling": {
         "factor": 8.0,
-        "rope_type": "linear"
+        "rope_type": "yarn"
       },
+      "ema_alpha": 0.99,
+      "balancing_strength": 0.01,
+      "no_rope_layers_interval": 4,
+      "use_sliding_window": true,
       "rope_theta": 1000000.0,
       "routed_scaling_factor": 2.5,
       "router_aux_loss_coef": 0.001,

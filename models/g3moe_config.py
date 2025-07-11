@@ -237,6 +237,13 @@ class G3MoETextConfig(PretrainedConfig):
         rope_scaling=None,
         rope_local_base_freq=10_000.0,
         sliding_window_pattern=6,
+        ema_alpha=0.99,
+        balancing_strength=0.01,
+        # 하이브리드 positional embedding 관련 추가 인자
+        no_rope_layers=None,
+        no_rope_layer_interval: int = 0,
+        layer_types=None,
+        use_sliding_window=False,
         **kwargs,
     ):
         super().__init__(
@@ -269,7 +276,12 @@ class G3MoETextConfig(PretrainedConfig):
         self.router_jitter_noise = router_jitter_noise
         self.input_jitter_noise = input_jitter_noise
         self.router_z_loss_coef = router_z_loss_coef
+        self.sliding_window_pattern = sliding_window_pattern
+        self.rope_local_base_freq = rope_local_base_freq
+        self.final_logit_softcapping = final_logit_softcapping
         self.freeze_shared_experts = freeze_shared_experts
+        self.ema_alpha = ema_alpha
+        self.balancing_strength = balancing_strength
         self.initializer_range = initializer_range
         self.rms_norm_eps = rms_norm_eps
         self.use_cache = use_cache
@@ -282,11 +294,35 @@ class G3MoETextConfig(PretrainedConfig):
         self.final_logit_softcapping = final_logit_softcapping
         self.attn_logit_softcapping = attn_logit_softcapping
         self.cache_implementation = cache_implementation
-
         self.rope_local_base_freq = rope_local_base_freq
-        # For configuring HybridCache to work with 5:1 attention pattern
         self.sliding_window_pattern = sliding_window_pattern
         self.rope_scaling = rope_scaling
+
+        # 하이브리드 positional embedding 패턴 생성 (smollm3 스타일)
+        if no_rope_layers is None:
+            self.no_rope_layers = [
+                int((layer_idx + 1) % no_rope_layer_interval == 0) if no_rope_layer_interval > 0 else 0
+                for layer_idx in range(num_hidden_layers)
+            ]
+        else:
+            self.no_rope_layers = no_rope_layers
+        self.no_rope_layer_interval = no_rope_layer_interval
+        # layer_types 자동 생성
+        if layer_types is None:
+            layer_types = []
+            for layer_idx in range(num_hidden_layers):
+                has_nope = self.no_rope_layers[layer_idx]
+                if use_sliding_window and sliding_window is not None and not has_nope:
+                    layer_types.append("sliding_attention")
+                else:
+                    layer_types.append("full_attention")
+        self.layer_types = layer_types
+        self.use_sliding_window = use_sliding_window
+        # layer_types validation 등 추가
+        # layer_type_validation(self.layer_types)  # 필요시 함수 정의
+        # rope config validation
+        if self.rope_scaling is not None and "type" in self.rope_scaling:
+            self.rope_scaling["rope_type"] = self.rope_scaling["type"]
         rope_config_validation(self)
 
 

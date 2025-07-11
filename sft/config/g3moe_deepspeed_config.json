@@ -19,7 +19,15 @@
       "router_aux_loss_coef": 0.003,
       "router_jitter_noise": 0.03,
       "input_jitter_noise": 0.01,
-      "router_z_loss_coef": 5e-4
+      "router_z_loss_coef": 5e-4,
+      "ema_alpha": 0.99,
+      "balancing_strength": 0.01,
+      "no_rope_layers_interval": 4,
+      "use_sliding_window": true,
+      "rope_scaling": {
+        "factor": 8.0,
+        "rope_type": "yarn"
+      }
     }
   },
   "data_config": {

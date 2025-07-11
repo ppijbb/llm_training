@@ -673,6 +673,8 @@ class G3MoEHybridRouter(nn.Module):
 
 class G3MoEGRINMoE(nn.Module):
     """Hybrid Router: 하나의 linear layer에서 sigmoid로 expert 선택, sparsemixer로 가중치 계산"""
+    expert_load_ema: torch.Tensor
+
     def __init__(self, config, **kwargs):
         super().__init__()
         config = config
@@ -690,6 +692,11 @@ class G3MoEGRINMoE(nn.Module):
         self.shared_experts = G3MoEMLP(config=config, intermediate_size=config.intermediate_size * config.n_shared_experts)
         self.router_jitter_noise = getattr(config, 'router_jitter_noise', 0.01)
         self.input_jitter_noise = getattr(config, 'input_jitter_noise', 0.0)   
+        
+        # Adaptive filter parameters for load balancing
+        self.ema_alpha = getattr(config, "ema_alpha", 0.99)
+        self.balancing_strength = getattr(config, "balancing_strength", 0.01)
+        self.register_buffer("expert_load_ema", torch.zeros(self.num_experts))
         
         # shared_experts freeze 여부 (기본값은 True로 설정)
         self.freeze_shared_experts = getattr(config, 'freeze_shared_experts', True)
@@ -739,12 +746,38 @@ class G3MoEGRINMoE(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_dim)
         # router_logits: (batch * sequence_length, n_experts)
         router_logits = F.linear(hidden_states.type(torch.float32), self.router.type(torch.float32))
+
+        # ---- Adaptive filter logic for load balancing (applied during training) ----
+        if self.training:
+            with torch.no_grad():
+                total_load = self.expert_load_ema.sum()
+                if total_load > 0:
+                    # Normalize EMA load to get balancing scores
+                    load_balancing_scores = self.expert_load_ema / total_load
+                else:
+                    load_balancing_scores = torch.zeros_like(self.expert_load_ema)
+                
+                # Penalize experts with high load by subtracting from logits
+                # The strength of the penalty is controlled by balancing_strength
+                adjustment = load_balancing_scores * self.balancing_strength * self.num_experts
+                router_logits = router_logits - adjustment.unsqueeze(0)
+        # ---- End of adaptive filter logic ----
+
         routing_weights, selected_experts = sparsemixer(
             router_logits, 
             top_k=self.top_k, 
             jitter_eps=self.router_jitter_noise, 
             training=self.training,
         )
+
+        # ---- EMA load update logic (applied during training) ----
+        if self.training:
+            with torch.no_grad():
+                # Count how many tokens were routed to each expert in this batch
+                current_load = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).sum(dim=[0, 1]).float()
+                # Update EMA of expert loads
+                self.expert_load_ema.mul_(self.ema_alpha).add_(current_load, alpha=1.0 - self.ema_alpha)
+        # ---- End of EMA load update logic ----
 
         final_hidden_states = torch.zeros(
             (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
@@ -985,8 +1018,10 @@ class G3MoEAttention(nn.Module):
         query_states = self.q_norm(query_states)
         key_states   = self.k_norm(key_states)
 
-        cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        if position_embeddings is not None:
+            cos, sin = position_embeddings
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        # else: NoPE, 그대로 사용
         
         if past_key_value is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
@@ -1052,6 +1087,7 @@ class G3MoEDecoderLayer(nn.Module):
         self.post_feedforward_layernorm = G3MoERMSNorm(self.hidden_size, eps=config.rms_norm_eps)
         self.is_sliding = self.self_attn.is_sliding
         self.sliding_window = config.sliding_window
+        self.use_nope = (hasattr(config, 'nope_layers') and (self.layer_idx in config.nope_layers))
 
     @deprecate_kwarg("last_cache_position", version="4.53.0")
     def forward(
@@ -1099,23 +1135,38 @@ class G3MoEDecoderLayer(nn.Module):
         
         hidden_states = self.input_layernorm(hidden_states)
         
-        # apply global RoPE to non-sliding layer only
-        if self.self_attn.is_sliding:
-            position_embeddings = position_embeddings_local
+        # 하이브리드 rope-nope positional embedding 적용
+        if self.use_nope:
+            # NoPE: position embedding 없이 self-attn
+            hidden_states, self_attn_weights = self.self_attn(
+                hidden_states=hidden_states,
+                position_embeddings=None,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_value,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                **kwargs,
+            )
         else:
-            position_embeddings = position_embeddings_global
+            # 기존 방식: RoPE(yarn)
+            if self.self_attn.is_sliding:
+                position_embeddings = position_embeddings_local
+            else:
+                position_embeddings = position_embeddings_global
+            hidden_states, self_attn_weights = self.self_attn(
+                hidden_states=hidden_states,
+                position_embeddings=position_embeddings,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_value,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                **kwargs,
+            )
         
-        hidden_states, self_attn_weights = self.self_attn(
-            hidden_states=hidden_states,
-            position_embeddings=position_embeddings,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_value=past_key_value,
-            output_attentions=output_attentions,
-            use_cache=use_cache,
-            cache_position=cache_position,
-            **kwargs,
-        )
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = residual + hidden_states
         
@@ -1417,6 +1468,7 @@ class G3MoETextModel(G3MoEPreTrainedModel):
         config.rope_theta = config.rope_local_base_freq
         config.rope_scaling = {"rope_type": "default"}
         self.rotary_emb_local = G3MoERotaryEmbedding(config=config)
+        self.has_sliding_layers = "sliding_attention" in self.config.layer_types
 
         # Initialize weights and apply final processing
         self.post_init()

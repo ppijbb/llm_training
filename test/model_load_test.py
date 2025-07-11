@@ -52,7 +52,7 @@ moe_config = {
         "input_jitter_noise": 0.01,
         "model_type": "g3moe_text",
         "rope_scaling":{
-            "rope_type": "linear",
+            "rope_type": "yarn",
             "factor": 8.0
         },
         # "intermediate_size": base_config['text_config']['hidden_size'],
