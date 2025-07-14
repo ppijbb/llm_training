@@ -3,15 +3,18 @@
         "enabled": false
     },
     "bf16": {
-        "enabled": false
+        "enabled": true
     },
     "optimizer": {
-        "type": "AdamW",
+        "type": "MuonOptimizer",
         "params": {
             "lr": "auto",
             "weight_decay": "auto",
-            "torch_adam": true,
-            "adam_w_mode": true
+            "momentum": 0.95,
+            "nesterov": true,
+            "ns_steps": 5,
+            "adamw_betas": [0.9, 0.95],
+            "adamw_eps": 1e-8
         }
     },
     "scheduler": {
