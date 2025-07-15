@@ -221,7 +221,7 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
             target_modules=[
                 # "q_proj", "k_proj", "v_proj", "o_proj",
                 "gate_proj", "up_proj", "down_proj",
-                "gate"
+                "router"
             ],
             bias="none",
         )

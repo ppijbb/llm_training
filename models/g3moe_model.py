@@ -572,7 +572,7 @@ class G3MoESparseGRINBlock(nn.Module):
         iterations +=1
         self.iter = iterations
         # gating
-        self.gate = nn.Linear(self.hidden_dim, self.num_experts, bias=False)
+        self.router = nn.Linear(self.hidden_dim, self.num_experts, bias=False)
 
         self.experts = nn.ModuleList([G3MoEMLP(config) for _ in range(self.num_experts)])
 
@@ -589,7 +589,7 @@ class G3MoESparseGRINBlock(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_dim)
         # router_logits: (batch * sequence_length, n_experts)
         # print ( 'moe', self.iter, torch.norm(hidden_states).item())
-        router_logits = self.gate(hidden_states)
+        router_logits = self.router(hidden_states)
         
         if self.training:
             # Add noise for exploration to prevent expert starvation
@@ -1144,7 +1144,7 @@ class G3MoEDecoderLayer(nn.Module):
         self.mlp = G3MoEMLP(config=config) # this layer is for loading pretrained base G3MoE model weights
         self.is_dense_replacement = layer_idx >= config.first_k_dense_replace
         if self.is_dense_replacement:
-            self.moe = G3MoESparseGRINBlock(config=config)
+            self.moe = G3MoEGRINMoE(config=config)
         else:
             self.moe = G3MoEMLP(config=config)
         self.input_layernorm = G3MoERMSNorm(self.hidden_size, eps=config.rms_norm_eps)

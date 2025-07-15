@@ -160,7 +160,12 @@ class TorchMoECallback:
                 if hasattr(gate, attr):
                     routing_info['routing_probs'] = getattr(gate, attr)
                     break
-        
+        if hasattr(module, 'router'):
+            router = module.router
+            for attr in ['last_routing_probs', 'routing_probs']:
+                if hasattr(router, attr):
+                    routing_info['routing_probs'] = getattr(router, attr)
+                    break
         # 4. combine_weights 형태로만 제공되는 경우
         cw = getattr(module, 'combine_weights', None)
         if cw is None and isinstance(output, tuple) and len(output) >= 3:
