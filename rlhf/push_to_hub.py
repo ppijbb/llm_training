@@ -1,5 +1,6 @@
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-from peft import PeftModel
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers.utils.quantization_config import BitsAndBytesConfig
+from peft.peft_model import PeftModel
 from huggingface_hub import HfApi, HfFolder
 import torch
 
@@ -9,7 +10,7 @@ model = AutoModelForCausalLM.from_pretrained(model_name)
 
 
 # Load the PEFT model
-peft_model_path = "/home/conan/workspace/llama3_finetuning/dpo/dpo_output/checkpoint-57500"
+peft_model_path = "/home/conan/workspace/llm_training/rlhf/dpo_simpo/checkpoint-57500"
 peft_model = PeftModel.from_pretrained(
     model=model, 
     model_id=peft_model_path, 
