@@ -1,3 +1,4 @@
+import logging
 from datasets import load_dataset
 from transformers import AutoProcessor
 import torch
@@ -5,6 +6,33 @@ import re
 import json
 from PIL import Image
 import io
+from typing import List, Dict, Any
+import base64
+
+# Configure logger
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+handler = logging.StreamHandler()
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+handler.setFormatter(formatter)
+logger.addHandler(handler)
+
+def process_vision_info(messages: List[Dict[str, Any]]) -> List[Image.Image]:
+    """Placeholder for extracting image information from messages.
+    This function needs to be implemented based on the actual structure of image data.
+    For now, it returns an empty list.
+    """
+    images = []
+    for message in messages:
+        if 'image' in message and message['image'] is not None:
+            try:
+                # Assuming message['image'] is base64 encoded string or bytes
+                # This part needs actual implementation based on data format
+                image_bytes = base64.b64decode(message['image']) if isinstance(message['image'], str) else message['image']
+                images.append(Image.open(io.BytesIO(image_bytes)))
+            except Exception as e:
+                logger.warning(f"Could not load image from message: {e}")
+    return images
 
 def create_multimodal_collate_fn(processor):
     """
@@ -63,7 +91,7 @@ def create_multimodal_collate_fn(processor):
             labels[labels == 262144] = -100
             
         except Exception as e:
-            print(f"Warning: Could not mask image tokens: {e}")
+            logger.warning(f"Warning: Could not mask image tokens: {e}")
         
         batch["labels"] = labels
         return batch
@@ -92,88 +120,167 @@ def get_dataset(
     if tokenizer is None:
         raise ValueError("Tokenizer must be provided")
     
-    # Load dataset
-    dataset = load_dataset(dataset_name, streaming=streaming)
+    logger.info(f"📦 로딩 중: {dataset_name}, streaming: {streaming}")
 
-    # Split into train/test first if not streaming
-    if not streaming:
-        dataset = dataset["train"].train_test_split(test_size=test_size)
-    
-    # Process each split separately
+    # Load dataset
+    loaded_dataset = load_dataset(dataset_name, streaming=streaming)
+
     processed_dataset = {}
-    for split_name, split_data in dataset.items():
-        try:
-            processed_split = split_data.map(
-                processing, 
-                batched=False, 
-                num_proc=1,
-                fn_kwargs={
-                    "tokenizer": tokenizer, 
-                    "max_length": max_length,
-                    "text_only": text_only
-                },
-                remove_columns=split_data.column_names
-            )
-            processed_dataset[split_name] = processed_split
-        except Exception as e:
-            print(f"Error during {split_name} processing: {e}")
-            print("Falling back to single-threaded processing...")
-            processed_split = split_data.map(
-                processing, 
-                batched=False,
-                fn_kwargs={
-                    "tokenizer": tokenizer, 
-                    "max_length": max_length,
-                    "text_only": text_only
-                },
-                # remove_columns=split_data.column_names
-            )
-            processed_dataset[split_name] = processed_split
-    
-    # Convert back to DatasetDict
+
+    if streaming:
+        # For streaming datasets, we directly process the available splits.
+        # loaded_dataset is an IterableDatasetDict or IterableDataset.
+        if isinstance(loaded_dataset, dict): # It's an IterableDatasetDict
+            splits_to_process = loaded_dataset
+        else: # It's a single IterableDataset (e.g., if split='train' was used in load_dataset outside this function)
+            splits_to_process = {"train": loaded_dataset} # Treat it as a 'train' split
+        
+        logger.info(f"📊 스트리밍 데이터셋 처리: {list(splits_to_process.keys())}")
+        for split_name, split_data in splits_to_process.items():
+            try:
+                # Streaming map does not support num_proc directly like non-streaming
+                processed_split = split_data.map(
+                    processing,
+                    fn_kwargs={
+                        "tokenizer": tokenizer,
+                        "max_length": max_length,
+                        "text_only": text_only
+                    },
+                    remove_columns=split_data.column_names if hasattr(split_data, 'column_names') else None
+                )
+                processed_dataset[split_name] = processed_split
+                logger.info(f"   ✅ {split_name} 스트리밍 처리 완료")
+            except Exception as e:
+                logger.error(f"❌ {split_name} 스트리밍 처리 실패: {e}")
+                raise # Re-raise for streaming as fallback to single-threaded map might not be meaningful
+
+    else: # Not streaming
+        # For non-streaming datasets, we expect a DatasetDict and perform train_test_split.
+        if "train" not in loaded_dataset:
+            raise ValueError("Non-streaming dataset must contain a 'train' split to perform train_test_split.")
+        
+        splits_for_training = loaded_dataset["train"].train_test_split(test_size=test_size)
+        
+        # Add other splits (validation, test etc.) if they exist in the original dataset
+        for key, value in loaded_dataset.items():
+            if key != "train":
+                splits_for_training[key] = value
+
+        logger.info(f"📊 비스트리밍 데이터셋 분할: 훈련/테스트 및 기타")
+        for split_name, split_data in splits_for_training.items():
+            try:
+                processed_split = split_data.map(
+                    processing,
+                    batched=False,
+                    num_proc=1, # Use num_proc for non-streaming
+                    fn_kwargs={
+                        "tokenizer": tokenizer,
+                        "max_length": max_length,
+                        "text_only": text_only
+                    },
+                    remove_columns=split_data.column_names
+                )
+                processed_dataset[split_name] = processed_split
+                logger.info(f"   ✅ {split_name} 처리 완료")
+            except Exception as e:
+                logger.error(f"❌ {split_name} 처리 실패: {e}")
+                logger.info("   🔄 싱글 스레드 처리로 폴백...")
+                processed_split = split_data.map(
+                    processing,
+                    batched=False,
+                    fn_kwargs={
+                        "tokenizer": tokenizer,
+                        "max_length": max_length,
+                        "text_only": text_only
+                    },
+                )
+                processed_dataset[split_name] = processed_split
+                logger.info(f"   ✅ {split_name} 싱글 스레드 처리 완료")
+
+    if not processed_dataset:
+        raise RuntimeError("데이터셋 처리 실패: 어떤 스플릿도 처리되지 않았습니다.")
+
     from datasets import DatasetDict
     return DatasetDict(processed_dataset)
 
+def process_content(contents_list):
+    processed_contents = []
+    for index, content in enumerate(contents_list["type"]):
+        key = "image" if content == "image" else "text"
+        if key == "image" and contents_list['text'][index] is None:
+            continue
+        processed_contents.append({"type": key, key: contents_list[key][index]})
+    return processed_contents
+
 def processing(
-    examples,
+    example, # Changed from 'examples' to 'example' to reflect single row
     tokenizer,
     max_length: int = 2048,
-    text_only: bool = False  # This argument is kept for compatibility but is not used
+    text_only: bool = False
 ):
     """
     Applies the chat template directly to each conversation in the 'messages' column.
     The apply_chat_template function handles both templating and tokenization.
     """
-    input_ids_list = []
+    # A single example is passed, extract its messages
+    conversation = example["messages"]
     
-    for index, conversation in enumerate(examples["messages"]):
-        # A conversation should be a list of message dictionaries.
-        # Skip any entries that are not lists (e.g., None or other malformed data).
-        if not isinstance(conversation, list):
-            continue
+    # A conversation should be a list of message dictionaries.
+    # Skip if not a list, or if malformed (e.g., None).
+    if not isinstance(conversation, list):
+        # This part of the logic seems to try and fix malformed 'conversation'
+        # if it's a dict with 'role' and 'content' keys that are lists.
+        # This might be specific to the dataset format.
+        if isinstance(conversation, dict) and "role" in conversation and "content" in conversation:
+            try:
+                conversation = [{
+                    "role": r, 
+                    "content": process_content(c)
+                    } 
+                    for r, c in zip(conversation["role"], conversation["content"])]
+            except Exception as e:
+                logger.warning(f"Malformed conversation dict during conversion: {conversation}, Error: {e}")
+                return None # Return None if conversion fails
+        else:
+            logger.warning(f"Skipping example due to malformed messages (not a list or expected dict format): {example}")
+            return None # Skip this example
+    
+    # If the conversion from malformed dict to list of dicts failed or was not applicable,
+    # and it's still not a list, return None.
+    if not isinstance(conversation, list):
+        return None
+
+    try:
+        # apply_chat_template with tokenize=True returns token IDs directly
+        token_ids = tokenizer.apply_chat_template(
+            conversation,
+            tokenize=True,
+            add_generation_prompt=False,  # Crucial for SFT
+            max_length=max_length,
+            truncation=True,
+            return_dict=True, 
+            return_tensors="pt"
+        )
+        assert token_ids is not None, f"Token IDs is None for conversation: {conversation}"
         
-        try:
-            # apply_chat_template with tokenize=True returns token IDs directly
-            token_ids = tokenizer.apply_chat_template(
-                conversation,
-                tokenize=True,
-                add_generation_prompt=False,  # Crucial for SFT
-                max_length=max_length,
-                truncation=True,
-                return_dict=True, 
-                return_tensors="pt"
-            )
-            assert token_ids is not None, f"Token IDs is None for conversation: {conversation}"
-            input_ids_list.append(token_ids)
-        except Exception as e:
-            # If a conversation is malformed and causes an error during templating,
-            # skip it and continue with the rest of the batch.
-            print(f"Skipping conversation due to error: [{index}] {e}")
-            print(f"Conversation: {conversation}")
-            continue
-    
-    # Return the tokenized results directly
-    return [{k:v for k,v in data.items()} for data in input_ids_list]
+        # Return the tokenized result directly (not a list of results for single example)
+        # The map function expects a dict from the processing function if not batched.
+        # So return the result in the format { "input_ids": [...], "attention_mask": [...] }
+        result = {}
+        for key, value in token_ids.items():
+            if isinstance(value, torch.Tensor):
+                result[key] = value.squeeze().tolist()
+            else:
+                result[key] = value
+        
+        return result
+
+    except Exception as e:
+        # If a conversation is malformed and causes an error during templating,
+        # skip it and continue with the rest of the batch.
+        logger.warning(f"Skipping example due to error during tokenization: {e}")
+        logger.warning(f"Conversation that caused error: {conversation}")
+        return None # Return None to indicate this example should be skipped
 
 
 if __name__ == "__main__":
@@ -182,4 +289,3 @@ if __name__ == "__main__":
         chat_template = f.read()
     tokenizer.chat_template = chat_template
     dataset = get_dataset(tokenizer=tokenizer)
-    print(dataset)
