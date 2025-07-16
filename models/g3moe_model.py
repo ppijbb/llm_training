@@ -721,9 +721,10 @@ class G3MoEGRINMoE(nn.Module):
         iterations += 1
         self.iter = iterations
         # self.router = G3MoEHybridRouter(config)
-        self.router = nn.Parameter(torch.zeros((self.num_experts, config.hidden_size)))
+        self.router = nn.Linear(config.hidden_size, self.num_experts, bias=False)
         self.experts = nn.ModuleList([G3MoEMLP(config) for _ in range(self.num_experts)])
         self.shared_experts = G3MoEMLP(config=config, intermediate_size=config.intermediate_size * config.n_shared_experts)
+
         self.router_jitter_noise = getattr(config, 'router_jitter_noise', 0.01)
         self.input_jitter_noise = getattr(config, 'input_jitter_noise', 0.0)   
         
@@ -746,13 +747,13 @@ class G3MoEGRINMoE(nn.Module):
         """shared_experts의 파라미터들을 freeze"""
         for param in self.shared_experts.parameters():
             param.requires_grad = False
-        print(f"Shared experts frozen for layer {self.iter}")
+        logger.debug(f"Shared experts frozen for layer {self.iter}")
     
     def _unfreeze_shared_experts(self):
         """shared_experts의 파라미터들을 unfreeze"""
         for param in self.shared_experts.parameters():
             param.requires_grad = True
-        print(f"Shared experts unfrozen for layer {self.iter}")
+        logger.debug(f"Shared experts unfrozen for layer {self.iter}")
     
     def freeze_shared_experts_manual(self):
         """수동으로 shared_experts freeze"""
@@ -784,8 +785,7 @@ class G3MoEGRINMoE(nn.Module):
             hidden_states *= torch.empty_like(hidden_states).uniform_(1.0 - self.input_jitter_noise, 1.0 + self.input_jitter_noise)
         hidden_states = hidden_states.view(-1, hidden_dim)
         # router_logits: (batch * sequence_length, n_experts)
-        router_logits = F.linear(hidden_states.type(torch.float32), self.router.type(torch.float32))
-
+        router_logits = self.router(hidden_states)
         # ---- Enhanced Routing Logic ----
         if self.training:
             # Add specialization bonus based on hidden state similarity to expert's specialization
@@ -794,11 +794,11 @@ class G3MoEGRINMoE(nn.Module):
                 normalized_ema = F.normalize(self.expert_specialization_ema.to(hidden_states.device), dim=-1)
                 specialization_bonus = torch.matmul(normalized_hidden, normalized_ema.T)
             router_logits += specialization_bonus * self.specialization_strength
-
+        assert router_logits.isnan().sum() == 0, f"{self.iter} layer router_logits is nan Line: 798"
         # Apply temperature scaling
         router_logits /= self.routing_temperature
         # ---- End of Enhanced Routing Logic ----
-
+        assert router_logits.isnan().sum() == 0, f"{self.iter} layer router_logits is nan Line: 802"
         # ---- Adaptive filter logic for load balancing (applied during training) ----
         if self.training:
             with torch.no_grad():
@@ -814,7 +814,6 @@ class G3MoEGRINMoE(nn.Module):
                 adjustment = load_balancing_scores * self.balancing_strength * self.num_experts
                 router_logits = router_logits - adjustment.unsqueeze(0)
         # ---- End of adaptive filter logic ----
-
         routing_weights, selected_experts = sparsemixer(
             router_logits, 
             top_k=self.top_k, 
@@ -1309,17 +1308,26 @@ class G3MoEPreTrainedModel(PreTrainedModel):
         if isinstance(module, (nn.Linear, nn.Conv2d)):
             logging.get_logger('transformers').debug(f"Initializing {module} with {std}")
             
-            # Check if this is a gate layer by examining the module's name in the model
+            # Check if this is a gate layer or router by examining the module's name in the model
             is_gate_layer = False
+            is_router = False
             for name, mod in self.named_modules():
-                if mod is module and 'gate' in name:
-                    is_gate_layer = True
-                    break
+                if mod is module:
+                    if 'gate' in name:
+                        is_gate_layer = True
+                        break
+                    elif 'router' in name:
+                        is_router = True
+                        break
             
             if is_gate_layer:
                 # Apply Xavier uniform initialization for gate layers
                 nn.init.xavier_uniform_(module.weight)
                 logging.get_logger('transformers').debug(f"Applied Xavier uniform initialization to gate layer: {name}")
+            elif is_router:
+                # Apply Xavier uniform initialization for router layers
+                nn.init.xavier_uniform_(module.weight)
+                logging.get_logger('transformers').debug(f"Applied Xavier uniform initialization to router layer: {name}")
             else:
                 # Apply standard normal initialization for other layers
                 module.weight.data.normal_(mean=0.0, std=std)
