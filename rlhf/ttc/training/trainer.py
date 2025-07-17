@@ -18,7 +18,7 @@ class RewardModelTrainer:
             gradient_accumulation_steps=ttc_config.GRADIENT_ACCUMULATION_STEPS,
             save_steps=500, # Example save steps
             logging_steps=100, # Example logging steps
-            evaluation_strategy="steps" if eval_dataset else "no",
+            eval_strategy="steps" if eval_dataset else "no",
             eval_steps=500 if eval_dataset else None,
             fp16=True, # Use mixed precision for faster training
             report_to="none", # Disable reporting to external services like wandb for simplicity

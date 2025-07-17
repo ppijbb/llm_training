@@ -37,12 +37,61 @@ class RLTDataLoader:
                     dataset = list(dataset.values())[0]
             
             print(f"Successfully loaded dataset: {len(dataset)} samples")
+            
+            # Convert Bespoke-Stratos format to RLT format if needed
+            if self.dataset_name == "bespokelabs/Bespoke-Stratos-17k":
+                dataset = self._convert_bespoke_format(dataset)
+            
             return dataset
             
         except Exception as e:
             print(f"Error loading dataset: {e}")
             # Return a small sample dataset for testing
             return self._create_sample_dataset()
+    
+    def _convert_bespoke_format(self, dataset: Dataset) -> Dataset:
+        """Convert Bespoke-Stratos format to RLT format."""
+        import re
+        
+        converted_data = []
+        
+        for example in dataset:
+            conversations = example.get('conversations', [])
+            if len(conversations) < 2:
+                continue
+                
+            # Extract user question (first message)
+            user_msg = conversations[0]
+            if user_msg.get('from') != 'user':
+                continue
+            question = user_msg.get('value', '')
+            
+            # Extract assistant response (second message)
+            assistant_msg = conversations[1]
+            if assistant_msg.get('from') != 'assistant':
+                continue
+            response = assistant_msg.get('value', '')
+            
+            # Extract reasoning trace and solution from response
+            reasoning_match = re.search(r'<\|begin_of_thought\|>(.*?)<\|end_of_thought\|>', response, re.DOTALL)
+            solution_match = re.search(r'<\|begin_of_solution\|>(.*?)<\|end_of_solution\|>', response, re.DOTALL)
+            
+            reasoning_trace = reasoning_match.group(1).strip() if reasoning_match else ""
+            solution = solution_match.group(1).strip() if solution_match else ""
+            
+            # Clean up the solution (remove LaTeX formatting)
+            solution = re.sub(r'\\boxed\{([^}]+)\}', r'\1', solution)  # Remove \boxed{}
+            solution = re.sub(r'\\[a-zA-Z]+\{[^}]*\}', '', solution)  # Remove other LaTeX commands
+            
+            if question and solution:
+                converted_data.append({
+                    "question": question,
+                    "solution": solution,
+                    "reasoning_trace": reasoning_trace
+                })
+        
+        print(f"Converted {len(converted_data)} samples from Bespoke-Stratos format")
+        return Dataset.from_list(converted_data)
     
     def _create_sample_dataset(self) -> Dataset:
         """Create a sample dataset for testing purposes."""

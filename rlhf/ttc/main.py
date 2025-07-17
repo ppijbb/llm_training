@@ -17,7 +17,27 @@ import argparse
 from typing import Optional
 
 def main():
-    parser = argparse.ArgumentParser(description="Run RLT (Reinforcement Learning Teachers) Test-Time Compute operations.")
+    parser = argparse.ArgumentParser(
+        description="Run RLT (Reinforcement Learning Teachers) Test-Time Compute operations.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Train RLT with GitHub recommended dataset (Bespoke-Stratos-17k)
+  python main.py --mode train_rlt
+  
+  # Train RLT with custom dataset
+  python main.py --mode train_rlt --dataset_path /path/to/custom/data.jsonl
+  
+  # Train RLT with different HuggingFace dataset
+  python main.py --mode train_rlt --dataset_name microsoft/DialoGPT-medium
+  
+  # Run RLT inference
+  python main.py --mode rlt_inference --prompt "What is 2+2?" --strategy adaptive
+  
+  # Run RLT inference with specific scaling
+  python main.py --mode rlt_inference --prompt "Solve: 3x + 5 = 20" --strategy fixed_scaling --scaling_factor 2.0
+        """
+    )
     parser.add_argument("--mode", type=str, 
                         choices=["train_reward", "train_rlt", "train_sft", "train_rl", "inference", "rlt_inference"], 
                         required=True,
@@ -31,6 +51,8 @@ def main():
     parser.add_argument("--target_quality", type=float, default=0.8,
                         help="Target quality for adaptive scaling.")
     parser.add_argument("--dataset_path", type=str, help="Path to custom dataset.")
+    parser.add_argument("--dataset_name", type=str, default="bespokelabs/Bespoke-Stratos-17k", 
+                        help="HuggingFace dataset name (default: bespokelabs/Bespoke-Stratos-17k from RLT paper)")
     parser.add_argument("--model_path", type=str, help="Path to pre-trained model.")
     args = parser.parse_args()
 
@@ -70,13 +92,79 @@ def main():
         if reward_model is None:
             print("Error: Reward model is required for reward training")
             return
-            
-        data_loader = DataLoader(ttc_config.TRAINING_DATA_PATH)
-        train_dataset = data_loader.load_for_reward_model_training()
         
-        # Ensure train_dataset is a Dataset, not DatasetDict
-        if hasattr(train_dataset, 'train'):
-            train_dataset = train_dataset['train']
+        # Load dataset for reward model training - use GitHub recommended dataset by default
+        if args.dataset_path:
+            print(f"Loading custom dataset from: {args.dataset_path}")
+            data_loader = DataLoader(args.dataset_path)
+        else:
+            print(f"Loading GitHub recommended dataset for reward training: {args.dataset_name}")
+            print("This is the Bespoke-Stratos-17k dataset used in the RLT paper")
+            # Use RLTDataLoader for the reasoning dataset
+            rlt_data_loader = RLTDataLoader(dataset_name=args.dataset_name)
+            dataset = rlt_data_loader.load_reasoning_dataset()
+            
+            # Convert reasoning dataset to reward model training format
+            from datasets import Dataset
+            reward_data = []
+            
+            # Ensure dataset is iterable
+            if hasattr(dataset, '__iter__'):
+                dataset_list = list(dataset)
+            else:
+                dataset_list = dataset
+            
+            for i, example in enumerate(dataset_list):
+                # Handle both dict and object access
+                if isinstance(example, dict):
+                    question = example.get('question', '')
+                    solution = example.get('solution', '')
+                    reasoning_trace = example.get('reasoning_trace', '')
+                else:
+                    question = getattr(example, 'question', '')
+                    solution = getattr(example, 'solution', '')
+                    reasoning_trace = getattr(example, 'reasoning_trace', '')
+                
+                # Positive example (good reasoning)
+                positive_text = f"Question: {question}\n<think>{reasoning_trace}</think>\n<solution>{solution}</solution>"
+                reward_data.append({"text": positive_text, "label": 1.0})
+                
+                # Negative example (poor reasoning) - create a simple negative version
+                negative_reasoning = "I don't know how to solve this." if reasoning_trace else "No reasoning provided."
+                negative_text = f"Question: {question}\n<think>{negative_reasoning}</think>\n<solution>I cannot solve this.</solution>"
+                reward_data.append({"text": negative_text, "label": 0.0})
+            
+            train_dataset = Dataset.from_list(reward_data)
+            print(f"Created reward training dataset with {len(train_dataset)} examples")
+        
+        # If using custom dataset path, load with original DataLoader
+        if args.dataset_path:
+            train_dataset = data_loader.load_for_reward_model_training()
+            
+            # Ensure train_dataset is a Dataset, not DatasetDict
+            from datasets import DatasetDict, Dataset
+            if isinstance(train_dataset, DatasetDict):
+                if 'train' in train_dataset:
+                    train_dataset = train_dataset['train']
+                else:
+                    # Take the first available split
+                    train_dataset = list(train_dataset.values())[0]
+            
+            # Ensure we have a proper Dataset type
+            if not isinstance(train_dataset, Dataset):
+                print(f"Warning: train_dataset is not a Dataset type: {type(train_dataset)}")
+                # Try to convert if it's an iterable dataset
+                try:
+                    if hasattr(train_dataset, '__iter__'):
+                        # Convert iterable to list and then to Dataset
+                        data_list = list(train_dataset)
+                        train_dataset = Dataset.from_list(data_list)
+                    else:
+                        print("Error: Cannot convert train_dataset to Dataset type")
+                        return
+                except Exception as e:
+                    print(f"Error converting dataset: {e}")
+                    return
             
         trainer = RewardModelTrainer(reward_model=reward_model, train_dataset=train_dataset)
         trainer.train()
@@ -89,11 +177,20 @@ def main():
             print("Error: Teacher model is required for RLT training")
             return
         
-        # Load reasoning dataset
-        rlt_data_loader = RLTDataLoader(data_path=args.dataset_path)
+        # Load reasoning dataset - use GitHub recommended dataset by default
+        if args.dataset_path:
+            print(f"Loading custom dataset from: {args.dataset_path}")
+            rlt_data_loader = RLTDataLoader(data_path=args.dataset_path)
+        else:
+            print(f"Loading GitHub recommended dataset: {args.dataset_name}")
+            print("This is the Bespoke-Stratos-17k dataset used in the RLT paper")
+            rlt_data_loader = RLTDataLoader(dataset_name=args.dataset_name)
+        
         dataset = rlt_data_loader.load_reasoning_dataset()
+        print(f"Dataset loaded successfully with {len(dataset)} samples")
         
         # Validate dataset format
+        print(f"Dataset columns: {dataset.column_names}")
         if not rlt_data_loader.validate_dataset_format(dataset):
             print("Dataset format validation failed. Exiting.")
             return

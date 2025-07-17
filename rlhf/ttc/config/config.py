@@ -14,6 +14,7 @@ class TTCConfig:
     
     # Training Configuration
     TRAINING_DATA_PATH = "data/reward_training_data.jsonl"
+    # GitHub RLT recommended dataset: https://github.com/SakanaAI/RLT
     REASONING_DATASET = "bespokelabs/Bespoke-Stratos-17k"  # RLT-style reasoning dataset
     LEARNING_RATE = 1e-5
     NUM_EPOCHS = 3

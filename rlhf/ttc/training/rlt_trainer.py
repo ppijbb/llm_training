@@ -1,4 +1,4 @@
-from transformers import TrainingArguments, Trainer
+from transformers.training_args import TrainingArguments
 from trl import SFTTrainer, RewardTrainer
 from datasets import Dataset
 import torch
@@ -47,7 +47,14 @@ class RLTTrainer:
                     f"<solution>{trace_result['solution']}</solution>"
                 )
             
-            return {"text": formatted_text}
+            # Return both text and messages format for compatibility
+            return {
+                "text": formatted_text,
+                "messages": [
+                    {"role": "user", "content": example['question']},
+                    {"role": "assistant", "content": formatted_text}
+                ]
+            }
         
         return dataset.map(format_for_sft)
     
@@ -55,8 +62,11 @@ class RLTTrainer:
         """Supervised Fine-tuning phase."""
         print("Starting SFT phase...")
         
-        # Prepare dataset
+        # Prepare datasets
         sft_dataset = self.prepare_sft_dataset(train_dataset)
+        sft_eval_dataset = None
+        if eval_dataset is not None:
+            sft_eval_dataset = self.prepare_sft_dataset(eval_dataset)
         
         # Training arguments for SFT
         training_args = TrainingArguments(
@@ -67,21 +77,20 @@ class RLTTrainer:
             gradient_accumulation_steps=ttc_config.GRADIENT_ACCUMULATION_STEPS,
             save_steps=500,
             logging_steps=100,
-            evaluation_strategy="steps" if eval_dataset else "no",
+            eval_strategy="steps" if eval_dataset else "no",
             eval_steps=500 if eval_dataset else None,
             save_total_limit=3,
             load_best_model_at_end=True if eval_dataset else False,
-            report_to=None,  # Disable wandb for now
+            report_to="none",  # Disable wandb for now
         )
         
         # Initialize SFT trainer
         sft_trainer = SFTTrainer(
             model=self.teacher_model.model,
-            tokenizer=self.teacher_model.tokenizer,
+            processing_class=self.teacher_model.tokenizer,
             train_dataset=sft_dataset,
-            eval_dataset=eval_dataset,
+            eval_dataset=sft_eval_dataset,
             args=training_args,
-            max_seq_length=2048,
         )
         
         # Train
@@ -162,23 +171,20 @@ class RLTTrainer:
             gradient_accumulation_steps=ttc_config.GRADIENT_ACCUMULATION_STEPS,
             save_steps=500,
             logging_steps=100,
-            evaluation_strategy="steps" if eval_dataset else "no",
+            eval_strategy="steps" if eval_dataset else "no",
             eval_steps=500 if eval_dataset else None,
             save_total_limit=3,
             load_best_model_at_end=True if eval_dataset else False,
-            report_to=None,
+            report_to="none",
         )
         
         # Initialize RL trainer
         rl_trainer = RewardTrainer(
             model=self.teacher_model.model,
-            tokenizer=self.teacher_model.tokenizer,
+            processing_class=self.teacher_model.tokenizer,
             train_dataset=rl_dataset,
-            eval_dataset=eval_dataset,
+            eval_dataset=eval_dataset if eval_dataset else None,
             args=training_args,
-            max_seq_length=2048,
-            reward_model=self.reward_model.model,
-            kl_penalty_reward_coeff=ttc_config.KL_PENALTY_COEFF,
         )
         
         # Train
