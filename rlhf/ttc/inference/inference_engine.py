@@ -1,7 +1,7 @@
-from ttc.models.llm_model import LLMModel
-from ttc.models.reward_model import RewardModel
-from ttc.inference.mcts_module import MCTSNode, run_mcts
-from ttc.config.config import ttc_config
+from models.llm_model import LLMModel
+from models.reward_model import RewardModel
+from inference.mcts_module import MCTSNode, run_mcts
+from config.config import ttc_config
 import torch
 
 class TTCInferenceEngine:

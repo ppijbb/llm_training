@@ -1,8 +1,8 @@
 from transformers import TrainingArguments
 from trl import RewardTrainer # Changed from SFTTrainer
 from datasets import Dataset
-from ttc.models.reward_model import RewardModel
-from ttc.config.config import ttc_config
+from models.reward_model import RewardModel
+from config.config import ttc_config
 
 class RewardModelTrainer:
     def __init__(self, reward_model: RewardModel, train_dataset: Dataset, eval_dataset: Dataset = None):
