@@ -373,7 +373,7 @@ class G3MoESharedExpertsLayer(nn.Module):
                 for _ in range(config.n_routed_experts)
             ]
         )
-        self.gate = G3MoETopkRouter(config=config, **kwargs)
+        self.router = G3MoETopkRouter(config=config, **kwargs)
         self.shared_experts = G3MoEMLP(
             config=config, intermediate_size=config.intermediate_size * config.n_shared_experts, **kwargs)
 
@@ -404,7 +404,7 @@ class G3MoESharedExpertsLayer(nn.Module):
     def forward(self, hidden_states):
         residuals = hidden_states
         orig_shape = hidden_states.shape
-        topk_indices, topk_weights = self.gate(hidden_states)
+        topk_indices, topk_weights = self.router(hidden_states)
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
         hidden_states = self.moe(hidden_states, topk_indices, topk_weights).view(*orig_shape)
         hidden_states = hidden_states + self.shared_experts(residuals)
@@ -582,7 +582,7 @@ class G3MoESparseGRINBlock(nn.Module):
         
     @torch._dynamo.disable  # Disable torch.compile for this method due to data-dependent branching
     def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """ """
+
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         if self.training and self.input_jitter_noise > 0:
             hidden_states *= torch.empty_like(hidden_states).uniform_(1.0 - self.input_jitter_noise, 1.0 + self.input_jitter_noise)
@@ -590,7 +590,6 @@ class G3MoESparseGRINBlock(nn.Module):
         # router_logits: (batch * sequence_length, n_experts)
         # print ( 'moe', self.iter, torch.norm(hidden_states).item())
         router_logits = self.router(hidden_states)
-        
         if self.training:
             # Add noise for exploration to prevent expert starvation
             router_logits = router_logits + torch.randn_like(router_logits) * 1e-3
@@ -790,15 +789,17 @@ class G3MoEGRINMoE(nn.Module):
         if self.training:
             # Add specialization bonus based on hidden state similarity to expert's specialization
             with torch.no_grad():
-                normalized_hidden = F.normalize(hidden_states, dim=-1)
-                normalized_ema = F.normalize(self.expert_specialization_ema.to(hidden_states.device), dim=-1)
-                specialization_bonus = torch.matmul(normalized_hidden, normalized_ema.T)
+                # normalize hidden and expert_specialization_ema
+                specialization_bonus = torch.matmul(
+                    F.normalize(hidden_states, dim=-1), 
+                    F.normalize(self.expert_specialization_ema.to(hidden_states.device), dim=-1).T
+                )
             router_logits += specialization_bonus * self.specialization_strength
-        assert router_logits.isnan().sum() == 0, f"{self.iter} layer router_logits is nan Line: 798"
+
         # Apply temperature scaling
-        router_logits /= self.routing_temperature
+        router_logits /= F.softplus(self.routing_temperature) + 0.1
         # ---- End of Enhanced Routing Logic ----
-        assert router_logits.isnan().sum() == 0, f"{self.iter} layer router_logits is nan Line: 802"
+        
         # ---- Adaptive filter logic for load balancing (applied during training) ----
         if self.training:
             with torch.no_grad():
@@ -820,7 +821,7 @@ class G3MoEGRINMoE(nn.Module):
             jitter_eps=self.router_jitter_noise, 
             training=self.training,
         )
-
+        assert routing_weights.isnan().sum() == 0, f"{self.iter} layer routing_weights is nan Line: 826"
         # ---- EMA load update logic (applied during training) ----
         if self.training:
             with torch.no_grad():
@@ -1144,6 +1145,7 @@ class G3MoEDecoderLayer(nn.Module):
         self.is_dense_replacement = layer_idx >= config.first_k_dense_replace
         if self.is_dense_replacement:
             self.moe = G3MoEGRINMoE(config=config)
+            # self.moe = G3MoESparseGRINBlock(config=config)
         else:
             self.moe = G3MoEMLP(config=config)
         self.input_layernorm = G3MoERMSNorm(self.hidden_size, eps=config.rms_norm_eps)
@@ -1319,19 +1321,15 @@ class G3MoEPreTrainedModel(PreTrainedModel):
                     elif 'router' in name:
                         is_router = True
                         break
-            
-            if is_gate_layer:
+
+            if is_gate_layer or is_router:
                 # Apply Xavier uniform initialization for gate layers
                 nn.init.xavier_uniform_(module.weight)
-                logging.get_logger('transformers').debug(f"Applied Xavier uniform initialization to gate layer: {name}")
-            elif is_router:
-                # Apply Xavier uniform initialization for router layers
-                nn.init.xavier_uniform_(module.weight)
-                logging.get_logger('transformers').debug(f"Applied Xavier uniform initialization to router layer: {name}")
+                logging.get_logger('transformers').warning(f"Applied Xavier uniform initialization to expert router: {name}")
             else:
                 # Apply standard normal initialization for other layers
                 module.weight.data.normal_(mean=0.0, std=std)
-                
+
             if module.bias is not None:
                 module.bias.data.zero_()
         elif isinstance(module, nn.Embedding):

@@ -113,7 +113,7 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
     else:
         tokenizer.padding_side = "right"
         print("  ✅ tokenizer.padding_side = 'right' 설정")
-    
+
     # Ensure tokenizer has pad token
     # if tokenizer.pad_token is None:
     #     tokenizer.pad_token = tokenizer.eos_token
@@ -221,7 +221,7 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
             target_modules=[
                 # "q_proj", "k_proj", "v_proj", "o_proj",
                 "gate_proj", "up_proj", "down_proj",
-                "router"
+                "router", "routing_temperature"
             ],
             bias="none",
         )
@@ -251,22 +251,9 @@ def setup_dataset(data_config: Dict[str, Any], tokenizer):
         print(f"  - ⚠️ chat_template이 설정되지 않음!")
     
     # print(f"Loading dataset: {data_config['dataset_name']}")
-    # dataset = get_dataset(
-    #     dataset_name=data_config["dataset_name"],
-    #     tokenizer=tokenizer,
-    #     max_length=data_config["max_seq_length"],
-    #     test_size=data_config["test_size"],
-    #     text_only=data_config["text_only"],
-    #     streaming=data_config["streaming"]
-    # )
     try:
         # 간단한 데이터셋 로더 사용
-        if "smoltalk" in dataset_name.lower():
-            dataset = smoltalk_dataset(tokenizer, max_samples=max_samples)
-        elif "orca" in dataset_name.lower():
-            dataset = orca_mini_dataset(tokenizer, max_samples=max_samples)
-        else:
-            # 일반적인 데이터셋 로더 시도
+        if "smoltalk" in dataset_name.lower() or "orca" in dataset_name.lower():
             print(f"일반 데이터셋 로더 시도: {dataset_name}")
             dataset = get_simple_sft_dataset(
                 dataset_name=dataset_name,
@@ -274,6 +261,16 @@ def setup_dataset(data_config: Dict[str, Any], tokenizer):
                 max_length=max_seq_length,
                 max_samples=max_samples,
                 test_size=test_size
+            )
+        else:
+            # 일반적인 데이터셋 로더 시도
+            dataset = get_dataset(
+                dataset_name=data_config["dataset_name"],
+                tokenizer=tokenizer,
+                max_length=data_config["max_seq_length"],
+                test_size=data_config["test_size"],
+                text_only=data_config["text_only"],
+                streaming=data_config["streaming"]
             )
         
         print(f"Dataset loaded:")
@@ -288,6 +285,7 @@ def setup_dataset(data_config: Dict[str, Any], tokenizer):
         
     except Exception as e:
         print(f"❌ 데이터셋 로딩 실패: {e}")
+        assert False, "데이터셋 로딩 실패"
         print("🔄 대안 데이터셋으로 재시도 (SmolTalk)")
         try:
             dataset = smoltalk_dataset(tokenizer, max_samples=max_samples)

@@ -7,7 +7,7 @@
     "lora_r": 16,
     "lora_alpha": 32,
     "lora_dropout": 0.1,
-    "deepspeed_config": "sft/config/deepspeed_cpu_offload.json",
+    "deepspeed_config": "sft/config/deepspeed_muon_optimizer.json",
     "g3moe_params": {
       "n_shared_experts": 1,
       "n_routed_experts": 8,
@@ -22,7 +22,7 @@
       "router_z_loss_coef": 5e-4,
       "ema_alpha": 0.99,
       "balancing_strength": 0.01,
-      "no_rope_layers_interval": 4,
+      "no_rope_layer_interval": 4,
       "use_sliding_window": true,
       "rope_scaling": {
         "factor": 8.0,
@@ -31,7 +31,7 @@
     }
   },
   "data_config": {
-    "dataset_name": "Gunulhona/open_m_3",
+    "dataset_name": "HuggingFaceTB/smoltalk",
     "max_seq_length": 131072,
     "test_size": 0.1,
     "text_only": false,

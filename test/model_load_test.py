@@ -51,6 +51,7 @@ moe_config = {
         "router_jitter_noise": 0.01,
         "input_jitter_noise": 0.01,
         "model_type": "g3moe_text",
+        "no_rope_layer_interval": 4,
         "rope_scaling":{
             "rope_type": "yarn",
             "factor": 8.0
