@@ -16,3 +16,4 @@ unsloth_training_checkpoints/
 .venv
 .deepeval
 *logs
+activate
