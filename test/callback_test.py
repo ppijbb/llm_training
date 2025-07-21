@@ -238,7 +238,7 @@ def setup_dataset(data_config: Dict[str, Any], tokenizer):
     """Setup training dataset"""    
     dataset_name = data_config.get("dataset_name", "HuggingFaceTB/smoltalk")
     max_samples = 10
-    max_seq_length = data_config.get("max_seq_length", 131072)
+    max_seq_length = 512
     test_size = data_config.get("test_size", 0.1)
     
     print(f"Loading simple SFT dataset: {dataset_name}")
@@ -444,7 +444,13 @@ def main():
         data_collator=collate_fn
     )
     # trainer.add_callback(moe_monitoring_callback)
-    trainer.add_callback(get_model_eval_callback(trainer=trainer))
+    trainer.add_callback(get_model_eval_callback(
+        trainer=trainer,  # Will be set by Trainer
+        enable_benchmarks=True,  # Enable benchmark evaluation
+        benchmarks_to_run=['mmlu', 'hellaswag', 'gsm8k', 'truthfulqa', 'arc', 'piqa'],  # Run multiple benchmarks
+        benchmark_eval_frequency=2,  # Run benchmarks every 2 epochs
+        mme_max_samples=10,  # Limit MME samples for faster evaluation
+    ))
     # Print training info
     print("\n" + "="*50)
     print("TRAINING CONFIGURATION")

@@ -212,7 +212,7 @@ class G3MoEModelForDeepEval(DeepEvalBaseLLM):
                     StopStringCriteria(
                         tokenizer=self.actual_tokenizer,
                         stop_strings=["<end_of_turn>"]
-                    )
+                    ),
                     MaxLengthCriteria(
                         max_length=128,
                         max_position_embeddings=128
