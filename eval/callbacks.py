@@ -5,13 +5,19 @@ from deepeval.dataset import EvaluationDataset
 from deepeval.integrations.hugging_face import DeepEvalHuggingFaceCallback
 from deepeval.dataset import EvaluationDataset, Golden
 from deepeval.metrics import GEval
-from deepeval.test_case import LLMTestCaseParams
+from deepeval.test_case import LLMTestCaseParams, LLMTestCase
 from transformers import (
         Trainer,
         TrainingArguments,
         TrainerState,
         TrainerControl
     )
+from deepeval.benchmarks import MMLU
+from deepeval.benchmarks.mmlu.task import MMLUTask
+from deepeval.metrics import HallucinationMetric, AnswerRelevancyMetric
+from deepeval.test_case import ArenaTestCase, LLMTestCase
+from deepeval.metrics import ArenaGEval
+from trl import SFTTrainer
 
 
 def get_model_eval_callback(
@@ -22,38 +28,34 @@ def get_model_eval_callback(
     aggregation_method: str = "avg",
     show_table: bool = False,
 ): 
-    
     if evaluation_dataset is None:
-        # evaluation_dataset = EvaluationDataset(
-        #     goldens=[
-        #         Golden(input="..."),
-        #         Golden(input="...")
-        #     ]
-        # )
-        from deepeval.benchmarks import MMLU
-        from deepeval.benchmarks.mmlu.task import MMLUTask
-        from deepeval.metrics import HallucinationMetric, AnswerRelevancyMetric
-        from deepeval.test_case import ArenaTestCase, LLMTestCase
-        from deepeval.metrics import ArenaGEval
-        # mmlu = MMLU(tasks=[MMLUTask.HIGH_SCHOOL_EUROPEAN_HISTORY], n_shots=0)
-        # evaluation_dataset = EvaluationDataset(
-        #     goldens=mmlu.load_benchmark_dataset(task=MMLUTask.HIGH_SCHOOL_EUROPEAN_HISTORY)
-        # )
-        # print("Golden dataset: ","\n",  evaluation_dataset.goldens, "\n")
+        """ ref
         evaluation_dataset = EvaluationDataset(
-            test_cases=[
-                LLMTestCase(
-                    name="GPT-4",
-                    input="What is the capital of France?",
-                    actual_output="Paris",
-                ),
-                LLMTestCase(
-                    name="Claude",
-                    input="What is the capital of France?",
-                    actual_output="Paris is the capital of France.",
-                )
+            goldens=[
+                Golden(input="..."),
+                Golden(input="...")
             ]
         )
+        """
+        benchmark = MMLU()
+        evaluation_dataset = EvaluationDataset(
+            goldens=benchmark.load_benchmark_dataset(task=MMLUTask.HIGH_SCHOOL_EUROPEAN_HISTORY)
+        )
+        # print("Golden dataset: ","\n",  evaluation_dataset.goldens, "\n")
+        # evaluation_dataset = EvaluationDataset(
+        #     test_cases=[
+        #         LLMTestCase(
+        #             name="GPT-4",
+        #             input="What is the capital of France?",
+        #             actual_output="Paris",
+        #         ),
+        #         LLMTestCase(
+        #             name="Claude",
+        #             input="What is the capital of France?",
+        #             actual_output="Paris is the capital of France.",
+        #         )
+        #     ]
+        # )
         evaluation_dataset.alias = evaluation_dataset._alias
     if metrics is None:
         metrics = [

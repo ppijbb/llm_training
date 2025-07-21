@@ -323,8 +323,7 @@ class G3MoETopkRouter(nn.Module):
         self.norm_topk_prob = config.norm_topk_prob
 
         # 적절한 초기화로 변경 (Xavier uniform 초기화)
-        self.weight = nn.Parameter(torch.zeros((self.n_routed_experts, config.hidden_size)))
-        nn.init.xavier_uniform_(self.weight)
+        self.router = nn.Linear(config.hidden_size, self.n_routed_experts, bias=False)
         self.register_buffer("e_score_correction_bias", torch.zeros((self.n_routed_experts)))
 
     @torch.no_grad()
@@ -349,7 +348,7 @@ class G3MoETopkRouter(nn.Module):
 
     def forward(self, hidden_states):
         hidden_states = hidden_states.view(-1, self.config.hidden_size)
-        router_logits = F.linear(hidden_states.type(torch.float32), self.weight.type(torch.float32))
+        router_logits = self.router(hidden_states)
         scores = router_logits.sigmoid()
         topk_indices = self.get_topk_indices(scores)
         topk_weights = scores.gather(1, topk_indices)

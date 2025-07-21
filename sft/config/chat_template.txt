@@ -1,33 +1,27 @@
 {{ bos_token }}
-{%- set ns = namespace(has_system=false) -%}
 {%- if messages[0]['role'] == 'system' -%}
-    {%- set ns.has_system = true -%}
-    {{ '<start_of_turn>system
-' }}
     {%- if messages[0]['content'] is string -%}
-        {{ messages[0]['content'] | trim }}
+        {%- set first_user_prefix = messages[0]['content'] + '
+
+' -%}
     {%- else -%}
-        {{ messages[0]['content'][0]['text'] | trim }}
+        {%- set first_user_prefix = messages[0]['content'][0]['text'] + '
+
+' -%}
     {%- endif -%}
-    {{ '<end_of_turn>
-' }}
     {%- set loop_messages = messages[1:] -%}
 {%- else -%}
+    {%- set first_user_prefix = "" -%}
     {%- set loop_messages = messages -%}
 {%- endif -%}
 {%- for message in loop_messages -%}
-    {%- if (message['role'] == 'user') != (loop.index0 % 2 == 0) -%}
-        {{ raise_exception("Conversation roles must alternate user/assistant/user/assistant/...") }}
-    {%- endif -%}
-    {%- if message['role'] == 'assistant' -%}
+    {%- if (message['role'] == 'assistant') -%}
         {%- set role = "model" -%}
-    {%- elif message['role'] == 'system' -%}
-        {%- set role = "system" -%}
     {%- else -%}
         {%- set role = message['role'] -%}
     {%- endif -%}
     {{ '<start_of_turn>' + role + '
-' }}
+' + (first_user_prefix if loop.first else "") }}
     {%- if message['content'] is string -%}
         {{ message['content'] | trim }}
     {%- elif message['content'] is iterable -%}

@@ -3,7 +3,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from deepeval.models.base_model import DeepEvalBaseLLM
 
 
-class Mistral7B(DeepEvalBaseLLM):
+class LocalModel(DeepEvalBaseLLM):
     def __init__(
         self,
         model_name: str
@@ -86,8 +86,8 @@ def run_deepeval()->None:
             # )
         ]
             
-        model_name = "Gunulhona/Gemma-3-4B"
-        eval_model = Mistral7B(model_name=model_name)
+        model_name = "google/gemma-3-4b-it"
+        eval_model = LocalModel(model_name=model_name)
 
         for benchmark in benchmarks:
             results = benchmark.evaluate(model=eval_model, batch_size=8)

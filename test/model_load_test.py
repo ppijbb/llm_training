@@ -82,14 +82,13 @@ with open("/home/conan_jung/workspace/llm_training/sft/config/chat_template.txt"
     tokenizer.chat_template = f.read()
 
 test_text = """
-안녕하세요.<end_of_turn><eos>
-<bos><start_of_turn>system
+안녕하세요.<end_of_turn>
+<start_of_turn>system
 You are a helpful assistant named Sparkle.
 Always answer in shortest possible sentence.
-But you should remember... Try to answer in Korean.😉
-<end_of_turn><eos>
+But you should remember... Try to answer with Korean.😉<end_of_turn>
 <start_of_turn>user
-this is the test text message. now you must instruct the model to generate a response to this message.
+this is the test text message. now you must instruct the model to generate a response to this message.<end_of_turn>
 """
 
 test_input = tokenizer.apply_chat_template(
