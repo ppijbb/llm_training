@@ -175,7 +175,7 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
                          "eoi_token_index", "image_token_index", "initializer_range"]
         }
     )
-    
+    assert config.vocab_size, "vocab_size is not set"
     print("G3MoE configuration created successfully")
     print(f"  - Shared experts: {g3moe_config['n_shared_experts']}")
     print(f"  - Routed experts: {g3moe_config['n_routed_experts']}")
@@ -199,7 +199,7 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
     
     model = Gemma3ForCausalLM.from_pretrained(
         model_config["model_name_or_path"],
-        config=config,
+        config=config.text_config,
         torch_dtype=torch.bfloat16,
         trust_remote_code=model_config["trust_remote_code"],
         device_map=device_map,
@@ -309,7 +309,7 @@ def create_training_args(
     # Create SFTConfig with all parameters
     training_args = SFTConfig(
         output_dir=training_config["output_dir"],
-        num_train_epochs=training_config["num_train_epochs"],
+        num_train_epochs=3,
         per_device_train_batch_size=training_config["per_device_train_batch_size"],
         per_device_eval_batch_size=training_config["per_device_eval_batch_size"],
         gradient_accumulation_steps=training_config["gradient_accumulation_steps"],
