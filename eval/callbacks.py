@@ -14,6 +14,7 @@ from deepeval.integrations.hugging_face import DeepEvalHuggingFaceCallback
 from deepeval.dataset import EvaluationDataset, Golden
 from deepeval.metrics import GEval
 from deepeval.test_case import LLMTestCaseParams, LLMTestCase
+from deepeval.integrations.hugging_face.utils import generate_test_cases
 from transformers import (
         Trainer,
         TrainingArguments,
@@ -37,19 +38,19 @@ from deepeval.benchmarks import GSM8K
 from deepeval.benchmarks import MathQA
 from deepeval.benchmarks.tasks import MathQATask
 from deepeval.benchmarks import TruthfulQA
-from deepeval.benchmarks import AGIEval
+# from deepeval.benchmarks import AGIEval
 from deepeval.benchmarks import ARC
 from deepeval.benchmarks import HellaSwag
-from deepeval.benchmarks import OpenBookQA
-from deepeval.benchmarks import PIQA
-from deepeval.benchmarks import WinoGrande
+# from deepeval.benchmarks import OpenBookQA
+# from deepeval.benchmarks import PIQA
+# from deepeval.benchmarks import WinoGrande
 from deepeval.benchmarks import BoolQ
-from deepeval.benchmarks import CB
-from deepeval.benchmarks import COPA
-from deepeval.benchmarks import MultiRC
-from deepeval.benchmarks import ReCoRD
-from deepeval.benchmarks import RTE
-from deepeval.benchmarks import WiC
+# from deepeval.benchmarks import CB
+# from deepeval.benchmarks import COPA
+# from deepeval.benchmarks import MultiRC
+# from deepeval.benchmarks import ReCoRD
+# from deepeval.benchmarks import RTE
+# from deepeval.benchmarks import WiC
 from deepeval.metrics import HallucinationMetric, AnswerRelevancyMetric
 from deepeval.test_case import ArenaTestCase, LLMTestCase
 from deepeval.metrics import ArenaGEval
@@ -189,7 +190,12 @@ def get_model_eval_callback(
                 ],
             )
         ]
-
+    tokenizer_args.update({
+        "return_tensors": "pt", 
+        "padding": "max_length", 
+        "truncation": True, 
+        "max_length": 8192
+        })
     return ModelEvalCallback(
         trainer=trainer,
         evaluation_dataset=evaluation_dataset,
@@ -265,33 +271,45 @@ class ModelEvalCallback(DeepEvalHuggingFaceCallback):
         control: TrainerControl,
         **kwargs,
     ):
-        super().on_epoch_end(args, state, control, **kwargs)
+        with torch.inference_mode():
+            with torch.device("cuda"):
+                control.should_log = True
+                self.rich_manager.change_spinner_text(
+                    self.task_descriptions["generating"]
+                )
+                test_cases = generate_test_cases(
+                    self.trainer.model,
+                    self.trainer.tokenizer.tokenizer,
+                    self.tokenizer_args,
+                    self.evaluation_dataset,
+                )
+                self.evaluation_dataset.test_cases = test_cases
         
-        # Run benchmark evaluation if enabled and it's the right epoch
-        if (self.enable_benchmarks and 
-            state.epoch is not None and 
-            (state.epoch + 1) % self.benchmark_eval_frequency == 0):
-            
-            print(f"\n{'='*60}")
-            print(f"Epoch {state.epoch + 1} Benchmark Evaluation")
-            print(f"{'='*60}")
-            
-            benchmark_results = self._run_benchmark_evaluation()
-            
-            if benchmark_results:
-                self.benchmark_results_history.append({
-                    'epoch': state.epoch + 1,
-                    'results': benchmark_results
-                })
+            # Run benchmark evaluation if enabled and it's the right epoch
+            if (self.enable_benchmarks and 
+                state.epoch is not None and 
+                (state.epoch + 1) % self.benchmark_eval_frequency == 0):
                 
-                # Log benchmark results to trainer
-                for metric_name, score in benchmark_results.items():
-                    self.trainer.log({
-                        f"benchmark/{metric_name}": score,
-                        "epoch": state.epoch + 1
+                print(f"\n{'='*60}")
+                print(f"Epoch {state.epoch + 1} Benchmark Evaluation")
+                print(f"{'='*60}")
+                
+                benchmark_results = self._run_benchmark_evaluation()
+                
+                if benchmark_results:
+                    self.benchmark_results_history.append({
+                        'epoch': state.epoch + 1,
+                        'results': benchmark_results
                     })
-                
-                print(f"Benchmark results logged for epoch {state.epoch + 1}")
+                    
+                    # Log benchmark results to trainer
+                    for metric_name, score in benchmark_results.items():
+                        self.trainer.log({
+                            f"benchmark/{metric_name}": score,
+                            "epoch": state.epoch + 1
+                        })
+                    
+                    print(f"Benchmark results logged for epoch {state.epoch + 1}")
         
     def _run_benchmark_evaluation(self) -> Dict[str, float]:
         """
@@ -364,16 +382,16 @@ class ModelEvalCallback(DeepEvalHuggingFaceCallback):
                     print(f"ARC evaluation failed: {e}")
                     results['arc'] = 0.0
             
-            if 'piqa' in self.benchmarks_to_run:
-                try:
-                    print("Running PIQA benchmark...")
-                    piqa_benchmark = PIQA(n_shots=3)
-                    piqa_benchmark.evaluate(model=self)
-                    results['piqa'] = piqa_benchmark.overall_score
-                    print(f"PIQA Score: {piqa_benchmark.overall_score:.4f}")
-                except Exception as e:
-                    print(f"PIQA evaluation failed: {e}")
-                    results['piqa'] = 0.0
+            # if 'piqa' in self.benchmarks_to_run:
+            #     try:
+            #         print("Running PIQA benchmark...")
+            #         piqa_benchmark = PIQA(n_shots=3)
+            #         piqa_benchmark.evaluate(model=self)
+            #         results['piqa'] = piqa_benchmark.overall_score
+            #         print(f"PIQA Score: {piqa_benchmark.overall_score:.4f}")
+            #     except Exception as e:
+            #         print(f"PIQA evaluation failed: {e}")
+            #         results['piqa'] = 0.0
             
             if 'bigbenchhard' in self.benchmarks_to_run:
                 try:
@@ -428,38 +446,38 @@ class ModelEvalCallback(DeepEvalHuggingFaceCallback):
                     print(f"MathQA evaluation failed: {e}")
                     results['mathqa'] = 0.0
             
-            if 'agieval' in self.benchmarks_to_run:
-                try:
-                    print("Running AGIEval benchmark...")
-                    agieval_benchmark = AGIEval(n_shots=3)
-                    agieval_benchmark.evaluate(model=self)
-                    results['agieval'] = agieval_benchmark.overall_score
-                    print(f"AGIEval Score: {agieval_benchmark.overall_score:.4f}")
-                except Exception as e:
-                    print(f"AGIEval evaluation failed: {e}")
-                    results['agieval'] = 0.0
+            # if 'agieval' in self.benchmarks_to_run:
+            #     try:
+            #         print("Running AGIEval benchmark...")
+            #         agieval_benchmark = AGIEval(n_shots=3)
+            #         agieval_benchmark.evaluate(model=self)
+            #         results['agieval'] = agieval_benchmark.overall_score
+            #         print(f"AGIEval Score: {agieval_benchmark.overall_score:.4f}")
+            #     except Exception as e:
+            #         print(f"AGIEval evaluation failed: {e}")
+            #         results['agieval'] = 0.0
             
-            if 'openbookqa' in self.benchmarks_to_run:
-                try:
-                    print("Running OpenBookQA benchmark...")
-                    openbookqa_benchmark = OpenBookQA(n_shots=3)
-                    openbookqa_benchmark.evaluate(model=self)
-                    results['openbookqa'] = openbookqa_benchmark.overall_score
-                    print(f"OpenBookQA Score: {openbookqa_benchmark.overall_score:.4f}")
-                except Exception as e:
-                    print(f"OpenBookQA evaluation failed: {e}")
-                    results['openbookqa'] = 0.0
+            # if 'openbookqa' in self.benchmarks_to_run:
+            #     try:
+            #         print("Running OpenBookQA benchmark...")
+            #         openbookqa_benchmark = OpenBookQA(n_shots=3)
+            #         openbookqa_benchmark.evaluate(model=self)
+            #         results['openbookqa'] = openbookqa_benchmark.overall_score
+            #         print(f"OpenBookQA Score: {openbookqa_benchmark.overall_score:.4f}")
+            #     except Exception as e:
+            #         print(f"OpenBookQA evaluation failed: {e}")
+            #         results['openbookqa'] = 0.0
             
-            if 'winogrande' in self.benchmarks_to_run:
-                try:
-                    print("Running WinoGrande benchmark...")
-                    winogrande_benchmark = WinoGrande(n_shots=3)
-                    winogrande_benchmark.evaluate(model=self)
-                    results['winogrande'] = winogrande_benchmark.overall_score
-                    print(f"WinoGrande Score: {winogrande_benchmark.overall_score:.4f}")
-                except Exception as e:
-                    print(f"WinoGrande evaluation failed: {e}")
-                    results['winogrande'] = 0.0
+            # if 'winogrande' in self.benchmarks_to_run:
+            #     try:
+            #         print("Running WinoGrande benchmark...")
+            #         winogrande_benchmark = WinoGrande(n_shots=3)
+            #         winogrande_benchmark.evaluate(model=self)
+            #         results['winogrande'] = winogrande_benchmark.overall_score
+            #         print(f"WinoGrande Score: {winogrande_benchmark.overall_score:.4f}")
+            #     except Exception as e:
+            #         print(f"WinoGrande evaluation failed: {e}")
+            #         results['winogrande'] = 0.0
             
             if 'boolq' in self.benchmarks_to_run:
                 try:
@@ -472,71 +490,71 @@ class ModelEvalCallback(DeepEvalHuggingFaceCallback):
                     print(f"BoolQ evaluation failed: {e}")
                     results['boolq'] = 0.0
             
-            if 'cb' in self.benchmarks_to_run:
-                try:
-                    print("Running CB benchmark...")
-                    cb_benchmark = CB(n_shots=3)
-                    cb_benchmark.evaluate(model=self)
-                    results['cb'] = cb_benchmark.overall_score
-                    print(f"CB Score: {cb_benchmark.overall_score:.4f}")
-                except Exception as e:
-                    print(f"CB evaluation failed: {e}")
-                    results['cb'] = 0.0
+            # if 'cb' in self.benchmarks_to_run:
+            #     try:
+            #         print("Running CB benchmark...")
+            #         cb_benchmark = CB(n_shots=3)
+            #         cb_benchmark.evaluate(model=self)
+            #         results['cb'] = cb_benchmark.overall_score
+            #         print(f"CB Score: {cb_benchmark.overall_score:.4f}")
+            #     except Exception as e:
+            #         print(f"CB evaluation failed: {e}")
+            #         results['cb'] = 0.0
             
-            if 'copa' in self.benchmarks_to_run:
-                try:
-                    print("Running COPA benchmark...")
-                    copa_benchmark = COPA(n_shots=3)
-                    copa_benchmark.evaluate(model=self)
-                    results['copa'] = copa_benchmark.overall_score
-                    print(f"COPA Score: {copa_benchmark.overall_score:.4f}")
-                except Exception as e:
-                    print(f"COPA evaluation failed: {e}")
-                    results['copa'] = 0.0
+            # if 'copa' in self.benchmarks_to_run:
+            #     try:
+            #         print("Running COPA benchmark...")
+            #         copa_benchmark = COPA(n_shots=3)
+            #         copa_benchmark.evaluate(model=self)
+            #         results['copa'] = copa_benchmark.overall_score
+            #         print(f"COPA Score: {copa_benchmark.overall_score:.4f}")
+            #     except Exception as e:
+            #         print(f"COPA evaluation failed: {e}")
+            #         results['copa'] = 0.0
             
-            if 'multirc' in self.benchmarks_to_run:
-                try:
-                    print("Running MultiRC benchmark...")
-                    multirc_benchmark = MultiRC(n_shots=3)
-                    multirc_benchmark.evaluate(model=self)
-                    results['multirc'] = multirc_benchmark.overall_score
-                    print(f"MultiRC Score: {multirc_benchmark.overall_score:.4f}")
-                except Exception as e:
-                    print(f"MultiRC evaluation failed: {e}")
-                    results['multirc'] = 0.0
+            # if 'multirc' in self.benchmarks_to_run:
+            #     try:
+            #         print("Running MultiRC benchmark...")
+            #         multirc_benchmark = MultiRC(n_shots=3)
+            #         multirc_benchmark.evaluate(model=self)
+            #         results['multirc'] = multirc_benchmark.overall_score
+            #         print(f"MultiRC Score: {multirc_benchmark.overall_score:.4f}")
+            #     except Exception as e:
+            #         print(f"MultiRC evaluation failed: {e}")
+            #         results['multirc'] = 0.0
             
-            if 'record' in self.benchmarks_to_run:
-                try:
-                    print("Running ReCoRD benchmark...")
-                    record_benchmark = ReCoRD(n_shots=3)
-                    record_benchmark.evaluate(model=self)
-                    results['record'] = record_benchmark.overall_score
-                    print(f"ReCoRD Score: {record_benchmark.overall_score:.4f}")
-                except Exception as e:
-                    print(f"ReCoRD evaluation failed: {e}")
-                    results['record'] = 0.0
+            # if 'record' in self.benchmarks_to_run:
+            #     try:
+            #         print("Running ReCoRD benchmark...")
+            #         record_benchmark = ReCoRD(n_shots=3)
+            #         record_benchmark.evaluate(model=self)
+            #         results['record'] = record_benchmark.overall_score
+            #         print(f"ReCoRD Score: {record_benchmark.overall_score:.4f}")
+            #     except Exception as e:
+            #         print(f"ReCoRD evaluation failed: {e}")
+            #         results['record'] = 0.0
             
-            if 'rte' in self.benchmarks_to_run:
-                try:
-                    print("Running RTE benchmark...")
-                    rte_benchmark = RTE(n_shots=3)
-                    rte_benchmark.evaluate(model=self)
-                    results['rte'] = rte_benchmark.overall_score
-                    print(f"RTE Score: {rte_benchmark.overall_score:.4f}")
-                except Exception as e:
-                    print(f"RTE evaluation failed: {e}")
-                    results['rte'] = 0.0
+            # if 'rte' in self.benchmarks_to_run:
+            #     try:
+            #         print("Running RTE benchmark...")
+            #         rte_benchmark = RTE(n_shots=3)
+            #         rte_benchmark.evaluate(model=self)
+            #         results['rte'] = rte_benchmark.overall_score
+            #         print(f"RTE Score: {rte_benchmark.overall_score:.4f}")
+            #     except Exception as e:
+            #         print(f"RTE evaluation failed: {e}")
+            #         results['rte'] = 0.0
             
-            if 'wic' in self.benchmarks_to_run:
-                try:
-                    print("Running WiC benchmark...")
-                    wic_benchmark = WiC(n_shots=3)
-                    wic_benchmark.evaluate(model=self)
-                    results['wic'] = wic_benchmark.overall_score
-                    print(f"WiC Score: {wic_benchmark.overall_score:.4f}")
-                except Exception as e:
-                    print(f"WiC evaluation failed: {e}")
-                    results['wic'] = 0.0
+            # if 'wic' in self.benchmarks_to_run:
+            #     try:
+            #         print("Running WiC benchmark...")
+            #         wic_benchmark = WiC(n_shots=3)
+            #         wic_benchmark.evaluate(model=self)
+            #         results['wic'] = wic_benchmark.overall_score
+            #         print(f"WiC Score: {wic_benchmark.overall_score:.4f}")
+            #     except Exception as e:
+            #         print(f"WiC evaluation failed: {e}")
+            #         results['wic'] = 0.0
             
             # Run vision-based benchmark (MME)
             if 'mme' in self.benchmarks_to_run:

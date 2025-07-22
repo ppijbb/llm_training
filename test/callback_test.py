@@ -329,7 +329,7 @@ def create_training_args(
         bf16=training_config["bf16"],
         dataloader_pin_memory=training_config["dataloader_pin_memory"],
         remove_unused_columns=training_config["remove_unused_columns"],
-        gradient_checkpointing=training_config["gradient_checkpointing"],
+        # gradient_checkpointing=training_config["gradient_checkpointing"],
         seed=training_config["seed"],
         dataset_kwargs={"skip_prepare_dataset": True}
     )
@@ -368,6 +368,9 @@ def main():
     
     # Setup logging
     import logging
+    from transformers import logging as transformers_logging
+
+    transformers_logging.enable_progress_bar()
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",

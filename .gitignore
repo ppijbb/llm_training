@@ -17,3 +17,4 @@ unsloth_training_checkpoints/
 .deepeval
 *logs
 activate
+mlruns
