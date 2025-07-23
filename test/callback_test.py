@@ -205,7 +205,7 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
         device_map=device_map,
         low_cpu_mem_usage=True,
         # load_in_4bit=True,
-        # _attn_implementation="flash_attention_2" if is_flash_attn_2_available() else "sdpa"
+        attn_implementation="flash_attention_2" if is_flash_attn_2_available() else "sdpa"
     )
     print("✓ G3MoE model loaded successfully")
     

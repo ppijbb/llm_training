@@ -238,7 +238,7 @@ class ModelEvalCallback(DeepEvalHuggingFaceCallback):
             metrics=metrics,
             tokenizer_args=tokenizer_args,
             show_table=show_table)
-        self.model = LocalModel(model=trainer.model, tokenizer=trainer.tokenizer)
+        self.eval_model = LocalModel(model=trainer.model, tokenizer=trainer.tokenizer)
         self.enable_benchmarks = enable_benchmarks
         self.benchmarks_to_run = benchmarks_to_run
         self.benchmark_eval_frequency = benchmark_eval_frequency
@@ -277,7 +277,7 @@ class ModelEvalCallback(DeepEvalHuggingFaceCallback):
             #         self.task_descriptions["generating"]
             #     )
             #     test_cases = generate_test_cases(
-            #         self.trainer.model,
+            #         self.eval_model,
             #         self.trainer.tokenizer.tokenizer,
             #         self.tokenizer_args,
             #         self.evaluation_dataset,
@@ -319,7 +319,7 @@ class ModelEvalCallback(DeepEvalHuggingFaceCallback):
         
         try:
             # Get current model and tokenizer from trainer
-            model = self.trainer.model
+            model = self.eval_model
             tokenizer = self.trainer.tokenizer
             
             if tokenizer is None:
@@ -331,10 +331,12 @@ class ModelEvalCallback(DeepEvalHuggingFaceCallback):
                 try:
                     print("Running MMLU benchmark...")
                     mmlu_benchmark = MMLU(n_shots=3)
-                    mmlu_benchmark.evaluate(model=self.trainer.model)
+                    mmlu_benchmark.evaluate(model=self.eval_model)
                     results['mmlu'] = mmlu_benchmark.overall_score
                     print(f"MMLU Score: {mmlu_benchmark.overall_score:.4f}")
                 except Exception as e:
+                    import traceback
+                    traceback.print_exc()
                     print(f"MMLU evaluation failed: {e}")
                     results['mmlu'] = 0.0
             
@@ -342,7 +344,7 @@ class ModelEvalCallback(DeepEvalHuggingFaceCallback):
                 try:
                     print("Running HellaSwag benchmark...")
                     hellaswag_benchmark = HellaSwag(n_shots=3)
-                    hellaswag_benchmark.evaluate(model=self.trainer.model)
+                    hellaswag_benchmark.evaluate(model=self.eval_model)
                     results['hellaswag'] = hellaswag_benchmark.overall_score
                     print(f"HellaSwag Score: {hellaswag_benchmark.overall_score:.4f}")
                 except Exception as e:
@@ -353,7 +355,7 @@ class ModelEvalCallback(DeepEvalHuggingFaceCallback):
                 try:
                     print("Running GSM8K benchmark...")
                     gsm8k_benchmark = GSM8K(n_problems=10, n_shots=3, enable_cot=True)
-                    gsm8k_benchmark.evaluate(model=self.trainer.model)
+                    gsm8k_benchmark.evaluate(model=self.eval_model)
                     results['gsm8k'] = gsm8k_benchmark.overall_score
                     print(f"GSM8K Score: {gsm8k_benchmark.overall_score:.4f}")
                 except Exception as e:
@@ -364,7 +366,7 @@ class ModelEvalCallback(DeepEvalHuggingFaceCallback):
                 try:
                     print("Running TruthfulQA benchmark...")
                     truthfulqa_benchmark = TruthfulQA()
-                    truthfulqa_benchmark.evaluate(model=self.trainer.model)
+                    truthfulqa_benchmark.evaluate(model=self.eval_model)
                     results['truthfulqa'] = truthfulqa_benchmark.overall_score
                     print(f"TruthfulQA Score: {truthfulqa_benchmark.overall_score:.4f}")
                 except Exception as e:
@@ -375,7 +377,7 @@ class ModelEvalCallback(DeepEvalHuggingFaceCallback):
                 try:
                     print("Running ARC benchmark...")
                     arc_benchmark = ARC(n_shots=3)
-                    arc_benchmark.evaluate(model=self.trainer.model)
+                    arc_benchmark.evaluate(model=self.eval_model)
                     results['arc'] = arc_benchmark.overall_score
                     print(f"ARC Score: {arc_benchmark.overall_score:.4f}")
                 except Exception as e:
@@ -397,7 +399,7 @@ class ModelEvalCallback(DeepEvalHuggingFaceCallback):
                 try:
                     print("Running BigBenchHard benchmark...")
                     bigbench_benchmark = BigBenchHard(enable_cot=True)
-                    bigbench_benchmark.evaluate(model=self.trainer.model)
+                    bigbench_benchmark.evaluate(model=self.eval_model)
                     results['bigbenchhard'] = bigbench_benchmark.overall_score
                     print(f"BigBenchHard Score: {bigbench_benchmark.overall_score:.4f}")
                 except Exception as e:
@@ -411,7 +413,7 @@ class ModelEvalCallback(DeepEvalHuggingFaceCallback):
                         tasks=[HumanEvalTask.HAS_CLOSE_ELEMENTS, HumanEvalTask.SORT_NUMBERS],
                         n=50
                     )
-                    humaneval_benchmark.evaluate(model=self.trainer.model)
+                    humaneval_benchmark.evaluate(model=self.eval_model)
                     results['humaneval'] = humaneval_benchmark.overall_score
                     print(f"HumanEval Score: {humaneval_benchmark.overall_score:.4f}")
                 except Exception as e:
@@ -425,7 +427,7 @@ class ModelEvalCallback(DeepEvalHuggingFaceCallback):
                         tasks=[SQuADTask.PHARMACY, SQuADTask.NORMANS],
                         n_shots=3
                     )
-                    squad_benchmark.evaluate(model=self.trainer.model)
+                    squad_benchmark.evaluate(model=self.eval_model)
                     results['squad'] = squad_benchmark.overall_score
                     print(f"SQuAD Score: {squad_benchmark.overall_score:.4f}")
                 except Exception as e:
@@ -439,7 +441,7 @@ class ModelEvalCallback(DeepEvalHuggingFaceCallback):
                         tasks=[MathQATask.PROBABILITY, MathQATask.GEOMETRY],
                         n_shots=3
                     )
-                    mathqa_benchmark.evaluate(model=self.trainer.model)
+                    mathqa_benchmark.evaluate(model=self.eval_model)
                     results['mathqa'] = mathqa_benchmark.overall_score
                     print(f"MathQA Score: {mathqa_benchmark.overall_score:.4f}")
                 except Exception as e:
@@ -450,7 +452,7 @@ class ModelEvalCallback(DeepEvalHuggingFaceCallback):
             #     try:
             #         print("Running AGIEval benchmark...")
             #         agieval_benchmark = AGIEval(n_shots=3)
-            #         agieval_benchmark.evaluate(model=self.trainer.model)
+            #         agieval_benchmark.evaluate(model=self.eval_model)
             #         results['agieval'] = agieval_benchmark.overall_score
             #         print(f"AGIEval Score: {agieval_benchmark.overall_score:.4f}")
             #     except Exception as e:
@@ -461,7 +463,7 @@ class ModelEvalCallback(DeepEvalHuggingFaceCallback):
             #     try:
             #         print("Running OpenBookQA benchmark...")
             #         openbookqa_benchmark = OpenBookQA(n_shots=3)
-            #         openbookqa_benchmark.evaluate(model=self.trainer.model)
+            #         openbookqa_benchmark.evaluate(model=self.eval_model)
             #         results['openbookqa'] = openbookqa_benchmark.overall_score
             #         print(f"OpenBookQA Score: {openbookqa_benchmark.overall_score:.4f}")
             #     except Exception as e:
@@ -472,7 +474,7 @@ class ModelEvalCallback(DeepEvalHuggingFaceCallback):
             #     try:
             #         print("Running WinoGrande benchmark...")
             #         winogrande_benchmark = WinoGrande(n_shots=3)
-            #         winogrande_benchmark.evaluate(model=self.trainer.model)
+            #         winogrande_benchmark.evaluate(model=self.eval_model)
             #         results['winogrande'] = winogrande_benchmark.overall_score
             #         print(f"WinoGrande Score: {winogrande_benchmark.overall_score:.4f}")
             #     except Exception as e:
@@ -483,7 +485,7 @@ class ModelEvalCallback(DeepEvalHuggingFaceCallback):
                 try:
                     print("Running BoolQ benchmark...")
                     boolq_benchmark = BoolQ(n_shots=3)
-                    boolq_benchmark.evaluate(model=self.trainer.model)
+                    boolq_benchmark.evaluate(model=self.eval_model)
                     results['boolq'] = boolq_benchmark.overall_score
                     print(f"BoolQ Score: {boolq_benchmark.overall_score:.4f}")
                 except Exception as e:
@@ -494,7 +496,7 @@ class ModelEvalCallback(DeepEvalHuggingFaceCallback):
             #     try:
             #         print("Running CB benchmark...")
             #         cb_benchmark = CB(n_shots=3)
-            #         cb_benchmark.evaluate(model=self.trainer.model)
+            #         cb_benchmark.evaluate(model=self.eval_model)
             #         results['cb'] = cb_benchmark.overall_score
             #         print(f"CB Score: {cb_benchmark.overall_score:.4f}")
             #     except Exception as e:
@@ -505,7 +507,7 @@ class ModelEvalCallback(DeepEvalHuggingFaceCallback):
             #     try:
             #         print("Running COPA benchmark...")
             #         copa_benchmark = COPA(n_shots=3)
-            #         copa_benchmark.evaluate(model=self.trainer.model)
+            #         copa_benchmark.evaluate(model=self.eval_model)
             #         results['copa'] = copa_benchmark.overall_score
             #         print(f"COPA Score: {copa_benchmark.overall_score:.4f}")
             #     except Exception as e:
@@ -516,7 +518,7 @@ class ModelEvalCallback(DeepEvalHuggingFaceCallback):
             #     try:
             #         print("Running MultiRC benchmark...")
             #         multirc_benchmark = MultiRC(n_shots=3)
-            #         multirc_benchmark.evaluate(model=self.trainer.model)
+            #         multirc_benchmark.evaluate(model=self.eval_model)
             #         results['multirc'] = multirc_benchmark.overall_score
             #         print(f"MultiRC Score: {multirc_benchmark.overall_score:.4f}")
             #     except Exception as e:
@@ -527,7 +529,7 @@ class ModelEvalCallback(DeepEvalHuggingFaceCallback):
             #     try:
             #         print("Running ReCoRD benchmark...")
             #         record_benchmark = ReCoRD(n_shots=3)
-            #         record_benchmark.evaluate(model=self.trainer.model)
+            #         record_benchmark.evaluate(model=self.eval_model)
             #         results['record'] = record_benchmark.overall_score
             #         print(f"ReCoRD Score: {record_benchmark.overall_score:.4f}")
             #     except Exception as e:
@@ -538,7 +540,7 @@ class ModelEvalCallback(DeepEvalHuggingFaceCallback):
             #     try:
             #         print("Running RTE benchmark...")
             #         rte_benchmark = RTE(n_shots=3)
-            #         rte_benchmark.evaluate(model=self.trainer.model)
+            #         rte_benchmark.evaluate(model=self.eval_model)
             #         results['rte'] = rte_benchmark.overall_score
             #         print(f"RTE Score: {rte_benchmark.overall_score:.4f}")
             #     except Exception as e:
@@ -549,7 +551,7 @@ class ModelEvalCallback(DeepEvalHuggingFaceCallback):
             #     try:
             #         print("Running WiC benchmark...")
             #         wic_benchmark = WiC(n_shots=3)
-            #         wic_benchmark.evaluate(model=self.trainer.model)
+            #         wic_benchmark.evaluate(model=self.eval_model)
             #         results['wic'] = wic_benchmark.overall_score
             #         print(f"WiC Score: {wic_benchmark.overall_score:.4f}")
             #     except Exception as e:
