@@ -104,9 +104,15 @@ fi
 # Determine the training command based on number of GPUs
 cd "$PROJECT_ROOT"
 
+# To run with 1 GPU, use the following command:
+# python3 $SCRIPT_DIR/custom_model_sft.py --config $CONFIG_FILE
+
+# To run with multiple GPUs, use the following command:
+# torchrun --nproc_per_node=$NUM_GPUS $SCRIPT_DIR/custom_model_sft.py --config $CONFIG_FILE
+
 if [ "$NUM_GPUS" -eq 1 ]; then
     echo -e "${GREEN}Starting single-GPU DeepSpeed training...${NC}"
-    TRAIN_CMD="python3 $SCRIPT_DIR/custom_model_sft.py --config $CONFIG_FILE"
+    TRAIN_CMD="uv run accelerate launch --num_processes=1 $SCRIPT_DIR/custom_model_sft.py --config $CONFIG_FILE"
 else
     echo -e "${GREEN}Starting multi-GPU DeepSpeed training with $NUM_GPUS GPUs...${NC}"
     TRAIN_CMD="torchrun --nproc_per_node=$NUM_GPUS $SCRIPT_DIR/custom_model_sft.py --config $CONFIG_FILE"

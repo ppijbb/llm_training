@@ -17,6 +17,8 @@ from transformers import (
     AutoProcessor,
     AutoConfig
 )
+from transformers import logging
+
 from transformers.trainer_utils import set_seed
 from trl import SFTTrainer, SFTConfig
 from peft.tuners.lora.config import LoraConfig
@@ -38,6 +40,9 @@ from optimizers.deepspeed_optimizer_registry import register_custom_optimizers
 from eval.callbacks import get_model_eval_callback
 from moe_monitoring_callback import create_moe_callback_for_transformers
 
+
+logging.enable_progress_bar()
+logging.set_verbosity_info()
 
 def load_config(config_path: str):
     """간단한 config 로더"""
@@ -194,7 +199,7 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
     
     # Load G3MoE model with the configured parameters
     print("Loading G3MoE model...")
-    
+    attn_implementation = "flash_attention_2" if is_flash_attn_2_available() else "sdpa"
     model = G3MoEForCausalLM.from_pretrained(
         model_config["model_name_or_path"],
         config=config,
@@ -203,9 +208,10 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
         device_map=device_map,
         low_cpu_mem_usage=True,
         # load_in_4bit=True,
-        _attn_implementation="flash_attention_2" if is_flash_attn_2_available() else "sdpa"
+        _attn_implementation=attn_implementation
     )
     print("✓ G3MoE model loaded successfully")
+    print(f"  - Attn implementation: {attn_implementation}")
     
     
     total_params = model.num_parameters()
@@ -249,6 +255,16 @@ def setup_dataset(data_config: Dict[str, Any], tokenizer):
         print(f"  - chat_template 길이: {len(str(tokenizer.chat_template))}")
     else:
         print(f"  - ⚠️ chat_template이 설정되지 않음!")
+    with open("/home/conan_jung/workspace/llm_training/sft/config/chat_template.txt", "r") as f:
+        chat_template = f.read()
+        
+        # AutoProcessor인 경우 tokenizer 속성에 설정
+        if hasattr(tokenizer, 'tokenizer'):
+            tokenizer.tokenizer.chat_template = chat_template
+            print("  ✅ 채팅 템플릿을 tokenizer.tokenizer에 설정")
+        
+        tokenizer.chat_template = chat_template
+        print("  ✅ 채팅 템플릿을 tokenizer에 설정")
     
     # print(f"Loading dataset: {data_config['dataset_name']}")
     try:
@@ -265,8 +281,8 @@ def setup_dataset(data_config: Dict[str, Any], tokenizer):
         else:
             # 일반적인 데이터셋 로더 시도
             dataset = get_dataset(
-                dataset_name=data_config["dataset_name"],
                 tokenizer=tokenizer,
+                dataset_name=data_config["dataset_name"],
                 max_length=data_config["max_seq_length"],
                 test_size=data_config["test_size"],
                 text_only=data_config["text_only"],
@@ -275,12 +291,12 @@ def setup_dataset(data_config: Dict[str, Any], tokenizer):
         
         print(f"Dataset loaded:")
         for split, data in dataset.items():
-            print(f"  {split}: {len(data)} examples")
+            print(f"  {split}: {data.info.dataset_size if bool(data_config['streaming']) else len(data)} examples")
         
         # 빈 데이터셋 체크
-        if len(dataset.get("train", [])) == 0:
-            raise ValueError("훈련 데이터셋이 비어있습니다!")
-        
+        if data_config.get("streaming", False):
+            if dataset.get("train", []).info.dataset_size == 0:
+                raise ValueError("훈련 데이터셋이 비어있습니다!")
         return dataset
         
     except Exception as e:
@@ -306,31 +322,32 @@ def create_training_args(
     
     # Create SFTConfig with all parameters
     training_args = SFTConfig(
-        output_dir=training_config["output_dir"],
-        num_train_epochs=training_config["num_train_epochs"],
-        per_device_train_batch_size=training_config["per_device_train_batch_size"],
-        per_device_eval_batch_size=training_config["per_device_eval_batch_size"],
-        gradient_accumulation_steps=training_config["gradient_accumulation_steps"],
-        learning_rate=training_config["learning_rate"],
-        weight_decay=training_config["weight_decay"],
-        lr_scheduler_type=training_config["lr_scheduler_type"],
-        warmup_ratio=training_config["warmup_ratio"],
-        logging_steps=training_config["logging_steps"],
-        eval_steps=training_config["eval_steps"],
-        save_steps=training_config["save_steps"],
-        save_total_limit=training_config["save_total_limit"],
-        eval_strategy=training_config["eval_strategy"],
-        load_best_model_at_end=training_config["load_best_model_at_end"],
-        metric_for_best_model=training_config["metric_for_best_model"],
-        greater_is_better=training_config["greater_is_better"],
-        fp16=training_config["fp16"],
-        bf16=training_config["bf16"],
-        dataloader_pin_memory=training_config["dataloader_pin_memory"],
-        remove_unused_columns=training_config["remove_unused_columns"],
-        gradient_checkpointing=training_config["gradient_checkpointing"],
-        report_to=training_config["report_to"],
-        run_name=training_config["run_name"],
-        seed=training_config["seed"],
+        **training_config,
+        # output_dir=training_config["output_dir"],
+        # num_train_epochs=training_config["num_train_epochs"],
+        # per_device_train_batch_size=training_config["per_device_train_batch_size"],
+        # per_device_eval_batch_size=training_config["per_device_eval_batch_size"],
+        # gradient_accumulation_steps=training_config["gradient_accumulation_steps"],
+        # learning_rate=training_config["learning_rate"],
+        # weight_decay=training_config["weight_decay"],
+        # lr_scheduler_type=training_config["lr_scheduler_type"],
+        # warmup_ratio=training_config["warmup_ratio"],
+        # logging_steps=training_config["logging_steps"],
+        # eval_steps=training_config["eval_steps"],
+        # save_steps=training_config["save_steps"],
+        # save_total_limit=training_config["save_total_limit"],
+        # eval_strategy=training_config["eval_strategy"],
+        # load_best_model_at_end=training_config["load_best_model_at_end"],
+        # metric_for_best_model=training_config["metric_for_best_model"],
+        # greater_is_better=training_config["greater_is_better"],
+        # fp16=training_config["fp16"],
+        # bf16=training_config["bf16"],
+        # dataloader_pin_memory=training_config["dataloader_pin_memory"],
+        # remove_unused_columns=training_config["remove_unused_columns"],
+        # gradient_checkpointing=training_config["gradient_checkpointing"],
+        # report_to=training_config["report_to"],
+        # run_name=training_config["run_name"],
+        # seed=training_config["seed"],
         dataset_kwargs={"skip_prepare_dataset": True}
     )
     
@@ -444,7 +461,13 @@ def main():
         data_collator=collate_fn
     )
     trainer.add_callback(moe_monitoring_callback)
-    trainer.add_callback(get_model_eval_callback(trainer=trainer))
+    trainer.add_callback(get_model_eval_callback(
+        trainer=trainer,  # Will be set by Trainer
+        enable_benchmarks=True,  # Enable benchmark evaluation
+        benchmarks_to_run=['mmlu', 'hellaswag', 'gsm8k', 'truthfulqa', 'arc', 'piqa'],  # Run multiple benchmarks
+        benchmark_eval_frequency=1,  # Run benchmarks every 2 epochs
+        mme_max_samples=10,  # Limit MME samples for faster evaluation
+    ))
     # Print training info
     print("\n" + "="*50)
     print("TRAINING CONFIGURATION")
