@@ -38,7 +38,7 @@ from training_utils.utils import format_parameters, load_config, setup_deepspeed
 from optimizers.custom_optimizers import get_custom_optimizer
 from optimizers.deepspeed_optimizer_registry import register_custom_optimizers
 from eval.callbacks import get_model_eval_callback
-from moe_monitoring_callback import create_moe_callback_for_transformers
+from eval.moe_monitoring_callback import create_moe_callback_for_transformers
 
 
 logging.enable_progress_bar()
@@ -278,6 +278,7 @@ def setup_dataset(data_config: Dict[str, Any], tokenizer):
                 max_samples=max_samples,
                 test_size=test_size
             )
+            collate_fn = create_simple_collate_fn(tokenizer)
         else:
             # 일반적인 데이터셋 로더 시도
             dataset = get_dataset(
@@ -288,6 +289,7 @@ def setup_dataset(data_config: Dict[str, Any], tokenizer):
                 text_only=data_config["text_only"],
                 streaming=data_config["streaming"]
             )
+            collate_fn = create_multimodal_collate_fn(tokenizer)
         
         print(f"Dataset loaded:")
         for split, data in dataset.items():
@@ -297,7 +299,8 @@ def setup_dataset(data_config: Dict[str, Any], tokenizer):
         if data_config.get("streaming", False):
             if dataset.get("train", []).info.dataset_size == 0:
                 raise ValueError("훈련 데이터셋이 비어있습니다!")
-        return dataset
+
+        return dataset, collate_fn
         
     except Exception as e:
         print(f"❌ 데이터셋 로딩 실패: {e}")
@@ -398,25 +401,14 @@ def main():
             name=training_config["run_name"],
             config=config
         )
-    moe_monitoring_callback = create_moe_callback_for_transformers(
-        log_every_n_steps=50,       # 50 스텝마다 로그 기록
-        logger=wandb,               # 사용할 로거 지정 (wandb)
-        log_to_console=True,        # 콘솔에도 주요 메트릭 출력
-        
-        # === 고급 설정 (선택사항) ===
-        log_heatmap_every=500,      # 500 스텝마다 Expert 사용률 히트맵 로깅
-        alert_threshold_imbalance=4.0, # 특정 Expert 사용률이 평균의 4배를 초과하면 경고
-        unused_expert_threshold=0.25,  # 25% 이상의 Expert가 미사용되면 경고
-        entropy_threshold=0.1,         # 라우팅 엔트로피가 0.1 미만이면 경고
-        save_detailed_logs=False       # 상세 JSON 로그 저장 여부
-    )
+
     # Setup model and tokenizer
     print("Setting up model and tokenizer...")
     model, tokenizer = setup_model_and_tokenizer(model_config)
     
     # Setup dataset
     print("Setting up dataset...")
-    dataset = setup_dataset(data_config, tokenizer)
+    dataset, collate_fn = setup_dataset(data_config, tokenizer)
     
     # Create training arguments
     training_args = create_training_args(
@@ -424,12 +416,6 @@ def main():
         model_config.get("deepspeed_config")
     )
     
-    # Create multimodal data collator
-    print("Creating multimodal data collator...")
-    # collate_fn = create_multimodal_collate_fn(tokenizer)
-    print("Creating data collator...")
-    collate_fn = create_simple_collate_fn(tokenizer)
-
     # Setup trainer
     print("Setting up trainer...")
     
@@ -460,7 +446,19 @@ def main():
         processing_class=tokenizer,
         data_collator=collate_fn
     )
-    trainer.add_callback(moe_monitoring_callback)
+    trainer.add_callback(create_moe_callback_for_transformers(
+        num_experts=model_config["g3moe_params"]["n_routed_experts"],
+        log_every_n_steps=50,       # 50 스텝마다 로그 기록
+        logger=wandb,               # 사용할 로거 지정 (wandb)
+        log_to_console=True,        # 콘솔에도 주요 메트릭 출력
+        
+        # === 고급 설정 (선택사항) ===
+        log_heatmap_every=500,      # 500 스텝마다 Expert 사용률 히트맵 로깅
+        alert_threshold_imbalance=4.0, # 특정 Expert 사용률이 평균의 4배를 초과하면 경고
+        unused_expert_threshold=0.25,  # 25% 이상의 Expert가 미사용되면 경고
+        entropy_threshold=0.1,         # 라우팅 엔트로피가 0.1 미만이면 경고
+        save_detailed_logs=False       # 상세 JSON 로그 저장 여부
+    ))
     trainer.add_callback(get_model_eval_callback(
         trainer=trainer,  # Will be set by Trainer
         enable_benchmarks=True,  # Enable benchmark evaluation
@@ -502,4 +500,12 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print(torch.cuda.memory_summary())
+        print(torch.cuda.max_memory_allocated())
+        print(torch.cuda.max_memory_reserved())

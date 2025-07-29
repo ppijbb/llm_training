@@ -41,60 +41,89 @@ def create_multimodal_collate_fn(processor):
     """
     def collate_fn(examples):
         # Extract messages from examples
-        messages_list = [example["messages"] for example in examples]
-        
-        # Apply chat template to get text
-        texts = []
-        images_list = []
-        
-        for messages in messages_list:
-            # Apply chat template
-            text = processor.apply_chat_template(
-                messages, 
-                tokenize=False, 
-                add_generation_prompt=False
-            ).strip()
-            texts.append(text)
+        if "messages" in examples[0]:
+            messages_list = [example["messages"] for example in examples]
             
-            # Extract images from messages
-            images = process_vision_info(messages)
-            images_list.append(images)
-        
-        # Process texts and images together
-        batch = processor(
-            text=texts, 
-            images=images_list, 
-            return_tensors="pt", 
-            padding=True
-        )
-        
-        # The labels are the input_ids, and we mask the padding tokens in the loss computation
-        labels = batch["input_ids"].clone()
-        
-        # Get special token IDs for masking
-        pad_token_id = processor.tokenizer.pad_token_id
-        
-        # Mask padding tokens
-        if pad_token_id is not None:
+            # Apply chat template to get text
+            texts = []
+            images_list = []
+            
+            for messages in messages_list:
+                # Apply chat template
+                text = processor.apply_chat_template(
+                    messages, 
+                    tokenize=False, 
+                    add_generation_prompt=False
+                ).strip()
+                texts.append(text)
+                
+                # Extract images from messages
+                images = process_vision_info(messages)
+                images_list.append(images)
+            
+            # Process texts and images together
+            batch = processor(
+                text=texts, 
+                images=images_list, 
+                return_tensors="pt", 
+                padding=True
+            )
+            
+            # The labels are the input_ids, and we mask the padding tokens in the loss computation
+            labels = batch["input_ids"].clone()
+            
+            # Get special token IDs for masking
+            pad_token_id = processor.tokenizer.pad_token_id
+            
+            # Mask padding tokens
+            if pad_token_id is not None:
+                labels[labels == pad_token_id] = -100
+            
+            # Mask image tokens if they exist
+            try:
+                # Try to get image token ID
+                if hasattr(processor.tokenizer, 'special_tokens_map') and 'boi_token' in processor.tokenizer.special_tokens_map:
+                    image_token_id = processor.tokenizer.convert_tokens_to_ids(
+                        processor.tokenizer.special_tokens_map["boi_token"]
+                    )
+                    labels[labels == image_token_id] = -100
+                
+                # Mask image soft tokens (gemma specific)
+                labels[labels == 262144] = -100
+                
+            except Exception as e:
+                logger.warning(f"Warning: Could not mask image tokens: {e}")
+            
+            batch["labels"] = labels
+            return batch
+        elif "input_ids" in examples[0]:
+            # input_ids와 attention_mask 추출
+            input_ids = [torch.tensor(example["input_ids"]) for example in examples if "input_ids" in example]
+            attention_mask = [torch.tensor(example["attention_mask"]) for example in examples if "attention_mask" in example]
+            
+            if not input_ids:
+                return None
+            
+            # 패딩 처리
+            from torch.nn.utils.rnn import pad_sequence
+            
+            input_ids = pad_sequence(input_ids, batch_first=True, padding_value=processor.tokenizer.pad_token_id or processor.tokenizer.eos_token_id)
+            attention_mask = pad_sequence(attention_mask, batch_first=True, padding_value=0)
+            
+            # labels는 input_ids와 동일 (causal LM)
+            labels = input_ids.clone()
+            
+            # 패딩 토큰은 loss 계산에서 제외
+            pad_token_id = processor.tokenizer.pad_token_id or processor.tokenizer.eos_token_id
             labels[labels == pad_token_id] = -100
-        
-        # Mask image tokens if they exist
-        try:
-            # Try to get image token ID
-            if hasattr(processor.tokenizer, 'special_tokens_map') and 'boi_token' in processor.tokenizer.special_tokens_map:
-                image_token_id = processor.tokenizer.convert_tokens_to_ids(
-                    processor.tokenizer.special_tokens_map["boi_token"]
-                )
-                labels[labels == image_token_id] = -100
             
-            # Mask image soft tokens (gemma specific)
-            labels[labels == 262144] = -100
-            
-        except Exception as e:
-            logger.warning(f"Warning: Could not mask image tokens: {e}")
-        
-        batch["labels"] = labels
-        return batch
+            return {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "labels": labels
+            }
+        else:
+            raise ValueError("Unknown dataset format")
     
     return collate_fn
 

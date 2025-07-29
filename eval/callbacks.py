@@ -146,7 +146,8 @@ def get_model_eval_callback(
     show_table: bool = False,
     enable_benchmarks: bool = False,
     benchmarks_to_run: List[str] = ['mmlu', 'hellaswag', 'gsm8k', 'truthfulqa', 'arc', 'piqa'],
-    benchmark_eval_frequency: int = 1,  # Run every N epochs
+    benchmark_eval_frequency: int = 1000,  # Changed to 1000 steps default
+    eval_mode: str = "step",  # Added eval_mode parameter with step as default
     mme_max_samples: int = 20,  # Limit MME samples for faster evaluation
 ): 
     if evaluation_dataset is None:
@@ -205,6 +206,7 @@ def get_model_eval_callback(
         enable_benchmarks=enable_benchmarks,
         benchmarks_to_run=benchmarks_to_run,
         benchmark_eval_frequency=benchmark_eval_frequency,
+        eval_mode=eval_mode,
         mme_max_samples=mme_max_samples,
     )
 
@@ -227,7 +229,8 @@ class ModelEvalCallback(DeepEvalHuggingFaceCallback):
         show_table: bool = False,
         enable_benchmarks: bool = False,
         benchmarks_to_run: List[str] = ['mmlu', 'hellaswag', 'gsm8k', 'truthfulqa', 'arc', 'piqa'],
-        benchmark_eval_frequency: int = 1,
+        benchmark_eval_frequency: int = 1000,  # Changed to step-based (1000 steps)
+        eval_mode: str = "step",  # Changed default to step-based
         mme_max_samples: int = 20,
         *args, 
         **kwargs
@@ -242,8 +245,10 @@ class ModelEvalCallback(DeepEvalHuggingFaceCallback):
         self.enable_benchmarks = enable_benchmarks
         self.benchmarks_to_run = benchmarks_to_run
         self.benchmark_eval_frequency = benchmark_eval_frequency
+        self.eval_mode = eval_mode  # "step" or "epoch"
         self.mme_max_samples = mme_max_samples
         self.benchmark_results_history = []
+        self.last_eval_step = 0  # Track last evaluation step
     
     def _calculate_metric_scores(self) -> Dict[str, List[float]]:
         return super()._calculate_metric_scores()
@@ -263,40 +268,30 @@ class ModelEvalCallback(DeepEvalHuggingFaceCallback):
     ):
         super().on_epoch_begin(args, state, control, **kwargs)
         
-    def on_epoch_end(
+    def on_step_end(
         self,
         args: TrainingArguments,
         state: TrainerState,
         control: TrainerControl,
         **kwargs,
     ):
-        with torch.inference_mode():
-            # with torch.device("cuda"):
-            #     control.should_log = True
-            #     self.rich_manager.change_spinner_text(
-            #         self.task_descriptions["generating"]
-            #     )
-            #     test_cases = generate_test_cases(
-            #         self.eval_model,
-            #         self.trainer.tokenizer.tokenizer,
-            #         self.tokenizer_args,
-            #         self.evaluation_dataset,
-            #     )
-            #     self.evaluation_dataset.test_cases = test_cases
-
-            # Run benchmark evaluation if enabled and it's the right epoch
-            if (self.enable_benchmarks and 
-                state.epoch is not None and 
-                (state.epoch) % self.benchmark_eval_frequency == 0):
-                
+        """Step-based benchmark evaluation"""
+        # Only run if step-based evaluation is enabled
+        if (self.eval_mode == "step" and 
+            self.enable_benchmarks and
+            state.global_step > 0 and
+            state.global_step - self.last_eval_step >= self.benchmark_eval_frequency):
+            
+            with torch.inference_mode():
                 print(f"\n{'='*60}")
-                print(f"Epoch {state.epoch} Benchmark Evaluation")
+                print(f"Step {state.global_step} Benchmark Evaluation")
                 print(f"{'='*60}")
                 
                 benchmark_results = self._run_benchmark_evaluation()
                 
                 if benchmark_results:
                     self.benchmark_results_history.append({
+                        'step': state.global_step,
                         'epoch': state.epoch,
                         'results': benchmark_results
                     })
@@ -305,10 +300,64 @@ class ModelEvalCallback(DeepEvalHuggingFaceCallback):
                     for metric_name, score in benchmark_results.items():
                         self.trainer.log({
                             f"benchmark/{metric_name}": score,
+                            "step": state.global_step,
                             "epoch": state.epoch
                         })
                     
-                    print(f"Benchmark results logged for epoch {state.epoch}")
+                    print(f"Benchmark results logged for step {state.global_step}")
+                
+                self.last_eval_step = state.global_step
+
+    def on_epoch_end(
+        self,
+        args: TrainingArguments,
+        state: TrainerState,
+        control: TrainerControl,
+        **kwargs,
+    ):
+        # Only run epoch-based evaluation if eval_mode is "epoch"
+        if self.eval_mode == "epoch":
+            with torch.inference_mode():
+                # with torch.device("cuda"):
+                #     control.should_log = True
+                #     self.rich_manager.change_spinner_text(
+                #         self.task_descriptions["generating"]
+                #     )
+                #     test_cases = generate_test_cases(
+                #         self.eval_model,
+                #         self.trainer.tokenizer.tokenizer,
+                #         self.tokenizer_args,
+                #         self.evaluation_dataset,
+                #     )
+                #     self.evaluation_dataset.test_cases = test_cases
+
+                # Run benchmark evaluation if enabled and it's the right epoch
+                if (self.enable_benchmarks and 
+                    state.epoch is not None and 
+                    (state.epoch) % self.benchmark_eval_frequency == 0):
+                    
+                    print(f"\n{'='*60}")
+                    print(f"Epoch {state.epoch} Benchmark Evaluation")
+                    print(f"{'='*60}")
+                    
+                    benchmark_results = self._run_benchmark_evaluation()
+                    
+                    if benchmark_results:
+                        self.benchmark_results_history.append({
+                            'epoch': state.epoch,
+                            'step': state.global_step,
+                            'results': benchmark_results
+                        })
+                        
+                        # Log benchmark results to trainer
+                        for metric_name, score in benchmark_results.items():
+                            self.trainer.log({
+                                f"benchmark/{metric_name}": score,
+                                "epoch": state.epoch,
+                                "step": state.global_step
+                            })
+                        
+                        print(f"Benchmark results logged for epoch {state.epoch}")
     
     @torch.no_grad()
     def _run_benchmark_evaluation(self) -> Dict[str, float]:

@@ -11,6 +11,7 @@ class TorchMoECallback:
     
     def __init__(
         self,
+        num_experts: int,
         log_every_n_steps: int = 100,
         log_heatmap_every: int = 1000,
         alert_threshold_imbalance: float = 5.0,
@@ -21,12 +22,13 @@ class TorchMoECallback:
         log_to_console: bool = False,
         save_detailed_logs: bool = False,
         log_dir: str = "./moe_logs",
-        debug_logging: bool = False
+        debug_logging: bool = False       
     ):
         self.log_every_n_steps = log_every_n_steps
         self.log_heatmap_every = log_heatmap_every
         self.alert_threshold_imbalance = alert_threshold_imbalance
         self.unused_expert_threshold = unused_expert_threshold
+        self.num_experts = num_experts
         self.entropy_threshold = entropy_threshold
         self.window_size = window_size
         self.logger = logger
@@ -232,7 +234,7 @@ class TorchMoECallback:
             
             expert_assignments = routing_info.get('expert_assignments')
             routing_probs = routing_info.get('routing_probs')
-            num_experts = routing_info.get('num_experts', 8)  # 기본값
+            num_experts = routing_info.get('num_experts', self.num_experts)  # 기본값
             
             if expert_assignments is not None:
                 if expert_assignments.is_cuda: # GPU tensor인 경우에만
@@ -374,7 +376,7 @@ class TorchMoECallback:
             # 사용되지 않는 experts
             if 'unused_experts' in layer_metrics:
                 unused = layer_metrics['unused_experts']
-                total_experts = layer_metrics.get('usage_counts', torch.zeros(8)).numel()
+                total_experts = layer_metrics.get('usage_counts', torch.zeros(self.num_experts)).numel()
                 if unused / total_experts > self.unused_expert_threshold:
                     alerts.append({
                         'type': 'unused_experts',
