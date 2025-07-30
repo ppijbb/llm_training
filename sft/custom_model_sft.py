@@ -463,7 +463,7 @@ def main():
         trainer=trainer,  # Will be set by Trainer
         enable_benchmarks=True,  # Enable benchmark evaluation
         benchmarks_to_run=['mmlu', 'hellaswag', 'gsm8k', 'truthfulqa', 'arc', 'piqa'],  # Run multiple benchmarks
-        benchmark_eval_frequency=1,  # Run benchmarks every 2 epochs
+        benchmark_eval_frequency=training_config["eval_steps"],  # Run benchmarks every 2 epochs
         mme_max_samples=10,  # Limit MME samples for faster evaluation
     ))
     # Print training info
