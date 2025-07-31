@@ -58,7 +58,7 @@ class IFEvalCallback(TrainerCallback):
         self.eval_dataset_name = eval_dataset_name
         self.max_samples = max_samples
         self.generation_config = generation_config or {
-            "max_new_tokens": 1024,
+            # "max_new_tokens": 1024,
             "do_sample": False,
             "temperature": 0.1,
         }

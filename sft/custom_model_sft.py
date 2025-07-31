@@ -37,7 +37,8 @@ from data.simple_sft_dataset import get_simple_sft_dataset, create_simple_collat
 from training_utils.utils import format_parameters, load_config, setup_deepspeed_environment
 from optimizers.custom_optimizers import get_custom_optimizer
 from optimizers.deepspeed_optimizer_registry import register_custom_optimizers
-from eval.callbacks import get_model_eval_callback, IFEvalCallback
+from eval.callbacks import get_model_eval_callback
+from eval.ifeval_callback import IFEvalCallback
 from eval.moe_monitoring_callback import create_moe_callback_for_transformers
 
 
@@ -468,9 +469,7 @@ def main():
     ))
     trainer.add_callback(IFEvalCallback(
         eval_dataset_name="google/IFEval",
-        max_samples=500,
-        generation_config=training_args.generation_config,
-        template=training_args.template,
+        max_samples=500
     ))
 
     # Print training info
