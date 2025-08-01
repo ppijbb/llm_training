@@ -43,7 +43,7 @@ from eval.moe_monitoring_callback import create_moe_callback_for_transformers
 
 
 logging.enable_progress_bar()
-logging.set_verbosity_info()
+logging.set_verbosity_warning()
 
 def load_config(config_path: str):
     """간단한 config 로더"""
@@ -52,7 +52,7 @@ def load_config(config_path: str):
 
 def setup_deepspeed_environment():
     """Setup environment variables for DeepSpeed optimization"""
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:1024"
+    # os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:1024"
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     
     # Enable DeepSpeed optimizations
