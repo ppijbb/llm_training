@@ -213,8 +213,11 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
     )
     print("✓ G3MoE model loaded successfully")
     print(f"  - Attn implementation: {attn_implementation}")
-    
-    summary(model, input_size=(1, 1024, 4096), depth=3)
+    summary(
+        model,
+        input_data={
+            'input_ids': torch.randint(0, tokenizer.tokenizer.vocab_size, (1, 1024), device=model.device)
+        }, depth=3)
     total_params = model.num_parameters()
     print(f"  - Total parameters: {format_parameters(total_params)}")
 
