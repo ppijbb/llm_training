@@ -30,6 +30,7 @@ ipython-genutils>=0.2.0
 ipywidgets>=8.1.5
 iso8601>=2.1.0
 isoduration>=20.11.0
+instruction-following-eval @ git+https://github.com/josejg/instruction_following_eval.git
 jaxlib>=0.4.28
 Jinja2>=3.1.5
 joblib>=1.4.2
@@ -161,6 +162,7 @@ torch-struct==0.5
 torch_geometric==2.6.1
 torchaudio==2.7.0
 torchfile==0.1.0
+torchinfo>=1.8.0
 torchmetrics>=1.6.1
 torchtext
 torchvision==0.22.0

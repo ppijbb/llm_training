@@ -8,6 +8,7 @@ from PIL import Image
 import io
 from typing import List, Dict, Any
 import base64
+from datasets import DatasetDict
 
 # Configure logger
 logger = logging.getLogger(__name__)
@@ -134,7 +135,7 @@ def get_dataset(
     test_size: float = 0.1,
     text_only: bool = False,
     streaming: bool = False
-):
+) -> DatasetDict:
     """
     Load and process the open_m_3 dataset for SFT training.
     
@@ -229,7 +230,6 @@ def get_dataset(
     if not processed_dataset:
         raise RuntimeError("데이터셋 처리 실패: 어떤 스플릿도 처리되지 않았습니다.")
 
-    from datasets import DatasetDict
     return DatasetDict(processed_dataset)
 
 def process_content(contents_list):

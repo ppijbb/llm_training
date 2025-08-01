@@ -9,7 +9,7 @@ import json
 import torch
 import argparse
 from typing import Dict, Any
-import io
+from torchinfo import summary
 from PIL import Image
 from transformers.utils.import_utils import is_flash_attn_2_available
 from transformers import (
@@ -214,7 +214,7 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
     print("✓ G3MoE model loaded successfully")
     print(f"  - Attn implementation: {attn_implementation}")
     
-    
+    summary(model, input_size=(1, 1024, 4096), depth=3)
     total_params = model.num_parameters()
     print(f"  - Total parameters: {format_parameters(total_params)}")
 
@@ -230,6 +230,7 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
                 "gate_proj", "up_proj", "down_proj",
                 "router", "routing_temperature"
             ],
+            modules_to_save=["router", "routing_temperature"],
             bias="none",
         )
         model.enable_input_require_grads()
