@@ -224,6 +224,8 @@ class TorchMoECallback:
         if self.save_detailed_logs:
             self._save_detailed_log(step_metrics)
 
+        torch.cuda.empty_cache()
+
     @torch.no_grad()
     def _calculate_step_metrics(self):
         """현재 step의 메트릭 계산"""

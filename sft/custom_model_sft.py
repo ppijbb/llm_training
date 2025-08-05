@@ -41,7 +41,6 @@ from eval.callbacks import get_model_eval_callback
 from eval.ifeval_callback import IFEvalCallback
 from eval.moe_monitoring_callback import create_moe_callback_for_transformers
 
-
 logging.enable_progress_bar()
 logging.set_verbosity_warning()
 
@@ -52,7 +51,7 @@ def load_config(config_path: str):
 
 def setup_deepspeed_environment():
     """Setup environment variables for DeepSpeed optimization"""
-    # os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:1024"
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:1024"
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     
     # Enable DeepSpeed optimizations
@@ -367,46 +366,11 @@ def create_training_args(
     return training_args
 
 
-def main():
-    # Parse command line arguments
-    parser = argparse.ArgumentParser(description="G3MoE SFT Training with Config File")
-    parser.add_argument(
-        "--config", 
-        type=str, 
-        default="sft/config/g3moe_training_config.json",
-        help="Path to training configuration JSON file"
-    )
-    args = parser.parse_args()
-    
-    # Register custom optimizers with DeepSpeed
-    register_custom_optimizers()
-    
-    # Load configuration
-    config = load_config(args.config)
-    
-    model_config = config["model_config"]
-    data_config = config["data_config"]
-    training_config = config["training_config"]
-    
-    # Set seed
-    set_seed(training_config["seed"])
-    
-    # Setup logging
-    import logging
-    logging.basicConfig(
-        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-        datefmt="%m/%d/%Y %H:%M:%S",
-        level=logging.INFO,
-    )
-    
-    # Initialize wandb if needed
-    if training_config.get("report_to") and "wandb" in training_config["report_to"]:
-        wandb.init(
-            project="g3moe-sft",
-            name=training_config["run_name"],
-            config=config
-        )
-
+def main(
+    model_config: Dict[str, Any], 
+    data_config: Dict[str, Any], 
+    training_config: Dict[str, Any]
+):
     # Setup model and tokenizer
     print("Setting up model and tokenizer...")
     model, tokenizer = setup_model_and_tokenizer(model_config)
@@ -442,7 +406,7 @@ def main():
     print("데이터셋 샘플 확인:")
     print(f"  - 첫 번째 훈련 샘플 키: {list(train_dataset[0].keys())}")
     print(f"  - 첫 번째 샘플 input_ids 길이: {len(train_dataset[0]['input_ids'])}")
-    
+    model.gradient_checkpointing_enable()
     trainer = SFTTrainer( 
         model=model,
         args=training_args,
@@ -511,7 +475,37 @@ def main():
 
 if __name__ == "__main__":
     try:
-        main()
+        # Parse command line arguments
+        parser = argparse.ArgumentParser(description="G3MoE SFT Training with Config File")
+        parser.add_argument(
+            "--config", 
+            type=str, 
+            default="sft/config/g3moe_training_config.json",
+            help="Path to training configuration JSON file"
+        )
+        args = parser.parse_args()
+        
+        # Register custom optimizers with DeepSpeed
+        register_custom_optimizers()
+        
+        # Load configuration
+        config = load_config(args.config)
+        
+        model_config = config["model_config"]
+        data_config = config["data_config"]
+        training_config = config["training_config"]
+        
+        # Set seed
+        set_seed(training_config["seed"])
+        # Initialize wandb if needed
+        if training_config.get("report_to") and "wandb" in training_config["report_to"]:
+            wandb.init(
+                project="g3moe-sft",
+                name=training_config["run_name"],
+                config=config
+            )
+
+        main(model_config, data_config, training_config)
 
     except Exception as e:
         import traceback
