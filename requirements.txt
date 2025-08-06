@@ -57,7 +57,7 @@ nltk>=3.9.1
 notebook==7.3.2
 notebook-shim==0.2.4
 numba>=0.61.0
-numpy>=1.26.4
+numpy>=1.26.4,<2.0.0
 --extra-index-url https://pypi.ngc.nvidia.com 
 nvidia-pyindex>=1.0.9
 onnx>=1.17.0

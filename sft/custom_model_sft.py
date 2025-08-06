@@ -22,7 +22,6 @@ from transformers import logging
 from transformers.trainer_utils import set_seed
 from trl import SFTTrainer, SFTConfig
 from peft.tuners.lora.config import LoraConfig
-from peft.mapping import get_peft_model
 from peft.utils.peft_types import TaskType
 import wandb
 
@@ -236,7 +235,7 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
             bias="none",
         )
         model.enable_input_require_grads()
-        model = get_peft_model(model, lora_config)
+        model.add_adapter(lora_config)
         model.print_trainable_parameters()
 
     return model, tokenizer
