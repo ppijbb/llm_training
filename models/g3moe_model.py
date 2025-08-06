@@ -53,7 +53,7 @@ from transformers.utils.generic import (
     ModelOutput,
     can_return_tuple,
 )
-from transformers.utils.args_doc import auto_docstring
+from transformers.utils import auto_docstring
 from transformers.utils.import_utils import (
     is_torchdynamo_compiling,
     is_torch_flex_attn_available,

@@ -1,6 +1,4 @@
 import outlines
-from outlines.inputs import Audio, Chat, Image, Video
-from outlines.processors import OutlinesLogitsProcessor
 from typing import List, Any, Optional, Union
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizer, GenerationConfig
 from transformers.processing_utils import ProcessorMixin

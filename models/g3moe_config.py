@@ -246,6 +246,7 @@ class G3MoETextConfig(PretrainedConfig):
         no_rope_layer_interval: int = 0,
         layer_types=None,
         use_sliding_window=False,
+        _attn_implementation="sdpa",
         **kwargs,
     ):
         super().__init__(
@@ -301,6 +302,7 @@ class G3MoETextConfig(PretrainedConfig):
         self.rope_local_base_freq = rope_local_base_freq
         self.sliding_window_pattern = sliding_window_pattern
         self.rope_scaling = rope_scaling
+        self._attn_implementation = _attn_implementation
 
         # 하이브리드 positional embedding 패턴 생성 (smollm3 스타일)
         if no_rope_layers is None:
@@ -394,6 +396,7 @@ class G3MoEConfig(PretrainedConfig):
         eoi_token_index: int = 256_000,
         image_token_index: int = 262_144,
         initializer_range: float = 0.02,
+        _attn_implementation: str = "sdpa",
         **kwargs,
     ):
         if text_config is None:
@@ -419,7 +422,7 @@ class G3MoEConfig(PretrainedConfig):
         self.eoi_token_index = eoi_token_index
         self.image_token_index = image_token_index
         self.initializer_range = initializer_range
-
+        self._attn_implementation = _attn_implementation
         super().__init__(**kwargs)
 
 

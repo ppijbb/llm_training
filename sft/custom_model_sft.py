@@ -123,6 +123,8 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
     #     tokenizer.pad_token = tokenizer.eos_token
     #     tokenizer.pad_token_id = tokenizer.eos_token_id
     
+    attn_implementation = "flash_attention_2" if is_flash_attn_2_available() else "sdpa"
+
     # Load and configure G3MoE model configuration
     print("Loading base model configuration...")
     base_config = AutoConfig.from_pretrained(
@@ -162,6 +164,7 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
             "factor": g3moe_params["rope_scaling_factor"]
         },
         "use_bfloat16": True,
+        "_attn_implementation": attn_implementation
     }
     base_model_config["text_config"].update(g3moe_config)
     # Create G3MoE configuration
@@ -172,6 +175,7 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
         eoi_token_index=base_model_config["eoi_token_index"],
         image_token_index=base_model_config["image_token_index"],
         initializer_range=base_model_config["initializer_range"],
+        _attn_implementation=attn_implementation,
         **{
             k:v for k,v in base_model_config.items() 
             if k not in ["text_config", "vision_config", "boi_token_index",
@@ -198,7 +202,6 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
     
     # Load G3MoE model with the configured parameters
     print("Loading G3MoE model...")
-    attn_implementation = "flash_attention_2" if is_flash_attn_2_available() else "sdpa"
     model = G3MoEForCausalLM.from_pretrained(
         model_config["model_name_or_path"],
         config=config,
