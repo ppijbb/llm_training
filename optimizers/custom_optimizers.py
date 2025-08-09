@@ -262,7 +262,6 @@ class MuonOptimizer(DeepSpeedCPUAdam):
                 else:
                     self.state[p]["use_muon"] = False
 
-    @torch.compile
     def zeropower_via_newtonschulz5(self, G, steps):
         """
         Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a

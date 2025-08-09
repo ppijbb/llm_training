@@ -21,6 +21,7 @@ from transformers import logging
 
 from transformers.trainer_utils import set_seed
 from trl import SFTTrainer, SFTConfig
+from peft import get_peft_model
 from peft.tuners.lora.config import LoraConfig
 from peft.utils.peft_types import TaskType
 import wandb
@@ -40,6 +41,9 @@ from eval.callbacks import get_model_eval_callback
 from eval.ifeval_callback import IFEvalCallback
 from eval.moe_monitoring_callback import create_moe_callback_for_transformers
 
+# Register custom optimizers with DeepSpeed
+register_custom_optimizers()
+
 logging.enable_progress_bar()
 logging.set_verbosity_warning()
 
@@ -50,13 +54,11 @@ def load_config(config_path: str):
 
 def setup_deepspeed_environment():
     """Setup environment variables for DeepSpeed optimization"""
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:1024"
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512,expandable_segments:True"
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
-    
-    # Enable DeepSpeed optimizations
+    os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = "1"
     if "DEEPSPEED_ZERO_INIT" not in os.environ:
         os.environ["DEEPSPEED_ZERO_INIT"] = "1"
-    
     print("DeepSpeed environment variables set")
 
 
@@ -119,11 +121,22 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
         print("  ✅ tokenizer.padding_side = 'right' 설정")
 
     # Ensure tokenizer has pad token
-    # if tokenizer.pad_token is None:
-    #     tokenizer.pad_token = tokenizer.eos_token
-    #     tokenizer.pad_token_id = tokenizer.eos_token_id
+    if not hasattr(tokenizer, 'pad_token'):
+        if hasattr(tokenizer, 'tokenizer'):
+            tokenizer.pad_token = tokenizer.tokenizer.pad_token if tokenizer.tokenizer.pad_token is not None else tokenizer.eos_token
+        else:
+            tokenizer.pad_token = tokenizer.eos_token
+            tokenizer.pad_token_id = tokenizer.eos_token_id
     
-    attn_implementation = "flash_attention_2" if is_flash_attn_2_available() else "sdpa"
+    if not hasattr(tokenizer, 'convert_tokens_to_ids'):
+        tokenizer.convert_tokens_to_ids = tokenizer.tokenizer.convert_tokens_to_ids
+
+    # Prefer config value; default to eager
+    attn_from_cfg = (model_config.get("g3moe_params") or {}).get("attn_implementation")
+    if attn_from_cfg in {"eager", "sdpa", "flash_attention_2"}:
+        attn_implementation = attn_from_cfg
+    else:
+        attn_implementation = "eager"
 
     # Load and configure G3MoE model configuration
     print("Loading base model configuration...")
@@ -164,7 +177,7 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
             "factor": g3moe_params["rope_scaling_factor"]
         },
         "use_bfloat16": True,
-        "_attn_implementation": attn_implementation
+        "attn_implementation": attn_implementation
     }
     base_model_config["text_config"].update(g3moe_config)
     # Create G3MoE configuration
@@ -175,7 +188,7 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
         eoi_token_index=base_model_config["eoi_token_index"],
         image_token_index=base_model_config["image_token_index"],
         initializer_range=base_model_config["initializer_range"],
-        _attn_implementation=attn_implementation,
+        attn_implementation=attn_implementation,
         **{
             k:v for k,v in base_model_config.items() 
             if k not in ["text_config", "vision_config", "boi_token_index",
@@ -209,16 +222,12 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
         trust_remote_code=model_config["trust_remote_code"],
         device_map=device_map,
         low_cpu_mem_usage=True,
+        use_cache=False,
         # load_in_4bit=True,
-        _attn_implementation=attn_implementation
+        attn_implementation=attn_implementation
     )
     print("✓ G3MoE model loaded successfully")
     print(f"  - Attn implementation: {attn_implementation}")
-    summary(
-        model,
-        input_data={
-            'input_ids': torch.randint(0, tokenizer.tokenizer.vocab_size, (1, 1024), device=model.device)
-        }, depth=3)
     total_params = model.num_parameters()
     print(f"  - Total parameters: {format_parameters(total_params)}")
 
@@ -236,11 +245,27 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
             ],
             modules_to_save=["router", "routing_temperature"],
             bias="none",
+            inference_mode=False,  # 훈련 모드 명시
+            fan_in_fan_out=False,  # LoRA 호환성 향상
         )
+        model = get_peft_model(model, lora_config)
         model.enable_input_require_grads()
-        model.add_adapter(lora_config)
         model.print_trainable_parameters()
-
+        
+        # LoRA 어댑터 설정
+        for name, module in model.named_modules():
+            if hasattr(module, 'lora_A') and hasattr(module, 'lora_B'):
+                module.lora_A.requires_grad_(True)
+                module.lora_B.requires_grad_(True)
+            # Ensure router modules remain fully trainable (not LoRA-wrapped)
+            if name.endswith('router') or name.split('.')[-1] == 'router':
+                for p in module.parameters(recurse=True):
+                    p.requires_grad_(True)
+        # DDP 정적 그래프 설정 추가
+        if hasattr(model, '_set_static_graph'):
+            model._set_static_graph(True)
+        print("✓ LoRA 적용")
+        
     return model, tokenizer
 
 
@@ -284,7 +309,7 @@ def setup_dataset(data_config: Dict[str, Any], tokenizer):
                 max_samples=max_samples,
                 test_size=test_size
             )
-            collate_fn = create_simple_collate_fn(tokenizer)
+            collate_fn = None # create_simple_collate_fn(tokenizer)
         else:
             # 일반적인 데이터셋 로더 시도
             dataset = get_dataset(
@@ -332,38 +357,30 @@ def create_training_args(
     # Create SFTConfig with all parameters
     training_args = SFTConfig(
         **training_config,
-        # output_dir=training_config["output_dir"],
-        # num_train_epochs=training_config["num_train_epochs"],
-        # per_device_train_batch_size=training_config["per_device_train_batch_size"],
-        # per_device_eval_batch_size=training_config["per_device_eval_batch_size"],
-        # gradient_accumulation_steps=training_config["gradient_accumulation_steps"],
-        # learning_rate=training_config["learning_rate"],
-        # weight_decay=training_config["weight_decay"],
-        # lr_scheduler_type=training_config["lr_scheduler_type"],
-        # warmup_ratio=training_config["warmup_ratio"],
-        # logging_steps=training_config["logging_steps"],
-        # eval_steps=training_config["eval_steps"],
-        # save_steps=training_config["save_steps"],
-        # save_total_limit=training_config["save_total_limit"],
-        # eval_strategy=training_config["eval_strategy"],
-        # load_best_model_at_end=training_config["load_best_model_at_end"],
-        # metric_for_best_model=training_config["metric_for_best_model"],
-        # greater_is_better=training_config["greater_is_better"],
-        # fp16=training_config["fp16"],
-        # bf16=training_config["bf16"],
-        # dataloader_pin_memory=training_config["dataloader_pin_memory"],
-        # remove_unused_columns=training_config["remove_unused_columns"],
-        # gradient_checkpointing=training_config["gradient_checkpointing"],
-        # report_to=training_config["report_to"],
-        # run_name=training_config["run_name"],
-        # seed=training_config["seed"],
         dataset_kwargs={"skip_prepare_dataset": True}
     )
     
     # Add DeepSpeed config if provided
     if deepspeed_config:
-        training_args.deepspeed = deepspeed_config
-        print(f"DeepSpeed config set: {deepspeed_config}")
+        import os, json
+        ds_cfg_path_abs = os.path.abspath(deepspeed_config)
+        training_args.deepspeed = ds_cfg_path_abs
+        print(f"DeepSpeed config set: {ds_cfg_path_abs}")
+        # Validate that CPU offload is disabled as required
+        try:
+            with open(ds_cfg_path_abs, "r") as f:
+                ds_cfg = json.load(f)
+            zero = ds_cfg.get("zero_optimization", {})
+            off_opt = (zero.get("offload_optimizer") or {}).get("device", "none").lower()
+            off_param = (zero.get("offload_param") or {}).get("device", "none").lower()
+            print(f"DeepSpeed zero stage: {zero.get('stage')}")
+            print(f"DeepSpeed offload_optimizer.device: {off_opt}")
+            print(f"DeepSpeed offload_param.device: {off_param}")
+            assert off_opt in {"none", None, ""} and off_param in {"none", None, ""}, (
+                "DeepSpeed CPU offload detected in config but must be disabled (device='none')."
+            )
+        except Exception as e:
+            print(f"⚠️ DeepSpeed config validation warning: {e}")
     
     return training_args
 
@@ -387,6 +404,32 @@ def main(
         model_config.get("deepspeed_config")
     )
     
+    # Optionally build a custom optimizer (e.g., Muon) prior to DeepSpeed init
+    custom_optimizer = None
+    try:
+        ds_cfg_path = model_config.get("deepspeed_config")
+        if ds_cfg_path:
+            with open(ds_cfg_path, "r") as f:
+                ds_cfg = json.load(f)
+            # Prefer explicit custom optimizer block
+            custom_opt_section = ds_cfg.get("custom_optimizer")
+            from optimizers.deepspeed_optimizer_registry import create_optimizer_from_config
+            if custom_opt_section:
+                trainable_params = (p for p in model.parameters() if p.requires_grad)
+                custom_optimizer = create_optimizer_from_config(custom_opt_section, trainable_params)
+                print(f"✓ Using custom optimizer: {custom_opt_section.get('type')}")
+            else:
+                # Fallback: if optimizer.type is a custom one, build it here
+                opt_section = ds_cfg.get("optimizer")
+                if opt_section:
+                    opt_type = str(opt_section.get("type", "")).lower()
+                    if opt_type in {"muon", "muonoptimizer", "lion", "adafactor", "sophia"}:
+                        trainable_params = (p for p in model.parameters() if p.requires_grad)
+                        custom_optimizer = create_optimizer_from_config(opt_section, trainable_params)
+                        print(f"✓ Using custom optimizer from optimizer block: {opt_section.get('type')}")
+    except Exception as opt_e:
+        print(f"⚠️ Custom optimizer setup skipped: {opt_e}")
+
     # Setup trainer
     print("Setting up trainer...")
     
@@ -415,14 +458,14 @@ def main(
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         processing_class=tokenizer,
-        data_collator=collate_fn
+        data_collator=collate_fn,
+        optimizers=(custom_optimizer, None) if custom_optimizer is not None else (None, None)
     )
     trainer.add_callback(create_moe_callback_for_transformers(
         num_experts=model_config["g3moe_params"]["n_routed_experts"],
         log_every_n_steps=50,       # 50 스텝마다 로그 기록
         logger=wandb,               # 사용할 로거 지정 (wandb)
         log_to_console=True,        # 콘솔에도 주요 메트릭 출력
-        
         # === 고급 설정 (선택사항) ===
         log_heatmap_every=500,      # 500 스텝마다 Expert 사용률 히트맵 로깅
         alert_threshold_imbalance=4.0, # 특정 Expert 사용률이 평균의 4배를 초과하면 경고
@@ -460,7 +503,11 @@ def main(
     print(f"FP16: {training_config['fp16']}")
     print(f"BF16: {training_config['bf16']}")
     print("="*50)
-    
+    # summary(
+    #     trainer.model,
+    #     input_data={
+    #         'input_ids': torch.randint(0, tokenizer.tokenizer.vocab_size, (1, 1024), device=trainer.model.device)
+    #     }, depth=3)
     # Start training
     print("Starting training...")
     trainer.train()
@@ -486,9 +533,6 @@ if __name__ == "__main__":
             help="Path to training configuration JSON file"
         )
         args = parser.parse_args()
-        
-        # Register custom optimizers with DeepSpeed
-        register_custom_optimizers()
         
         # Load configuration
         config = load_config(args.config)

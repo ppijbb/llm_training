@@ -541,6 +541,13 @@ class GRINFlashAttention2(GRINMoEAttention):
             # TODO: Remove the `query_length != 1` check once Flash Attention for RoCm is bumped to 2.1. For details, please see the comment in LlamaFlashAttention2 __init__.
             causal = self.is_causal and query_length != 1
 
+        # Ensure all tensors are on the same CUDA device for FlashAttention 2
+        target_device = query_states.device
+        key_states = key_states.to(target_device)
+        value_states = value_states.to(target_device)
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(target_device)
+
         # Contains at least one padding token in the sequence
         if attention_mask is not None:
             batch_size = query_states.shape[0]
@@ -604,6 +611,9 @@ class GRINFlashAttention2(GRINMoEAttention):
         return attn_output
 
     def _upad_input(self, query_layer, key_layer, value_layer, attention_mask, query_length):
+        # Move mask to the same device as QKV for FA2 varlen kernels
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(query_layer.device)
         batch_size, kv_seq_len, num_heads, head_dim = key_layer.shape
 
         # On the first iteration we need to properly re-create the padding mask

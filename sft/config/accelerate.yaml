@@ -1,0 +1,8 @@
+compute_environment: LOCAL_MACHINE
+num_processes: 2         # GPU 수
+gpu_ids: "0,1"           # 사용할 GPU
+same_network: true
+rdzv_backend: static
+distributed_type: DEEPSPEED
+deepspeed_config:
+  deepspeed_config_file: /home/conan_jung/workspace/llm_training/sft/config/deepspeed_muon_optimizer.json

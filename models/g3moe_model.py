@@ -22,6 +22,7 @@
 import copy
 import os
 import inspect
+import math
 from functools import partial
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -57,6 +58,7 @@ from transformers.utils import auto_docstring
 from transformers.utils.import_utils import (
     is_torchdynamo_compiling,
     is_torch_flex_attn_available,
+    is_flash_attn_2_available
 )
 from transformers.modeling_utils import (
     restore_default_torch_dtype,
@@ -105,11 +107,13 @@ def calculate_ortho_loss_for_experts(expert_weights: List[torch.Tensor]) -> torc
 
 
 def load_balancing_loss_func(
-    gate_logits: torch.Tensor, 
-    num_experts: int, 
-    top_k: int = 2, 
-    attention_mask: Optional[torch.Tensor] = None, 
-    router_z_loss_coef: Optional[float] = None
+    gate_logits: torch.Tensor,
+    num_experts: int,
+    top_k: int = 2,
+    attention_mask: Optional[torch.Tensor] = None,
+    router_z_loss_coef: Optional[float] = None,
+    router_entropy_coef: Optional[float] = None,
+    usage_uniformity_coef: Optional[float] = None,
 ) -> torch.Tensor:
     r"""
     Computes auxiliary load balancing loss as in Switch Transformer - implemented in Pytorch.
@@ -185,12 +189,31 @@ def load_balancing_loss_func(
             router_per_expert_attention_mask, dim=0
         )
 
-    overall_loss = torch.sum(tokens_per_expert * router_prob_per_expert.unsqueeze(0))
-    if router_z_loss_coef is not None:
+    # Core Switch-style load balancing loss
+    aux_loss = torch.sum(tokens_per_expert * router_prob_per_expert.unsqueeze(0)) * num_experts
+
+    # Router z-loss (Switch Transformer) to prevent overconfident routers
+    if router_z_loss_coef is not None and router_z_loss_coef > 0:
         log_z = torch.logsumexp(concatenated_gate_logits, dim=-1)
         z_loss = torch.square(log_z).mean()
-        overall_loss += router_z_loss_coef * z_loss
-    return overall_loss * num_experts
+        aux_loss = aux_loss + router_z_loss_coef * z_loss
+
+    # Entropy regularization to avoid routing collapse (maximize entropy)
+    if router_entropy_coef is not None and router_entropy_coef > 0:
+        token_entropy = -(routing_weights * torch.log(routing_weights.clamp_min(1e-12))).sum(dim=-1)
+        # Normalize by log(num_experts) for scale invariance across different expert counts
+        normalized_entropy = token_entropy / math.log(max(num_experts, 2))
+        entropy_reg = -normalized_entropy.mean()
+        aux_loss = aux_loss + router_entropy_coef * entropy_reg
+
+    # Usage uniformity (optional): encourage average routing probability per expert to be near-uniform
+    if usage_uniformity_coef is not None and usage_uniformity_coef > 0:
+        # router_prob_per_expert already accounts for attention mask when provided
+        target = torch.full_like(router_prob_per_expert, 1.0 / float(num_experts))
+        usage_uniformity_loss = torch.mean(torch.square(router_prob_per_expert - target))
+        aux_loss = aux_loss + usage_uniformity_coef * usage_uniformity_loss
+
+    return aux_loss
 
 
 # Copied from Phi-3.5-MoE
@@ -1095,7 +1118,7 @@ class G3MoEAttention(nn.Module):
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
             
             # Here we need to slice as we use a static cache by default, but FA2 does not support it
-            if attention_mask is not None and self.config._attn_implementation == "flash_attention_2":
+            if attention_mask is not None and self.config.attn_implementation == "flash_attention_2":
                 if hasattr(past_key_value, "get_seq_length"):
                     seq_len = past_key_value.get_seq_length()
                 else:
@@ -1103,18 +1126,18 @@ class G3MoEAttention(nn.Module):
                 key_states, value_states = key_states[:, :, :seq_len, :], value_states[:, :, :seq_len, :]
         
         attention_interface: Callable = eager_attention_forward
-        if self.config._attn_implementation != "eager":
-            if self.config._attn_implementation == "sdpa" and kwargs.get("output_attentions", False):
+        if self.config.attn_implementation != "eager":
+            if self.config.attn_implementation == "sdpa" and kwargs.get("output_attentions", False):
                 logger.warning_once(
                     "`torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. "
                     "Falling back to eager attention. This warning can be removed using the argument "
                     '`attn_implementation="eager"` when loading the model.'
                 )
             else:
-                attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+                attention_interface = ALL_ATTENTION_FUNCTIONS[self.config.attn_implementation]
         if attention_mask is not None:
-            # backwards compatibility
-            attention_mask = attention_mask.to(query_states)
+            # backwards compatibility and ensure mask is on correct device for FA2
+            attention_mask = attention_mask.to(query_states.device)
         attn_output, attn_weights = attention_interface(
             self,
             query_states,
@@ -1174,8 +1197,8 @@ class G3MoEDecoderLayer(nn.Module):
             effective_seq_len = max(cache_position.shape[0], self.sliding_window)
             # For FA2, the mask is 2D and is of shape [bs, processed_tokens] (not [bs, max_cache_len]),
             # thus we must slice from the right (at most `effective_seq_len` elements)
-            if self.config._attn_implementation == "flash_attention_2":
-                attention_mask = attention_mask[:, -effective_seq_len:]
+            if self.config.attn_implementation == "flash_attention_2":
+                attention_mask = attention_mask[:, -effective_seq_len:].to(hidden_states.device)
             # Otherwise, the mask is 4D of shape [bs, 1, query_len, max_cache_len] thus we must slice
             # from the left, with an offset if we are beyond the sliding window
             else:
@@ -1369,6 +1392,14 @@ class G3MoEPreTrainedModel(PreTrainedModel):
             config = AutoConfig.from_pretrained(pretrained_model_name_or_path, **kwargs.get("config_kwargs", {}))
         if not isinstance(config, G3MoEConfig):
             config = G3MoEConfig(**config.to_dict())
+            if config.attn_implementation == None:
+                if is_torch_flex_attn_available():
+                    config.attn_implementation = "flex_attention"
+                elif is_flash_attn_2_available():
+                    config.attn_implementation = "flash_attention_2"
+                else:
+                    config.attn_implementation = "eager"
+            print(f"Forced attn implementation: {config.attn_implementation}")
 
         logging.get_logger('transformers').debug("Loading G3MoE model skeleton using super().from_pretrained...")
         logging.set_verbosity_error()
@@ -1635,6 +1666,10 @@ class G3MoETextModel(G3MoEPreTrainedModel):
                 max_cache_len=seq_len,
                 dtype=inputs_embeds.dtype,
             )
+        # During training, avoid generating/using mutable cache to keep checkpoint recompute deterministic
+        if self.training:
+            use_cache = False
+            past_key_values = None
 
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
@@ -1671,17 +1706,32 @@ class G3MoETextModel(G3MoEPreTrainedModel):
                 all_hidden_states += (hidden_states,)
 
             if self.gradient_checkpointing and self.training:
-                layer_outputs = self._gradient_checkpointing_func(
-                    partial(decoder_layer.__call__, **flash_attn_kwargs),
+                # Use deterministic checkpointing to avoid graph/tensor-count mismatch
+                def _ckpt_layer(hs, posg, posl, mask, posids, cachepos):
+                    return decoder_layer(
+                        hs,
+                        position_embeddings_global=posg,
+                        position_embeddings_local=posl,
+                        attention_mask=mask,
+                        position_ids=posids,
+                        past_key_value=None,          # prevent mutable cache state during recompute
+                        output_attentions=output_attentions,
+                        use_cache=False,              # disable cache within checkpointed block
+                        cache_position=cachepos,
+                        **flash_attn_kwargs,
+                    )
+
+                from torch.utils.checkpoint import checkpoint as _ckpt
+                layer_outputs = _ckpt(
+                    _ckpt_layer,
                     hidden_states,
                     position_embeddings_global,
                     position_embeddings_local,
                     causal_mask,
                     position_ids,
-                    past_key_values,
-                    output_attentions,
-                    use_cache,
                     cache_position,
+                    use_reentrant=True,
+                    preserve_rng_state=True,
                 )
             else:
                 layer_outputs = decoder_layer(
@@ -1728,9 +1778,9 @@ class G3MoETextModel(G3MoEPreTrainedModel):
         # So we will pass in attention mask as is in any case, not only when ther's padding. Then we'll use its shape
         # to cut out keys/values trailing 0 used in static cache. This workaround should be compile compatible
         # as it doesn't cause dynamic control issues.
-        if self.config._attn_implementation == "flash_attention_2":
+        if self.config.attn_implementation == "flash_attention_2":
             return attention_mask
-        if self.config._attn_implementation == "flex_attention":
+        if self.config.attn_implementation == "flex_attention":
             if isinstance(attention_mask, torch.Tensor):
                 attention_mask = make_flex_block_causal_mask(attention_mask)
             return attention_mask
@@ -1894,10 +1944,10 @@ class G3MoEForCausalLM(G3MoEPreTrainedModel, GenerationMixin):
         "What is your favorite condiment?"
         ```"""
 
-        if self.training and self.config._attn_implementation != "eager":
+        if self.training and self.config.attn_implementation != "eager":
             logger.warning_once(
                 "It is strongly recommended to train G3MoE models with the `eager` attention implementation "
-                f"instead of `{self.config._attn_implementation}`. Use `eager` with `AutoModelForCausalLM.from_pretrained('<path-to-checkpoint>', attn_implementation='eager')`."
+                f"instead of `{self.config.attn_implementation}`. Use `eager` with `AutoModelForCausalLM.from_pretrained('<path-to-checkpoint>', attn_implementation='eager')`."
             )
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -1953,6 +2003,8 @@ class G3MoEForCausalLM(G3MoEPreTrainedModel, GenerationMixin):
                     self.model.config.num_experts_per_tok,
                     attention_mask,
                     router_z_loss_coef=self.model.config.router_z_loss_coef,
+                    router_entropy_coef=getattr(self.model.config, "router_entropy_coef", 0.0),
+                    usage_uniformity_coef=getattr(self.model.config, "usage_uniformity_coef", 0.0),
                 )
                 loss += self.model.config.router_aux_loss_coef * aux_loss
 
@@ -2000,7 +2052,7 @@ class G3MoEForCausalLM(G3MoEPreTrainedModel, GenerationMixin):
         if (
             isinstance(past_key_values, HybridCache)
             and attention_mask.ndim == 2
-            and not self.config._attn_implementation == "flash_attention_2"
+            and not self.config.attn_implementation == "flash_attention_2"
         ):
             if model_inputs["inputs_embeds"] is not None:
                 batch_size, sequence_length, _ = model_inputs["inputs_embeds"].shape
@@ -2058,7 +2110,7 @@ class G3MoEModel(G3MoEPreTrainedModel):
         input_tensor,
         is_training: bool = False,
     ):
-        if self.config.text_config._attn_implementation == "flash_attention_2":
+        if self.config.text_config.attn_implementation == "flash_attention_2":
             return attention_mask
 
         if attention_mask is not None and attention_mask.dim() == 4:

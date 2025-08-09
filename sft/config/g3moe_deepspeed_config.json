@@ -14,26 +14,27 @@
       "n_group": 2,
       "topk_group": 2,
       "num_experts_per_tok": 2,
-      "rope_scaling_factor": 8.0,
       "first_k_dense_replace": 8,
-      "router_aux_loss_coef": 0.01,
-      "router_jitter_noise": 0.01,
-      "input_jitter_noise": 0.01,
-      "router_z_loss_coef": 1e-5,
+      "router_aux_loss_coef": 1e-2,
+      "router_jitter_noise": 5e-3,
+      "input_jitter_noise": 5e-3,
+      "router_z_loss_coef": 1e-4,
       "ema_alpha": 0.99,
-      "balancing_strength": 0.05,
-      "no_rope_layer_interval": 8,
+      "balancing_strength": 5e-2,
+      "no_rope_layer_interval": 0,
       "use_sliding_window": true,
+      "rope_scaling_factor": 8.0,
       "rope_scaling": {
         "factor": 8.0,
         "rope_type": "yarn"
-      }
+      },
+      "attn_implementation": "flash_attention_2"
     }
   },
   "data_config": {
     "dataset_name": "Gunulhona/open_m_3",
     "max_seq_length": 131072,
-    "test_size": 0.1,
+    "test_size": 0.3,
     "text_only": false,
     "streaming": false
   },
@@ -42,7 +43,7 @@
     "num_train_epochs": 3,
     "per_device_train_batch_size": 1,
     "per_device_eval_batch_size": 1,
-    "gradient_accumulation_steps": 2,
+    "gradient_accumulation_steps": 64,
     "learning_rate": 5e-5,
     "weight_decay": 0.01,
     "lr_scheduler_type": "cosine",
@@ -55,14 +56,21 @@
     "load_best_model_at_end": true,
     "metric_for_best_model": "eval_loss",
     "greater_is_better": false,
+
+    "dataset_num_proc": 16,
     "fp16": false,
     "bf16": true,
     "dataloader_pin_memory": false,
     "remove_unused_columns": false,
+    "dataloader_drop_last": true,
     "gradient_checkpointing": true,
+    "gradient_checkpointing_kwargs": {"use_reentrant": false, "preserve_rng_state": false},
     "report_to": ["wandb"],
     "run_name": "g3moe-deepspeed-sft",
-    "seed": 42,
-    "max_grad_norm": 1.0
+    "seed": 777,
+    "log_on_each_node": false,
+    "max_grad_norm": 1.0,
+    "ddp_find_unused_parameters": false,
+    "ddp_broadcast_buffers": false
   }
-} 
+}

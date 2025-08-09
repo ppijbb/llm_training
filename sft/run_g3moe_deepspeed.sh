@@ -22,7 +22,18 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # Default config file and GPU count
 CONFIG_FILE="${1:-$SCRIPT_DIR/config/g3moe_deepspeed_config.json}"
-NUM_GPUS="${2:-1}"
+
+# Detect available GPUs if not specified
+if [ -n "$2" ]; then
+    NUM_GPUS="$2"
+else
+    if command -v nvidia-smi &>/dev/null; then
+        NUM_GPUS=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
+    else
+        echo -e "${YELLOW}Warning:${NC} nvidia-smi not found, defaulting to $2 GPUs"
+        NUM_GPUS=4
+    fi
+fi
 
 echo -e "${YELLOW}Project Root:${NC} $PROJECT_ROOT"
 echo -e "${YELLOW}Config File:${NC} $CONFIG_FILE"
@@ -48,12 +59,29 @@ fi
 
 # Set environment variables
 export PYTHONPATH="$PROJECT_ROOT:$PYTHONPATH"
-export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-$(seq -s, 0 $((NUM_GPUS-1)))}
+if [ -z "$CUDA_VISIBLE_DEVICES" ]; then
+    export CUDA_VISIBLE_DEVICES=$(seq 0 $((NUM_GPUS-1)) | paste -sd, -)
+fi
 export TOKENIZERS_PARALLELISM=false
 
 # For 120K context length, increase memory limits
 export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:1024
-export CUDA_LAUNCH_BLOCKING=0
+# export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export CUDA_LAUNCH_BLOCKING="1"
+export TORCH_USE_CUDA_DSA="1"
+export FLASH_ATTENTION_2_ENABLED="1"
+export OMP_NUM_THREADS=$(nproc)  # 논리 코어 전체
+# export TORCH_DISTRIBUTED_DEBUG=DETAIL
+# export NCCL_DEBUG=INFO
+export NCCL_ASYNC_ERROR_HANDLING=1
+export DEEPSPEED_AUTOTP=0
+export DS_AUTOTP=0
+export DEEPSPEED_ENABLE_TP=0
+export DS_ENABLE_TP=0
+export ACCELERATE_USE_DEEPSPEED=true
+export ACCELERATE_DISTRIBUTED_TYPE=DEEPSPEED
+export CUDA_VISIBLE_DEVICES=0,1
+
 
 # Create output directory
 OUTPUT_DIR=$(python3 -c "import json; print(json.load(open('$CONFIG_FILE'))['training_config']['output_dir'])")
@@ -65,7 +93,7 @@ echo -e "${YELLOW}CUDA Devices:${NC} $CUDA_VISIBLE_DEVICES"
 # Check dependencies
 echo -e "${YELLOW}Checking dependencies...${NC}"
 for package in torch transformers trl peft datasets wandb deepspeed; do
-    if ! python3 -c "import $package" 2>/dev/null; then
+    if ! .venv/bin/python3 -c "import $package" 2>/dev/null; then
         echo -e "${RED}Error: $package is not installed${NC}"
         echo "Please install required packages:"
         echo "pip install torch transformers trl peft datasets wandb deepspeed"
@@ -112,10 +140,12 @@ cd "$PROJECT_ROOT"
 
 if [ "$NUM_GPUS" -eq 1 ]; then
     echo -e "${GREEN}Starting single-GPU DeepSpeed training...${NC}"
-    TRAIN_CMD="uv run accelerate launch --num_processes=1 $SCRIPT_DIR/custom_model_sft.py --config $CONFIG_FILE"
+    TRAIN_CMD="uv run accelerate launch --config_file $SCRIPT_DIR/config/accelerate.yaml $SCRIPT_DIR/custom_model_sft.py --config $CONFIG_FILE"
+    
 else
     echo -e "${GREEN}Starting multi-GPU DeepSpeed training with $NUM_GPUS GPUs...${NC}"
-    TRAIN_CMD="torchrun --nproc_per_node=$NUM_GPUS $SCRIPT_DIR/custom_model_sft.py --config $CONFIG_FILE"
+    TRAIN_CMD="uv run accelerate launch --config_file $SCRIPT_DIR/config/accelerate.yaml \
+        $SCRIPT_DIR/custom_model_sft.py --config $CONFIG_FILE"
 fi
 
 echo -e "${BLUE}Command:${NC} $TRAIN_CMD"

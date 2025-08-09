@@ -6,20 +6,10 @@
         "enabled": true
     },
     "optimizer": {
-        "type": "MuonOptimizer",
+        "type": "Adamw",
         "params": {
             "lr": "auto",
-            "weight_decay": "auto",
-            "momentum": 0.95,
-            "nesterov": true,
-            "ns_steps": 5,
-            "adamw_betas": [0.9, 0.95],
-            "adamw_eps": 1e-8,
-            "use_8bit": true,
-            "memory_efficient": true,
-            "ns_steps_lightweight": true,
-            "enable_checkpointing": true,
-            "grad_clip_norm": 1.0
+            "weight_decay": "auto"
         }
     },
     "scheduler": {
@@ -31,33 +21,36 @@
             "total_num_steps": "auto"
         }
     },
+    "activation_checkpointing": {
+        "partition_activations": true,
+        "cpu_checkpointing": false,
+        "contiguous_memory_optimization": true
+   },
     "zero_optimization": {
         "stage": 3,
-        "offload_optimizer": {
-            "device": "cpu",
-            "pin_memory": true
-        },
-        "offload_param": {
-            "device": "cpu",
-            "pin_memory": true
-        },
-        "overlap_comm": true,
+        "zero_hpz_partition_size": 1,
+        "overlap_comm": false,
         "contiguous_gradients": true,
-        "sub_group_size": 1e8,
+        "sub_group_size": 1e12,
         "reduce_bucket_size": 5e8,
+        "allgather_bucket_size": 5e8,
         "stage3_prefetch_bucket_size": 5e8,
-        "stage3_param_persistence_threshold": 1e6,
+        "stage3_param_persistence_threshold": 1e5,
         "stage3_max_live_parameters": 1e8,
         "stage3_max_reuse_distance": 1e8,
         "stage3_gather_16bit_weights_on_model_save": true
     },
-    "gradient_accumulation_steps": "auto",
-    "gradient_clipping": "auto",
-    "steps_per_print": 2000,
+    
     "train_batch_size": "auto",
     "train_micro_batch_size_per_gpu": "auto",
+    "gradient_accumulation_steps": "auto",
+    "gradient_clipping": 1.0,
+    "steps_per_print": 2000,
     "wall_clock_breakdown": false,
     "data_types": {
         "grad_accum_dtype": "bf16"
+    },
+    "wandb": {
+        "enabled": true
     }
 } 
