@@ -67,7 +67,8 @@ from transformers.modeling_utils import (
 from transformers.configuration_utils import PretrainedConfig
 from transformers import logging
 from transformers.utils.deprecation import deprecate_kwarg
-from transformers import AutoModel, AutoConfig
+from transformers import AutoModel, AutoConfig, AutoModelForCausalLM
+from transformers.modeling_utils import set_initialized_submodules
 from .g3moe_config import G3MoEConfig, G3MoETextConfig
 
 if is_torch_flex_attn_available():
@@ -323,6 +324,8 @@ class G3MoEMLP(nn.Module):
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size if intermediate_size is None else intermediate_size
         self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        # Mark for fast init path
+        setattr(self.gate_proj, "_is_g3moe_gate_layer", True)
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_activation]
@@ -347,6 +350,8 @@ class G3MoETopkRouter(nn.Module):
 
         # 적절한 초기화로 변경 (Xavier uniform 초기화)
         self.router = nn.Linear(config.hidden_size, self.n_routed_experts, bias=False)
+        # Mark for fast init path
+        setattr(self.router, "_is_g3moe_router", True)
         self.register_buffer("e_score_correction_bias", torch.zeros((self.n_routed_experts)))
 
     @torch.no_grad()
@@ -1320,6 +1325,40 @@ class G3MoEPreTrainedModel(PreTrainedModel):
     _supports_static_cache = True
     _supports_attention_backend = True
 
+    def _initialize_missing_keys(
+        self,
+        loaded_keys: list[str],
+        ignore_mismatched_sizes: bool,
+        is_quantized: bool,
+    ) -> "PreTrainedModel":
+        """
+        Fast-path init: only initialize missing MoE-specific submodules instead of walking the entire graph.
+        This avoids expensive default initialization work when we plan to immediately copy dense MLP weights
+        into MoE or leave most parameters loaded from the checkpoint.
+        """
+        # Mark already-initialized modules based on loaded keys
+        not_initialized_submodules = set_initialized_submodules(self, loaded_keys)
+
+        # Collect parameters of typical MoE submodules only
+        moe_param_tensors = []
+        for submodule in not_initialized_submodules.values():
+            name = submodule.__class__.__name__
+            if name in {"G3MoETopkRouter", "G3MoEMLP", "G3MoESharedExpertsLayer", "G3MoEGRINMoE", "G3MoESparseGRINBlock"}:
+                moe_param_tensors.extend(list(submodule.parameters(recurse=False)))
+
+        if moe_param_tensors:
+            # Initialize just these MoE parameters with our _init_weights policy
+            for p in moe_param_tensors:
+                # Create a tiny module wrapper to reuse _initialize_weights logic
+                class _Wrap(nn.Module):
+                    def __init__(self, param):
+                        super().__init__()
+                        self.weight = param
+                wrapper = _Wrap(p)
+                self._initialize_weights(wrapper)
+        # Do not call the global initialize; we deliberately skip it to avoid re-initting loaded modules
+        return self
+
     def _init_weights(self, module):
         # important: this ported version of Gemma2 isn't meant for training from scratch - only
         # inference and fine-tuning - so the proper init weights code has been removed
@@ -1332,22 +1371,11 @@ class G3MoEPreTrainedModel(PreTrainedModel):
         if isinstance(module, (nn.Linear, nn.Conv2d)):
             logging.get_logger('transformers').debug(f"Initializing {module} with {std}")
             
-            # Check if this is a gate layer or router by examining the module's name in the model
-            is_gate_layer = False
-            is_router = False
-            for name, mod in self.named_modules():
-                if mod is module:
-                    if 'gate' in name:
-                        is_gate_layer = True
-                        break
-                    elif 'router' in name:
-                        is_router = True
-                        break
-
-            if is_gate_layer or is_router:
+            # Fast path: rely on explicit flags set on construction instead of name scans
+            if getattr(module, "_is_g3moe_gate_layer", False) or getattr(module, "_is_g3moe_router", False):
                 # Apply Xavier uniform initialization for gate layers
                 nn.init.xavier_uniform_(module.weight)
-                logging.get_logger('transformers').warning(f"Applied Xavier uniform initialization to expert router: {name}")
+                logging.get_logger('transformers').debug("Applied Xavier uniform initialization to expert/router layer")
             else:
                 # Apply standard normal initialization for other layers
                 module.weight.data.normal_(mean=0.0, std=std)
@@ -1403,12 +1431,15 @@ class G3MoEPreTrainedModel(PreTrainedModel):
 
         logging.get_logger('transformers').debug("Loading G3MoE model skeleton using super().from_pretrained...")
         logging.set_verbosity_error()
+        import time
+        debug_time = time.time()
         model = super().from_pretrained(
             pretrained_model_name_or_path,
             *model_args,
             config=config,
             cache_dir=cache_dir,
-            ignore_mismatched_sizes=True,
+            # Initialize only truly missing keys; avoids re-initializing the whole model graph
+            ignore_mismatched_sizes=False,
             force_download=force_download,
             local_files_only=local_files_only,
             token=token,
@@ -1416,6 +1447,7 @@ class G3MoEPreTrainedModel(PreTrainedModel):
             use_safetensors=use_safetensors,
             **{k: v for k, v in kwargs.items()}
         )
+        print(f"G3MoE model skeleton loaded in {time.time() - debug_time} seconds")
         logging.set_verbosity_warning()
         logging.get_logger('transformers').debug("G3MoE model skeleton loaded.")
 
@@ -1425,32 +1457,35 @@ class G3MoEPreTrainedModel(PreTrainedModel):
             logging.get_logger('transformers').debug("Initializing MoE experts with MLP weights...")
             with torch.no_grad():
                 processing = tqdm(
-                    enumerate(model.model.layers), 
-                    total=len(model.model.layers), 
-                    desc=f"Copying MLP weights to MoE experts : Start"
+                    enumerate(model.model.layers),
+                    total=len(model.model.layers),
+                    desc="Copying MLP weights to MoE experts: start",
+                    leave=False,
                 )
                 for layer_idx, decoder_layer in processing:
-                    processing.set_description(f"Copying MLP weights to MoE experts : Processing layer {layer_idx}")
                     if hasattr(decoder_layer.moe, 'experts') or hasattr(decoder_layer.moe, 'shared_experts'):
                         if hasattr(decoder_layer.moe, 'shared_experts'):
-                            processing.set_description(f"Copying MLP weights to MoE experts : Processing layer {layer_idx} to shared experts")
+                            processing.set_description(f"Copying layer {layer_idx} → shared experts")
                             decoder_layer.moe.shared_experts.gate_proj.weight.copy_(decoder_layer.mlp.gate_proj.weight)
                             decoder_layer.moe.shared_experts.up_proj.weight.copy_(decoder_layer.mlp.up_proj.weight)
                             decoder_layer.moe.shared_experts.down_proj.weight.copy_(decoder_layer.mlp.down_proj.weight)
 
                         for expert_idx, expert in enumerate(decoder_layer.moe.experts):
-                            processing.set_description(f"Copying MLP weights to MoE experts : Processing layer {layer_idx} to expert {expert_idx}")
+                            if expert_idx % 8 == 0:
+                                processing.set_description(f"Copying layer {layer_idx} → expert {expert_idx}")
                             expert.gate_proj.weight.copy_(decoder_layer.mlp.gate_proj.weight)
                             expert.up_proj.weight.copy_(decoder_layer.mlp.up_proj.weight)
                             expert.down_proj.weight.copy_(decoder_layer.mlp.down_proj.weight)
 
                     elif hasattr(decoder_layer.moe, 'gate_proj'):
+                        processing.set_description(f"Copying layer {layer_idx} → dense MoE")
                         decoder_layer.moe.gate_proj.weight.copy_(decoder_layer.mlp.gate_proj.weight)
                         decoder_layer.moe.up_proj.weight.copy_(decoder_layer.mlp.up_proj.weight)
                         decoder_layer.moe.down_proj.weight.copy_(decoder_layer.mlp.down_proj.weight)
                     else:
                         raise Exception("MoE model has no MLP or shared MLP")
                     del decoder_layer.mlp
+                processing.set_description("Copy finished")
 
             logging.get_logger('transformers').debug("MoE experts initialization completed.")
         else:
@@ -2007,6 +2042,14 @@ class G3MoEForCausalLM(G3MoEPreTrainedModel, GenerationMixin):
                     usage_uniformity_coef=getattr(self.model.config, "usage_uniformity_coef", 0.0),
                 )
                 loss += self.model.config.router_aux_loss_coef * aux_loss
+
+        try:
+            import torch.distributed as dist
+            is_main_proc = (not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0
+        except Exception:
+            is_main_proc = True
+        if is_main_proc:
+            print(f"G3MoE Loss : {loss}", flush=True)
 
         return G3MoECausalLMOutputWithPast(
             loss=loss,
