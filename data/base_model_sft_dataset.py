@@ -131,7 +131,7 @@ def create_multimodal_collate_fn(processor):
 def get_dataset(
     dataset_name: str = "Gunulhona/open_m_3",
     tokenizer=None,
-    max_length: int = 16384,
+    max_length: int = 131072,
     test_size: float = 0.1,
     text_only: bool = False,
     streaming: bool = False
@@ -178,6 +178,7 @@ def get_dataset(
                     },
                     remove_columns=split_data.column_names if hasattr(split_data, 'column_names') else None
                 )
+                processed_split["conversations"] = processed_split["messages"].to_list()
                 processed_dataset[split_name] = processed_split
                 logger.info(f"   ✅ {split_name} 스트리밍 처리 완료")
             except Exception as e:
@@ -202,7 +203,7 @@ def get_dataset(
                 processed_split = split_data.map(
                     processing,
                     batched=False,
-                    num_proc=1, # Use num_proc for non-streaming
+                    num_proc=8, # Use num_proc for non-streaming
                     fn_kwargs={
                         "tokenizer": tokenizer,
                         "max_length": max_length,
@@ -253,7 +254,7 @@ def processing(
     """
     # A single example is passed, extract its messages
     conversation = example["messages"]
-    
+    images = example["images"]
     # A conversation should be a list of message dictionaries.
     # Skip if not a list, or if malformed (e.g., None).
     if not isinstance(conversation, list):
@@ -268,10 +269,10 @@ def processing(
                     } 
                     for r, c in zip(conversation["role"], conversation["content"])]
             except Exception as e:
-                logger.warning(f"Malformed conversation dict during conversion: {conversation}, Error: {e}")
+                logger.warning(f"Malformed conversation dict during conversion: , Error: {e}")
                 return None # Return None if conversion fails
         else:
-            logger.warning(f"Skipping example due to malformed messages (not a list or expected dict format): {example}")
+            logger.warning(f"Skipping example due to malformed messages (not a list or expected dict format): ")
             return None # Skip this example
     
     # If the conversion from malformed dict to list of dicts failed or was not applicable,

@@ -1,8 +1,10 @@
 import logging
-from datasets import load_dataset
+from tqdm import tqdm
+from datasets import load_dataset, get_dataset_config_names, concatenate_datasets
 from transformers import AutoProcessor
 import torch
 from typing import Dict, Any, List, Optional
+import traceback
 
 # Configure logger
 logger = logging.getLogger(__name__)
@@ -34,67 +36,33 @@ def get_simple_sft_dataset(
     # 작은 데이터셋 로드
     dataset = None
     try:
-        if config_name:
-            logger.info(f"   - 시도: load_dataset({dataset_name}, {config_name}, split='train', streaming=True)")
-            dataset = load_dataset(dataset_name, config_name, split="train", streaming=True)
-        else:
+        try:
+            config_names = get_dataset_config_names(dataset_name)
+            sample_for_each_config = max_samples // len(config_names)
+            logger.info(f"   - 시도: load_dataset({dataset_name}, {config_name}, split='train', streaming=False)")
+            loading_dataset = tqdm(config_names, desc=f"Loading {dataset_name} configs")
+            for config in loading_dataset:
+                loading_dataset.set_description(f"Loading {dataset_name} config: {config}")
+                config_data = load_dataset(path=dataset_name, name=config, split="train", streaming=False)
+                config_data = config_data.shuffle(seed=42) 
+                config_data = config_data.select(range(sample_for_each_config))if len(config_data) > sample_for_each_config else config_data
+                dataset = config_data if dataset is None else concatenate_datasets([dataset, config_data])
+
+        except Exception as e:
+            traceback.print_exc()
+            logger.error(f"❌ 데이터셋 로드 실패: {e}")
             logger.info(f"   - 시도: load_dataset({dataset_name}, split='train', streaming=True)")
-            dataset = load_dataset(dataset_name, split="train", streaming=True)
+            dataset = load_dataset(path=dataset_name, name="all", split="train", streaming=True)
+            dataset = dataset.shuffle(seed=42)
+            dataset = dataset.select(range(max_samples)) if len(dataset) > max_samples else dataset
+        
         logger.info("   ✅ 데이터셋 로드 성공")
     except Exception as e:
         logger.error(f"❌ 데이터셋 로드 실패: {e}")
-        # 대안 데이터셋 시도
-        logger.info("🔄 대안 데이터셋 시도: microsoft/orca-agentinstruct-1M-v1")
-        try:
-            dataset = load_dataset("microsoft/orca-agentinstruct-1M-v1", "creative_content", split="train", streaming=True)
-            logger.info("   ✅ 대안 데이터셋 로드 성공")
-        except Exception as e2:
-            logger.error(f"❌ 대안 데이터셋도 실패: {e2}")
-            # 최후의 수단: 매우 작은 더미 텍스트 데이터셋 생성
-            logger.info("🔄 더미 데이터셋 생성")
-            dummy_data = [
-                {"messages": [{"role": "user", "content": "Hello"}, {"role": "assistant", "content": "Hi there!"}]},
-                {"messages": [{"role": "user", "content": "How are you?"}, {"role": "assistant", "content": "I'm doing well, thank you!"}]},
-                {"messages": [{"role": "user", "content": "What's the weather like?"}, {"role": "assistant", "content": "I don't have access to real-time weather data."}]},
-                {"messages": [{"role": "user", "content": "Tell me a joke"}, {"role": "assistant", "content": "Why don't scientists trust atoms? Because they make up everything!"}]},
-                {"messages": [{"role": "user", "content": "Explain AI"}, {"role": "assistant", "content": "AI is artificial intelligence, computer systems that can perform tasks typically requiring human intelligence."}]}
-            ]
-            # 더미 데이터를 여러 번 반복하여 최소 샘플 수 확보
-            while len(dummy_data) < max_samples:
-                dummy_data.extend(dummy_data[:min(len(dummy_data), max_samples - len(dummy_data))])
-            
-            samples = dummy_data[:max_samples]
-            logger.info(f"   ✅ 더미 데이터셋 생성: {len(samples)}개 샘플")
-            
-            # 훈련/테스트 분할
-            split_idx = int(len(samples) * (1 - test_size))
-            train_samples = samples[:split_idx]
-            test_samples = samples[split_idx:]
-            
-            # 토크나이즈 처리
-            train_dataset = []
-            test_dataset = []
-            
-            for sample in train_samples:
-                processed = process_sample(sample, tokenizer, max_length)
-                if processed is not None:
-                    train_dataset.append(processed)
-            
-            for sample in test_samples:
-                processed = process_sample(sample, tokenizer, max_length)
-                if processed is not None:
-                    test_dataset.append(processed)
-            
-            logger.info(f"📊 더미 데이터 - 훈련: {len(train_dataset)}개, 테스트: {len(test_dataset)}개")
-            
-            from datasets import Dataset, DatasetDict
-            return DatasetDict({
-                "train": Dataset.from_list(train_dataset),
-                "test": Dataset.from_list(test_dataset)
-            })
+        raise Exception(f"😢 데이터셋 로딩 시도가 실패했습니다.")
     
     if dataset is None:
-        raise RuntimeError("모든 데이터셋 로딩 시도가 실패했습니다.")
+        raise RuntimeError("데이터셋 로딩 시도가 실패했습니다.")
     
     # 제한된 샘플만 가져오기
     samples = []
@@ -240,8 +208,8 @@ def process_sample(sample: Dict[str, Any], tokenizer, max_length: int):
                 messages,
                 tokenize=True,
                 add_generation_prompt=False,
-                max_length=max_length,
-                truncation=True,
+                # max_length=max_length,
+                # truncation=True,
                 return_dict=True,
                 return_tensors="pt"
             )
@@ -266,8 +234,8 @@ def process_sample(sample: Dict[str, Any], tokenizer, max_length: int):
             tokenized = actual_tokenizer(
                 text,
                 max_length=max_length,
-                truncation=True,
-                padding=False,
+                # truncation=True,
+                # padding=False,
                 return_tensors="pt"
             )
         

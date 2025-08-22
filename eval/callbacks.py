@@ -38,6 +38,7 @@ from deepeval.benchmarks import GSM8K
 from deepeval.benchmarks import MathQA
 from deepeval.benchmarks.tasks import MathQATask
 from deepeval.benchmarks import TruthfulQA
+from deepeval.benchmarks import IFEval
 # from deepeval.benchmarks import AGIEval
 from deepeval.benchmarks import ARC
 from deepeval.benchmarks import HellaSwag
@@ -54,10 +55,22 @@ from deepeval.benchmarks import BoolQ
 from deepeval.metrics import HallucinationMetric, AnswerRelevancyMetric
 from deepeval.test_case import ArenaTestCase, LLMTestCase
 from deepeval.metrics import ArenaGEval
+from deepeval.integrations.hugging_face.rich_manager import RichManager
 from trl import SFTTrainer
+from transformers.trainer_callback import ProgressCallback
 from eval.local_deepeval import LocalModel
 # Add parent directory to path for custom model imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# Distributed rank helper
+def _is_main_process() -> bool:
+    try:
+        import torch.distributed as dist
+        if dist.is_available() and dist.is_initialized():
+            return dist.get_rank() == 0
+    except Exception:
+        pass
+    return True
 
 # Disable torch.compile to avoid data-dependent branching issues
 os.environ["TORCH_COMPILE_DISABLE"] = "1"
@@ -161,7 +174,9 @@ def get_model_eval_callback(
         """
         benchmark = MMLU()
         evaluation_dataset = EvaluationDataset(
-            goldens=benchmark.load_benchmark_dataset(task=MMLUTask.HIGH_SCHOOL_EUROPEAN_HISTORY)
+            goldens=benchmark.load_benchmark_dataset(
+                task=MMLUTask.HIGH_SCHOOL_EUROPEAN_HISTORY
+            )
         )
         # print("Golden dataset: ","\n",  evaluation_dataset.goldens, "\n")
         # evaluation_dataset = EvaluationDataset(
@@ -210,6 +225,38 @@ def get_model_eval_callback(
         mme_max_samples=mme_max_samples,
     )
 
+class EmptyRichManager(RichManager): 
+    def __init__(self, show_table: bool, total_train_epochs: int) -> None:
+        """
+        Initialize RichManager.
+
+        Args:
+            show_table (bool): Flag to show or hide the table.
+            total_train_epochs (int): Total number of training epochs.
+        """
+        pass
+
+    def _initialize_progress_trackers(self) -> None:
+        pass
+
+    def change_spinner_text(self,*args, **kwargs) -> None:
+        pass
+
+    def stop(self) -> None:
+        pass
+
+    def start(self) -> None:
+        pass
+
+    def update(self, *args, **kwargs) -> None:
+        pass
+
+    def create_column(self, *args, **kwargs):
+        return None, None
+
+    def advance_progress(self) -> None:
+        pass
+
 
 class ModelEvalCallback(DeepEvalHuggingFaceCallback):
     '''
@@ -241,6 +288,9 @@ class ModelEvalCallback(DeepEvalHuggingFaceCallback):
             metrics=metrics,
             tokenizer_args=tokenizer_args,
             show_table=show_table)
+
+        self.trainer.add_callback(ProgressCallback)
+        self.rich_manager = EmptyRichManager(show_table=show_table, total_train_epochs=trainer.args.num_train_epochs)
         self.eval_model = LocalModel(model=trainer.model, tokenizer=trainer.tokenizer)
         self.enable_benchmarks = enable_benchmarks
         self.benchmarks_to_run = benchmarks_to_run
@@ -249,10 +299,22 @@ class ModelEvalCallback(DeepEvalHuggingFaceCallback):
         self.mme_max_samples = mme_max_samples
         self.benchmark_results_history = []
         self.last_eval_step = 0  # Track last evaluation step
+        self.is_main_process = _is_main_process()
+
     
     def _calculate_metric_scores(self) -> Dict[str, List[float]]:
-        return super()._calculate_metric_scores()
-
+        # return super()._calculate_metric_scores()
+        on_log_metrics = IFEval(n_problems=10, verbose_mode=True)
+        self.eval_model = LocalModel(model=self.trainer.model, tokenizer=self.trainer.tokenizer)
+        try:
+            test_results = on_log_metrics.evaluate(self.eval_model)
+            scores = {
+                "ifeval": [test_results["overall_accuracy"]]
+            }
+        except Exception as e:
+            print(f"Error in _calculate_metric_scores: {e}\nIFEval scores set to 0.0")
+            scores = self._aggregate_scores({"ifeval": [0.0]})
+        return scores
     def _aggregate_scores(
         self, 
         scores: Dict[str, List[float]]
@@ -276,6 +338,9 @@ class ModelEvalCallback(DeepEvalHuggingFaceCallback):
         **kwargs,
     ):
         """Step-based benchmark evaluation"""
+        # Only run heavy benchmarking on the main process
+        if not self.is_main_process:
+            return control
         # Only run if step-based evaluation is enabled
         if (self.eval_mode == "step" and 
             self.enable_benchmarks and
@@ -316,6 +381,8 @@ class ModelEvalCallback(DeepEvalHuggingFaceCallback):
         **kwargs,
     ):
         # Only run epoch-based evaluation if eval_mode is "epoch"
+        if not self.is_main_process:
+            return control
         if self.eval_mode == "epoch":
             with torch.inference_mode():
                 # with torch.device("cuda"):
@@ -633,7 +700,8 @@ class ModelEvalCallback(DeepEvalHuggingFaceCallback):
         control: TrainerControl,
         **kwargs,
     ):
-        super().on_log(args, state, control, **kwargs)
+        # super().on_log(args, state, control, **kwargs)
+        pass
         
     def _generate_table(self):
         super()._generate_table()

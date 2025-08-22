@@ -10,12 +10,14 @@ Removed bloat and focused on actual working features.
 import os
 import sys
 import torch
+import time
 import logging
 from typing import Optional
 
 # Add project root to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-
+os.environ["VLLM_LOGGING_LEVEL"] = "DEBUG"
+os.environ["HF_HOME"] = "/mnt/disks/data/hf"
 # Check dependencies
 try:
     from vllm import LLMEngine, SamplingParams, EngineArgs
@@ -24,15 +26,17 @@ except ImportError:
     VLLM_AVAILABLE = False
 
 try:
-    from models.g3moe_model import G3MoEForCausalLM, G3MoEModel
+    from models.g3moe_model import G3MoEForCausalLM, G3MoEModel, G3MoETextModel
     from models.g3moe_config import G3MoETextConfig, G3MoEConfig
     G3MOE_AVAILABLE = True
     if VLLM_AVAILABLE:
         from vllm import ModelRegistry
         from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
         # AutoConfig.register("g3moe", G3MoEConfig)
+        AutoConfig.register("g3moe", G3MoEConfig)
         AutoConfig.register("g3moe_text", G3MoETextConfig)
-        # AutoModel.register(G3MoETextConfig, G3MoEModel)
+        AutoModel.register(G3MoEConfig, G3MoEModel)
+        AutoModel.register(G3MoETextConfig, G3MoETextModel)
         AutoModelForCausalLM.register(G3MoETextConfig, G3MoEForCausalLM)
         ModelRegistry.register_model(model_arch="G3MoEForCausalLM", model_cls=G3MoEForCausalLM)
 except ImportError as e:
@@ -44,6 +48,14 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+def format_parameters(number):
+    if number >= 1_000_000_000:
+        return f"{number / 1_000_000_000:.2f} B"
+    elif number >= 1_000_000:
+        return f"{number / 1_000_000:.2f} M"
+    else:
+        return str(number)
+
 def save_g3moe_for_vllm(save_path: str) -> bool:
     """
     Save G3MoE model in HuggingFace compatible format for vLLM.
@@ -52,7 +64,7 @@ def save_g3moe_for_vllm(save_path: str) -> bool:
     if not G3MOE_AVAILABLE:
         logger.error("G3MoE not available")
         return False
-    
+     
     try:
         from transformers import AutoTokenizer
         import json
@@ -65,12 +77,12 @@ def save_g3moe_for_vllm(save_path: str) -> bool:
         text_config = G3MoETextConfig(
             **{
                 "n_shared_experts": 1,
-                "n_routed_experts": 5, # 256, 15, 6
-                "n_group": 4,
-                "topk_group": 8,
+                "n_routed_experts": 3, # 256, 15, 6
+                "n_group": 2,
+                "topk_group": 2,
                 # "num_key_value_heads": base_config['text_config']['num_attention_heads'],
                 "num_experts_per_tok": 2,
-                "first_k_dense_replace": 18,
+                "first_k_dense_replace": 22,
                 "router_aux_loss_coef": 0.001,
                 "router_jitter_noise": 0.01,
                 "input_jitter_noise": 0.01,
@@ -87,13 +99,14 @@ def save_g3moe_for_vllm(save_path: str) -> bool:
         config = text_config
         model = G3MoEForCausalLM(config)
         model.init_weights()
-        
+        print("Test vLLM Custom Model size:", format_parameters(model.num_parameters()))
+
         # Save model and config
         model.save_pretrained(save_path)
         config.save_pretrained(save_path)
         
         # Save tokenizer
-        tokenizer = AutoTokenizer.from_pretrained("gpt2")
+        tokenizer = AutoTokenizer.from_pretrained("google/gemma-3-4b-it")
         tokenizer.save_pretrained(save_path)
         ModelRegistry.register_model(model_arch="G3MoEForCausalLM", model_cls=G3MoEForCausalLM)
         # Copy model files
@@ -111,8 +124,10 @@ def save_g3moe_for_vllm(save_path: str) -> bool:
         config_dict.update({
             "model_type": "g3moe_text",
             "architectures": ["G3MoEForCausalLM"],
+            # Provide explicit auto_map entries so vLLM worker can import classes
             "auto_map": {
                 "AutoConfig": "g3moe_config.G3MoETextConfig",
+                "AutoModel": "g3moe_model.G3MoETextModel",
                 "AutoModelForCausalLM": "g3moe_model.G3MoEForCausalLM"
             }
         })
@@ -190,7 +205,7 @@ def main():
         return
     
     # Test model saving
-    test_path = "./test_g3moe_model"
+    test_path = f"/mnt/disks/data/test_g3moe_model_{os.getpid()}_{int(time.time())}"
     
     logger.info("\n=== Test 1: Save G3MoE Model ===")
     if save_g3moe_for_vllm(test_path):

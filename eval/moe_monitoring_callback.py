@@ -6,6 +6,16 @@ from typing import Dict, Any, Optional, Callable
 import json
 import time
 
+def _is_main_process() -> bool:
+    """Best-effort check for rank-0 to gate logging/plotting on distributed runs."""
+    try:
+        import torch.distributed as dist
+        if dist.is_available() and dist.is_initialized():
+            return dist.get_rank() == 0
+    except Exception:
+        pass
+    return True
+
 class TorchMoECallback:
     """Pure PyTorch MoE monitoring callback"""
     
@@ -36,6 +46,7 @@ class TorchMoECallback:
         self.save_detailed_logs = save_detailed_logs
         self.log_dir = log_dir
         self.debug_logging = debug_logging
+        self.is_main_process = _is_main_process()
         
         # 내부 상태
         self.step = 0
@@ -100,7 +111,23 @@ class TorchMoECallback:
             try:
                 routing_info = self._extract_routing_info(module, input, output)
                 if routing_info:
-                    self.layer_outputs[layer_name] = routing_info
+                    # Store only lightweight, CPU-detached summaries to avoid GPU memory growth
+                    lightweight_entry = {}
+                    if 'expert_assignments' in routing_info and routing_info['expert_assignments'] is not None:
+                        ea = routing_info['expert_assignments']
+                        if torch.is_tensor(ea):
+                            ea = ea.detach().to('cpu', non_blocking=True)
+                        lightweight_entry['expert_assignments'] = ea
+                    # Keep num_experts metadata if present
+                    if 'num_experts' in routing_info:
+                        lightweight_entry['num_experts'] = routing_info['num_experts']
+                    # Optionally carry an already-aggregated avg entropy (scalar)
+                    if 'avg_routing_entropy' in routing_info and routing_info['avg_routing_entropy'] is not None:
+                        val = routing_info['avg_routing_entropy']
+                        if torch.is_tensor(val):
+                            val = val.detach().to('cpu')
+                        lightweight_entry['avg_routing_entropy'] = val
+                    self.layer_outputs[layer_name] = lightweight_entry
                     if self.step % 100 == 0:  # 100스텝마다 디버깅
                         self._log_debug(f"{layer_name}: extracted {list(routing_info.keys())}")
                 else:
@@ -111,24 +138,27 @@ class TorchMoECallback:
                     self._log_debug(f"Warning: Failed to extract routing info from {layer_name}: {e}")
         return hook_fn
     
+    @torch.no_grad()
     def _extract_routing_info(self, module, input, output):
         """모듈에서 라우팅 정보 추출"""
         routing_info = {}
-        
+        # Lightweight mode: avoid retaining large tensors by default
+        lightweight = True
+
         # 실제 G3MoE/GRIN 모델 구조에 맞춘 추출
         # output이 (hidden_states, router_logits) 튜플인 경우
         if isinstance(output, tuple) and len(output) == 2:
             hidden_states, router_logits = output
             if router_logits is not None:
-                # router_logits에서 routing_probs와 expert_assignments 계산
-                routing_probs = torch.nn.functional.softmax(router_logits, dim=-1)
-                expert_assignments = routing_probs.argmax(dim=-1)
-                
+                # Compute expert assignments cheaply; skip storing full probs/logits
+                expert_assignments = router_logits.argmax(dim=-1)
                 routing_info.update({
-                    'routing_probs': routing_probs,
                     'expert_assignments': expert_assignments,
-                    'gate_logits': router_logits
                 })
+                if not lightweight:
+                    routing_probs = torch.nn.functional.softmax(router_logits, dim=-1)
+                    routing_info['routing_probs'] = routing_probs
+                    routing_info['gate_logits'] = router_logits
         
         # 다양한 MoE 구현에서 라우팅 정보 추출
         # 1. 속성으로 저장된 경우
@@ -139,42 +169,47 @@ class TorchMoECallback:
         
         for attr in ['last_routing_probs', 'routing_probs', 'gate_probs']:
             if hasattr(module, attr):
-                routing_info['routing_probs'] = getattr(module, attr)
+                if not lightweight:
+                    routing_info['routing_probs'] = getattr(module, attr)
                 break
                 
         for attr in ['last_gate_logits', 'gate_logits', 'router_logits']:
             if hasattr(module, attr):
-                routing_info['gate_logits'] = getattr(module, attr)
+                if not lightweight:
+                    routing_info['gate_logits'] = getattr(module, attr)
                 break
         
         # 2. 기존 output에서 추출 (다른 MoE 구현용)
         if isinstance(output, tuple) and len(output) >= 3:
             # (hidden_states, routing_weights, selected_experts) 형태
-            routing_info.update({
-                'routing_probs': output[1] if output[1] is not None else None,
-                'expert_assignments': output[2] if output[2] is not None else None
-            })
+            if output[2] is not None:
+                routing_info['expert_assignments'] = output[2]
+            if not lightweight and output[1] is not None:
+                routing_info['routing_probs'] = output[1]
         
         # 3. gate/router 서브모듈에서 추출
         if hasattr(module, 'gate'):
             gate = module.gate
             for attr in ['last_routing_probs', 'routing_probs']:
                 if hasattr(gate, attr):
-                    routing_info['routing_probs'] = getattr(gate, attr)
+                    if not lightweight:
+                        routing_info['routing_probs'] = getattr(gate, attr)
                     break
         if hasattr(module, 'router'):
             router = module.router
             for attr in ['last_routing_probs', 'routing_probs']:
                 if hasattr(router, attr):
-                    routing_info['routing_probs'] = getattr(router, attr)
+                    if not lightweight:
+                        routing_info['routing_probs'] = getattr(router, attr)
                     break
         # 4. combine_weights 형태로만 제공되는 경우
         cw = getattr(module, 'combine_weights', None)
         if cw is None and isinstance(output, tuple) and len(output) >= 3:
             cw = output[2]
         if cw is not None:
-            routing_info['routing_probs'] = cw
             routing_info['expert_assignments'] = cw.argmax(dim=-1)
+            if not lightweight:
+                routing_info['routing_probs'] = cw
         
         # num_experts 정보 추출
         if hasattr(module, 'num_experts'):
@@ -188,6 +223,14 @@ class TorchMoECallback:
         elif len(getattr(module, 'experts', [])) > 0:
             routing_info['num_experts'] = len(module.experts)
         
+        # Optionally pre-aggregate avg entropy without keeping full probs
+        if not lightweight and 'routing_probs' in routing_info and routing_info['routing_probs'] is not None:
+            probs = routing_info['routing_probs']
+            if probs.dim() > 2:
+                probs = probs.view(-1, probs.size(-1))
+            token_entropy = -torch.sum(probs * torch.log(probs + 1e-10), dim=-1)
+            routing_info['avg_routing_entropy'] = token_entropy.mean()
+
         return routing_info if routing_info else None
     
     def on_step_begin(self):
@@ -305,16 +348,16 @@ class TorchMoECallback:
                 'moe/step': self.step
             })
         
-        # 로거에 전송
-        if self.logger:
+        # 로거에 전송 (rank 0 전용)
+        if self.logger and self.is_main_process:
             if hasattr(self.logger, 'log'):
                 self.logger.log(log_data, step=self.step)
             elif hasattr(self.logger, 'add_scalars'):  # TensorBoard
                 for key, value in log_data.items():
                     self.logger.add_scalar(key, value, self.step)
         
-        # 콘솔 출력
-        if self.log_to_console:
+        # 콘솔 출력 (rank 0 전용)
+        if self.log_to_console and self.is_main_process:
             self._log_debug(f"Step {self.step} MoE Metrics:")
             for key, value in log_data.items():
                 if 'avg_' in key or 'total_' in key:
@@ -322,6 +365,9 @@ class TorchMoECallback:
     
     def _log_heatmaps(self):
         """Expert 사용률 히트맵 로깅"""
+        # 무거운 작업은 rank 0에서만 실행
+        if not self.is_main_process:
+            return
         try:
             import matplotlib.pyplot as plt
             import seaborn as sns
@@ -344,7 +390,7 @@ class TorchMoECallback:
                     plt.xlabel('Time Steps')
                     plt.ylabel('Expert Index')
                     
-                    if self.logger and hasattr(self.logger, 'log'):
+                    if self.logger and hasattr(self.logger, 'log') and self.is_main_process:
                         import wandb
                         self.logger.log({
                             f'moe/{layer_name}/usage_heatmap': wandb.Image(plt)
@@ -412,10 +458,10 @@ class TorchMoECallback:
                 **alert
             })
             
-            if self.log_to_console:
+            if self.log_to_console and self.is_main_process:
                 self._log_debug(f"⚠️  MoE Alert at step {self.step}: {alert['message']}")
             
-            if self.logger and hasattr(self.logger, 'log'):
+            if self.logger and hasattr(self.logger, 'log') and self.is_main_process:
                 self.logger.log({
                     f'alerts/{alert["type"]}': 1,
                     f'alerts/{alert["layer"]}_severity': alert.get('severity', 1)
@@ -423,6 +469,8 @@ class TorchMoECallback:
     
     def _save_detailed_log(self, metrics):
         """상세 로그 저장"""
+        if not self.is_main_process:
+            return
         log_entry = {
             'step': self.step,
             'timestamp': time.time(),
