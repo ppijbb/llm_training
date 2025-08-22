@@ -38,6 +38,57 @@ session.headers.update({
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
 })
 
+# 데이터셋별 모드 선택 매핑 (reasoning 모드와 instruction 모드 구분)
+DATASET_MODE_MAPPING = {
+    # Reasoning 모드가 적합한 데이터셋들 (복잡한 추론과 논리적 사고가 필요한 데이터셋)
+    "HuggingFaceTB/smoltalk": "reasoning",
+    "PrincetonPLI/Instruct-SkillMix-SDD": "reasoning", 
+    "nvidia/OpenCodeInstruct": "reasoning",
+    "microsoft/orca-agentinstruct-1M-v1": "reasoning",
+    "open-r1/Mixture-of-Thoughts": "reasoning",
+    "NousResearch/Hermes-3-Dataset": "reasoning",
+    
+    # Instruction 모드가 적합한 데이터셋들 (명확한 지시사항 수행과 대화에 특화된 데이터셋)
+    "R0k1e/UltraLink": "instruction",
+    "allenai/WildChat-1M": "instruction",
+    "MaziyarPanahi/Llama-Nemotron-Post-Training-Dataset-v1-ShareGPT": "instruction",
+    "nvidia/Llama-Nemotron-Post-Training-Dataset": "instruction",
+    "Salesforce/blip3-kale": "instruction",
+    "liuhaotian/LLaVA-Instruct-150K": "instruction",
+    "Lin-Chen/ShareGPT4V": "instruction",
+    "nvidia/Llama-Nemotron-VLM-Dataset-v1": "instruction"
+}
+
+# 통합 시스템 프롬프트 - 간결하고 명확한 버전
+UNIFIED_SYSTEM_PROMPT = """You are an AI assistant. You have two modes:
+
+**REASONING MODE**: Use "Let me think through this step by step..." for complex problems, coding, math, or when user requests deep thinking.
+
+**INSTRUCTION MODE**: Follow instructions directly for simple tasks, questions, or conversations.
+
+Choose mode based on user request. For images, analyze carefully and choose appropriate mode."""
+
+# 데이터셋별 모드 선택 매핑
+DATASET_MODE_MAPPING = {
+    # Reasoning 모드가 적합한 데이터셋들
+    "HuggingFaceTB/smoltalk": "reasoning",
+    "PrincetonPLI/Instruct-SkillMix-SDD": "reasoning", 
+    "nvidia/OpenCodeInstruct": "reasoning",
+    "microsoft/orca-agentinstruct-1M-v1": "reasoning",
+    "open-r1/Mixture-of-Thoughts": "reasoning",
+    "NousResearch/Hermes-3-Dataset": "reasoning",
+    
+    # Instruction 모드가 적합한 데이터셋들
+    "R0k1e/UltraLink": "instruction",
+    "allenai/WildChat-1M": "instruction",
+    "MaziyarPanahi/Llama-Nemotron-Post-Training-Dataset-v1-ShareGPT": "instruction",
+    "nvidia/Llama-Nemotron-Post-Training-Dataset": "instruction",
+    "Salesforce/blip3-kale": "instruction",
+    "liuhaotian/LLaVA-Instruct-150K": "instruction",
+    "Lin-Chen/ShareGPT4V": "instruction",
+    "nvidia/Llama-Nemotron-VLM-Dataset-v1": "instruction"
+}
+
 # 멀티모달 데이터셋 목록
 dataset_configs = [
     ("HuggingFaceTB/smoltalk", "all"),
@@ -51,8 +102,40 @@ dataset_configs = [
     ("open-r1/Mixture-of-Thoughts", "all"),
     ("Salesforce/blip3-kale", "core"),
     ("liuhaotian/LLaVA-Instruct-150K", None),
-    ("Lin-Chen/ShareGPT4V", "ShareGPT4V")
+    ("Lin-Chen/ShareGPT4V", "ShareGPT4V"),
+    # 추가: Hermes-3, Nemotron VLM v1
+    ("NousResearch/Hermes-3-Dataset", None),
+    ("nvidia/Llama-Nemotron-VLM-Dataset-v1", None)
 ]
+
+def get_system_prompt_for_dataset(dataset_name: str) -> str:
+    """데이터셋에 적절한 통합 시스템 프롬프트를 반환합니다."""
+    return UNIFIED_SYSTEM_PROMPT
+
+def get_dataset_mode(dataset_name: str) -> str:
+    """데이터셋의 기본 모드를 반환합니다."""
+    return DATASET_MODE_MAPPING.get(dataset_name, "instruction")
+
+def add_system_prompt_to_messages(messages: List[Dict[str, Any]], system_prompt: str, dataset_name: str) -> List[Dict[str, Any]]:
+    """메시지 리스트의 맨 앞에 시스템 프롬프트와 모드 선택 지시를 추가합니다."""
+    if not messages:
+        return messages
+    
+    # 데이터셋의 기본 모드 가져오기
+    default_mode = get_dataset_mode(dataset_name)
+    
+    # 모드 선택 지시를 포함한 시스템 프롬프트 생성
+    mode_instruction = f"\n\n**Current Context:** This dataset typically requires {default_mode.upper()} MODE responses. However, adapt the mode based on the specific user request as outlined in the system prompt above."
+    
+    enhanced_system_prompt = system_prompt + mode_instruction
+    
+    # 시스템 프롬프트를 첫 번째 메시지로 추가
+    system_message = {
+        "role": "system",
+        "content": [{"type": "text", "text": enhanced_system_prompt}]
+    }
+    
+    return [system_message] + messages
 
 def construct_image_url(
     image_path,
@@ -201,30 +284,10 @@ def convert_to_target_format(
 ) -> Optional[Dict[str, Any]]:
     """
     각 데이터셋의 샘플을 목표 형식으로 변환합니다.
-    텍스트 전용 데이터셋과 멀티모달 데이터셋을 모두 처리합니다.
-    목표 형식 (index 필드 완전 제거):
-    {
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "질문"},
-                    {"type": "image", "text": null}  # 멀티모달인 경우만
-                ]
-            },
-            {
-                "role": "assistant", 
-                "content": [
-                    {"type": "text", "text": "답변"}
-                ]
-            }
-        ],
-        "images": [actual_image_object],  # 멀티모달인 경우만
-        "source_dataset": "dataset_name",
-        "original_data": {...}
-    }
+    - messages: List[{ role: string, content: List[{type: "text"|"image", text: string}] }]
+    - images: [PIL.Image] (멀티모달에서만)
     """
-    
+
     result: Dict[str, Any] = {
         "messages": [],
         "images": [],
@@ -232,6 +295,9 @@ def convert_to_target_format(
         "original_data": sample.copy()
     }
     
+    # 데이터셋에 적절한 시스템 프롬프트 가져오기
+    system_prompt = get_system_prompt_for_dataset(dataset_name)
+
     try:
         # 텍스트 전용 데이터셋들 처리
         if dataset_name == "HuggingFaceTB/smoltalk":
@@ -242,7 +308,7 @@ def convert_to_target_format(
                             "role": msg["role"],
                             "content": [{"type": "text", "text": str(msg["content"])}]
                         })
-        
+
         elif dataset_name == "R0k1e/UltraLink":
             if "data" in sample and isinstance(sample["data"], list) and len(sample["data"]) >= 2:
                 data = sample["data"]
@@ -252,43 +318,43 @@ def convert_to_target_format(
                             {"role": "user", "content": [{"type": "text", "text": str(data[i])}]},
                             {"role": "assistant", "content": [{"type": "text", "text": str(data[i + 1])}]}
                         ])
-        
+
         elif dataset_name == "PrincetonPLI/Instruct-SkillMix-SDD":
             if "instruction" in sample and "output" in sample:
                 user_content_str = str(sample["instruction"])
                 if "input" in sample and sample["input"] and str(sample["input"]).strip():
                     user_content_str += f"\n\nInput: {sample['input']}"
-                
+
                 result["messages"] = [
                     {"role": "user", "content": [{"type": "text", "text": user_content_str}]},
-                    {"role": "assistant", "content": [{"type": "text", "text": str(sample["output"])}]}
+                    {"role": "assistant", "content": [{"type": "text", "text": str(sample["output"]) }]}
                 ]
-        
+
         elif dataset_name == "allenai/WildChat-1M":
             if "conversation" in sample and isinstance(sample["conversation"], list):
                 for conv in sample["conversation"]:
                     if isinstance(conv, dict) and "role" in conv and "content" in conv:
                         result["messages"].append({
                             "role": conv["role"],
-                            "content": [{"type": "text", "text": str(conv["content"])}]
+                            "content": [{"type": "text", "text": str(conv["content"]) }]
                         })
-        
+
         elif dataset_name == "nvidia/OpenCodeInstruct":
             if "input" in sample and "output" in sample:
                 result["messages"] = [
-                    {"role": "user", "content": [{"type": "text", "text": str(sample["input"])}]},
-                    {"role": "assistant", "content": [{"type": "text", "text": str(sample["output"])}]}
+                    {"role": "user", "content": [{"type": "text", "text": str(sample["input"]) }]},
+                    {"role": "assistant", "content": [{"type": "text", "text": str(sample["output"]) }]}
                 ]
-        
+
         elif dataset_name == "microsoft/orca-agentinstruct-1M-v1":
             if "messages" in sample and isinstance(sample["messages"], list):
                 for msg in sample["messages"]:
                     if isinstance(msg, dict) and "role" in msg and "content" in msg:
                         result["messages"].append({
                             "role": msg["role"],
-                            "content": [{"type": "text", "text": str(msg["content"])}]
+                            "content": [{"type": "text", "text": str(msg["content"]) }]
                         })
-        
+
         elif "Nemotron" in dataset_name:
             if "conversations" in sample and isinstance(sample["conversations"], list):
                 for conv in sample["conversations"]:
@@ -296,18 +362,55 @@ def convert_to_target_format(
                         role = "user" if conv["from"] in ["human", "user"] else "assistant"
                         result["messages"].append({
                             "role": role,
-                            "content": [{"type": "text", "text": str(conv["value"])}]
+                            "content": [{"type": "text", "text": str(conv["value"]) }]
                         })
-        
+
+        elif dataset_name == "NousResearch/Hermes-3-Dataset":
+            # Hermes-3는 conversations 배열을 그대로 사용
+            convs = sample.get("conversations") or sample.get("messages")
+            if isinstance(convs, list):
+                for conv in convs:
+                    if not isinstance(conv, dict):
+                        continue
+                    frm = conv.get("from") or conv.get("role")
+                    val = str(conv.get("value") or conv.get("content") or "")
+                    if not frm:
+                        continue
+                    role = "user" if frm in ["human", "user"] else ("assistant" if frm in ["gpt", "assistant"] else frm)
+                    result["messages"].append({
+                        "role": role,
+                        "content": [{"type": "text", "text": val }]
+                    })
+
+        elif dataset_name == "nvidia/Llama-Nemotron-VLM-Dataset-v1":
+            # VLM v1: 다양한 서브스플릿, captioning 류는 이미지 + 캡션 구조
+            # 예시 필드: image_url/image_path, caption/response 등을 가정하고 매핑
+            image_obj = None
+            for k in ["image", "image_path", "image_url", "url"]:
+                if k in sample and sample[k]:
+                    image_obj = load_image_from_url_or_path(sample[k])
+                    if image_obj is not None:
+                        result["images"].append(image_obj)
+                        break
+            caption = str(sample.get("caption") or sample.get("response") or sample.get("value") or "").strip()
+            if caption:
+                user_content: List[Dict[str, Any]] = [{"type": "text", "text": "Describe this image.", "image": ""}]
+                if result["images"]:
+                    user_content.append({"type": "image", "text": "", "image": ""})
+                result["messages"] = [
+                    {"role": "user", "content": user_content},
+                    {"role": "assistant", "content": [{"type": "text", "text": caption, "image": ""}]}
+                ]
+
         elif dataset_name == "open-r1/Mixture-of-Thoughts":
             if "messages" in sample and isinstance(sample["messages"], list):
                 for msg in sample["messages"]:
                     if isinstance(msg, dict) and "role" in msg and "content" in msg:
                         result["messages"].append({
                             "role": msg["role"],
-                            "content": [{"type": "text", "text": str(msg["content"])}]
+                            "content": [{"type": "text", "text": str(msg["content"]) }]
                         })
-        
+
         # 멀티모달 데이터셋들 처리
         elif dataset_name in ["Lin-Chen/ShareGPT4V", "liuhaotian/LLaVA-Instruct-150K"]:
             # 이미지 추출 및 로드
@@ -319,16 +422,16 @@ def convert_to_target_format(
                     image_obj = load_image_from_url_or_path(sample["images"][0], dataset_name)
                 else:
                     image_obj = load_image_from_url_or_path(sample["images"], dataset_name)
-            
+
             if image_obj is not None:
                 result["images"].append(image_obj)
-            
-            # conversations 처리
+
+            # conversations 처리 (content: List[{type,text}] + 이미지 토큰은 별도 item로 표현)
             if "conversations" in sample and isinstance(sample["conversations"], list):
                 for i, conv in enumerate(sample["conversations"]):
                     if not isinstance(conv, dict):
                         continue
-                        
+
                     # role 결정
                     role = "assistant"
                     if "from" in conv:
@@ -336,34 +439,31 @@ def convert_to_target_format(
                             role = "user"
                         elif conv["from"] in ["gpt", "assistant"]:
                             role = "assistant"
-                    
-                    # content 생성
-                    content_list = []
-                    text_content = str(conv.get("value", ""))
-                    
+                    content_list: List[Dict[str, Any]] = []
+                    text_content = str(conv.get("value", "")).strip()
                     if text_content:
-                        # <image> 태그 제거 (이미지는 별도 처리)
-                        text_content = text_content.replace("<image>", "").strip()
-                        
-                        if text_content:  # 빈 문자열이 아닌 경우만
-                            content_list.append({
-                                "type": "text",
-                                "text": text_content
-                            })
-                    
-                    # 첫 번째 user 메시지에 이미지 추가
-                    if role == "user" and i == 0 and result["images"]:
-                        content_list.append({
-                            "type": "image", 
-                            "text": None
-                        })
-                    
-                    if content_list:  # content가 있는 경우만 추가
+                        # 원 데이터에 <image> 토큰이 포함되어 있으면, 분리하여 image item으로 보존
+                        if "<image>" in text_content:
+                            # 각 토큰 앞뒤 텍스트도 보존
+                            segments = [seg for seg in text_content.split("<image>")]
+                            for sidx, seg in enumerate(segments):
+                                seg = seg.strip()
+                                if seg:
+                                    content_list.append({"type": "text", "text": seg})
+                                if sidx != len(segments) - 1:
+                                    content_list.append({"type": "image", "text": None})
+                        else:
+                            content_list.append({"type": "text", "text": text_content})
+                    # 첫 turn에 이미지가 존재하지만 텍스트에 <image> 토큰이 전혀 없는 경우, image item을 추가
+                    if role == "user" and i == 0 and result["images"] and not any(it.get('type') == 'image' for it in content_list):
+                        content_list.append({"type": "image", "text": None})
+
+                    if content_list:
                         result["messages"].append({
                             "role": role,
                             "content": content_list
                         })
-        
+
         elif dataset_name == "Salesforce/blip3-kale":
             # 이미지 로드
             image_obj = None
@@ -371,32 +471,35 @@ def convert_to_target_format(
                 image_obj = load_image_from_url_or_path(sample["url"], dataset_name)
             elif "image" in sample:
                 image_obj = load_image_from_url_or_path(sample["image"], dataset_name)
-            
+
             if image_obj is not None:
                 result["images"].append(image_obj)
-            
-            # caption을 대화 형식으로 변환
+
+            # caption을 대화 형식으로 변환 (content 리스트 구조)
             caption = str(sample.get("caption", "")).strip()
             if not caption:
                 caption = str(sample.get("cogvlm_caption", "")).strip()
-            
+
             if caption:
-                # 첫 번째 user 메시지에 이미지 포함
-                user_content: List[Dict[str, Any]] = [{"type": "text", "text": "Describe this image."}]
+                user_content: List[Dict[str, Any]] = [{"type": "text", "text": "Describe this image.", "image": ""}]
                 if result["images"]:
-                    user_content.append({"type": "image", "text": None})
-                
+                    # content.image에 상대 경로를 넣을 수 있으나, 이 시점에서는 이미지 파일명이 아직 없으므로 빈 문자열 유지
+                    user_content.append({"type": "image", "text": "", "image": ""})
+
                 result["messages"] = [
                     {"role": "user", "content": user_content},
-                    {"role": "assistant", "content": [{"type": "text", "text": caption}]}
+                    {"role": "assistant", "content": [{"type": "text", "text": caption, "image": ""}]}
                 ]
-        
+
         # 빈 messages인 경우 None 반환
         if not result["messages"]:
             return None
+        
+        # 시스템 프롬프트를 메시지 맨 앞에 추가
+        result["messages"] = add_system_prompt_to_messages(result["messages"], system_prompt, dataset_name)
             
         return result
-        
+
     except Exception as e:
         # 오류가 발생하면 None 반환하여 건너뛰기
         print(f"샘플 변환 중 오류 (건너뛰기): {dataset_name} - {str(e)}")
@@ -460,35 +563,50 @@ def process_dataset(
     try:
         # 특정 데이터셋들의 split 설정
         if dataset_name == "microsoft/orca-agentinstruct-1M-v1":
-            split = "creative_content"
+            split_candidates = ["creative_content", "train"]
         elif dataset_name == "MaziyarPanahi/Llama-Nemotron-Post-Training-Dataset-v1-ShareGPT":
-            split = "chat"
+            split_candidates = ["chat", "train"]
         elif dataset_name == "nvidia/Llama-Nemotron-Post-Training-Dataset":
-            split = "chat"
+            split_candidates = ["chat", "train"]
+        elif dataset_name == "nvidia/Llama-Nemotron-VLM-Dataset-v1":
+            # 다양한 서브스플릿 존재: captioning_x 등. 우선 train, 없으면 모든 split 나열 후 순회
+            split_candidates = ["train"]
         else:
-            split = "train"
+            split_candidates = ["train"]
         
-        # 데이터셋 로드
-        try:
-            if config_name:
-                full_dataset = load_dataset(dataset_name, config_name, split=split, streaming=True)
-            else:
-                full_dataset = load_dataset(dataset_name, split=split, streaming=True)
-        except Exception as e:
-            print(f"❌ 데이터셋 로드 실패 ({split} split): {e}")
-            # train split으로 재시도
-            if split != "train":
-                try:
-                    print(f"🔄 train split으로 재시도...")
-                    if config_name:
-                        full_dataset = load_dataset(dataset_name, config_name, split="train", streaming=True)
-                    else:
-                        full_dataset = load_dataset(dataset_name, split="train", streaming=True)
-                except Exception as e2:
-                    print(f"❌ train split으로도 실패: {e2}")
-                    return
-            else:
+        # 데이터셋 로드 (여러 후보 split 순회)
+        full_dataset = None
+        last_err = None
+        for split in split_candidates:
+            try:
+                if config_name:
+                    full_dataset = load_dataset(dataset_name, config_name, split=split, streaming=True)
+                else:
+                    full_dataset = load_dataset(dataset_name, split=split, streaming=True)
+                break
+            except Exception as e:
+                last_err = e
+                print(f"⚠️ split '{split}' 로드 실패: {e}")
+                continue
+        if full_dataset is None:
+            # Nemotron VLM 처럼 다양한 split이 있을 경우 전체 split을 불러와 순회
+            try:
+                ds_all = load_dataset(dataset_name, config_name) if config_name else load_dataset(dataset_name)
+                # 가능한 첫 split 선택
+                for split_name in ds_all.keys():
+                    try:
+                        full_dataset = load_dataset(dataset_name, config_name, split=split_name, streaming=True) if config_name else load_dataset(dataset_name, split=split_name, streaming=True)
+                        print(f"✅ split '{split_name}'로 진행")
+                        break
+                    except Exception as e:
+                        print(f"⚠️ split '{split_name}' 로드 실패: {e}")
+                        continue
+            except Exception as e2:
+                print(f"❌ 데이터셋 split 탐색 실패: {e2}")
                 return
+        if full_dataset is None:
+            print(f"❌ 데이터셋 로드 실패(모든 split): {last_err}")
+            return
 
         success_count = 0
         total_count = 0
@@ -557,17 +675,29 @@ def generate_cleaned_records(file_path: str):
                 record = json.loads(line)
                 
                 # Clean the 'messages' field in-place for efficiency
+                # messages -> conversations로 이행. 기존 messages는 무시하고 conversations만 유지
                 if 'messages' in record and isinstance(record['messages'], list):
-                    for message in record['messages']:
-                        if 'content' in message and isinstance(message['content'], list):
-                            for content_item in message['content']:
-                                # Fix 1: Ensure 'index' is always an integer (None -> -1)
-                                if content_item.get('index') is None:
-                                    content_item['index'] = -1
-                                
-                                # Fix 2: Ensure 'text' is always a string (None -> "")
-                                if content_item.get('text') is None:
-                                    content_item['text'] = ""
+                    conversations = []
+                    for m in record['messages']:
+                        role = m.get('role', '')
+                        # 시스템 메시지는 conversations에서 제외 (시스템 프롬프트는 별도로 처리)
+                        if role == 'system':
+                            continue
+                        frm = 'human' if role == 'user' else ('gpt' if role == 'assistant' else role)
+                        parts: List[str] = []
+                        for it in m.get('content', []) or []:
+                            if not isinstance(it, dict):
+                                continue
+                            if it.get('type') == 'text':
+                                txt = str(it.get('text') or '')
+                                if txt:
+                                    parts.append(txt)
+                            elif it.get('type') == 'image':
+                                img_ref = it.get('image') or ''
+                                parts.append(f"<image:{img_ref}>" if img_ref else "<image>")
+                        conversations.append({'from': frm, 'value': '\n'.join(parts)})
+                    record['conversations'] = conversations
+                    del record['messages']
 
                 yield record
 
@@ -628,6 +758,49 @@ def merge_and_create_dataset(
                                         image_counter += 1
                             
                             sample["images"] = image_paths
+
+                            # messages.content 내 image 아이템에 경로 매핑 (순서대로 할당)
+                            try:
+                                if sample.get("messages"):
+                                    img_idx = 0
+                                    for m in sample["messages"]:
+                                        content_list = m.get("content")
+                                        if isinstance(content_list, list):
+                                            for item in content_list:
+                                                if isinstance(item, dict) and item.get("type") == "image":
+                                                    if img_idx < len(image_paths):
+                                                        item["image"] = image_paths[img_idx]
+                                                        img_idx += 1
+                                                    else:
+                                                        # 남는 경로가 없으면 None 유지
+                                                        item.setdefault("image", None)
+                            except Exception:
+                                pass
+
+                            # Hermes 스타일 'conversations' 필드 동시 생성 (viewer 호환)
+                            try:
+                                conversations = []
+                                for m in sample.get("messages", []):
+                                    role = m.get("role", "")
+                                    frm = "human" if role == "user" else ("gpt" if role == "assistant" else role)
+                                    parts: List[str] = []
+                                    for it in m.get("content", []) or []:
+                                        if not isinstance(it, dict):
+                                            continue
+                                        if it.get("type") == "text":
+                                            txt = str(it.get("text") or "")
+                                            if txt:
+                                                parts.append(txt)
+                                        elif it.get("type") == "image":
+                                            img_ref = it.get("image") or ""
+                                            if img_ref:
+                                                parts.append(f"<image:{img_ref}>")
+                                            else:
+                                                parts.append("<image>")
+                                    conversations.append({"from": frm, "value": "\n".join(parts)})
+                                sample["conversations"] = conversations
+                            except Exception:
+                                pass
                             
                             # original_data를 안전하게 JSON 문자열로 변환
                             try:
@@ -674,15 +847,10 @@ def merge_and_create_dataset(
 
     # 데이터셋의 최종 스키마(구조) 정의
     features = Features({
-        'messages': Sequence(
+        'conversations': Sequence(
             Features({
-                'role': Value('string'),
-                'content': Sequence(
-                    Features({
-                        'type': Value('string'),
-                        'text': Value('string')
-                    })
-                )
+                'from': Value('string'),
+                'value': Value('string')
             })
         ),
         'images': Sequence(Value('string')), # 먼저 문자열 경로로 로드
@@ -722,6 +890,7 @@ def merge_and_create_dataset(
                 else:
                     loaded_images.append(None)
             example['images'] = loaded_images
+        # 메시지 내 image 경로는 그대로 두고(문자열), 이후 캐스팅으로 처리하거나 업로드에서 ImageFeature로 처리
         return example
 
     # 이미지 경로를 변환하고, None인 이미지를 필터링 (다중 처리로 가속)
@@ -765,10 +934,16 @@ def upload_dataset_to_hub(
         chunk_size = min(200, num_workers * 25)  # 더 작은 청크 크기
         
     jsonl_path = os.path.join(dataset_path, "data.jsonl")
-    
+    # Fallback: 최종 폴더에 JSONL이 없다면 staging 경로를 자동 검색
     if not os.path.exists(jsonl_path):
-        print(f"❌ JSONL 파일 없음: {jsonl_path}")
-        return False
+        candidate = f"{dataset_path}_staging"
+        alt_jsonl = os.path.join(candidate, "data.jsonl")
+        if os.path.exists(alt_jsonl):
+            print(f"ℹ️ data.jsonl이 최종 경로에 없어 staging 경로로 대체: {alt_jsonl}")
+            jsonl_path = alt_jsonl
+        else:
+            print(f"❌ JSONL 파일 없음: {jsonl_path}")
+            return False
 
     print(f"🚀 데이터셋 업로드: {repo_id}")
     print(f"📊 청크 크기: {chunk_size}, 워커 수: {num_workers}")
@@ -782,6 +957,27 @@ def upload_dataset_to_hub(
                     try:
                         record = json.loads(line.strip())
                         
+                        # 메시지 content 정규화 (업로드 스키마 유지)
+                        if 'messages' in record and isinstance(record['messages'], list):
+                            for message in record['messages']:
+                                content_value = message.get('content')
+                                if isinstance(content_value, list):
+                                    normalized: List[Dict[str, Any]] = []
+                                    for item in content_value:
+                                        if not isinstance(item, dict):
+                                            continue
+                                        item_type = item.get('type')
+                                        if item_type == 'text':
+                                            normalized.append({'type': 'text', 'text': str(item.get('text') or ''), 'image': ''})
+                                        elif item_type == 'image':
+                                            # 업로드 시에는 messages.content.image를 파일 경로 문자열로 유지
+                                            normalized.append({'type': 'image', 'text': '', 'image': str(item.get('image') or '')})
+                                    message['content'] = normalized
+                                elif isinstance(content_value, str):
+                                    message['content'] = [{'type': 'text', 'text': content_value, 'image': ''}]
+                                elif content_value is None:
+                                    message['content'] = []
+
                         # 이미지 경로를 실제 이미지로 변환
                         if 'images' in record and isinstance(record['images'], list):
                             loaded_images = []
@@ -797,6 +993,25 @@ def upload_dataset_to_hub(
                                             continue
                             record['images'] = loaded_images
                         
+                        # 시스템 프롬프트 및 모드 정보 추출 및 추가
+                        system_prompt = ""
+                        dataset_mode = "instruction"  # 기본값
+                        
+                        if 'messages' in record and isinstance(record['messages'], list):
+                            for message in record['messages']:
+                                if message.get('role') == 'system':
+                                    content = message.get('content', [])
+                                    if isinstance(content, list) and len(content) > 0:
+                                        system_prompt = str(content[0].get('text', ''))
+                                        break
+                        
+                        # 소스 데이터셋에서 모드 정보 추출
+                        if 'source_dataset' in record:
+                            dataset_mode = get_dataset_mode(record['source_dataset'])
+                        
+                        record['system_prompt'] = system_prompt
+                        record['dataset_mode'] = dataset_mode
+                        
                         yield record
                         
                         # 메모리 정리를 위해 주기적으로 가비지 컬렉션
@@ -807,23 +1022,26 @@ def upload_dataset_to_hub(
                         print(f"   라인 {line_num} 건너뛰기: {e}")
                         continue
         
-        # 이미지를 포함한 데이터셋 스키마
+        # 이미지를 포함한 데이터셋 스키마 (시스템 프롬프트 및 모드 정보 포함)
         from datasets import Features, Value, Sequence, Image as ImageFeature
         features = Features({
-            'messages': Sequence(
+            'conversations': Sequence(
                 Features({
                     'role': Value('string'),
                     'content': Sequence(
                         Features({
                             'type': Value('string'),
-                            'text': Value('string')
+                            'text': Value('string'),
+                            'image': Value('string')
                         })
                     )
                 })
             ),
             'images': Sequence(ImageFeature()),
             'source_dataset': Value('string'),
-            'original_data': Value('string')
+            'original_data': Value('string'),
+            'system_prompt': Value('string'),  # 시스템 프롬프트
+            'dataset_mode': Value('string')   # 데이터셋 기본 모드
         })
         
         print("📦 스트리밍 방식으로 데이터셋 생성 중...")
@@ -840,6 +1058,9 @@ def upload_dataset_to_hub(
         chunk_datasets = []
         current_chunk = []
         chunk_num = 0
+        # 청크 저장 디렉토리 보장 (이미지 포함 저장 시 경로 필요)
+        temp_chunk_dir = "/mnt/disks/data/tmp"
+        os.makedirs(temp_chunk_dir, exist_ok=True)
         
         for record in tqdm(iterable_dataset, desc="Processing records"):
             current_chunk.append(record)
@@ -853,7 +1074,7 @@ def upload_dataset_to_hub(
 
                 # 청크를 Dataset으로 변환하고 임시 저장
                 chunk_dataset = Dataset.from_list(current_chunk, features=features)
-                temp_chunk_path = f"/mnt/disks/data/tmp/chunk_{chunk_num}"
+                temp_chunk_path = f"{temp_chunk_dir}/chunk_{chunk_num}"
                 chunk_dataset.save_to_disk(temp_chunk_path)
                 chunk_datasets.append(temp_chunk_path)
                 
@@ -869,7 +1090,7 @@ def upload_dataset_to_hub(
         if current_chunk:
             if chunk_num >= start_chunk_num:
                 chunk_dataset = Dataset.from_list(current_chunk, features=features)
-                temp_chunk_path = f"/mnt/disks/data/tmp/chunk_{chunk_num}"
+                temp_chunk_path = f"{temp_chunk_dir}/chunk_{chunk_num}"
                 chunk_dataset.save_to_disk(temp_chunk_path)
                 chunk_datasets.append(temp_chunk_path)
                 print(f"   청크 {chunk_num}: {len(current_chunk)}개 저장 완료")
@@ -880,7 +1101,6 @@ def upload_dataset_to_hub(
         print(f"📤 총 {len(chunk_datasets)}개 신규 청크와 기존 청크를 하나의 리포지토리에 순차 추가...")
         
         all_chunk_paths_to_process = []
-        temp_chunk_dir = "/mnt/disks/data/tmp"
         if start_chunk_num > 0:
             print(f"기존 청크 (0 ~ {start_chunk_num - 1})를 처리 목록에 추가 중...")
             for i in range(start_chunk_num):
@@ -1043,19 +1263,21 @@ def inspect_dataset(
             print(f"   이미지 수: {len(sample_with_image['images'])}")
             print(f"   메시지 수: {len(sample_with_image['messages'])}")
             
-            # 첫 번째 메시지 구조 확인
+            # 첫 번째 메시지 구조 확인 (멀티모달 스키마)
             if sample_with_image['messages']:
                 first_msg = sample_with_image['messages'][0]
                 print(f"   첫 번째 메시지 role: {first_msg.get('role')}")
-                print(f"   첫 번째 메시지 content 수: {len(first_msg.get('content', []))}")
-                
-                for j, content in enumerate(first_msg.get('content', [])[:3]):
-                    content_type = content.get('type', 'unknown')
-                    if content_type == 'text':
-                        text_preview = content.get('text', '')[:50] + "..." if len(content.get('text', '')) > 50 else content.get('text', '')
-                        print(f"     Content {j+1}: {content_type} - '{text_preview}'")
+                content_list = first_msg.get('content', [])
+                print(f"   첫 번째 메시지 content 수: {len(content_list)}")
+                for j, content in enumerate(content_list[:3]):
+                    ctype = content.get('type')
+                    if ctype == 'text':
+                        text_preview = (content.get('text') or '')
+                        if len(text_preview) > 80:
+                            text_preview = text_preview[:80] + '...'
+                        print(f"     Content {j+1}: text - '{text_preview}'")
                     else:
-                        print(f"     Content {j+1}: {content_type} - index: {content.get('index')}")
+                        print(f"     Content {j+1}: {ctype}")
         
         # 통계
         image_count = sum(1 for s in dataset if cast(Dict[str, Any], s).get("images"))
@@ -1075,6 +1297,36 @@ def inspect_dataset(
         # 원본 데이터 보존 확인
         original_data_count = sum(1 for s in dataset if cast(Dict[str, Any], s).get("original_data"))
         print(f"\n💾 원본 데이터 보존: {original_data_count}/{len(dataset)} ({original_data_count/len(dataset)*100:.1f}%)")
+        
+        # 시스템 프롬프트 및 모드 통계
+        system_prompt_count = sum(1 for s in dataset if cast(Dict[str, Any], s).get("system_prompt"))
+        print(f"\n🤖 시스템 프롬프트 포함: {system_prompt_count}/{len(dataset)} ({system_prompt_count/len(dataset)*100:.1f}%)")
+        
+        # 모드별 통계
+        mode_stats = {}
+        for s in dataset:
+            sample = cast(Dict[str, Any], s)
+            mode = sample.get("dataset_mode", "unknown")
+            mode_stats[mode] = mode_stats.get(mode, 0) + 1
+        
+        print(f"\n🎯 모드별 분포:")
+        for mode, count in sorted(mode_stats.items()):
+            print(f"   {mode.upper()} 모드: {count}개 ({count/len(dataset)*100:.1f}%)")
+        
+        # 시스템 프롬프트 예시 (첫 번째 샘플)
+        if len(dataset) > 0:
+            first_sample = cast(Dict[str, Any], dataset[0])
+            if first_sample.get("system_prompt"):
+                print(f"\n📝 시스템 프롬프트 예시 (첫 번째 샘플):")
+                system_prompt = first_sample["system_prompt"]
+                if len(system_prompt) > 100:
+                    print(f"   {system_prompt[:100]}...")
+                else:
+                    print(f"   {system_prompt}")
+                
+                # 모드 정보도 표시
+                if first_sample.get("dataset_mode"):
+                    print(f"   기본 모드: {first_sample['dataset_mode'].upper()}")
         
         # 원본 데이터 예시 (첫 번째 샘플)
         if len(dataset) > 0:
