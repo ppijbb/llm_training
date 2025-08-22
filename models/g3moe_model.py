@@ -376,7 +376,7 @@ class G3MoETopkRouter(nn.Module):
 
     def forward(self, hidden_states):
         hidden_states = hidden_states.view(-1, self.config.hidden_size)
-        router_logits = self.router(hidden_states)
+        router_logits = F.linear(hidden_states.to(torch.float32), self.router.weight.to(torch.float32))
         scores = router_logits.sigmoid()
         topk_indices = self.get_topk_indices(scores)
         topk_weights = scores.gather(1, topk_indices)
@@ -483,7 +483,7 @@ def sparsemixer(scores, top_k, jitter_eps, training):
     with torch.no_grad():
         # compute mask for sparsity
         mask_logits_threshold, max_ind = scores.max(dim=-1, keepdim=True)
-        factor = scores.abs().clamp(min=mask_logits_threshold.abs())  # 수치적 안정성 개선
+        factor = scores.abs().clamp(min=mask_logits_threshold.abs()).clamp(min=1e-10)  # 수치적 안정성 개선
         mask_logits_threshold = (
             (mask_logits_threshold - scores) / factor
         ) > (2 * jitter_eps)
@@ -600,6 +600,7 @@ class G3MoESparseGRINBlock(nn.Module):
         self.iter = iterations
         # gating
         self.router = nn.Linear(self.hidden_dim, self.num_experts, bias=False)
+        setattr(self.router, "_is_g3moe_router", True)
 
         self.experts = nn.ModuleList([G3MoEMLP(config) for _ in range(self.num_experts)])
 
@@ -616,7 +617,7 @@ class G3MoESparseGRINBlock(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_dim)
         # router_logits: (batch * sequence_length, n_experts)
         # print ( 'moe', self.iter, torch.norm(hidden_states).item())
-        router_logits = self.router(hidden_states)
+        router_logits = F.linear(hidden_states.to(torch.float32), self.router.weight.to(torch.float32))
         if self.training:
             # Add noise for exploration to prevent expert starvation
             router_logits = router_logits + torch.randn_like(router_logits) * 1e-3
@@ -748,6 +749,7 @@ class G3MoEGRINMoE(nn.Module):
         self.iter = iterations
         # self.router = G3MoEHybridRouter(config)
         self.router = nn.Linear(config.hidden_size, self.num_experts, bias=False)
+        setattr(self.router, "_is_g3moe_router", True)
         self.experts = nn.ModuleList([G3MoEMLP(config) for _ in range(self.num_experts)])
         self.shared_experts = G3MoEMLP(config=config, intermediate_size=config.intermediate_size * config.n_shared_experts)
 
@@ -757,10 +759,10 @@ class G3MoEGRINMoE(nn.Module):
         # Adaptive filter parameters for load balancing
         self.ema_alpha = getattr(config, "ema_alpha", 0.99)
         self.balancing_strength = getattr(config, "balancing_strength", 0.01)
-        self.register_buffer("expert_load_ema", torch.zeros(self.num_experts))
+        self.register_buffer("expert_load_ema", torch.zeros(self.num_experts), persistent=True)
         
         # Enhanced Expert Utilization
-        self.register_buffer("expert_specialization_ema", torch.zeros(self.num_experts, self.hidden_dim))
+        self.register_buffer("expert_specialization_ema", torch.zeros(self.num_experts, self.hidden_dim), persistent=True)
         self.routing_temperature = nn.Parameter(torch.ones(1))
         self.specialization_strength = getattr(config, "specialization_strength", 0.01)
         
@@ -796,6 +798,7 @@ class G3MoEGRINMoE(nn.Module):
         residual = hidden_states
         final_hidden_states, router_logits = self._sparse_routing(hidden_states)
         with torch.no_grad():
+            # print( f'residual in rank {torch.distributed.get_rank()}', residual.shape, residual.dtype)
             pretriained_residual = self.shared_experts(residual)
         final_hidden_states = (final_hidden_states + pretriained_residual)
         if self.training:
@@ -811,7 +814,7 @@ class G3MoEGRINMoE(nn.Module):
             hidden_states *= torch.empty_like(hidden_states).uniform_(1.0 - self.input_jitter_noise, 1.0 + self.input_jitter_noise)
         hidden_states = hidden_states.view(-1, hidden_dim)
         # router_logits: (batch * sequence_length, n_experts)
-        router_logits = self.router(hidden_states)
+        router_logits = F.linear(hidden_states.to(torch.float32), self.router.weight.to(torch.float32))
         # ---- Enhanced Routing Logic ----
         if self.training:
             # Add specialization bonus based on hidden state similarity to expert's specialization
@@ -1267,12 +1270,16 @@ class G3MoEDecoderLayer(nn.Module):
         
         residual = hidden_states
         hidden_states = self.pre_feedforward_layernorm(hidden_states)
+
+        # print( f'decoder-{self.layer_idx} hidden_states in rank {torch.distributed.get_rank()}', hidden_states.shape, hidden_states.dtype)
         if self.layer_idx >= self.config.first_k_dense_replace:
             hidden_states, router_logits = self.moe(hidden_states)
         else:
             with torch.no_grad():
                 hidden_states = self.moe(hidden_states)
                 router_logits = None
+        # print( f'decoder-{self.layer_idx} hidden_states in rank {torch.distributed.get_rank()}', hidden_states.shape, hidden_states.dtype)
+        # print(f'{self.post_feedforward_layernorm}')
         hidden_states = self.post_feedforward_layernorm(hidden_states)
         if self.training:
             hidden_states = hidden_states.requires_grad_(True)
@@ -1325,63 +1332,48 @@ class G3MoEPreTrainedModel(PreTrainedModel):
     _supports_static_cache = True
     _supports_attention_backend = True
 
-    def _initialize_missing_keys(
-        self,
-        loaded_keys: list[str],
-        ignore_mismatched_sizes: bool,
-        is_quantized: bool,
-    ) -> "PreTrainedModel":
-        """
-        Fast-path init: only initialize missing MoE-specific submodules instead of walking the entire graph.
-        This avoids expensive default initialization work when we plan to immediately copy dense MLP weights
-        into MoE or leave most parameters loaded from the checkpoint.
-        """
-        # Mark already-initialized modules based on loaded keys
-        not_initialized_submodules = set_initialized_submodules(self, loaded_keys)
+    def _initialize_moe_router_and_temperature(self) -> None:
+        """Initialize only MoE router weights and routing temperature if they were not loaded from a checkpoint.
 
-        # Collect parameters of typical MoE submodules only
-        moe_param_tensors = []
-        for submodule in not_initialized_submodules.values():
-            name = submodule.__class__.__name__
-            if name in {"G3MoETopkRouter", "G3MoEMLP", "G3MoESharedExpertsLayer", "G3MoEGRINMoE", "G3MoESparseGRINBlock"}:
-                moe_param_tensors.extend(list(submodule.parameters(recurse=False)))
-
-        if moe_param_tensors:
-            # Initialize just these MoE parameters with our _init_weights policy
-            for p in moe_param_tensors:
-                # Create a tiny module wrapper to reuse _initialize_weights logic
-                class _Wrap(nn.Module):
-                    def __init__(self, param):
-                        super().__init__()
-                        self.weight = param
-                wrapper = _Wrap(p)
-                self._initialize_weights(wrapper)
-        # Do not call the global initialize; we deliberately skip it to avoid re-initting loaded modules
-        return self
+        - Router linear weights: Xavier uniform for stable logits
+        - Routing temperature: ones (softplus(1) ~ 1.313) keeps scale reasonable
+        """
+        with torch.no_grad():
+            for module in self.modules():
+                # Initialize router linears ONLY if not already initialized/loaded
+                router = getattr(module, "router", None)
+                if isinstance(router, nn.Linear):
+                    already_init = getattr(router, "_is_hf_initialized", False)
+                    if not already_init:
+                        nn.init.xavier_uniform_(router.weight)
+                        if router.bias is not None:
+                            router.bias.zero_()
+                # Initialize routing temperature ONLY if looks uninitialized/bad
+                routing_temp = getattr(module, "routing_temperature", None)
+                if isinstance(routing_temp, nn.Parameter):
+                    if not torch.isfinite(routing_temp).all() or routing_temp.abs().sum() == 0:
+                        routing_temp.data.fill_(1.0)
 
     def _init_weights(self, module):
         # important: this ported version of Gemma2 isn't meant for training from scratch - only
         # inference and fine-tuning - so the proper init weights code has been removed
+
         std = (
             self.config.initializer_range
             if hasattr(self.config, "initializer_range")
             else self.config.text_config.initializer_range
         )
 
+        # Only initialize router linears explicitly; skip expert MLPs and other dense layers during fine-tuning
         if isinstance(module, (nn.Linear, nn.Conv2d)):
-            logging.get_logger('transformers').debug(f"Initializing {module} with {std}")
-            
-            # Fast path: rely on explicit flags set on construction instead of name scans
-            if getattr(module, "_is_g3moe_gate_layer", False) or getattr(module, "_is_g3moe_router", False):
-                # Apply Xavier uniform initialization for gate layers
+            if getattr(module, "_is_g3moe_router", False):
+                logging.get_logger('transformers').debug(f"Initializing router layer with Xavier uniform: {module}")
                 nn.init.xavier_uniform_(module.weight)
-                logging.get_logger('transformers').debug("Applied Xavier uniform initialization to expert/router layer")
+                if module.bias is not None:
+                    module.bias.data.zero_()
             else:
-                # Apply standard normal initialization for other layers
-                module.weight.data.normal_(mean=0.0, std=std)
-
-            if module.bias is not None:
-                module.bias.data.zero_()
+                # Do not touch non-router linears here to avoid re-initializing experts or base MLPs
+                return
         elif isinstance(module, nn.Embedding):
             module.weight.data.normal_(mean=0.0, std=std)
             if module.padding_idx is not None:
@@ -1438,18 +1430,25 @@ class G3MoEPreTrainedModel(PreTrainedModel):
             *model_args,
             config=config,
             cache_dir=cache_dir,
-            # Initialize only truly missing keys; avoids re-initializing the whole model graph
-            ignore_mismatched_sizes=False,
+            # Critical: only init truly missing keys to avoid full-graph init slowdown
+            ignore_mismatched_sizes=True,
             force_download=force_download,
             local_files_only=local_files_only,
             token=token,
             revision=revision,
             use_safetensors=use_safetensors,
+            weights_only=weights_only,
             **{k: v for k, v in kwargs.items()}
         )
         print(f"G3MoE model skeleton loaded in {time.time() - debug_time} seconds")
         logging.set_verbosity_warning()
         logging.get_logger('transformers').debug("G3MoE model skeleton loaded.")
+
+        # After model load, ensure router and routing temperature are initialized if not present in checkpoint
+        try:
+            model._initialize_moe_router_and_temperature()
+        except Exception:
+            pass
 
         if hasattr(model, 'model') and hasattr(model.model, 'layers') and hasattr(model.model.layers, 'moe'):
           logging.get_logger('transformers').debug("G3MoE Pretrained model loaded.")
@@ -1626,10 +1625,28 @@ class G3MoETextModel(G3MoEPreTrainedModel):
 
     def __init__(self, config: G3MoETextConfig, **kwargs):
         super().__init__(config)
-        self.config = config if isinstance(config, G3MoETextConfig) else config.text_config
+        # Robustly resolve text config without relying on class identity across module boundaries
+        if getattr(config, "model_type", None) == "g3moe_text" or not hasattr(config, "text_config"):
+            self.config = config
+        else:
+            self.config = config.text_config
         config = self.config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
+
+        # Expose a tensor-parallel plan for vLLM on the base text model
+        if not hasattr(self, "_tp_plan") or self._tp_plan is None:
+            default_tp_plan = {
+                "layers.*.self_attn.q_proj": "colwise",
+                "layers.*.self_attn.k_proj": "colwise",
+                "layers.*.self_attn.v_proj": "colwise",
+                "layers.*.self_attn.o_proj": "rowwise",
+                "layers.*.mlp.gate_proj": "colwise",
+                "layers.*.mlp.up_proj": "colwise",
+                "layers.*.mlp.down_proj": "rowwise",
+            }
+            # allow overriding via config if provided
+            self._tp_plan = getattr(config, "base_model_tp_plan", default_tp_plan)
 
         # G3MoE downcasts the below to bfloat16, causing sqrt(3072)=55.4256 to become 55.5. See https://github.com/huggingface/transformers/pull/29402
         self.embed_tokens = G3MoETextScaledWordEmbedding(
@@ -1905,7 +1922,8 @@ class G3MoEForCausalLM(G3MoEPreTrainedModel, GenerationMixin):
     def __init__(self, config: G3MoETextConfig, **kwargs):
         super().__init__(config)
         self.model = G3MoETextModel(config, **kwargs)
-        self.config = self.config if isinstance(self.config, self.config_class) else self.config.text_config
+        # Ensure config refers to resolved text config from the submodule
+        self.config = self.model.config
         self.vocab_size = self.config.vocab_size
         self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
 
@@ -2048,8 +2066,7 @@ class G3MoEForCausalLM(G3MoEPreTrainedModel, GenerationMixin):
             is_main_proc = (not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0
         except Exception:
             is_main_proc = True
-        if is_main_proc:
-            print(f"G3MoE Loss : {loss}", flush=True)
+
 
         return G3MoECausalLMOutputWithPast(
             loss=loss,
@@ -2075,7 +2092,6 @@ class G3MoEForCausalLM(G3MoEPreTrainedModel, GenerationMixin):
         **kwargs,
     ):
         # Overwritten: has a special cache type, `HybridCache`
-
         model_inputs = super().prepare_inputs_for_generation(
             input_ids,
             past_key_values=past_key_values,

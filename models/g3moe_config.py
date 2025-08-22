@@ -308,6 +308,7 @@ class G3MoETextConfig(PretrainedConfig):
         self.sliding_window_pattern = sliding_window_pattern
         self.rope_scaling = rope_scaling
         self.attn_implementation = attn_implementation
+        self._attn_implementation = attn_implementation
 
         # 하이브리드 positional embedding 패턴 생성 (smollm3 스타일)
         if no_rope_layers is None:
@@ -428,6 +429,7 @@ class G3MoEConfig(PretrainedConfig):
         self.image_token_index = image_token_index
         self.initializer_range = initializer_range
         self.attn_implementation = attn_implementation
+        self._attn_implementation = attn_implementation
         super().__init__(**kwargs)
 
 
