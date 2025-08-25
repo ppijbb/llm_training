@@ -1136,18 +1136,9 @@ class G3MoEAttention(nn.Module):
                 key_states, value_states = key_states[:, :, :seq_len, :], value_states[:, :, :seq_len, :]
         
         attention_interface: Callable = eager_attention_forward
-        if self.config.attn_implementation != "eager":
-            if self.config.attn_implementation == "sdpa" and kwargs.get("output_attentions", False):
-                logger.warning_once(
-                    "`torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. "
-                    "Falling back to eager attention. This warning can be removed using the argument "
-                    '`attn_implementation="eager"` when loading the model.'
-                )
-            else:
-                attention_interface = ALL_ATTENTION_FUNCTIONS[self.config.attn_implementation]
-        if attention_mask is not None:
-            # backwards compatibility and ensure mask is on correct device for FA2
-            attention_mask = attention_mask.to(query_states.device)
+        if self.config._attn_implementation != "eager":
+            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+
         attn_output, attn_weights = attention_interface(
             self,
             query_states,
@@ -1722,13 +1713,6 @@ class G3MoETextModel(G3MoEPreTrainedModel):
             inputs_embeds = self.embed_tokens(input_ids)
 
         if use_cache and past_key_values is None and not self.training:
-            # batch_size, seq_len, _ = inputs_embeds.shape
-            # past_key_values = HybridCache(
-            #     self.config,
-            #     max_batch_size=batch_size,
-            #     max_cache_len=seq_len,
-            #     dtype=inputs_embeds.dtype,
-            # )
             past_key_values = DynamicCache()
         # During training, avoid generating/using mutable cache to keep checkpoint recompute deterministic
         if self.training:
@@ -1745,14 +1729,6 @@ class G3MoETextModel(G3MoEPreTrainedModel):
 
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
-
-        # causal_mask = self._update_causal_mask(
-        #     attention_mask,
-        #     inputs_embeds,
-        #     cache_position,
-        #     past_key_values,
-        #     output_attentions,
-        # )
         
         # It may already have been prepared by e.g. `generate`
         if not isinstance(causal_mask_mapping := attention_mask, dict):
@@ -2591,13 +2567,6 @@ class G3MoEForConditionalGeneration(G3MoEPreTrainedModel, GenerationMixin):
         # Otherwise we need pixel values to be passed to model. NOTE: use_cache=False needs pixel_values always
         if cache_position[0] == 0:
             model_inputs["pixel_values"] = pixel_values
-        is_training = token_type_ids is not None and labels is not None
-        if cache_position[0] == 0 and isinstance(past_key_values, HybridCache):
-            input_tensor = inputs_embeds if inputs_embeds is not None else input_ids
-            causal_mask = self.model._update_causal_mask(
-                attention_mask, token_type_ids, past_key_values, cache_position, input_tensor, is_training
-            )
-            model_inputs["attention_mask"] = causal_mask
 
         return model_inputs
 
