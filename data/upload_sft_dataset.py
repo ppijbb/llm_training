@@ -1,4 +1,5 @@
 from datasets import load_dataset, concatenate_datasets, Dataset, Features, Value, Sequence, Image as ImageFeature, load_from_disk, DatasetDict
+from huggingface_hub import HfApi
 import json
 from typing import List, Dict, Any, Optional, cast
 from tqdm.auto import tqdm
@@ -117,25 +118,46 @@ def get_dataset_mode(dataset_name: str) -> str:
     return DATASET_MODE_MAPPING.get(dataset_name, "instruction")
 
 def add_system_prompt_to_messages(messages: List[Dict[str, Any]], system_prompt: str, dataset_name: str) -> List[Dict[str, Any]]:
-    """메시지 리스트의 맨 앞에 시스템 프롬프트와 모드 선택 지시를 추가합니다."""
+    """메시지 리스트의 맨 앞에 시스템 프롬프트와 모드 선택 지시를 추가합니다. 기존 시스템 프롬프트가 있다면 병합합니다."""
     if not messages:
         return messages
     
     # 데이터셋의 기본 모드 가져오기
     default_mode = get_dataset_mode(dataset_name)
     
+    # 기존 시스템 프롬프트가 있는지 확인하고 추출
+    existing_system_prompt = ""
+    non_system_messages = []
+    
+    for message in messages:
+        if message.get("role") == "system":
+            # 기존 시스템 프롬프트 내용 추출
+            content = message.get("content", [])
+            if isinstance(content, list) and len(content) > 0:
+                existing_system_prompt = str(content[0].get("text", ""))
+            elif isinstance(content, str):
+                existing_system_prompt = content
+        else:
+            non_system_messages.append(message)
+    
     # 모드 선택 지시를 포함한 시스템 프롬프트 생성
     mode_instruction = f"\n\n**Current Context:** This dataset typically requires {default_mode.upper()} MODE responses. However, adapt the mode based on the specific user request as outlined in the system prompt above."
     
-    enhanced_system_prompt = system_prompt + mode_instruction
+    # 기존 시스템 프롬프트와 새로운 시스템 프롬프트 병합
+    if existing_system_prompt:
+        # 기존 시스템 프롬프트가 있으면 병합
+        combined_system_prompt = f"{existing_system_prompt}\n\n{system_prompt}{mode_instruction}"
+    else:
+        # 기존 시스템 프롬프트가 없으면 새로운 것만 사용
+        combined_system_prompt = system_prompt + mode_instruction
     
-    # 시스템 프롬프트를 첫 번째 메시지로 추가
+    # 병합된 시스템 프롬프트를 첫 번째 메시지로 추가
     system_message = {
         "role": "system",
-        "content": [{"type": "text", "text": enhanced_system_prompt}]
+        "content": [{"type": "text", "text": combined_system_prompt}]
     }
     
-    return [system_message] + messages
+    return [system_message] + non_system_messages
 
 def construct_image_url(
     image_path,
@@ -569,7 +591,8 @@ def process_dataset(
         elif dataset_name == "nvidia/Llama-Nemotron-Post-Training-Dataset":
             split_candidates = ["chat", "train"]
         elif dataset_name == "nvidia/Llama-Nemotron-VLM-Dataset-v1":
-            # 다양한 서브스플릿 존재: captioning_x 등. 우선 train, 없으면 모든 split 나열 후 순회
+            # 다양한 서브스플릿 존재: captioning_x, ocr_x, vqa_x 등
+            # 이 데이터셋은 split 정보 불일치 문제가 있어서 특별 처리
             split_candidates = ["train"]
         else:
             split_candidates = ["train"]
@@ -577,17 +600,28 @@ def process_dataset(
         # 데이터셋 로드 (여러 후보 split 순회)
         full_dataset = None
         last_err = None
+        
+        # 특정 데이터셋들은 streaming=False로 처리 (split 정보 불일치 문제 해결)
+        use_streaming = True
+        special_handling = False
+        
+        if dataset_name == "nvidia/Llama-Nemotron-VLM-Dataset-v1":
+            use_streaming = False
+            special_handling = True
+            print(f"ℹ️ {dataset_name}: split 정보 불일치 문제로 인해 특별 처리 모드 활성화")
+        
         for split in split_candidates:
             try:
                 if config_name:
-                    full_dataset = load_dataset(dataset_name, config_name, split=split, streaming=True)
+                    full_dataset = load_dataset(dataset_name, config_name, split=split, streaming=use_streaming)
                 else:
-                    full_dataset = load_dataset(dataset_name, split=split, streaming=True)
+                    full_dataset = load_dataset(dataset_name, split=split, streaming=use_streaming)
                 break
             except Exception as e:
                 last_err = e
                 print(f"⚠️ split '{split}' 로드 실패: {e}")
                 continue
+                
         if full_dataset is None:
             # Nemotron VLM 처럼 다양한 split이 있을 경우 전체 split을 불러와 순회
             try:
@@ -595,7 +629,7 @@ def process_dataset(
                 # 가능한 첫 split 선택
                 for split_name in ds_all.keys():
                     try:
-                        full_dataset = load_dataset(dataset_name, config_name, split=split_name, streaming=True) if config_name else load_dataset(dataset_name, split=split_name, streaming=True)
+                        full_dataset = load_dataset(dataset_name, config_name, split=split_name, streaming=use_streaming) if config_name else load_dataset(dataset_name, split=split_name, streaming=use_streaming)
                         print(f"✅ split '{split_name}'로 진행")
                         break
                     except Exception as e:
@@ -603,7 +637,77 @@ def process_dataset(
                         continue
             except Exception as e2:
                 print(f"❌ 데이터셋 split 탐색 실패: {e2}")
-                return
+                # split 정보 불일치 문제가 있는 경우 전체 데이터셋을 한 번에 로드 시도
+                if "split" in str(e2).lower() or "expected" in str(e2).lower():
+                    print(f"🔄 split 정보 불일치 문제 감지. 전체 데이터셋을 한 번에 로드 시도...")
+                    
+                            # 특별 처리 모드인 경우 huggingface_hub에서 split 정보를 먼저 확인
+        if special_handling:
+            print(f"🔄 특별 처리 모드: huggingface_hub에서 split 정보 확인 중...")
+            try:
+                api = HfApi()
+                # 데이터셋의 split 정보를 먼저 확인
+                dataset_info = api.dataset_info(dataset_name)
+                available_splits = list(dataset_info.splits.keys())
+                print(f"✅ 사용 가능한 split: {available_splits}")
+                
+                # 사용 가능한 split 중에서 첫 번째를 선택하여 로드
+                if available_splits:
+                    selected_split = available_splits[0]
+                    print(f"🔄 선택된 split: {selected_split}")
+                    
+                    try:
+                        if config_name:
+                            full_dataset = load_dataset(dataset_name, config_name, split=selected_split, streaming=use_streaming)
+                        else:
+                            full_dataset = load_dataset(dataset_name, split=selected_split, streaming=use_streaming)
+                        print(f"✅ {selected_split} split 로드 성공!")
+                    except Exception as split_e:
+                        print(f"⚠️ {selected_split} split 로드 실패: {split_e}")
+                        # 다른 split들도 시도
+                        for split_name in available_splits[1:]:
+                            try:
+                                print(f"🔄 {split_name} split 시도 중...")
+                                if config_name:
+                                    full_dataset = load_dataset(dataset_name, config_name, split=split_name, streaming=use_streaming)
+                                else:
+                                    full_dataset = load_dataset(dataset_name, split=split_name, streaming=use_streaming)
+                                print(f"✅ {split_name} split 로드 성공!")
+                                break
+                            except Exception as other_split_e:
+                                print(f"⚠️ {split_name} split 실패: {other_split_e}")
+                                continue
+                        else:
+                            print(f"❌ 모든 split 로드 실패")
+                            return
+                else:
+                    print(f"❌ 사용 가능한 split이 없습니다")
+                    return
+                    
+            except Exception as e3:
+                print(f"⚠️ huggingface_hub에서 split 정보 가져오기 실패: {e3}")
+                # fallback: 기존 방식으로 시도
+                try:
+                    if config_name:
+                        full_dataset = load_dataset(dataset_name, config_name, trust_remote_code=True, streaming=use_streaming)
+                    else:
+                        full_dataset = load_dataset(dataset_name, trust_remote_code=True, streaming=use_streaming)
+                    print(f"✅ trust_remote_code=True로 데이터셋 로드 성공")
+                except Exception as e4:
+                    print(f"❌ fallback 방식도 실패: {e4}")
+                    return
+            else:
+                # 일반적인 fallback 시도
+                try:
+                    if config_name:
+                        full_dataset = load_dataset(dataset_name, config_name, streaming=use_streaming)
+                    else:
+                        full_dataset = load_dataset(dataset_name, streaming=use_streaming)
+                    print(f"✅ 전체 데이터셋 로드 성공")
+                except Exception as e3:
+                    print(f"❌ 전체 데이터셋 로드도 실패: {e3}")
+                    return
+                    
         if full_dataset is None:
             print(f"❌ 데이터셋 로드 실패(모든 split): {last_err}")
             return
@@ -621,38 +725,66 @@ def process_dataset(
         # leave=False를 추가하여 완료 후 진행 막대가 사라지도록 함
         progress_bar = tqdm(desc=desc, unit="samples", leave=False)
         
-        # 스트리밍 데이터 처리
-        for sample in full_dataset:
-            if max_samples and total_count >= max_samples:
-                break
+        # 데이터 처리 (streaming 여부에 따라 다르게 처리)
+        if use_streaming:
+            # 스트리밍 데이터 처리
+            for sample in full_dataset:
+                if max_samples and total_count >= max_samples:
+                    break
+                
+                current_batch.append(sample)
+                total_count += 1
+                
+                # 배치가 찼거나 마지막 샘플인 경우 처리
+                if len(current_batch) >= batch_size or (max_samples and total_count >= max_samples):
+                    # 배치 처리
+                    batch_results = process_samples_batch(current_batch, dataset_name, num_workers)
+                    
+                    if batch_results:
+                        success_count += len(batch_results)
+                        yield batch_results
+                    
+                    progress_bar.update(len(current_batch))
+                    progress_bar.set_postfix({
+                        "processed": f"{success_count}/{total_count}",
+                        "success_rate": f"{success_count/total_count*100:.1f}%"
+                    })
+                    
+                    current_batch = []
             
-            current_batch.append(sample)
-            total_count += 1
-            
-            # 배치가 찼거나 마지막 샘플인 경우 처리
-            if len(current_batch) >= batch_size or (max_samples and total_count >= max_samples):
-                # 배치 처리
+            # 남은 배치 처리
+            if current_batch:
                 batch_results = process_samples_batch(current_batch, dataset_name, num_workers)
+                if batch_results:
+                    success_count += len(batch_results)
+                    yield batch_results
+                progress_bar.update(len(current_batch))
+        else:
+            # 일반 Dataset 객체 처리 (전체 데이터를 한 번에 처리)
+            total_samples_in_dataset = len(full_dataset)
+            if max_samples:
+                total_samples_in_dataset = min(total_samples_in_dataset, max_samples)
+            
+            print(f"📊 전체 {total_samples_in_dataset}개 샘플을 배치로 처리 중...")
+            
+            # 전체 데이터를 배치 단위로 처리
+            for i in range(0, total_samples_in_dataset, batch_size):
+                end_idx = min(i + batch_size, total_samples_in_dataset)
+                batch_samples = list(full_dataset.select(range(i, end_idx)))
+                
+                # 배치 처리
+                batch_results = process_samples_batch(batch_samples, dataset_name, num_workers)
                 
                 if batch_results:
                     success_count += len(batch_results)
                     yield batch_results
                 
-                progress_bar.update(len(current_batch))
+                total_count = end_idx
+                progress_bar.update(len(batch_samples))
                 progress_bar.set_postfix({
                     "processed": f"{success_count}/{total_count}",
                     "success_rate": f"{success_count/total_count*100:.1f}%"
                 })
-                
-                current_batch = []
-        
-        # 남은 배치 처리
-        if current_batch:
-            batch_results = process_samples_batch(current_batch, dataset_name, num_workers)
-            if batch_results:
-                success_count += len(batch_results)
-                yield batch_results
-            progress_bar.update(len(current_batch))
         
         progress_bar.close()
         
@@ -957,26 +1089,31 @@ def upload_dataset_to_hub(
                     try:
                         record = json.loads(line.strip())
                         
-                        # 메시지 content 정규화 (업로드 스키마 유지)
-                        if 'messages' in record and isinstance(record['messages'], list):
+                        # conversations 필드가 이미 올바른 형태로 되어 있으므로 그대로 사용
+                        # messages 필드가 있다면 conversations로 변환
+                        if 'messages' in record and isinstance(record['messages'], list) and 'conversations' not in record:
+                            conversations = []
                             for message in record['messages']:
-                                content_value = message.get('content')
+                                role = message.get('role', '')
+                                if role == 'system':
+                                    continue  # 시스템 메시지는 제외
+                                frm = 'human' if role == 'user' else ('gpt' if role == 'assistant' else role)
+                                content_value = message.get('content', [])
                                 if isinstance(content_value, list):
-                                    normalized: List[Dict[str, Any]] = []
+                                    parts = []
                                     for item in content_value:
-                                        if not isinstance(item, dict):
-                                            continue
-                                        item_type = item.get('type')
-                                        if item_type == 'text':
-                                            normalized.append({'type': 'text', 'text': str(item.get('text') or ''), 'image': ''})
-                                        elif item_type == 'image':
-                                            # 업로드 시에는 messages.content.image를 파일 경로 문자열로 유지
-                                            normalized.append({'type': 'image', 'text': '', 'image': str(item.get('image') or '')})
-                                    message['content'] = normalized
+                                        if isinstance(item, dict):
+                                            if item.get('type') == 'text':
+                                                txt = str(item.get('text') or '')
+                                                if txt:
+                                                    parts.append(txt)
+                                            elif item.get('type') == 'image':
+                                                img_ref = item.get('image') or ''
+                                                parts.append(f"<image:{img_ref}>" if img_ref else "<image>")
+                                    conversations.append({'from': frm, 'value': '\n'.join(parts)})
                                 elif isinstance(content_value, str):
-                                    message['content'] = [{'type': 'text', 'text': content_value, 'image': ''}]
-                                elif content_value is None:
-                                    message['content'] = []
+                                    conversations.append({'from': frm, 'value': content_value})
+                            record['conversations'] = conversations
 
                         # 이미지 경로를 실제 이미지로 변환
                         if 'images' in record and isinstance(record['images'], list):
@@ -997,6 +1134,7 @@ def upload_dataset_to_hub(
                         system_prompt = ""
                         dataset_mode = "instruction"  # 기본값
                         
+                        # messages 필드에서 시스템 프롬프트 추출
                         if 'messages' in record and isinstance(record['messages'], list):
                             for message in record['messages']:
                                 if message.get('role') == 'system':
@@ -1027,14 +1165,8 @@ def upload_dataset_to_hub(
         features = Features({
             'conversations': Sequence(
                 Features({
-                    'role': Value('string'),
-                    'content': Sequence(
-                        Features({
-                            'type': Value('string'),
-                            'text': Value('string'),
-                            'image': Value('string')
-                        })
-                    )
+                    'from': Value('string'),
+                    'value': Value('string')
                 })
             ),
             'images': Sequence(ImageFeature()),
