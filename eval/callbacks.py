@@ -266,6 +266,8 @@ class ModelEvalCallback(DeepEvalHuggingFaceCallback):
     The file is saved to the path specified by the `results_file` argument.
     The file is saved to the path specified by the `results_file` argument.
     '''
+    train_mode = "transformers"
+    
     def __init__(
         self, 
         trainer: Trainer,
@@ -300,6 +302,13 @@ class ModelEvalCallback(DeepEvalHuggingFaceCallback):
         self.benchmark_results_history = []
         self.last_eval_step = 0  # Track last evaluation step
         self.is_main_process = _is_main_process()
+        
+        try:
+            import deepspeed
+        except ImportError:
+            print("Deepspeed is not installed, using outlines instead")
+        else:
+            self.train_mode = "deepspeed"
 
     
     def _calculate_metric_scores(self) -> Dict[str, List[float]]:
@@ -315,6 +324,7 @@ class ModelEvalCallback(DeepEvalHuggingFaceCallback):
             print(f"Error in _calculate_metric_scores: {e}\nIFEval scores set to 0.0")
             scores = self._aggregate_scores({"ifeval": [0.0]})
         return scores
+    
     def _aggregate_scores(
         self, 
         scores: Dict[str, List[float]]

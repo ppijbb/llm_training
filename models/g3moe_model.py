@@ -37,12 +37,14 @@ import torch.nn.functional as F
 import torch._dynamo
 
 from transformers.activations import ACT2FN
-from transformers.cache_utils import Cache, HybridCache, StaticCache
+from transformers.cache_utils import Cache, HybridCache, StaticCache, DynamicCache
 from transformers.generation.utils import GenerationMixin
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
+from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
+from transformers.masking_utils import create_causal_mask, create_masks_for_generate, create_sliding_window_causal_mask
 from transformers.processing_utils import Unpack
 from transformers.utils import logging
 from transformers.utils.doc import (
@@ -1164,12 +1166,13 @@ class G3MoEAttention(nn.Module):
         return attn_output, attn_weights, past_key_value
 
 
-class G3MoEDecoderLayer(nn.Module):
+class G3MoEDecoderLayer(GradientCheckpointingLayer):
     def __init__(self, config: G3MoETextConfig, layer_idx: int, **kwargs):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
         self.layer_idx = layer_idx
+        self.attention_type = config.layer_types[layer_idx]
         self.self_attn = G3MoEAttention(config=config, layer_idx=layer_idx, **kwargs)
         self.mlp = G3MoEMLP(config=config) # this layer is for loading pretrained base G3MoE model weights
         self.is_dense_replacement = layer_idx >= config.first_k_dense_replace
@@ -1331,6 +1334,14 @@ class G3MoEPreTrainedModel(PreTrainedModel):
     _supports_quantized_cache = True
     _supports_static_cache = True
     _supports_attention_backend = True
+    
+    _can_compile_fullgraph = True
+    _supports_attention_backend = True
+    _can_record_outputs = {
+        "hidden_states": G3MoEDecoderLayer,
+        "attentions": G3MoEAttention,
+        "router_logits": G3MoEGRINMoE
+    }
 
     def _initialize_moe_router_and_temperature(self) -> None:
         """Initialize only MoE router weights and routing temperature if they were not loaded from a checkpoint.
@@ -1711,13 +1722,14 @@ class G3MoETextModel(G3MoEPreTrainedModel):
             inputs_embeds = self.embed_tokens(input_ids)
 
         if use_cache and past_key_values is None and not self.training:
-            batch_size, seq_len, _ = inputs_embeds.shape
-            past_key_values = HybridCache(
-                self.config,
-                max_batch_size=batch_size,
-                max_cache_len=seq_len,
-                dtype=inputs_embeds.dtype,
-            )
+            # batch_size, seq_len, _ = inputs_embeds.shape
+            # past_key_values = HybridCache(
+            #     self.config,
+            #     max_batch_size=batch_size,
+            #     max_cache_len=seq_len,
+            #     dtype=inputs_embeds.dtype,
+            # )
+            past_key_values = DynamicCache()
         # During training, avoid generating/using mutable cache to keep checkpoint recompute deterministic
         if self.training:
             use_cache = False
@@ -1734,13 +1746,30 @@ class G3MoETextModel(G3MoEPreTrainedModel):
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
-        causal_mask = self._update_causal_mask(
-            attention_mask,
-            inputs_embeds,
-            cache_position,
-            past_key_values,
-            output_attentions,
-        )
+        # causal_mask = self._update_causal_mask(
+        #     attention_mask,
+        #     inputs_embeds,
+        #     cache_position,
+        #     past_key_values,
+        #     output_attentions,
+        # )
+        
+        # It may already have been prepared by e.g. `generate`
+        if not isinstance(causal_mask_mapping := attention_mask, dict):
+            # Prepare mask arguments
+            mask_kwargs = {
+                "config": self.config,
+                "input_embeds": inputs_embeds,
+                "attention_mask": attention_mask,
+                "cache_position": cache_position,
+                "past_key_values": past_key_values,
+                "position_ids": position_ids,
+            }
+            # Create the masks
+            causal_mask_mapping = {
+                "full_attention": create_causal_mask(**mask_kwargs),
+                "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
+            }
 
         # embed positions
         hidden_states = inputs_embeds
@@ -1757,40 +1786,11 @@ class G3MoETextModel(G3MoEPreTrainedModel):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            if self.gradient_checkpointing and self.training:
-                # Use deterministic checkpointing to avoid graph/tensor-count mismatch
-                def _ckpt_layer(hs, posg, posl, mask, posids, cachepos):
-                    return decoder_layer(
-                        hs,
-                        position_embeddings_global=posg,
-                        position_embeddings_local=posl,
-                        attention_mask=mask,
-                        position_ids=posids,
-                        past_key_value=None,          # prevent mutable cache state during recompute
-                        output_attentions=output_attentions,
-                        use_cache=False,              # disable cache within checkpointed block
-                        cache_position=cachepos,
-                        **flash_attn_kwargs,
-                    )
-
-                from torch.utils.checkpoint import checkpoint as _ckpt
-                layer_outputs = _ckpt(
-                    _ckpt_layer,
-                    hidden_states,
-                    position_embeddings_global,
-                    position_embeddings_local,
-                    causal_mask,
-                    position_ids,
-                    cache_position,
-                    use_reentrant=True,
-                    preserve_rng_state=True,
-                )
-            else:
-                layer_outputs = decoder_layer(
+            layer_outputs = decoder_layer(
                     hidden_states,
                     position_embeddings_global=position_embeddings_global,
                     position_embeddings_local=position_embeddings_local,
-                    attention_mask=causal_mask,
+                    attention_mask=causal_mask_mapping[decoder_layer.attention_type],
                     position_ids=position_ids,
                     past_key_value=past_key_values,
                     output_attentions=output_attentions,
@@ -1854,61 +1854,6 @@ class G3MoETextModel(G3MoEPreTrainedModel):
             cache_position=cache_position,
             batch_size=input_tensor.shape[0],
         )
-        return causal_mask
-
-    @staticmethod
-    def _prepare_4d_causal_attention_mask_with_cache_position(
-        attention_mask: torch.Tensor,
-        sequence_length: int,
-        target_length: int,
-        dtype: torch.dtype,
-        cache_position: torch.Tensor,
-        batch_size: int,
-        **kwargs,
-    ):
-        """
-        Creates a causal 4D mask of shape `(batch_size, 1, query_length, key_value_length)` from a 2D mask of shape
-        `(batch_size, key_value_length)`, or if the input `attention_mask` is already 4D, do nothing.
-
-        Args:
-            attention_mask (`torch.Tensor`):
-                A 2D attention mask of shape `(batch_size, key_value_length)` or a 4D attention mask of shape
-                `(batch_size, 1, query_length, key_value_length)`.
-            sequence_length (`int`):
-                The sequence length being processed.
-            target_length (`int`):
-                The target length: when generating with static cache, the mask should be as long as the static cache,
-                to account for the 0 padding, the part of the cache that is not filled yet.
-            dtype (`torch.dtype`):
-                The dtype to use for the 4D attention mask.
-            cache_position (`torch.Tensor`):
-                Indices depicting the position of the input sequence tokens in the sequence.
-            batch_size (`torch.Tensor`):
-                Batch size.
-        """
-        if attention_mask is not None and attention_mask.dim() == 4:
-            # In this case we assume that the mask comes already in inverted form and requires no inversion or slicing.
-            causal_mask = attention_mask
-        else:
-            min_dtype = torch.finfo(dtype).min
-            causal_mask = torch.full(
-                (sequence_length, target_length), fill_value=min_dtype, dtype=dtype, device=cache_position.device
-            )
-            if sequence_length != 1:
-                causal_mask = torch.triu(causal_mask, diagonal=1)
-            causal_mask *= torch.arange(target_length, device=cache_position.device) > cache_position.reshape(-1, 1)
-            causal_mask = causal_mask[None, None, :, :].expand(batch_size, 1, -1, -1)
-            if attention_mask is not None:
-                causal_mask = causal_mask.clone()  # copy to contiguous memory for in-place edit
-                mask_length = attention_mask.shape[-1]
-                padding_mask = causal_mask[:, :, :, :mask_length] + attention_mask[:, None, None, :].to(
-                    causal_mask.device
-                )
-                padding_mask = padding_mask == 0
-                causal_mask[:, :, :, :mask_length] = causal_mask[:, :, :, :mask_length].masked_fill(
-                    padding_mask, min_dtype
-                )
-
         return causal_mask
 
 
@@ -2082,12 +2027,15 @@ class G3MoEForCausalLM(G3MoEPreTrainedModel, GenerationMixin):
         self,
         input_ids,
         past_key_values=None,
-        attention_mask=None,
         inputs_embeds=None,
         cache_position=None,
         position_ids=None,
+        pixel_values=None,
+        attention_mask=None,
+        token_type_ids=None,
         use_cache=True,
         logits_to_keep=None,
+        labels=None,
         device='auto',
         **kwargs,
     ):
@@ -2095,44 +2043,54 @@ class G3MoEForCausalLM(G3MoEPreTrainedModel, GenerationMixin):
         model_inputs = super().prepare_inputs_for_generation(
             input_ids,
             past_key_values=past_key_values,
-            attention_mask=attention_mask,
             inputs_embeds=inputs_embeds,
-            cache_position=cache_position,
+            attention_mask=attention_mask,
             position_ids=position_ids,
+            cache_position=cache_position,
             use_cache=use_cache,
             logits_to_keep=logits_to_keep,
+            token_type_ids=token_type_ids,
             device=device,
             **kwargs,
         )
-
-        if logits_to_keep is None:
-            _ = model_inputs.pop("logits_to_keep", None)
-
-        if (
-            isinstance(past_key_values, HybridCache)
-            and attention_mask.ndim == 2
-            and not self.config.attn_implementation == "flash_attention_2"
-        ):
-            if model_inputs["inputs_embeds"] is not None:
-                batch_size, sequence_length, _ = model_inputs["inputs_embeds"].shape
-                device = model_inputs["inputs_embeds"].device
-            else:
-                batch_size, sequence_length = model_inputs["input_ids"].shape
-                device = model_inputs["input_ids"].device
-
-            attention_mask = self.model._prepare_4d_causal_attention_mask_with_cache_position(
-                attention_mask,
-                sequence_length=sequence_length,
-                target_length=past_key_values.get_max_cache_shape(),
-                dtype=self.lm_head.weight.dtype,
-                device=device,
-                cache_position=cache_position,
-                batch_size=batch_size,
-            )
-            model_inputs["attention_mask"] = attention_mask
+        # If we're in cached decoding stage, pixel values should be None because input ids do not contain special image token anymore
+        # Otherwise we need pixel values to be passed to model. NOTE: use_cache=False needs pixel_values always
+        if cache_position[0] == 0:
+            model_inputs["pixel_values"] = pixel_values
 
         return model_inputs
 
+def token_type_ids_mask_function(
+    token_type_ids: Optional[torch.Tensor],
+    image_group_ids: Optional[torch.Tensor],
+    tokens_per_image: int,
+) -> Optional[Callable]:
+    """
+    This function adds the correct offsets to the `q_idx` and `kv_idx` as the torch API can only accept lengths,
+    not start and end indices.
+    """
+    # Do not return an additional mask in this case
+    if token_type_ids is None:
+        return None
+
+    def inner_mask(batch_idx: int, head_idx: int, q_idx: int, kv_idx: int) -> bool:
+        # If it's 1 for both query and key/value, we are in an image block
+        # NOTE: static cache shape goes beyond input seq length, while token_type_ids.shape[1] == input seq length
+        # Since vmap doesn't support `if statement` we workaround it with `torch.where`
+        safe_idx = torch.where(kv_idx < token_type_ids.shape[1], kv_idx, 0)
+        token_type_ids_at_kv_idx = token_type_ids[batch_idx, safe_idx]
+        token_type_ids_at_kv_idx = torch.where(kv_idx < token_type_ids.shape[1], token_type_ids_at_kv_idx, 0)
+
+        image_group_ids_at_kv_idx = image_group_ids[batch_idx, safe_idx]
+        image_group_ids_at_kv_idx = torch.where(kv_idx < image_group_ids.shape[1], image_group_ids_at_kv_idx, -1)
+
+        is_image_block = (token_type_ids[batch_idx, q_idx] == 1) & (token_type_ids_at_kv_idx == 1)
+        same_image_block = image_group_ids[batch_idx, q_idx] == image_group_ids_at_kv_idx
+
+        # This is bidirectional attention whenever we are dealing with image tokens
+        return is_image_block & same_image_block
+
+    return inner_mask
 
 @auto_docstring(
     custom_intro="""
@@ -2327,34 +2285,48 @@ class G3MoEModel(G3MoEPreTrainedModel):
             cache_position = torch.arange(
                 past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
             )
-
+                
         # Merge text and images
         if pixel_values is not None:
             image_features = self.get_image_features(pixel_values)
-
-            if input_ids is None:
-                special_image_mask = inputs_embeds == self.get_input_embeddings()(
-                    torch.tensor(self.config.image_token_id, dtype=torch.long, device=inputs_embeds.device)
-                )
-            else:
-                special_image_mask = (input_ids == self.config.image_token_id).unsqueeze(-1)
-                special_image_mask = special_image_mask.expand_as(inputs_embeds).to(inputs_embeds.device)
-
-            if not is_torchdynamo_compiling() and inputs_embeds[special_image_mask].numel() != image_features.numel():
-                image_tokens_in_text = (special_image_mask).sum(dim=1).sum(dim=0)[0]
-                raise ValueError(
-                    f"Number of images does not match number of special image tokens in the input text. "
-                    f"Got {image_tokens_in_text} image tokens in the text but {image_features.shape[0] * image_features.shape[1]} "
-                    "tokens from image embeddings."
-                )
             image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
+            special_image_mask = self.get_placeholder_mask(
+                input_ids, inputs_embeds=inputs_embeds, image_features=image_features
+            )
             inputs_embeds = inputs_embeds.masked_scatter(special_image_mask, image_features)
 
-        causal_mask = self._update_causal_mask(
-            attention_mask, token_type_ids, past_key_values, cache_position, inputs_embeds, is_training
-        )
+        # It may already have been prepared by e.g. `generate`
+        if not isinstance(causal_mask_mapping := attention_mask, dict):
+            # Prepare mask arguments
+            mask_kwargs = {
+                "config": self.config.get_text_config(),
+                "input_embeds": inputs_embeds,
+                "attention_mask": attention_mask,
+                "cache_position": cache_position,
+                "past_key_values": past_key_values,
+                "position_ids": position_ids,
+            }
+            if token_type_ids is not None and inputs_embeds.shape[1] != 1:
+                # We need to pass an additional mask function to account for token type ids, and it needs to be an `or`
+
+                # First find where a new image block starts: 1 if image and previous not image
+                # The images cannot attend to future images, but can attend to all prev images and to itself bidirectionally
+                is_image = (token_type_ids == 1).to(cache_position.device)
+                new_image_start = is_image & ~nn.functional.pad(is_image, (1, 0), value=0)[:, :-1]
+                image_group_ids = torch.cumsum(new_image_start.int(), dim=1) - 1
+                image_group_ids = torch.where(is_image, image_group_ids, torch.full_like(token_type_ids, -1))
+                mask_kwargs["or_mask_function"] = token_type_ids_mask_function(
+                    token_type_ids.to(cache_position.device), image_group_ids, self.config.mm_tokens_per_image
+                )
+
+            # Create the masks
+            causal_mask_mapping = {
+                "full_attention": create_causal_mask(**mask_kwargs),
+                "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
+            }
+        
         outputs = self.language_model(
-            attention_mask=causal_mask,
+            attention_mask=causal_mask_mapping,
             position_ids=position_ids,
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,

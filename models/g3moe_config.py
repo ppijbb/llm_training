@@ -19,9 +19,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import warnings
 from typing import Optional, Union, Dict, Any
 
-from transformers.configuration_utils import PretrainedConfig
+from transformers.configuration_utils import PretrainedConfig, layer_type_validation
 from transformers.modeling_rope_utils import rope_config_validation
 from transformers.utils import logging
 from transformers.models.siglip import SiglipVisionConfig
@@ -233,6 +234,7 @@ class G3MoETextConfig(PretrainedConfig):
         attention_dropout=0.0,
         query_pre_attn_scalar=256,
         sliding_window=4096,
+        layer_types=None,
         final_logit_softcapping=None,
         attn_logit_softcapping=None,
         cache_implementation="hybrid",
@@ -246,7 +248,6 @@ class G3MoETextConfig(PretrainedConfig):
         # 하이브리드 positional embedding 관련 추가 인자
         no_rope_layers=None,
         no_rope_layer_interval: int = 0,
-        layer_types=None,
         use_sliding_window=False,
         attn_implementation="eager",
         **kwargs,
@@ -306,6 +307,10 @@ class G3MoETextConfig(PretrainedConfig):
         self.cache_implementation = cache_implementation
         self.rope_local_base_freq = rope_local_base_freq
         self.sliding_window_pattern = sliding_window_pattern
+        self.final_logit_softcapping = final_logit_softcapping
+        self.attn_logit_softcapping = attn_logit_softcapping
+        self.layer_types = layer_types
+        
         self.rope_scaling = rope_scaling
         self.attn_implementation = attn_implementation
         self._attn_implementation = attn_implementation
@@ -320,6 +325,7 @@ class G3MoETextConfig(PretrainedConfig):
             self.no_rope_layers = no_rope_layers
         self.no_rope_layer_interval = no_rope_layer_interval
         # layer_types 자동 생성
+        self._sliding_window_pattern = kwargs.get("sliding_window_pattern", 6)
         if layer_types is None:
             layer_types = []
             for layer_idx in range(num_hidden_layers):
@@ -329,6 +335,8 @@ class G3MoETextConfig(PretrainedConfig):
                 else:
                     layer_types.append("full_attention")
         self.layer_types = layer_types
+        layer_type_validation(self.layer_types)
+
         self.use_sliding_window = use_sliding_window
         # layer_types validation 등 추가
         # layer_type_validation(self.layer_types)  # 필요시 함수 정의
@@ -336,7 +344,18 @@ class G3MoETextConfig(PretrainedConfig):
         if self.rope_scaling is not None and "type" in self.rope_scaling:
             self.rope_scaling["rope_type"] = self.rope_scaling["type"]
         rope_config_validation(self)
+        
+    @property
+    def sliding_window_pattern(self):
+        warnings.warn(
+            "The `sliding_window_pattern` attribute is deprecated and will be removed in v4.55.0.",
+            FutureWarning,
+        )
+        return self._sliding_window_pattern
 
+    @sliding_window_pattern.setter
+    def sliding_window_pattern(self, value):
+        self._sliding_window_pattern = value
 
 class G3MoEConfig(PretrainedConfig):
     r"""

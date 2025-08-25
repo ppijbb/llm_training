@@ -7,6 +7,7 @@ import os
 import sys
 import json
 import torch
+import traceback
 import argparse
 from typing import Dict, Any
 from torchinfo import summary
@@ -37,7 +38,7 @@ from data.simple_sft_dataset import get_simple_sft_dataset, create_simple_collat
 from training_utils.utils import format_parameters, load_config, setup_deepspeed_environment
 from optimizers.custom_optimizers import get_custom_optimizer
 from optimizers.deepspeed_optimizer_registry import register_custom_optimizers
-from eval.callbacks import get_model_eval_callback
+from eval.callbacks import ModelEvalCallback
 from eval.ifeval_callback import IFEvalCallback
 from eval.moe_monitoring_callback import create_moe_callback_for_transformers
 
@@ -54,21 +55,27 @@ def load_config(config_path: str):
 
 def setup_deepspeed_environment():
     """Setup environment variables for DeepSpeed optimization"""
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512,expandable_segments:True"
+    if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512,expandable_segments:True"
+
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = "1"
     if "DEEPSPEED_ZERO_INIT" not in os.environ:
         os.environ["DEEPSPEED_ZERO_INIT"] = "1"
+    # Ensure global AMP default uses BF16 under CUDA
+    try:
+        if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+            torch.set_autocast_gpu_dtype(torch.bfloat16)
+    except Exception as _:
+        pass
     print("DeepSpeed environment variables set")
 
 
 def setup_model_and_tokenizer(model_config: Dict[str, Any]):
     """Setup G3MoE model and tokenizer"""
     
-    # Setup DeepSpeed environment if config is provided
-    if model_config.get("deepspeed_config"):
-        setup_deepspeed_environment()
-    
+    # NOTE: Delay DeepSpeed env setup until AFTER model load to avoid HF ZeRO-3 init slow path
+    setup_deepspeed_environment()
     # Load tokenizer - 안정적인 로딩 로직
     tokenizer_path = model_config.get("tokenizer_name_or_path") or model_config["model_name_or_path"]
     print(f"토크나이저 로딩 시도: {tokenizer_path}")
@@ -173,8 +180,8 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
         "input_jitter_noise": g3moe_params["input_jitter_noise"],
         "model_type": "g3moe_text",
         "rope_scaling": {
-            "rope_type": "linear",
-            "factor": g3moe_params["rope_scaling_factor"]
+            "rope_type": g3moe_params["rope_scaling"]["rope_type"],
+            "factor": g3moe_params["rope_scaling"]["factor"]
         },
         "use_bfloat16": True,
         "attn_implementation": attn_implementation
@@ -191,8 +198,11 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
         attn_implementation=attn_implementation,
         **{
             k:v for k,v in base_model_config.items() 
-            if k not in ["text_config", "vision_config", "boi_token_index",
-                         "eoi_token_index", "image_token_index", "initializer_range"]
+            if k not in [
+                "text_config", "vision_config", "boi_token_index",
+                "eoi_token_index", "image_token_index", "initializer_range",
+                "attn_implementation"
+            ]
         }
     )
     print("G3MoE configuration created successfully")
@@ -218,11 +228,13 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
     model = G3MoEForCausalLM.from_pretrained(
         model_config["model_name_or_path"],
         config=config,
-        torch_dtype=torch.bfloat16,
+        torch_dtype=torch.bfloat16, # Using bfloat16
         trust_remote_code=model_config["trust_remote_code"],
         device_map=device_map,
         low_cpu_mem_usage=True,
+        offload_state_dict=True,
         use_cache=False,
+        gradient_checkpointing=False,
         # load_in_4bit=True,
         attn_implementation=attn_implementation
     )
@@ -234,7 +246,6 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
     # Setup LoRA if requested
     if model_config["use_lora"]:
         lora_config = LoraConfig(
-            task_type=TaskType.CAUSAL_LM,
             r=model_config["lora_r"],
             lora_alpha=model_config["lora_alpha"],
             lora_dropout=model_config["lora_dropout"],
@@ -245,6 +256,7 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
             ],
             modules_to_save=["router", "routing_temperature"],
             bias="none",
+            task_type=TaskType.CAUSAL_LM,
             inference_mode=False,  # 훈련 모드 명시
             fan_in_fan_out=False,  # LoRA 호환성 향상
         )
@@ -261,9 +273,18 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
             if name.endswith('router') or name.split('.')[-1] == 'router':
                 for p in module.parameters(recurse=True):
                     p.requires_grad_(True)
-        # DDP 정적 그래프 설정 추가
+        # DDP 정적 그래프 비활성화: MoE 라우팅/LoRA로 스텝마다 활성 파라미터가 달라질 수 있으므로 동적 그래프 허용
         if hasattr(model, '_set_static_graph'):
             model._set_static_graph(True)
+        # Ensure all parameters incl. LoRA adapters are bfloat16 for consistency
+        try:
+            model.to(torch.bfloat16)
+            for name, param in model.named_parameters():
+                if param.requires_grad and param.dtype != torch.bfloat16:
+                    param.data = param.data.to(torch.bfloat16)
+            print("✓ Parameters cast to bfloat16")
+        except Exception as cast_e:
+            print(f"⚠️ BF16 cast warning: {cast_e}")
         print("✓ LoRA 적용")
         
     return model, tokenizer
@@ -300,7 +321,7 @@ def setup_dataset(data_config: Dict[str, Any], tokenizer):
     # print(f"Loading dataset: {data_config['dataset_name']}")
     try:
         # 간단한 데이터셋 로더 사용
-        if "smoltalk" in dataset_name.lower() or "orca" in dataset_name.lower():
+        if "smoltalk" in dataset_name.lower() or "orca" in dataset_name.lower() or "llava" in dataset_name.lower():
             print(f"일반 데이터셋 로더 시도: {dataset_name}")
             dataset = get_simple_sft_dataset(
                 dataset_name=dataset_name,
@@ -311,7 +332,7 @@ def setup_dataset(data_config: Dict[str, Any], tokenizer):
             )
             collate_fn = None # create_simple_collate_fn(tokenizer)
         else:
-            # 일반적인 데이터셋 로더 시도
+            # open_m_3 데이터셋 로더 시도
             dataset = get_dataset(
                 tokenizer=tokenizer,
                 dataset_name=data_config["dataset_name"],
@@ -379,6 +400,14 @@ def create_training_args(
             assert off_opt in {"none", None, ""} and off_param in {"none", None, ""}, (
                 "DeepSpeed CPU offload detected in config but must be disabled (device='none')."
             )
+            # Workaround: ZeRO-3 + gradient checkpointing can trigger duplicate ds_id assertion
+            try:
+                zero_stage = int(zero.get("stage", 0) or 0)
+            except Exception:
+                zero_stage = 0
+            if zero_stage == 3 and getattr(training_args, "gradient_checkpointing", False):
+                print("⚠️ Detected ZeRO-3 with gradient checkpointing enabled. Disabling to avoid ds_id assertion.")
+                training_args.gradient_checkpointing = False
         except Exception as e:
             print(f"⚠️ DeepSpeed config validation warning: {e}")
     
@@ -390,6 +419,7 @@ def main(
     data_config: Dict[str, Any], 
     training_config: Dict[str, Any]
 ):
+    register_custom_optimizers()
     # Setup model and tokenizer
     print("Setting up model and tokenizer...")
     model, tokenizer = setup_model_and_tokenizer(model_config)
@@ -451,7 +481,7 @@ def main(
     print("데이터셋 샘플 확인:")
     print(f"  - 첫 번째 훈련 샘플 키: {list(train_dataset[0].keys())}")
     print(f"  - 첫 번째 샘플 input_ids 길이: {len(train_dataset[0]['input_ids'])}")
-    model.gradient_checkpointing_enable()
+    
     trainer = SFTTrainer( 
         model=model,
         args=training_args,
@@ -461,29 +491,46 @@ def main(
         data_collator=collate_fn,
         optimizers=(custom_optimizer, None) if custom_optimizer is not None else (None, None)
     )
-    trainer.add_callback(create_moe_callback_for_transformers(
-        num_experts=model_config["g3moe_params"]["n_routed_experts"],
-        log_every_n_steps=50,       # 50 스텝마다 로그 기록
-        logger=wandb,               # 사용할 로거 지정 (wandb)
-        log_to_console=True,        # 콘솔에도 주요 메트릭 출력
-        # === 고급 설정 (선택사항) ===
-        log_heatmap_every=500,      # 500 스텝마다 Expert 사용률 히트맵 로깅
-        alert_threshold_imbalance=4.0, # 특정 Expert 사용률이 평균의 4배를 초과하면 경고
-        unused_expert_threshold=0.25,  # 25% 이상의 Expert가 미사용되면 경고
-        entropy_threshold=0.1,         # 라우팅 엔트로피가 0.1 미만이면 경고
-        save_detailed_logs=False       # 상세 JSON 로그 저장 여부
-    ))
-    trainer.add_callback(get_model_eval_callback(
-        trainer=trainer,  # Will be set by Trainer
-        enable_benchmarks=True,  # Enable benchmark evaluation
-        benchmarks_to_run=['mmlu', 'hellaswag', 'gsm8k', 'truthfulqa', 'arc', 'piqa'],  # Run multiple benchmarks
-        benchmark_eval_frequency=training_config["eval_steps"],  # Run benchmarks every 2 epochs
-        mme_max_samples=10,  # Limit MME samples for faster evaluation
-    ))
-    trainer.add_callback(IFEvalCallback(
-        eval_dataset_name="google/IFEval",
-        max_samples=500
-    ))
+    # Enforce: Disable gradient checkpointing with ZeRO-3 at runtime as an additional safeguard
+    try:
+        ds_cfg_path = getattr(trainer.args, "deepspeed", None)
+        if ds_cfg_path:
+            import json
+            with open(ds_cfg_path, "r") as f:
+                _zero_stage = int((json.load(f).get("zero_optimization", {}) or {}).get("stage", 0) or 0)
+            if _zero_stage == 3:
+                if hasattr(trainer.model, "gradient_checkpointing_disable"):
+                    trainer.model.gradient_checkpointing_disable()
+                trainer.args.gradient_checkpointing = False
+                print("✓ Disabled gradient checkpointing for DeepSpeed ZeRO-3 compatibility")
+    except Exception as _:
+        pass
+    trainer.add_callback(
+        create_moe_callback_for_transformers(
+            num_experts=model_config["g3moe_params"]["n_routed_experts"],
+            log_every_n_steps=50,       # 50 스텝마다 로그 기록
+            logger=wandb,               # 사용할 로거 지정 (wandb)
+            log_to_console=True,        # 콘솔에도 주요 메트릭 출력
+            # === (선택사항) ===
+            log_heatmap_every=500,      # 500 스텝마다 Expert 사용률 히트맵 로깅
+            alert_threshold_imbalance=4.0, # 특정 Expert 사용률이 평균의 4배를 초과하면 경고
+            unused_expert_threshold=0.25,  # 25% 이상의 Expert가 미사용되면 경고
+            entropy_threshold=0.1,         # 라우팅 엔트로피가 0.1 미만이면 경고
+            save_detailed_logs=False       # 상세 JSON 로그 저장 여부
+        ))
+    trainer.add_callback(
+        ModelEvalCallback(
+            trainer=trainer,  # Will be set by Trainer
+            enable_benchmarks=True,  # Enable benchmark evaluation
+            benchmarks_to_run=['mmlu', 'hellaswag', 'gsm8k', 'truthfulqa', 'arc', 'piqa'],  # Run multiple benchmarks
+            benchmark_eval_frequency=training_config["eval_steps"],  # Run benchmarks every 2 epochs
+            mme_max_samples=10,  # Limit MME samples for faster evaluation
+        ))
+    trainer.add_callback(
+        IFEvalCallback(
+            eval_dataset_name="google/IFEval",
+            max_samples=500
+        ))
 
     # Print training info
     print("\n" + "="*50)
@@ -510,19 +557,38 @@ def main(
     #     }, depth=3)
     # Start training
     print("Starting training...")
-    trainer.train()
-    
+    # Guard heavy profiler behind an env flag to avoid OOM from profiler buffers during full training
+    enable_profiler = bool(int(os.getenv("PROFILE_TRAINING", "0")))
+    if enable_profiler:
+        from torch.profiler import profile, record_function, ProfilerActivity
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+        ) as prof:
+            try:
+                trainer.train()
+                profiler_table = prof.key_averages().table(sort_by="self_cuda_memory_usage", row_limit=10)
+                wandb.log({"profiler_table": wandb.Table(data=[profiler_table])})
+            except Exception as e:
+                traceback.print_exc()
+                print(f"⚠️ Profiler error: {e}")
+    else:
+        trainer.train()
+
     # Save final model
     print("Saving final model...")
     trainer.save_model()
     
-    # Save tokenizer
+    # Save tokenizer``
     tokenizer.save_pretrained(training_args.output_dir)
     
     print("Training completed!")
 
 
 if __name__ == "__main__":
+    register_custom_optimizers()
     try:
         # Parse command line arguments
         parser = argparse.ArgumentParser(description="G3MoE SFT Training with Config File")
@@ -545,11 +611,13 @@ if __name__ == "__main__":
         set_seed(training_config["seed"])
         # Initialize wandb if needed
         if training_config.get("report_to") and "wandb" in training_config["report_to"]:
-            wandb.init(
-                project="g3moe-sft",
-                name=training_config["run_name"],
-                config=config
-            )
+            rank = int(os.getenv("RANK", "0"))
+            if rank == 0:
+                wandb.init(
+                    project="g3moe-sft",
+                    name=training_config["run_name"],
+                    config=config
+                )
 
         main(model_config, data_config, training_config)
 

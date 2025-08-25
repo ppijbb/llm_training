@@ -62,6 +62,8 @@ moe_config = {
 base_config['text_config'].update(moe_config)
 base_config.update(base_config['text_config'])
 model_config = G3MoEConfig(**base_config)
+model_config.model_type = "g3moe"
+
 pprint.pprint(model_config)
 # BitsAndBytesConfig int-4 config
 test_model = model_architecture.from_pretrained(
@@ -89,7 +91,7 @@ Always answer in shortest possible sentence.
 But you should remember... Try to answer with Korean.😉<end_of_turn>
 <start_of_turn>user
 this is the test text message. now you must instruct the model to generate a response to this message.<end_of_turn>
-"""
+""" * 1
 
 test_input = tokenizer.apply_chat_template(
     [

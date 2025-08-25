@@ -1,23 +1,83 @@
 import torch
-import outlines
-from typing import List, Any, Optional, Union
+from collections import defaultdict
+from outlines.models import TransformersMultiModal
+from typing import List, Any, Optional, Union, Tuple
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoProcessor, AutoConfig
 from transformers import PreTrainedModel, PreTrainedTokenizer, GenerationConfig
 from transformers.processing_utils import ProcessorMixin
 from transformers.generation.logits_process import LogitsProcessorList
 from deepeval.models.base_model import DeepEvalBaseLLM
+from outlines.inputs import Audio, Chat, Image, Video
+from outlines.processors import OutlinesLogitsProcessor
+# from ..models import G3MoEForCausalLM, G3MoEConfig, Gemma3Config
+# If this import fails, try using an absolute import based on your project structure:
+try:
+    from models import G3MoEForCausalLM, G3MoEConfig, G3MoEConfig
+    from transformers import Gemma3Config
+except ImportError:
+    # Fallback: add parent directory to sys.path and retry
+    import sys
+    import os
+    sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+    from models import G3MoEForCausalLM, G3MoEConfig, G3MoEConfig
+    from transformers import Gemma3Config
 
 # Setting high precision for matmul
 torch.set_float32_matmul_precision('high')
 
 
-class CustomOutlinesTransformers(outlines.models.TransformersMultiModal):
+class CustomOutlinesTransformers(TransformersMultiModal):
+    @torch.no_grad()
+    def _prepare_model_inputs(
+        self,
+        model_input,
+        is_batch: bool = False,
+    ) -> Tuple[Union[str, List[str]], dict]:
+        """Turn the user input into arguments to pass to the model"""
+        if is_batch:
+            prompts = [
+                self.type_adapter.format_input(item) for item in model_input
+            ]
+        else:
+            prompts = self.type_adapter.format_input(model_input)
+
+        # The expected format is a single dict
+        if is_batch:
+            merged_prompts = defaultdict(list)
+            for d in prompts:
+                for key, value in d.items():
+                    if key == "text":
+                        merged_prompts[key].append(value)
+                    else:
+                        merged_prompts[key].extend(value)
+        else:
+            merged_prompts = prompts # type: ignore
+
+        inputs = self.processor(
+            **merged_prompts, padding=True, return_tensors="pt"
+        ).to(self.model.device)
+
+        return merged_prompts["text"], inputs
+    
+    @torch.no_grad()
     def _generate_output_seq(self, prompts, inputs, **inference_kwargs):
         if "token_type_ids" in inputs:
             del inputs["token_type_ids"]
         if "token_type_ids" in inference_kwargs:
             del inference_kwargs["token_type_ids"]
-        return super()._generate_output_seq(prompts, inputs, **inference_kwargs)
+        input_ids = inputs["input_ids"]
+        output_ids = self.model.generate(
+            **inputs,
+            **inference_kwargs,
+        )
+
+        # encoder-decoder returns output_ids only, decoder-only returns full seq ids
+        if self.model.config.is_encoder_decoder:
+            generated_ids = output_ids
+        else:
+            generated_ids = output_ids[:, input_ids.shape[1] :]
+
+        return generated_ids
 
 
 class LocalModel(DeepEvalBaseLLM):
@@ -56,6 +116,7 @@ class LocalModel(DeepEvalBaseLLM):
     def _call(self, *args, **kwargs):
         return self.generate(*args, **kwargs)
 
+    @torch.no_grad()
     def generate(self, prompt: str, schema: Optional[Any] = None, **kwargs) -> str:
         """
         Generate text from prompt, handling DeepEval's prompt and schema parameters
@@ -71,8 +132,9 @@ class LocalModel(DeepEvalBaseLLM):
                 output_type=schema,
                 generation_config=GenerationConfig(
                     max_new_tokens=1024,
-                    do_sample=False,
-                    temperature=1.0
+                    do_sample=True,
+                    temperature=1.0,
+                    pad_token_id=self.tokenizer.eos_token_id if isinstance(self.tokenizer, PreTrainedTokenizer) else self.tokenizer.tokenizer.eos_token_id
                 ))
             return schema.model_validate_json(response)
 
@@ -123,7 +185,8 @@ def run_deepeval()->None:
         benchmarks = [
             MMLU(
                 tasks=[task for task in MMLUTask],
-                n_shots=5
+                n_shots=5,
+                n_problems_per_task=3
             ),
             # HellaSwag(n_shots=3),
             # BigBenchHard(enable_cot=True),
@@ -147,11 +210,53 @@ def run_deepeval()->None:
         ]
             
         model_name = "Gunulhona/Gemma-3-4B"
-        eval_model = LocalModel(model=model_name)
+        model_architecture = G3MoEForCausalLM ## G3MoEForCausalLM
+        base_config = Gemma3Config.from_pretrained(model_name)
+        base_config = base_config.to_dict()
+        moe_config = {
+                "n_shared_experts": 1,
+                "n_routed_experts": 5, # 256, 15, 6
+                "n_group": 4,
+                "topk_group": 8,
+                # "num_key_value_heads": base_config['text_config']['num_attention_heads'],
+                "num_experts_per_tok": 2,
+                "first_k_dense_replace": 18,
+                "router_aux_loss_coef": 0.001,
+                "router_jitter_noise": 0.01,
+                "input_jitter_noise": 0.01,
+                "model_type": "g3moe_text",
+                "no_rope_layer_interval": 0,
+                "rope_scaling":{
+                    "rope_type": "yarn",
+                    "factor": 8.0
+                },
+                # "intermediate_size": base_config['text_config']['hidden_size'],
+                "use_bfloat16": True,
+            }
+        base_config['text_config'].update(moe_config)
+        base_config.update(base_config['text_config'])
+        model_config = G3MoEConfig(**base_config)
+        model_config.model_type = "g3moe"
+        # BitsAndBytesConfig int-4 config
+        test_model = model_architecture.from_pretrained(
+            pretrained_model_name_or_path=model_name,
+            config=model_config,
+            torch_dtype=torch.bfloat16,
+            attn_implementation="flash_attention_2",
+            use_cache=False
+            # quantization_config=BitsAndBytesConfig(
+            #     load_in_4bit=True,
+            #     bnb_4bit_use_double_quant=True,
+            #     bnb_4bit_quant_type="nf4",
+            #     bnb_4bit_compute_dtype=torch.bfloat16,
+            #     bnb_4bit_quant_storage=torch.bfloat16)
+            ).to("cuda")
+        tokenizer = AutoProcessor.from_pretrained(model_name)
+        eval_model = LocalModel(model=test_model, tokenizer=tokenizer)
 
         for benchmark in benchmarks:
             results = benchmark.evaluate(model=eval_model, batch_size=8)
-            print(f"Overall Score: {benchmark.__name__} - {results}")
+            print(f"Overall Score: {benchmark.__class__.__name__} - {results}")
 
     except Exception as e:
         import traceback
