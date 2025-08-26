@@ -245,7 +245,7 @@ def process_content(contents_list):
 def processing(
     example, # Changed from 'examples' to 'example' to reflect single row
     tokenizer,
-    max_length: int = 2048,
+    max_length: int = 131072,
     text_only: bool = False
 ):
     """
