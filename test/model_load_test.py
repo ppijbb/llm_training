@@ -19,7 +19,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from models import (#G2MoEConfig, G2MoEForCausalLM, G2MoETextConfig,
                     G3MoEConfig, G3MoEForCausalLM, G3MoETextConfig)
 
-logging.getLogger("transformers.processing_utils").setLevel(logging.WARNNING)
 
 os.environ["TORCH_COMPILE_DISABLE"] = "1"
 os.environ["TORCHDYNAMO_DISABLE"] = "1"
@@ -73,6 +72,7 @@ model_config.model_type = "g3moe"
 # BitsAndBytesConfig int-4 config
 
 def main():
+    logging.getLogger("transformers.processing_utils").setLevel(logging.WARN)
     test_model = model_architecture.from_pretrained(
         pretrained_model_name_or_path=base_model_name,
         config=model_config,
@@ -132,7 +132,7 @@ def main():
         images=image2,
         return_tensors="pt")
     inputs = inputs.to(test_model.device)
-
+    logging.getLogger("transformers.processing_utils").setLevel(logging.INFO)
     print(test_model)
     # print(test_model.config)
     print(format_parameters(test_model.num_parameters()))
