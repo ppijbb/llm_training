@@ -1,9 +1,11 @@
+import os
 from datasets import load_dataset
 from transformers import AutoTokenizer
 from PIL import PngImagePlugin
 LARGE_ENOUGH_NUMBER = 100
 PngImagePlugin.MAX_TEXT_CHUNK = LARGE_ENOUGH_NUMBER * (1024**2)
 
+os.environ["HF_DATASETS_CACHE"] = "/mnt/disks/local-ssd/datasets_cache"
 
 def process_content(contents_list):
     processed_contents = []

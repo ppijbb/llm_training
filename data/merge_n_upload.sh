@@ -12,12 +12,12 @@ elif [ -f "venv/bin/activate" ]; then
     source venv/bin/activate
 fi
 
-uv run python data/upload_sft_dataset.py \
-    merge \
-        --output_name=open_m_3 \
-        --num_workers=16 \
-        --local_path /mnt/disks/local-ssd/ \
-        --max_samples 100
+# uv run python data/upload_sft_dataset.py \
+#     merge \
+#         --output_name=open_m_3 \
+#         --num_workers=16 \
+#         --local_path /mnt/disks/local-ssd/ \
+#         --max_samples 100
 
 uv run python data/upload_sft_dataset.py \
     upload \

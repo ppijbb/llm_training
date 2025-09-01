@@ -16,7 +16,9 @@ from transformers.utils.import_utils import is_flash_attn_2_available
 from transformers import (
     AutoTokenizer,
     AutoProcessor,
-    AutoConfig
+    AutoConfig,
+    AutoModel,
+    AutoModelForCausalLM
 )
 from transformers import logging
 
@@ -31,7 +33,7 @@ import wandb
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Import custom modules  
-from models import G3MoEForCausalLM, G3MoEConfig
+from models import G3MoEForCausalLM, G3MoEConfig, G3MoEForConditionalGeneration
 from data.base_model_sft_dataset import get_dataset, create_multimodal_collate_fn
 from data.simple_sft_dataset import get_simple_sft_dataset, create_simple_collate_fn, smoltalk_dataset, orca_mini_dataset
 
@@ -44,6 +46,14 @@ from eval.moe_monitoring_callback import create_moe_callback_for_transformers
 
 # Register custom optimizers with DeepSpeed
 register_custom_optimizers()
+
+# AutoConfig.register("g3moe", G3MoEConfig)
+AutoConfig.register("g3moe", G3MoEConfig)
+AutoConfig.register("g3moe_text", G3MoETextConfig)
+AutoModel.register(G3MoEConfig, G3MoEModel)
+AutoModel.register(G3MoETextConfig, G3MoETextModel)
+AutoModelForCausalLM.register(G3MoETextConfig, G3MoEForCausalLM)
+
 
 logging.enable_progress_bar()
 logging.set_verbosity_warning()
@@ -225,7 +235,7 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
     
     # Load G3MoE model with the configured parameters
     print("Loading G3MoE model...")
-    model = G3MoEForCausalLM.from_pretrained(
+    model = G3MoEForConditionalGeneration.from_pretrained(
         model_config["model_name_or_path"],
         config=config,
         torch_dtype=torch.bfloat16, # Using bfloat16
@@ -252,7 +262,8 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
             target_modules=[
                 # "q_proj", "k_proj", "v_proj", "o_proj",
                 "gate_proj", "up_proj", "down_proj",
-                "router", "routing_temperature"
+                "router", "routing_temperature",
+                "rnn.weight_ih_l0", "rnn.weight_hh_l0"
             ],
             modules_to_save=["router", "routing_temperature"],
             bias="none",

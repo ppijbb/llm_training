@@ -51,7 +51,7 @@ from transformers.utils.import_utils import is_torch_fx_available
 from einops import rearrange
 from flash_attn.layers.rotary import RotaryEmbedding as FlashRotaryEmbedding
 from transformers.modeling_utils import (
-    restore_default_torch_dtype,
+    restore_default_dtype,
     SpecificPreTrainedModelType,
     PretrainedConfig,
     load_state_dict as hf_load_state_dict
@@ -767,7 +767,7 @@ class G2MoEPreTrainedModel(PreTrainedModel):
                 module.weight.data[module.padding_idx].zero_()
 
     @classmethod
-    @restore_default_torch_dtype
+    @restore_default_dtype
     def from_pretrained(
         cls: Type[SpecificPreTrainedModelType],
         pretrained_model_name_or_path: Optional[Union[str, os.PathLike]],

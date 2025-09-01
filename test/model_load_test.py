@@ -5,7 +5,7 @@ import logging
 from transformers import AutoProcessor, AutoModelForImageTextToText
 from transformers.generation.configuration_utils import GenerationConfig
 from transformers.utils.quantization_config import BitsAndBytesConfig
-from transformers import Gemma3ForCausalLM, Gemma3Config
+from transformers import Gemma3ForCausalLM, Gemma3ForConditionalGeneration, Gemma3Config
 from transformers.utils.import_utils import is_flash_attn_2_available
 from transformers.image_utils import load_image
 
@@ -17,7 +17,15 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from models import (#G2MoEConfig, G2MoEForCausalLM, G2MoETextConfig,
-                    G3MoEConfig, G3MoEForCausalLM, G3MoETextConfig)
+                    G3MoEModel, G3MoETextModel,
+                    G3MoEConfig, G3MoEForCausalLM, G3MoEForConditionalGeneration, G3MoETextConfig)
+from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
+# AutoConfig.register("g3moe", G3MoEConfig)
+AutoConfig.register("g3moe", G3MoEConfig)
+AutoConfig.register("g3moe_text", G3MoETextConfig)
+AutoModel.register(G3MoEConfig, G3MoEModel)
+AutoModel.register(G3MoETextConfig, G3MoETextModel)
+AutoModelForCausalLM.register(G3MoETextConfig, G3MoEForCausalLM)
 
 
 os.environ["TORCH_COMPILE_DISABLE"] = "1"
@@ -40,8 +48,8 @@ def format_parameters(number):
         return str(number)
 
 base_model_name = "google/gemma-3-4b-it"
-model_architecture = G3MoEForCausalLM ## G3MoEForCausalLM
-base_config = Gemma3Config.from_pretrained(base_model_name)
+model_architecture = G3MoEForConditionalGeneration
+base_config = Gemma3Config.from_pretrained(base_model_name, trust_remote_code=True)
 base_config = base_config.to_dict()
 moe_config = {
         "n_shared_experts": 1,
@@ -55,17 +63,17 @@ moe_config = {
         "router_jitter_noise": 0.01,
         "input_jitter_noise": 0.01,
         "model_type": "g3moe_text",
-        "no_rope_layer_interval": 4,
+        "no_rope_layer_interval": 0,
         "rope_scaling":{
             "rope_type": "yarn",
             "factor": 8.0
         },
         # "intermediate_size": base_config['text_config']['hidden_size'],
-        "use_bfloat16": True,
+        "use_bfloat16": True
     }
 base_config['text_config'].update(moe_config)
 base_config.update(base_config['text_config'])
-model_config = G3MoEConfig(**base_config)
+model_config = G3MoEConfig (**base_config)
 model_config.model_type = "g3moe"
 
 # pprint.pprint(model_config)
@@ -78,6 +86,7 @@ def main():
         config=model_config,
         torch_dtype=torch.bfloat16,
         attn_implementation="flash_attention_2",
+        # trust_remote_code=True,
         # quantization_config=BitsAndBytesConfig(
         #     load_in_4bit=True,
         #     bnb_4bit_use_double_quant=True,
@@ -90,22 +99,22 @@ def main():
     with open("/home/conan_jung/workspace/llm_training/sft/config/chat_template.txt", "r") as f:
         tokenizer.chat_template = f.read()
     # logging.set_verbosity_warning()
-    test_text = """
-    안녕하세요.<end_of_turn>
-    <start_of_turn>system
-    You are a helpful assistant named Sparkle.
-    Always answer in shortest possible sentence.
-    But you should remember... Try to answer with Korean.😉<end_of_turn>
-    <start_of_turn>user
-    this is the test text message. now you must instruct the model to generate a response to this message.<end_of_turn>
-    """ * 1
+    test_text = f"""
+안녕하세요.<end_of_turn>
+<start_of_turn>system
+You are a helpful assistant named Sparkle.
+Always answer in shortest possible sentence.
+But you should remember... Try to answer with Korean.😉<end_of_turn>
+<start_of_turn>user
+this is the test text message. now you must instruct the model to generate a response to this message.<end_of_turn>
+""" * 1
 
     test_input = tokenizer.apply_chat_template(
         [
             {
                 "role": "system",
                 "content": [
-                    {"type": "text", "text": test_text}
+                    {"type": "text", "text": test_text.strip()}
                 ]
             },
             {
@@ -130,29 +139,30 @@ def main():
     inputs = tokenizer(
         text=test_input,
         images=image2,
-        return_tensors="pt")
-    inputs = inputs.to(test_model.device)
+        return_tensors="pt").to(test_model.device)
+    
+    if "token_type_ids" in inputs:
+        del inputs["token_type_ids"]
     logging.getLogger("transformers.processing_utils").setLevel(logging.INFO)
-    print(test_model)
+    # print(test_model)
     # print(test_model.config)
     print(format_parameters(test_model.num_parameters()))
-
+    print("Test Sequence Length:", inputs.input_ids.shape[1])
 
     with torch.inference_mode():
         # torch._dynamo.config.capture_dynamic_output_shape_ops = True
         response = tokenizer.batch_decode(
             test_model.generate(
-                input_ids=inputs.input_ids,
-                attention_mask=inputs.attention_mask,
+                **inputs,
                 generation_config=GenerationConfig(
                     device=test_model.device,
-                    max_new_tokens=10,
+                    # max_new_tokens=10,
                     do_sample=True,
-                    top_p=0.9,
-                    top_k=1,
-                    temperature=0.7,
-                    repetition_penalty=1.2,
-                    length_penalty=1.0,
+                    # top_p=0.9,
+                    # top_k=1,
+                    # temperature=0.7,
+                    # repetition_penalty=1.2,
+                    # length_penalty=1.0,
                     # num_beams=1,
                     # num_beam_groups=1,
                     # num_beam_hyps=1
@@ -161,6 +171,7 @@ def main():
                 )
             )[0]
         print(test_text)
+        print("--- Model Response ---")
         print(response[len(test_text):].split("<start_of_turn>model\n")[-1])
 
 

@@ -183,9 +183,14 @@ class G3MoETextConfig(PretrainedConfig):
         "layers.*.self_attn.k_proj": "colwise",
         "layers.*.self_attn.v_proj": "colwise",
         "layers.*.self_attn.o_proj": "rowwise",
-        "layers.*.mlp.gate_proj": "colwise",
-        "layers.*.mlp.up_proj": "colwise",
-        "layers.*.mlp.down_proj": "rowwise",
+        "layers.*.experts": "gater",
+        "layers.*.router": "ep_router",
+        "layers.*.experts.*.gate_proj": "grouped_gemm",
+        "layers.*.experts.*.gate_proj_bias": "grouped_gemm",
+        "layers.*.experts.*.up_proj": "grouped_gemm",
+        "layers.*.experts.*.up_proj_bias": "grouped_gemm",
+        "layers.*.experts.*.down_proj": "grouped_gemm",
+        "layers.*.experts.*.down_proj_bias": "grouped_gemm",
     }
     base_model_pp_plan = {
         "embed_tokens": (["input_ids"], ["inputs_embeds"]),
@@ -219,6 +224,7 @@ class G3MoETextConfig(PretrainedConfig):
         router_z_loss_coef=1e-4,
         router_entropy_coef=0.0,
         usage_uniformity_coef=0.0,
+        router_dim=128,
         freeze_shared_experts=True,
         hidden_activation="gelu_pytorch_tanh",
         max_position_embeddings=131_072,
@@ -243,6 +249,7 @@ class G3MoETextConfig(PretrainedConfig):
         sliding_window_pattern=6,
         ema_alpha=0.99,
         balancing_strength=0.01,
+        ortho_strength=1.0,
         ortho_loss_coef=0.01,
         specialization_strength=0.01,
         # 하이브리드 positional embedding 관련 추가 인자
@@ -282,15 +289,16 @@ class G3MoETextConfig(PretrainedConfig):
         self.router_jitter_noise = router_jitter_noise
         self.input_jitter_noise = input_jitter_noise
         self.router_z_loss_coef = router_z_loss_coef
+        self.router_dim = router_dim
         # Additional router regularizers to combat expert collapse
         self.router_entropy_coef = router_entropy_coef
         self.usage_uniformity_coef = usage_uniformity_coef
         self.sliding_window_pattern = sliding_window_pattern
         self.rope_local_base_freq = rope_local_base_freq
-        self.final_logit_softcapping = final_logit_softcapping
         self.freeze_shared_experts = freeze_shared_experts
         self.ema_alpha = ema_alpha
         self.balancing_strength = balancing_strength
+        self.ortho_strength = ortho_strength
         self.ortho_loss_coef = ortho_loss_coef
         self.specialization_strength = specialization_strength
         self.initializer_range = initializer_range
@@ -302,8 +310,6 @@ class G3MoETextConfig(PretrainedConfig):
         self.hidden_activation = hidden_activation
         self.query_pre_attn_scalar = query_pre_attn_scalar
         self.sliding_window = sliding_window
-        self.final_logit_softcapping = final_logit_softcapping
-        self.attn_logit_softcapping = attn_logit_softcapping
         self.cache_implementation = cache_implementation
         self.rope_local_base_freq = rope_local_base_freq
         self.sliding_window_pattern = sliding_window_pattern
@@ -407,6 +413,11 @@ class G3MoEConfig(PretrainedConfig):
     ```"""
 
     model_type = "g3moe"
+    attribute_map = {
+        "image_token_id": "image_token_index",
+        "boi_token_id": "boi_token_index",
+        "eoi_token_id": "eoi_token_index",
+    }
     sub_configs = {
         "text_config": G3MoETextConfig,
         "vision_config": SiglipVisionConfig,
@@ -421,7 +432,6 @@ class G3MoEConfig(PretrainedConfig):
         eoi_token_index: int = 256_000,
         image_token_index: int = 262_144,
         initializer_range: float = 0.02,
-        attn_implementation: str = "sdpa",
         **kwargs,
     ):
         if text_config is None:
@@ -447,8 +457,7 @@ class G3MoEConfig(PretrainedConfig):
         self.eoi_token_index = eoi_token_index
         self.image_token_index = image_token_index
         self.initializer_range = initializer_range
-        self.attn_implementation = attn_implementation
-        self._attn_implementation = attn_implementation
+
         super().__init__(**kwargs)
 
 
