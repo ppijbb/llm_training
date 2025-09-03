@@ -27,16 +27,13 @@ from transformers import (
     )
 from transformers.generation.stopping_criteria import StopStringCriteria, StoppingCriteriaList, MaxLengthCriteria
 from deepeval.benchmarks import MMLU
-from deepeval.benchmarks.mmlu.task import MMLUTask
+
 from deepeval.benchmarks.hellaswag.hellaswag import HellaSwag
 from deepeval.benchmarks import BigBenchHard
 from deepeval.benchmarks import HumanEval
-from deepeval.benchmarks.tasks import HumanEvalTask
 from deepeval.benchmarks import SQuAD
-from deepeval.benchmarks.tasks import SQuADTask
 from deepeval.benchmarks import GSM8K
 from deepeval.benchmarks import MathQA
-from deepeval.benchmarks.tasks import MathQATask
 from deepeval.benchmarks import TruthfulQA
 from deepeval.benchmarks import IFEval
 # from deepeval.benchmarks import AGIEval
@@ -172,6 +169,9 @@ def get_model_eval_callback(
             ]
         )
         """
+        from deepeval.benchmarks.mmlu.task import MMLUTask
+        from deepeval.benchmarks import MMLU
+
         benchmark = MMLU()
         evaluation_dataset = EvaluationDataset(
             goldens=benchmark.load_benchmark_dataset(
@@ -316,10 +316,12 @@ class ModelEvalCallback(DeepEvalHuggingFaceCallback):
         on_log_metrics = IFEval(n_problems=10, verbose_mode=True)
         self.eval_model = LocalModel(model=self.trainer.model, tokenizer=self.trainer.tokenizer)
         try:
-            test_results = on_log_metrics.evaluate(self.eval_model)
+            with torch.no_grad():
+                test_results = on_log_metrics.evaluate(self.eval_model)
             scores = {
                 "ifeval": [test_results["overall_accuracy"]]
             }
+            self.trainer.log(scores)
         except Exception as e:
             print(f"Error in _calculate_metric_scores: {e}\nIFEval scores set to 0.0")
             scores = self._aggregate_scores({"ifeval": [0.0]})
@@ -437,7 +439,7 @@ class ModelEvalCallback(DeepEvalHuggingFaceCallback):
                         print(f"Benchmark results logged for epoch {state.epoch}")
     
     @torch.no_grad()
-    def _run_benchmark_evaluation(self) -> Dict[str, float]:
+    def _run_benchmark_evaluation(self, mode:str="epoch") -> Dict[str, float]:
         """
         Run benchmark evaluation on the current model
         """
@@ -456,20 +458,22 @@ class ModelEvalCallback(DeepEvalHuggingFaceCallback):
             if 'mmlu' in self.benchmarks_to_run:
                 try:
                     print("Running MMLU benchmark...")
-                    mmlu_benchmark = MMLU(n_shots=3)
+                    mmlu_benchmark = MMLU(
+                        n_problems_per_task=5 if mode != "epoch" else None,
+                        n_shots=3)
                     mmlu_benchmark.evaluate(model=self.eval_model)
                     results['mmlu'] = mmlu_benchmark.overall_score
                     print(f"MMLU Score: {mmlu_benchmark.overall_score:.4f}")
                 except Exception as e:
-                    import traceback
-                    traceback.print_exc()
                     print(f"MMLU evaluation failed: {e}")
                     results['mmlu'] = 0.0
             
             if 'hellaswag' in self.benchmarks_to_run:
                 try:
                     print("Running HellaSwag benchmark...")
-                    hellaswag_benchmark = HellaSwag(n_shots=3)
+                    hellaswag_benchmark = HellaSwag(
+                        n_problems_per_task=5 if mode != "epoch" else None,
+                        n_shots=3)
                     hellaswag_benchmark.evaluate(model=self.eval_model)
                     results['hellaswag'] = hellaswag_benchmark.overall_score
                     print(f"HellaSwag Score: {hellaswag_benchmark.overall_score:.4f}")
@@ -480,7 +484,11 @@ class ModelEvalCallback(DeepEvalHuggingFaceCallback):
             if 'gsm8k' in self.benchmarks_to_run:
                 try:
                     print("Running GSM8K benchmark...")
-                    gsm8k_benchmark = GSM8K(n_problems=10, n_shots=3, enable_cot=True)
+                    gsm8k_benchmark = GSM8K(
+                        n_problems=5 if mode != "epoch" else 1319, 
+                        n_shots=3, 
+                        enable_cot=True,
+                    )
                     gsm8k_benchmark.evaluate(model=self.eval_model)
                     results['gsm8k'] = gsm8k_benchmark.overall_score
                     print(f"GSM8K Score: {gsm8k_benchmark.overall_score:.4f}")
@@ -491,7 +499,9 @@ class ModelEvalCallback(DeepEvalHuggingFaceCallback):
             if 'truthfulqa' in self.benchmarks_to_run:
                 try:
                     print("Running TruthfulQA benchmark...")
-                    truthfulqa_benchmark = TruthfulQA()
+                    truthfulqa_benchmark = TruthfulQA(
+                        n_problems_per_task=5 if mode != "epoch" else None,
+                    )
                     truthfulqa_benchmark.evaluate(model=self.eval_model)
                     results['truthfulqa'] = truthfulqa_benchmark.overall_score
                     print(f"TruthfulQA Score: {truthfulqa_benchmark.overall_score:.4f}")
@@ -502,7 +512,9 @@ class ModelEvalCallback(DeepEvalHuggingFaceCallback):
             if 'arc' in self.benchmarks_to_run:
                 try:
                     print("Running ARC benchmark...")
-                    arc_benchmark = ARC(n_shots=3)
+                    arc_benchmark = ARC(
+                        n_problems=5 if mode != "epoch" else None,
+                        n_shots=3)
                     arc_benchmark.evaluate(model=self.eval_model)
                     results['arc'] = arc_benchmark.overall_score
                     print(f"ARC Score: {arc_benchmark.overall_score:.4f}")
@@ -524,7 +536,9 @@ class ModelEvalCallback(DeepEvalHuggingFaceCallback):
             if 'bigbenchhard' in self.benchmarks_to_run:
                 try:
                     print("Running BigBenchHard benchmark...")
-                    bigbench_benchmark = BigBenchHard(enable_cot=True)
+                    bigbench_benchmark = BigBenchHard(
+                        n_problems_per_task=5 if mode != "epoch" else None,
+                        enable_cot=True)
                     bigbench_benchmark.evaluate(model=self.eval_model)
                     results['bigbenchhard'] = bigbench_benchmark.overall_score
                     print(f"BigBenchHard Score: {bigbench_benchmark.overall_score:.4f}")
@@ -536,8 +550,8 @@ class ModelEvalCallback(DeepEvalHuggingFaceCallback):
                 try:
                     print("Running HumanEval benchmark...")
                     humaneval_benchmark = HumanEval(
-                        tasks=[HumanEvalTask.HAS_CLOSE_ELEMENTS, HumanEvalTask.SORT_NUMBERS],
-                        n=50
+                        # tasks=[HumanEvalTask.HAS_CLOSE_ELEMENTS, HumanEvalTask.SORT_NUMBERS],
+                        n=5 if mode != "epoch" else 200,
                     )
                     humaneval_benchmark.evaluate(model=self.eval_model)
                     results['humaneval'] = humaneval_benchmark.overall_score
@@ -550,8 +564,9 @@ class ModelEvalCallback(DeepEvalHuggingFaceCallback):
                 try:
                     print("Running SQuAD benchmark...")
                     squad_benchmark = SQuAD(
-                        tasks=[SQuADTask.PHARMACY, SQuADTask.NORMANS],
-                        n_shots=3
+                        # tasks=[SQuADTask.PHARMACY, SQuADTask.NORMANS],
+                        n_shots=3,
+                        n_problems_per_task=5 if mode != "epoch" else None,
                     )
                     squad_benchmark.evaluate(model=self.eval_model)
                     results['squad'] = squad_benchmark.overall_score
@@ -564,8 +579,9 @@ class ModelEvalCallback(DeepEvalHuggingFaceCallback):
                 try:
                     print("Running MathQA benchmark...")
                     mathqa_benchmark = MathQA(
-                        tasks=[MathQATask.PROBABILITY, MathQATask.GEOMETRY],
-                        n_shots=3
+                        # tasks=[MathQATask.PROBABILITY, MathQATask.GEOMETRY],
+                        n_shots=3,
+                        n_problems_per_task=5 if mode != "epoch" else None,
                     )
                     mathqa_benchmark.evaluate(model=self.eval_model)
                     results['mathqa'] = mathqa_benchmark.overall_score
@@ -610,7 +626,9 @@ class ModelEvalCallback(DeepEvalHuggingFaceCallback):
             if 'boolq' in self.benchmarks_to_run:
                 try:
                     print("Running BoolQ benchmark...")
-                    boolq_benchmark = BoolQ(n_shots=3)
+                    boolq_benchmark = BoolQ(
+                        n_problems=5 if mode != "epoch" else None,
+                        n_shots=3)
                     boolq_benchmark.evaluate(model=self.eval_model)
                     results['boolq'] = boolq_benchmark.overall_score
                     print(f"BoolQ Score: {boolq_benchmark.overall_score:.4f}")

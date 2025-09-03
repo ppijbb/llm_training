@@ -63,7 +63,7 @@ from transformers.utils.import_utils import (
     is_flash_attn_2_available
 )
 from transformers.modeling_utils import (
-    restore_default_torch_dtype,
+    restore_default_dtype,
     SpecificPreTrainedModelType,
 )
 from transformers.configuration_utils import PretrainedConfig
@@ -108,6 +108,26 @@ def calculate_ortho_loss_for_experts(expert_weights: List[torch.Tensor]) -> torc
     ortho_loss = torch.pow(torch.norm(gram_matrix - identity, p='fro'), 2)
     return ortho_loss
 
+
+def _orthogonal_constraint_loss(
+    num_experts: int, 
+    gate_logits: torch.Tensor
+) -> torch.Tensor:
+        """라우터 출력값들의 직교성 제약 손실"""
+        # router_outputs: [batch*seq, num_experts]
+        
+        # 각 토큰별로 expert 방향이 직교하도록
+        normalized_outputs = F.normalize(gate_logits, dim=-1)
+        
+        # Gram matrix: [num_experts, num_experts]
+        gram_matrix = torch.matmul(normalized_outputs.T, normalized_outputs)
+        
+        # Target: identity matrix
+        identity = torch.eye(num_experts, device=gate_logits.device, dtype=gate_logits.dtype)
+        
+        # Loss: squared Frobenius norm of (GG' - I)
+        constraint_loss = torch.pow(torch.norm(gram_matrix - identity, p='fro'), 2)
+        return constraint_loss
 
 def load_balancing_loss_func(
     gate_logits: torch.Tensor,
@@ -262,7 +282,13 @@ class G3MoEModelOutputWithPast(BaseModelOutputWithPast):
     """
 
     image_hidden_states: Optional[torch.FloatTensor] = None
-    
+    aux_loss: Optional[torch.FloatTensor] = None
+    router_logits: Optional[torch.FloatTensor] = None
+    speciality_loss: Optional[torch.FloatTensor] = None
+    cosine_similarities: Optional[torch.FloatTensor] = None
+    ortho_loss: Optional[torch.FloatTensor] = None
+
+
 @dataclass
 class G3MoECausalLMOutputWithPast(ModelOutput):
     """
@@ -303,7 +329,11 @@ class G3MoECausalLMOutputWithPast(ModelOutput):
     image_hidden_states: Optional[torch.FloatTensor] = None
     # this is moe specific
     aux_loss: Optional[torch.FloatTensor] = None
+    ortho_loss: Optional[torch.FloatTensor] = None
     router_logits: Optional[torch.FloatTensor] = None
+    speciality_loss: Optional[torch.FloatTensor] = None
+    cosine_similarities: Optional[torch.FloatTensor] = None
+    # hn_context 제거 - 차원 문제로 인해 사용하지 않음
 
 
 class G3MoETextScaledWordEmbedding(nn.Embedding):
@@ -335,109 +365,6 @@ class G3MoEMLP(nn.Module):
     def forward(self, x):
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
         return down_proj
-
-
-class G3MoETopkRouter(nn.Module):
-
-    def __init__(self, config, **kwargs):
-        super().__init__()
-        self.config = config
-        config = config.text_config
-        self.top_k = config.num_experts_per_tok
-        self.n_routed_experts = config.n_routed_experts
-        self.routed_scaling_factor = config.routed_scaling_factor
-        self.n_group = config.n_group
-        self.topk_group = config.topk_group
-        self.norm_topk_prob = config.norm_topk_prob
-
-        # 적절한 초기화로 변경 (Xavier uniform 초기화)
-        self.router = nn.Linear(config.hidden_size, self.n_routed_experts, bias=False)
-        # Mark for fast init path
-        setattr(self.router, "_is_g3moe_router", True)
-        self.register_buffer("e_score_correction_bias", torch.zeros((self.n_routed_experts)))
-
-    @torch.no_grad()
-    def get_topk_indices(self, scores):
-        scores_for_choice = scores.view(-1, self.n_routed_experts) + self.e_score_correction_bias.unsqueeze(0)
-        group_scores = (
-            scores_for_choice.view(-1, self.n_group, self.n_routed_experts // self.n_group)
-            .topk(2, dim=-1)[0]
-            .sum(dim=-1)
-        )
-        group_idx = torch.topk(group_scores, k=self.topk_group, dim=-1, sorted=False)[1]
-        group_mask = torch.zeros_like(group_scores)
-        group_mask.scatter_(1, group_idx, 1)
-        score_mask = (
-            group_mask.unsqueeze(-1)
-            .expand(-1, self.n_group, self.n_routed_experts // self.n_group)
-            .reshape(-1, self.n_routed_experts)
-        )
-        scores_for_choice = scores_for_choice.masked_fill(~score_mask.bool(), 0.0)
-        topk_indices = torch.topk(scores_for_choice, k=self.top_k, dim=-1, sorted=False)[1]
-        return topk_indices
-
-    def forward(self, hidden_states):
-        hidden_states = hidden_states.view(-1, self.config.hidden_size)
-        router_logits = F.linear(hidden_states.to(torch.float32), self.router.weight.to(torch.float32))
-        scores = router_logits.sigmoid()
-        topk_indices = self.get_topk_indices(scores)
-        topk_weights = scores.gather(1, topk_indices)
-        if self.norm_topk_prob:
-            denominator = topk_weights.sum(dim=-1, keepdim=True) + 1e-20
-            topk_weights /= denominator
-        topk_weights = topk_weights * self.routed_scaling_factor
-        return topk_indices, topk_weights
-
-class G3MoESharedExpertsLayer(nn.Module):
-    """
-    A mixed expert module containing shared experts.
-    """
-
-    def __init__(self, config, **kwargs):
-        super().__init__()
-        self.config = config
-        self.experts = nn.ModuleList(
-            [
-                G3MoEMLP(config, **kwargs)
-                for _ in range(config.n_routed_experts)
-            ]
-        )
-        self.router = G3MoETopkRouter(config=config, **kwargs)
-        self.shared_experts = G3MoEMLP(
-            config=config, intermediate_size=config.intermediate_size * config.n_shared_experts, **kwargs)
-
-    def moe(self, hidden_states: torch.Tensor, topk_indices: torch.Tensor, topk_weights: torch.Tensor):
-        r"""
-        CALL FOR CONTRIBUTION! I don't have time to optimise this right now, but expert weights need to be fused
-        to not have to do a loop here (deepseek has 256 experts soooo yeah).
-        """
-        final_hidden_states = torch.zeros_like(hidden_states, dtype=topk_weights.dtype)
-        expert_mask = torch.nn.functional.one_hot(topk_indices, num_classes=len(self.experts))
-        expert_mask = expert_mask.permute(2, 0, 1)
-        
-        for expert_idx in range(len(self.experts)):
-            expert = self.experts[expert_idx]
-            mask = expert_mask[expert_idx]
-            token_indices, weight_indices = torch.where(mask)
-            if token_indices.numel() > 0:
-                expert_weights = topk_weights[token_indices, weight_indices]
-                expert_input = hidden_states[token_indices]
-                expert_output = expert(expert_input)
-                weighted_output = expert_output * expert_weights.unsqueeze(-1)
-                final_hidden_states.index_add_(0, token_indices, weighted_output)
-        # in original deepseek, the output of the experts are gathered once we leave this module
-        # thus the moe module is itelsf an IsolatedParallel module
-        # and all expert are "local" meaning we shard but we don't gather
-        return final_hidden_states.type(hidden_states.dtype)
-
-    def forward(self, hidden_states):
-        residuals = hidden_states
-        orig_shape = hidden_states.shape
-        topk_indices, topk_weights = self.router(hidden_states)
-        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
-        hidden_states = self.moe(hidden_states, topk_indices, topk_weights).view(*orig_shape)
-        hidden_states = hidden_states + self.shared_experts(residuals)
-        return hidden_states
 
 
 class mp(torch.autograd.Function):
@@ -578,179 +505,43 @@ def sparsemixer(scores, top_k, jitter_eps, training):
         selected_experts,
     )
 
-iterations = 0
-class G3MoESparseGRINBlock(nn.Module):
-    """
-    This implementation is
-    strictly equivalent to standard MoE with full capacity (no
-    dropped tokens). It's faster since it formulates MoE operations
-    in terms of block-sparse operations to accomodate imbalanced
-    assignments of tokens to experts, whereas standard MoE either
-    (1) drop tokens at the cost of reduced performance or (2) set
-    capacity factor to number of experts and thus waste computation
-    and memory on padding.
-    """
 
-    def __init__(self, config, **kwargs):
-        super().__init__()
-        self.hidden_dim = config.hidden_size
-        self.ffn_dim = config.intermediate_size
-        self.num_experts = config.n_routed_experts
-        self.top_k = config.num_experts_per_tok
-        global iterations
-        iterations +=1
-        self.iter = iterations
-        # gating
-        self.router = nn.Linear(self.hidden_dim, self.num_experts, bias=False)
-        setattr(self.router, "_is_g3moe_router", True)
-
-        self.experts = nn.ModuleList([G3MoEMLP(config) for _ in range(self.num_experts)])
-
-        # Jitter parameters
-        self.router_jitter_noise = config.router_jitter_noise
-        self.input_jitter_noise = config.input_jitter_noise
-        
-    @torch._dynamo.disable  # Disable torch.compile for this method due to data-dependent branching
-    def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-
-        batch_size, sequence_length, hidden_dim = hidden_states.shape
-        if self.training and self.input_jitter_noise > 0:
-            hidden_states *= torch.empty_like(hidden_states).uniform_(1.0 - self.input_jitter_noise, 1.0 + self.input_jitter_noise)
-        hidden_states = hidden_states.view(-1, hidden_dim)
-        # router_logits: (batch * sequence_length, n_experts)
-        # print ( 'moe', self.iter, torch.norm(hidden_states).item())
-        router_logits = F.linear(hidden_states.to(torch.float32), self.router.weight.to(torch.float32))
-        if self.training:
-            # Add noise for exploration to prevent expert starvation
-            router_logits = router_logits + torch.randn_like(router_logits) * 1e-3
-
-        routing_weights, selected_experts = sparsemixer(
-            router_logits, 
-            top_k=self.top_k, 
-            jitter_eps=self.router_jitter_noise, 
-            training=self.training,
-        )
-
-        final_hidden_states = torch.zeros(
-            (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
-        )
-
-        # One hot encode the selected experts to create an expert mask
-        # this will be used to easily index which expert is going to be sollicitated
-        expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
-
-        # Loop over all available experts in the model and perform the computation on each expert
-        for expert_idx in range(self.num_experts):
-            expert_layer = self.experts[expert_idx]
-            idx, top_x = torch.where(expert_mask[expert_idx])
-
-            # Use torch.where to handle empty tensor case in a compile-friendly way
-            has_tokens = top_x.numel() > 0
-            if has_tokens:
-                # in torch it is faster to index using lists than torch tensors
-                top_x_list = top_x.tolist()
-                idx_list = idx.tolist()
-
-                # Index the correct hidden states and compute the expert hidden state for
-                # the current expert. We need to make sure to multiply the output hidden
-                # states by `routing_weights` on the corresponding tokens (top-1 and top-2)
-                current_state = hidden_states[None, top_x_list].reshape(-1, hidden_dim)
-                current_hidden_states = expert_layer(current_state) * routing_weights[top_x_list, idx_list, None]
-
-                # However `index_add_` only support torch tensors for indexing so we'll use
-                # the `top_x` tensor here.
-                final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
-        final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
-        # print ( 'moe', self.iter, torch.norm(final_hidden_states).item())
-        return final_hidden_states, router_logits
-
-
-class G3MoEHybridRouter(nn.Module):
-    """Hybrid Router: 하나의 linear layer에서 sigmoid와 sparsemixer 두 방식으로 routing"""
-    e_score_correction_bias: torch.Tensor
-    
-    def __init__(self, config, **kwargs):
+class G3MoERouter(nn.Module):
+    def __init__(self, config: G3MoETextConfig, **kwargs):
         super().__init__()
         self.config = config
-        config = config.text_config if hasattr(config, 'text_config') else config
-        self.hidden_dim = config.hidden_size
+        self.hidden_size = config.hidden_size
         self.num_experts = config.n_routed_experts
-        self.top_k = config.num_experts_per_tok
-        self.router_jitter_noise = getattr(config, 'router_jitter_noise', 0.01)
+        self.router_dim = config.router_dim
 
-        # Sigmoid routing 관련 파라미터들
-        self.routed_scaling_factor = config.routed_scaling_factor
-        self.n_group = config.n_group
-        self.topk_group = config.topk_group
-        self.norm_topk_prob = config.norm_topk_prob
-
-        # 하나의 공유 linear layer
-        self.weight = nn.Parameter(torch.zeros((self.num_experts, config.hidden_size)))
-        nn.init.xavier_uniform_(self.weight)
-        self.register_buffer("e_score_correction_bias", torch.zeros((self.num_experts)))
-
-    @torch.no_grad()
-    def get_topk_indices_sigmoid(self, scores):
-        """Sigmoid 방식의 topk 선택"""
-        scores_for_choice = scores.view(-1, self.num_experts) + self.e_score_correction_bias.unsqueeze(0)
-        group_scores = (
-            scores_for_choice.view(-1, self.n_group, self.num_experts // self.n_group)
-            .topk(2, dim=-1)[0]
-            .sum(dim=-1)
+        self.router = nn.GRU(
+            input_size=self.hidden_size,
+            hidden_size=self.num_experts * self.router_dim,
+            num_layers=1,
+            bias=False,
+            batch_first=True,
         )
-        group_idx = torch.topk(group_scores, k=self.topk_group, dim=-1, sorted=False)[1]
-        group_mask = torch.zeros_like(group_scores)
-        group_mask.scatter_(1, group_idx, 1)
-        score_mask = (
-            group_mask.unsqueeze(-1)
-            .expand(-1, self.n_group, self.num_experts // self.n_group)
-            .reshape(-1, self.num_experts)
-        )
-        scores_for_choice = scores_for_choice.masked_fill(~score_mask.bool(), 0.0)
-        topk_indices = torch.topk(scores_for_choice, k=self.top_k, dim=-1, sorted=False)[1]
-        return topk_indices
 
-    def forward(self, hidden_states, training=True):
-        """
-        하나의 router_logits에서 두 가지 routing 방식 적용
-        Returns:
-            topk_indices: sigmoid 방식으로 선택된 expert indices
-            routing_weights: sparsemixer 방식으로 계산된 가중치
-            router_logits: raw logits
-        """
-        hidden_states = hidden_states.view(-1, self.hidden_dim)
-        router_logits = F.linear(hidden_states.type(torch.float32), self.weight.type(torch.float32))
-        
-        # 1. Sigmoid 방식으로 expert 선택
-        sigmoid_scores = router_logits.sigmoid()
-        topk_indices = self.get_topk_indices_sigmoid(sigmoid_scores)
-        
-        # 2. SparseMixer 방식으로 가중치 계산
-        routing_weights, selected_experts = sparsemixer(
-            router_logits, 
-            top_k=self.top_k, 
-            jitter_eps=self.router_jitter_noise, 
-            training=training,
-        )
-        return topk_indices, routing_weights, router_logits
+    def forward(self, x, hn):
+        return self.router(x, hn)
 
-
+iterations = 0
 class G3MoEGRINMoE(nn.Module):
     """Hybrid Router: 하나의 linear layer에서 sigmoid로 expert 선택, sparsemixer로 가중치 계산"""
 
-    def __init__(self, config, **kwargs):
+    def __init__(self, config, global_router, **kwargs):
         super().__init__()
         config = config
         self.hidden_dim = config.hidden_size
         self.ffn_dim = config.hidden_size
         self.num_experts = config.n_routed_experts
         self.top_k = config.num_experts_per_tok
-
+        self.router_dim = config.router_dim
         global iterations
         iterations += 1
         self.iter = iterations
-        # self.router = G3MoEHybridRouter(config)
-        self.router = nn.Linear(config.hidden_size, self.num_experts, bias=False)
+        self.router = global_router
+        # self.router = nn.Linear(config.hidden_size, config.n_routed_experts, bias=False)
         setattr(self.router, "_is_g3moe_router", True)
         self.experts = nn.ModuleList([G3MoEMLP(config) for _ in range(self.num_experts)])
         self.shared_experts = G3MoEMLP(config=config, intermediate_size=config.intermediate_size * config.n_shared_experts)
@@ -772,7 +563,13 @@ class G3MoEGRINMoE(nn.Module):
         self.freeze_shared_experts = getattr(config, 'freeze_shared_experts', True)
         if self.freeze_shared_experts:
             self._freeze_shared_experts()
+    
+        # Orthogonal projector: hidden_size → num_experts
+        self.orthogonal_projector = nn.Linear(self.hidden_dim, self.router_dim, bias=False)
+        setattr(self.orthogonal_projector, "_is_g3moe_router", True)
+        self.ortho_strength = getattr(config, 'ortho_strength', 1.0)
 
+    
     def _freeze_shared_experts(self):
         """shared_experts의 파라미터들을 freeze"""
         for param in self.shared_experts.parameters():
@@ -796,37 +593,87 @@ class G3MoEGRINMoE(nn.Module):
         self.freeze_shared_experts = False
 
     @torch._dynamo.disable  # Disable torch.compile for this method due to data-dependent branching
-    def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, hidden_states: torch.Tensor, global_routing_logits: torch.Tensor) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
         residual = hidden_states
-        final_hidden_states, router_logits = self._sparse_routing(hidden_states)
+        final_hidden_states, routing_info = self._sparse_routing(hidden_states, global_routing_logits)
+        router_logits, hn, speciality_loss, cosine_similarities = routing_info
         with torch.no_grad():
             # print( f'residual in rank {torch.distributed.get_rank()}', residual.shape, residual.dtype)
             pretriained_residual = self.shared_experts(residual)
-        final_hidden_states = (final_hidden_states + pretriained_residual)
+        final_hidden_states = final_hidden_states# + pretriained_residual * 1.0
         if self.training:
             final_hidden_states = final_hidden_states.requires_grad_(True)
             if router_logits is not None:
                 router_logits = router_logits.requires_grad_(True)
-        return final_hidden_states, router_logits
+        return final_hidden_states, (router_logits, hn, speciality_loss, cosine_similarities)    
     
+    def _speciality_routing(self, hidden_states: torch.Tensor, global_routing_hn: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Enhanced orthogonal projection을 사용해서 각 전문가별 라우터 출력 생성
+        hn을 활용하여 전역 문맥을 고려한 라우팅
+        """
+        # GRU를 통한 전역 라우팅 (hn 활용)
+        routing_logits, hn = self.router(hidden_states, global_routing_hn)
+        input_shape = routing_logits.shape[:-1]
+        hidden_shape = (*input_shape, -1, self.router_dim)
+
+        # Orthogonal projection for expert specialization
+        orthogonal_logits = self.orthogonal_projector(hidden_states)
+        orthogonal_logits = F.normalize(orthogonal_logits, dim=-1)
+        orthogonal_logits = orthogonal_logits.view(hidden_shape)
+        
+        routing_logits = routing_logits.view(hidden_shape)
+        routing_logits = F.normalize(routing_logits, dim=-1)
+        
+        # Enhanced Gram matrix calculation with hn context
+        gram = torch.bmm(routing_logits, routing_logits.transpose(1, 2))
+        routing_i = torch.eye(self.num_experts, device=routing_logits.device)
+        
+        # Speciality penalty: encourage orthogonal expert representations
+        speciality_penalty = torch.mean((F.normalize(gram - routing_i, dim=-1) ** 2).sum(dim=(1,2)))
+        
+        # Cosine similarity between orthogonal and routing logits
+        cosine_similarities = F.cosine_similarity(orthogonal_logits, routing_logits, dim=-1)
+        
+        # routing_logits 대신 cosine_similarities를 기반으로 한 도메인 스코어 반환
+        # 이렇게 하면 각 expert의 도메인 정보가 더 잘 반영됨
+        domain_scores = cosine_similarities * (1.0 + speciality_penalty.unsqueeze(-1))
+        
+        return domain_scores, orthogonal_logits, hn, speciality_penalty, cosine_similarities
+
+    def _calculate_orthogonal_bonus(self, hidden_states: torch.Tensor, orthogonal_logits: torch.Tensor, cosine_similarities: torch.Tensor) -> torch.Tensor:
+        """
+        Orthogonal projection을 활용한 전문성 보너스 계산
+        """
+        # orthogonal_logits: [batch*seq, num_experts, router_dim]
+        # cosine_similarities: [batch*seq, num_experts]
+        batch_size = hidden_states.shape[0]
+        # 각 expert의 orthogonal representation과의 유사도
+        orthogonal_bonus = cosine_similarities.unsqueeze(-1) * orthogonal_logits.reshape(batch_size, -1, self.router_dim).mean(dim=-1)
+        
+        return orthogonal_bonus
+
     @torch._dynamo.disable  # Disable torch.compile for this method due to data-dependent branching
-    def _sparse_routing(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _sparse_routing(self, hidden_states: torch.Tensor, global_routing_logits: torch.Tensor) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         if self.training and self.input_jitter_noise > 0:
             hidden_states *= torch.empty_like(hidden_states).uniform_(1.0 - self.input_jitter_noise, 1.0 + self.input_jitter_noise)
         hidden_states = hidden_states.view(-1, hidden_dim)
         # router_logits: (batch * sequence_length, n_experts)
-        router_logits = F.linear(hidden_states.to(torch.float32), self.router.weight.to(torch.float32))
+        router_logits, orthogonal_logits, hn, speciality_loss, cosine_similarities = self._speciality_routing(hidden_states, global_routing_logits)
         # ---- Enhanced Routing Logic ----
-        if self.training:
-            # Add specialization bonus based on hidden state similarity to expert's specialization
-            with torch.no_grad():
-                # normalize hidden and expert_specialization_ema
-                specialization_bonus = torch.matmul(
-                    F.normalize(hidden_states, dim=-1), 
-                    F.normalize(self.expert_specialization_ema.to(hidden_states.device), dim=-1).T
-                )
-            router_logits += specialization_bonus * self.specialization_strength
+        # if self.training:
+        #     # HN-based specialization bonus 제거 (hn_context 문제로 인해)
+        #     # hn_specialization_bonus = self._calculate_hn_specialization_bonus(
+        #     #     hidden_states, hn_context, cosine_similarities
+        #     # )
+        #     # router_logits += hn_specialization_bonus * self.specialization_strength
+            
+        #     # Orthogonal specialization bonus
+        #     orthogonal_bonus = self._calculate_orthogonal_bonus(
+        #         hidden_states, orthogonal_logits, cosine_similarities
+        #     )
+        #     router_logits += orthogonal_bonus * self.ortho_strength
 
         # Apply temperature scaling
         router_logits /= F.softplus(self.routing_temperature) + 0.1
@@ -901,27 +748,7 @@ class G3MoEGRINMoE(nn.Module):
                 # --- End Update Specialization EMA ---
 
         final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
-        return final_hidden_states, router_logits
-    
-    def _hybrid_routing(self, hidden_states, topk_indices, routing_weights, batch_size, sequence_length, hidden_dim):
-        """하이브리드: sigmoid로 expert 선택, sparsemixer로 가중치 계산"""
-        final_hidden_states = torch.zeros(
-            (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
-        )
-        expert_mask = torch.nn.functional.one_hot(topk_indices, num_classes=self.num_experts).permute(2, 0, 1)
-        
-        for expert_idx in range(self.num_experts):
-            expert_layer = self.experts[expert_idx]
-            mask = expert_mask[expert_idx]
-            token_indices, weight_indices = torch.where(mask)
-            if token_indices.numel() > 0:
-                # sigmoid로 선택된 expert에 sparsemixer 가중치 적용
-                sparse_weights = routing_weights[token_indices, weight_indices]
-                expert_input = hidden_states[token_indices]
-                expert_output = expert_layer(expert_input)
-                weighted_output = expert_output * sparse_weights.unsqueeze(-1)
-                final_hidden_states.index_add_(0, token_indices, weighted_output)
-        return final_hidden_states
+        return final_hidden_states, (router_logits, hn, speciality_loss, cosine_similarities)
 
 
 class G3MoERMSNorm(nn.Module):
@@ -1112,11 +939,12 @@ class G3MoEAttention(nn.Module):
         query_states = self.q_norm(query_states)
         key_states   = self.k_norm(key_states)
 
+        cos, sin = None, None
         if position_embeddings is not None:
             cos, sin = position_embeddings
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
         # else: NoPE, 그대로 사용
-        
+
         if past_key_value is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {
@@ -1128,12 +956,12 @@ class G3MoEAttention(nn.Module):
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
             
             # Here we need to slice as we use a static cache by default, but FA2 does not support it
-            if attention_mask is not None and self.config.attn_implementation == "flash_attention_2":
-                if hasattr(past_key_value, "get_seq_length"):
-                    seq_len = past_key_value.get_seq_length()
-                else:
-                    seq_len = key_states.shape[-1]
-                key_states, value_states = key_states[:, :, :seq_len, :], value_states[:, :, :seq_len, :]
+            # if attention_mask is not None and self.config.attn_implementation == "flash_attention_2":
+            #     if hasattr(past_key_value, "get_seq_length"):
+            #         seq_len = past_key_value.get_seq_length()
+            #     else:
+            #         seq_len = key_states.shape[-1]
+            #     key_states, value_states = key_states[:, :, :seq_len, :], value_states[:, :, :seq_len, :]
         
         attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
@@ -1158,7 +986,7 @@ class G3MoEAttention(nn.Module):
 
 
 class G3MoEDecoderLayer(GradientCheckpointingLayer):
-    def __init__(self, config: G3MoETextConfig, layer_idx: int, **kwargs):
+    def __init__(self, config: G3MoETextConfig, layer_idx: int, global_router: G3MoERouter, **kwargs):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
@@ -1168,7 +996,7 @@ class G3MoEDecoderLayer(GradientCheckpointingLayer):
         self.mlp = G3MoEMLP(config=config) # this layer is for loading pretrained base G3MoE model weights
         self.is_dense_replacement = layer_idx >= config.first_k_dense_replace
         if self.is_dense_replacement:
-            self.moe = G3MoEGRINMoE(config=config)
+            self.moe = G3MoEGRINMoE(config=config, global_router=global_router)
             # self.moe = G3MoESparseGRINBlock(config=config)
         else:
             self.moe = G3MoEMLP(config=config)
@@ -1178,9 +1006,8 @@ class G3MoEDecoderLayer(GradientCheckpointingLayer):
         self.post_feedforward_layernorm = G3MoERMSNorm(self.hidden_size, eps=config.rms_norm_eps)
         self.is_sliding = self.self_attn.is_sliding
         self.sliding_window = config.sliding_window
-        self.use_nope = (hasattr(config, 'nope_layers') and (self.layer_idx in config.nope_layers))
+        self.use_nope = (hasattr(config, 'no_rope_layers') and bool(config.no_rope_layers[self.layer_idx]))
 
-    @deprecate_kwarg("last_cache_position", version="4.53.0")
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1192,61 +1019,21 @@ class G3MoEDecoderLayer(GradientCheckpointingLayer):
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
+        global_routing_hn: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> tuple[torch.FloatTensor, Optional[tuple[torch.FloatTensor, torch.FloatTensor]]]:
-        if self.is_sliding and attention_mask is not None:  # efficient SDPA and no padding
-            # In prefill, we may be larger than sliding window
-            effective_seq_len = max(cache_position.shape[0], self.sliding_window)
-            # For FA2, the mask is 2D and is of shape [bs, processed_tokens] (not [bs, max_cache_len]),
-            # thus we must slice from the right (at most `effective_seq_len` elements)
-            if self.config.attn_implementation == "flash_attention_2":
-                attention_mask = attention_mask[:, -effective_seq_len:].to(hidden_states.device)
-            # Otherwise, the mask is 4D of shape [bs, 1, query_len, max_cache_len] thus we must slice
-            # from the left, with an offset if we are beyond the sliding window
-            else:
-                min_dtype = torch.finfo(attention_mask.dtype).min
-                sliding_window_mask = torch.tril(
-                    torch.ones_like(attention_mask, dtype=torch.bool), diagonal=-self.sliding_window
-                )
-                attention_mask = torch.where(sliding_window_mask, min_dtype, attention_mask)
-                # In case we are beyond the sliding window, we need to correctly offset the mask slicing
-                # `last_cache_position` is equivalent to `cache_position[-1]` but without breaking dynamo
-                offset = cache_position[-1] - effective_seq_len + 1
-                # Should only be used when beyond the sliding window (i.e. offset > 0)
-                offset = torch.clamp(offset, min=0)
-                # equivalent to: `attention_mask = attention_mask[:, :, :, offset : offset + effective_seq_len]`,
-                # but without data-dependent slicing (i.e. torch.compile friendly)
-                mask_indexes = torch.arange(
-                    min(effective_seq_len, attention_mask.shape[-1]), device=attention_mask.device
-                )
-                mask_indexes += offset
-                attention_mask = attention_mask[:, :, :, mask_indexes]
-                
+
         residual = hidden_states
         
         hidden_states = self.input_layernorm(hidden_states)
-        
+
         # 하이브리드 rope-nope positional embedding 적용
         if self.use_nope:
             # NoPE: position embedding 없이 self-attn
-            hidden_states, self_attn_weights = self.self_attn(
-                hidden_states=hidden_states,
-                position_embeddings=None,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_value=past_key_value,
-                output_attentions=output_attentions,
-                use_cache=use_cache,
-                cache_position=cache_position,
-                **kwargs,
-            )
+            position_embeddings = None
         else:
-            # 기존 방식: RoPE(yarn)
-            if self.self_attn.is_sliding:
-                position_embeddings = position_embeddings_local
-            else:
-                position_embeddings = position_embeddings_global
-
+            # 기존 방식: RoPE
+            position_embeddings = position_embeddings_local if self.self_attn.is_sliding else position_embeddings_global
         hidden_states, self_attn_weights, past_key_value = self.self_attn(
             hidden_states=hidden_states,
             position_embeddings=position_embeddings,
@@ -1258,22 +1045,16 @@ class G3MoEDecoderLayer(GradientCheckpointingLayer):
             cache_position=cache_position,
             **kwargs,
         )
-        
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = residual + hidden_states
         
         residual = hidden_states
         hidden_states = self.pre_feedforward_layernorm(hidden_states)
-
-        # print( f'decoder-{self.layer_idx} hidden_states in rank {torch.distributed.get_rank()}', hidden_states.shape, hidden_states.dtype)
         if self.layer_idx >= self.config.first_k_dense_replace:
-            hidden_states, router_logits = self.moe(hidden_states)
+            hidden_states, (router_logits, hn, speciality_loss, cosine_similarities) = self.moe(hidden_states, global_routing_hn)
         else:
             with torch.no_grad():
-                hidden_states = self.moe(hidden_states)
-                router_logits = None
-        # print( f'decoder-{self.layer_idx} hidden_states in rank {torch.distributed.get_rank()}', hidden_states.shape, hidden_states.dtype)
-        # print(f'{self.post_feedforward_layernorm}')
+                hidden_states, (router_logits, hn, speciality_loss, cosine_similarities) = self.moe(hidden_states), (None, None, None, None)
         hidden_states = self.post_feedforward_layernorm(hidden_states)
         if self.training:
             hidden_states = hidden_states.requires_grad_(True)
@@ -1283,7 +1064,7 @@ class G3MoEDecoderLayer(GradientCheckpointingLayer):
         outputs = (hidden_states,)
         if output_attentions:
             outputs += (self_attn_weights,)
-        outputs += (router_logits,)
+        outputs += ((router_logits, hn, speciality_loss, cosine_similarities),)
         return outputs
 
 
@@ -1303,13 +1084,10 @@ G3MoE_START_DOCSTRING = r"""
             [`~PreTrainedModel.from_pretrained`] method to load the model weights.
 """
 
-@add_start_docstrings(
-    "The bare G3MoE Model outputting raw hidden-states without any specific head on top.",
-    G3MoE_START_DOCSTRING,
-)
+@auto_docstring
 class G3MoEPreTrainedModel(PreTrainedModel):
-    config_class = G3MoEConfig
-    base_model_prefix = "language_model"
+    config: G3MoEConfig
+    base_model_prefix = ""
     supports_gradient_checkpointing = True
     _no_split_modules = [
         "G3MoEDecoderLayer",
@@ -1330,8 +1108,7 @@ class G3MoEPreTrainedModel(PreTrainedModel):
     _supports_attention_backend = True
     _can_record_outputs = {
         "hidden_states": G3MoEDecoderLayer,
-        "attentions": G3MoEAttention,
-        "router_logits": G3MoEGRINMoE
+        "attentions": G3MoEAttention
     }
 
     def _initialize_moe_router_and_temperature(self) -> None:
@@ -1360,14 +1137,8 @@ class G3MoEPreTrainedModel(PreTrainedModel):
         # important: this ported version of Gemma2 isn't meant for training from scratch - only
         # inference and fine-tuning - so the proper init weights code has been removed
 
-        std = (
-            self.config.initializer_range
-            if hasattr(self.config, "initializer_range")
-            else self.config.text_config.initializer_range
-        )
-
         # Only initialize router linears explicitly; skip expert MLPs and other dense layers during fine-tuning
-        if isinstance(module, (nn.Linear, nn.Conv2d)):
+        if isinstance(module, (nn.Linear, nn.Conv1d, nn.Conv2d, nn.Conv3d, nn.ConvTranspose1d, nn.ConvTranspose2d)):
             if getattr(module, "_is_g3moe_router", False):
                 logging.get_logger('transformers').debug(f"Initializing router layer with Xavier uniform: {module}")
                 nn.init.xavier_uniform_(module.weight)
@@ -1375,23 +1146,24 @@ class G3MoEPreTrainedModel(PreTrainedModel):
                     module.bias.data.zero_()
             else:
                 # Do not touch non-router linears here to avoid re-initializing experts or base MLPs
-                return
-        elif isinstance(module, nn.Embedding):
-            module.weight.data.normal_(mean=0.0, std=std)
-            if module.padding_idx is not None:
-                module.weight.data[module.padding_idx].zero_()
-        elif isinstance(module, nn.Parameter):
-            module.weight.data.normal_(mean=0.0, std=std)
-            if module.padding_idx is not None:
-                module.weight.data[module.padding_idx].zero_()
-        elif isinstance(module, G3MoERMSNorm):
-            module.weight.data.fill_(1.0)
+                pass
         elif isinstance(module, G3MoEMultiModalProjector):
-            module.mm_input_projection_weight.data.zero_()
-
+            nn.init.xavier_uniform_(module.mm_input_projection_weight.data)
+        elif isinstance(module, nn.GRU):
+            for name, param in module.named_parameters():
+                if 'weight_ih' in name:
+                    nn.init.xavier_uniform_(param.data)
+                elif 'weight_hh' in name:
+                    nn.init.xavier_uniform_(param.data)
+                elif 'weight_hr' in name:
+                    nn.init.xavier_uniform_(param.data)
+                elif 'bias' in name:
+                    param.data.fill_(0)
+        else:
+            super()._init_weights(module)
 
     @classmethod
-    @restore_default_torch_dtype
+    @restore_default_dtype
     def from_pretrained(
         cls: Type[SpecificPreTrainedModelType],
         pretrained_model_name_or_path: Optional[Union[str, os.PathLike]],
@@ -1415,19 +1187,21 @@ class G3MoEPreTrainedModel(PreTrainedModel):
         if not isinstance(config, G3MoEConfig):
             config = G3MoEConfig(**config.to_dict())
             if config.attn_implementation == None:
-                if is_torch_flex_attn_available():
-                    config.attn_implementation = "flex_attention"
-                elif is_flash_attn_2_available():
+                if is_flash_attn_2_available():
                     config.attn_implementation = "flash_attention_2"
-                else:
+                elif is_torch_flex_attn_available():
+                    config.attn_implementation = "flex_attention"
+                elif cls.training:
                     config.attn_implementation = "eager"
+                else:
+                    config.attn_implementation = "sdpa"
             print(f"Forced attn implementation: {config.attn_implementation}")
 
         logging.get_logger('transformers').debug("Loading G3MoE model skeleton using super().from_pretrained...")
         logging.set_verbosity_error()
         import time
         debug_time = time.time()
-        model = super().from_pretrained(
+        base_model = super().from_pretrained(
             pretrained_model_name_or_path,
             *model_args,
             config=config,
@@ -1446,52 +1220,60 @@ class G3MoEPreTrainedModel(PreTrainedModel):
         logging.set_verbosity_warning()
         logging.get_logger('transformers').debug("G3MoE model skeleton loaded.")
 
-        # After model load, ensure router and routing temperature are initialized if not present in checkpoint
-        try:
-            model._initialize_moe_router_and_temperature()
-        except Exception:
-            pass
-
-        if hasattr(model, 'model') and hasattr(model.model, 'layers') and hasattr(model.model.layers, 'moe'):
-          logging.get_logger('transformers').debug("G3MoE Pretrained model loaded.")
-        elif hasattr(model, 'model') and hasattr(model.model, 'layers'):
+        if hasattr(base_model, 'model'):
+            if hasattr(base_model.model, 'layers') and hasattr(base_model.model.layers, 'moe'):
+                logging.get_logger('transformers').debug("G3MoE Pretrained model loaded.")
+                return base_model
             logging.get_logger('transformers').debug("Initializing MoE experts with MLP weights...")
-            with torch.no_grad():
-                processing = tqdm(
-                    enumerate(model.model.layers),
-                    total=len(model.model.layers),
-                    desc="Copying MLP weights to MoE experts: start",
-                    leave=False,
-                )
-                for layer_idx, decoder_layer in processing:
-                    if hasattr(decoder_layer.moe, 'experts') or hasattr(decoder_layer.moe, 'shared_experts'):
-                        if hasattr(decoder_layer.moe, 'shared_experts'):
-                            processing.set_description(f"Copying layer {layer_idx} → shared experts")
-                            decoder_layer.moe.shared_experts.gate_proj.weight.copy_(decoder_layer.mlp.gate_proj.weight)
-                            decoder_layer.moe.shared_experts.up_proj.weight.copy_(decoder_layer.mlp.up_proj.weight)
-                            decoder_layer.moe.shared_experts.down_proj.weight.copy_(decoder_layer.mlp.down_proj.weight)
-
-                        for expert_idx, expert in enumerate(decoder_layer.moe.experts):
-                            if expert_idx % 8 == 0:
-                                processing.set_description(f"Copying layer {layer_idx} → expert {expert_idx}")
-                            expert.gate_proj.weight.copy_(decoder_layer.mlp.gate_proj.weight)
-                            expert.up_proj.weight.copy_(decoder_layer.mlp.up_proj.weight)
-                            expert.down_proj.weight.copy_(decoder_layer.mlp.down_proj.weight)
-
-                    elif hasattr(decoder_layer.moe, 'gate_proj'):
-                        processing.set_description(f"Copying layer {layer_idx} → dense MoE")
-                        decoder_layer.moe.gate_proj.weight.copy_(decoder_layer.mlp.gate_proj.weight)
-                        decoder_layer.moe.up_proj.weight.copy_(decoder_layer.mlp.up_proj.weight)
-                        decoder_layer.moe.down_proj.weight.copy_(decoder_layer.mlp.down_proj.weight)
-                    else:
-                        raise Exception("MoE model has no MLP or shared MLP")
-                    del decoder_layer.mlp
-                processing.set_description("Copy finished")
-
+            if hasattr(base_model.model, 'layers'):
+                base_model.model = base_model._upcycle(base_model.model)
+            elif hasattr(base_model.model.language_model, 'layers'):
+                base_model.model.language_model = base_model._upcycle(base_model.model.language_model)
+            logging.get_logger('transformers').debug("MoE experts initialization completed.")
+        elif hasattr(base_model, "language_model"):
+            if hasattr(base_model.language_model, 'layers') and hasattr(base_model.language_model.layers, 'moe'):
+                logging.get_logger('transformers').debug("G3MoE Pretrained model loaded.")
+                return base_model
+            logging.get_logger('transformers').debug("Initializing MoE experts with MLP weights...")
+            base_model.language_model = base_model._upcycle(base_model.language_model)
             logging.get_logger('transformers').debug("MoE experts initialization completed.")
         else:
             logging.get_logger('transformers').info("Model does not have expected structure. MoE experts not initialized from MLP weights.")
-        logging.set_verbosity_info()
+        logging.set_verbosity_warning() 
+        return base_model
+
+    @torch.no_grad()
+    def _upcycle(self, model):
+        processing = tqdm(
+            enumerate(model.layers),
+            total=len(model.layers),
+            desc=f"Copying MLP weights to {self.__class__.__name__} MoE experts: start",
+            leave=False)
+
+        for layer_idx, decoder_layer in processing:
+            if hasattr(decoder_layer.moe, 'experts') or hasattr(decoder_layer.moe, 'shared_experts'):
+                if hasattr(decoder_layer.moe, 'shared_experts'):
+                    processing.set_description(f"Copying mlp {layer_idx} → shared experts")
+                    decoder_layer.moe.shared_experts.gate_proj.weight.copy_(decoder_layer.mlp.gate_proj.weight)
+                    decoder_layer.moe.shared_experts.up_proj.weight.copy_(decoder_layer.mlp.up_proj.weight)
+                    decoder_layer.moe.shared_experts.down_proj.weight.copy_(decoder_layer.mlp.down_proj.weight)
+
+                for expert_idx, expert in enumerate(decoder_layer.moe.experts):
+                    if expert_idx % 2 == 0:
+                        processing.set_description(f"Copying mlp {layer_idx} → expert {expert_idx}")
+                    expert.gate_proj.weight.copy_(decoder_layer.mlp.gate_proj.weight)
+                    expert.up_proj.weight.copy_(decoder_layer.mlp.up_proj.weight)
+                    expert.down_proj.weight.copy_(decoder_layer.mlp.down_proj.weight)
+
+            elif hasattr(decoder_layer.moe, 'gate_proj'):
+                processing.set_description(f"Copying mlp {layer_idx} → dense MoE")
+                decoder_layer.moe.gate_proj.weight.copy_(decoder_layer.mlp.gate_proj.weight)
+                decoder_layer.moe.up_proj.weight.copy_(decoder_layer.mlp.up_proj.weight)
+                decoder_layer.moe.down_proj.weight.copy_(decoder_layer.mlp.down_proj.weight)
+            else:
+                raise Exception("MoE model has no MLP or shared MLP")
+            del decoder_layer.mlp
+        processing.set_description("Copy finished")
         return model
 
     def get_parameter_groups(self):
@@ -1622,8 +1404,7 @@ class G3MoETextModel(G3MoEPreTrainedModel):
     Args:
         config: G3MoETextConfig
     """
-
-    config_class = G3MoETextConfig
+    config: G3MoETextConfig
 
     def __init__(self, config: G3MoETextConfig, **kwargs):
         super().__init__(config)
@@ -1643,9 +1424,9 @@ class G3MoETextModel(G3MoEPreTrainedModel):
                 "layers.*.self_attn.k_proj": "colwise",
                 "layers.*.self_attn.v_proj": "colwise",
                 "layers.*.self_attn.o_proj": "rowwise",
-                "layers.*.mlp.gate_proj": "colwise",
-                "layers.*.mlp.up_proj": "colwise",
-                "layers.*.mlp.down_proj": "rowwise",
+                "layers.*.moe.experts.*.gate_proj": "colwise",
+                "layers.*.moe.experts.*.up_proj": "colwise",
+                "layers.*.moe.experts.*.down_proj": "rowwise",
             }
             # allow overriding via config if provided
             self._tp_plan = getattr(config, "base_model_tp_plan", default_tp_plan)
@@ -1654,30 +1435,29 @@ class G3MoETextModel(G3MoEPreTrainedModel):
         self.embed_tokens = G3MoETextScaledWordEmbedding(
             config.vocab_size, config.hidden_size, self.padding_idx, embed_scale=self.config.hidden_size**0.5
         )
+        self.global_router = G3MoERouter(config)
         self.layers = nn.ModuleList(
-            [G3MoEDecoderLayer(config, layer_idx, **kwargs) for layer_idx in range(config.num_hidden_layers)]
+            [G3MoEDecoderLayer(config, layer_idx, self.global_router, **kwargs) for layer_idx in range(config.num_hidden_layers)]
         )
         self.norm = G3MoERMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = G3MoERotaryEmbedding(config=config)
         self.gradient_checkpointing = False
-        
+
         self.router_aux_loss_coef = config.router_aux_loss_coef
         # TODO: raushan fix this after RoPE refactor. For now we hack it by reassigning thetas
         # when we want to create a local RoPE layer. Config defaults should hold values for global RoPE
         config = copy.deepcopy(config)
         config.rope_theta = config.rope_local_base_freq
-        config.rope_scaling = {"rope_type": "default"}
+        config.rope_scaling = config.rope_scaling if config.rope_scaling is not None else {"rope_type":  "default"}
         self.rotary_emb_local = G3MoERotaryEmbedding(config=config)
         self.has_sliding_layers = "sliding_attention" in self.config.layer_types
 
         # Initialize weights and apply final processing
         self.post_init()
 
-    def get_input_embeddings(self):
-        return self.embed_tokens
-
-    def set_input_embeddings(self, value):
-        self.embed_tokens = value
+    @classmethod
+    def from_config(cls, **kwargs):
+        return cls._from_config(**kwargs)
 
     @can_return_tuple
     @auto_docstring
@@ -1713,11 +1493,7 @@ class G3MoETextModel(G3MoEPreTrainedModel):
             inputs_embeds = self.embed_tokens(input_ids)
 
         if use_cache and past_key_values is None and not self.training:
-            past_key_values = DynamicCache()
-        # During training, avoid generating/using mutable cache to keep checkpoint recompute deterministic
-        if self.training:
-            use_cache = False
-            past_key_values = None
+            past_key_values = DynamicCache(config=self.config)
 
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
@@ -1757,26 +1533,33 @@ class G3MoETextModel(G3MoEPreTrainedModel):
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
+        global_routing_hn = None
 
         for decoder_layer in self.layers[: self.config.num_hidden_layers]:
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
-
+        
             layer_outputs = decoder_layer(
-                    hidden_states,
-                    position_embeddings_global=position_embeddings_global,
-                    position_embeddings_local=position_embeddings_local,
-                    attention_mask=causal_mask_mapping[decoder_layer.attention_type],
-                    position_ids=position_ids,
-                    past_key_value=past_key_values,
-                    output_attentions=output_attentions,
-                    use_cache=use_cache,
-                    cache_position=cache_position,
-                    **flash_attn_kwargs,
-                )
-
+                hidden_states,
+                position_embeddings_global=position_embeddings_global,
+                position_embeddings_local=position_embeddings_local,
+                attention_mask=causal_mask_mapping[decoder_layer.attention_type],
+                position_ids=position_ids,
+                past_key_value=past_key_values,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                global_routing_hn=global_routing_hn,
+                **flash_attn_kwargs,
+            )
             hidden_states = layer_outputs[0]
-            router_logits = layer_outputs[-1]
+            routing_result = layer_outputs[-1]
+            if routing_result is not None:
+                router_logits = routing_result[0]
+                global_routing_hn = routing_result[1]
+                speciality_loss = routing_result[2]
+                cosine_similarities = routing_result[3]
+
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
 
@@ -1785,59 +1568,23 @@ class G3MoETextModel(G3MoEPreTrainedModel):
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
-        return G3MoECausalLMOutputWithPast(
-            logits=hidden_states,
+        return G3MoEModelOutputWithPast(
+            last_hidden_state=hidden_states,
             past_key_values=past_key_values,
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
             router_logits=router_logits,
+            speciality_loss=speciality_loss,
+            cosine_similarities=cosine_similarities,
         )
 
-    @torch.no_grad()
-    def _update_causal_mask(
-        self,
-        attention_mask: Union[torch.Tensor, "BlockMask"],
-        input_tensor: torch.Tensor,
-        cache_position: torch.Tensor,
-        past_key_values: HybridCache,
-        output_attentions: bool = False,
-    ):
-        # Flash Attention currently doesn't support static cache but G3MoEText work only with static cache.
-        # So we will pass in attention mask as is in any case, not only when ther's padding. Then we'll use its shape
-        # to cut out keys/values trailing 0 used in static cache. This workaround should be compile compatible
-        # as it doesn't cause dynamic control issues.
-        if self.config.attn_implementation == "flash_attention_2":
-            return attention_mask
-        if self.config.attn_implementation == "flex_attention":
-            if isinstance(attention_mask, torch.Tensor):
-                attention_mask = make_flex_block_causal_mask(attention_mask)
-            return attention_mask
 
-        dtype, device = input_tensor.dtype, input_tensor.device
-        sequence_length = input_tensor.shape[1]
-        if isinstance(past_key_values, (HybridCache, StaticCache)):
-            target_length = past_key_values.get_max_cache_shape()
-        else:
-            target_length = attention_mask.shape[-1] if attention_mask is not None else input_tensor.shape[1]
-
-        # In case the provided `attention` mask is 2D, we generate a causal mask here (4D).
-        causal_mask = self._prepare_4d_causal_attention_mask_with_cache_position(
-            attention_mask,
-            sequence_length=sequence_length,
-            target_length=target_length,
-            dtype=dtype,
-            device=device,
-            cache_position=cache_position,
-            batch_size=input_tensor.shape[0],
-        )
-        return causal_mask
-
-
+@auto_docstring
 class G3MoEForCausalLM(G3MoEPreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
-    config_class = G3MoETextConfig
+    config: G3MoETextConfig
     base_model_prefix = "language_model"
 
     def __init__(self, config: G3MoETextConfig, **kwargs):
@@ -1874,6 +1621,7 @@ class G3MoEForCausalLM(G3MoEPreTrainedModel, GenerationMixin):
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
+        pixel_values: Optional[torch.FloatTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[HybridCache] = None,
@@ -1930,6 +1678,7 @@ class G3MoEForCausalLM(G3MoEPreTrainedModel, GenerationMixin):
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs: BaseModelOutputWithPast = self.model(
             input_ids=input_ids,
+            pixel_values=pixel_values,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
@@ -1941,7 +1690,7 @@ class G3MoEForCausalLM(G3MoEPreTrainedModel, GenerationMixin):
             **loss_kwargs,
         )
 
-        hidden_states = outputs[0]
+        hidden_states = outputs.last_hidden_state
         # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])
@@ -1952,13 +1701,26 @@ class G3MoEForCausalLM(G3MoEPreTrainedModel, GenerationMixin):
 
         loss = None
         aux_loss = None
+        ortho_loss = None
         if labels is not None:
             loss = self.loss_function(logits, labels, self.vocab_size, **loss_kwargs)
-
+            # Speciality loss 추가 (스칼라 값으로 변환)
+            if outputs.speciality_loss is not None:
+                # speciality_loss는 이미 스칼라이므로 그대로 사용
+                loss += outputs.speciality_loss * 0.01  # 가중치 적용
+            
+            # Cosine similarities loss (평균값으로 변환)
+            if outputs.cosine_similarities is not None:
+                cosine_loss = outputs.cosine_similarities.mean()
+                loss += cosine_loss * 0.005  # 가중치 적용
+            
+            # HN context loss는 제거 (이미 speciality_loss에 포함됨)
+                
             # Orthogonalization loss for expert weights to encourage functional diversity
             if self.training and self.model.config.ortho_loss_coef > 0:
                 ortho_loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
                 num_moe_layers = 0
+                self.model.layer
                 for layer in self.model.layers:
                     if layer.is_dense_replacement and hasattr(layer.moe, "experts"):
                         num_moe_layers += 1
@@ -1968,6 +1730,10 @@ class G3MoEForCausalLM(G3MoEPreTrainedModel, GenerationMixin):
                 if num_moe_layers > 0:
                     ortho_loss = ortho_loss / num_moe_layers  # Average over layers
                     loss += self.model.config.ortho_loss_coef * ortho_loss
+                    ortho_loss += _orthogonal_constraint_loss(
+                        self.model.config.num_experts_per_tok, 
+                        outputs.router_logits
+                    )
 
             if outputs.router_logits is not None:
                 # Add router z-loss to prevent router from being too confident
@@ -1997,331 +1763,10 @@ class G3MoEForCausalLM(G3MoEPreTrainedModel, GenerationMixin):
             attentions=outputs.attentions,
             aux_loss=outputs.aux_loss,
             router_logits=outputs.router_logits,
-        )
-
-    def prepare_inputs_for_generation(
-        self,
-        input_ids,
-        past_key_values=None,
-        inputs_embeds=None,
-        cache_position=None,
-        position_ids=None,
-        pixel_values=None,
-        attention_mask=None,
-        token_type_ids=None,
-        use_cache=True,
-        logits_to_keep=None,
-        labels=None,
-        device='auto',
-        **kwargs,
-    ):
-        # Overwritten: has a special cache type, `HybridCache`
-        model_inputs = super().prepare_inputs_for_generation(
-            input_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            cache_position=cache_position,
-            use_cache=use_cache,
-            logits_to_keep=logits_to_keep,
-            token_type_ids=token_type_ids,
-            device=device,
-            **kwargs,
-        )
-        # If we're in cached decoding stage, pixel values should be None because input ids do not contain special image token anymore
-        # Otherwise we need pixel values to be passed to model. NOTE: use_cache=False needs pixel_values always
-        if cache_position[0] == 0:
-            model_inputs["pixel_values"] = pixel_values
-
-        return model_inputs
-
-def token_type_ids_mask_function(
-    token_type_ids: Optional[torch.Tensor],
-    image_group_ids: Optional[torch.Tensor],
-    tokens_per_image: int,
-) -> Optional[Callable]:
-    """
-    This function adds the correct offsets to the `q_idx` and `kv_idx` as the torch API can only accept lengths,
-    not start and end indices.
-    """
-    # Do not return an additional mask in this case
-    if token_type_ids is None:
-        return None
-
-    def inner_mask(batch_idx: int, head_idx: int, q_idx: int, kv_idx: int) -> bool:
-        # If it's 1 for both query and key/value, we are in an image block
-        # NOTE: static cache shape goes beyond input seq length, while token_type_ids.shape[1] == input seq length
-        # Since vmap doesn't support `if statement` we workaround it with `torch.where`
-        safe_idx = torch.where(kv_idx < token_type_ids.shape[1], kv_idx, 0)
-        token_type_ids_at_kv_idx = token_type_ids[batch_idx, safe_idx]
-        token_type_ids_at_kv_idx = torch.where(kv_idx < token_type_ids.shape[1], token_type_ids_at_kv_idx, 0)
-
-        image_group_ids_at_kv_idx = image_group_ids[batch_idx, safe_idx]
-        image_group_ids_at_kv_idx = torch.where(kv_idx < image_group_ids.shape[1], image_group_ids_at_kv_idx, -1)
-
-        is_image_block = (token_type_ids[batch_idx, q_idx] == 1) & (token_type_ids_at_kv_idx == 1)
-        same_image_block = image_group_ids[batch_idx, q_idx] == image_group_ids_at_kv_idx
-
-        # This is bidirectional attention whenever we are dealing with image tokens
-        return is_image_block & same_image_block
-
-    return inner_mask
-
-@auto_docstring(
-    custom_intro="""
-    The Base G3MoE model which consists of a vision backbone and a language model withou language modeling head.,
-    """
-)
-class G3MoEModel(G3MoEPreTrainedModel):
-    _checkpoint_conversion_mapping = {"language_model.model": "language_model"}
-
-    def __init__(self, config: G3MoEConfig, **kwargs):
-        super().__init__(config)
-        self.vision_tower = AutoModel.from_config(config=config.vision_config, **kwargs)
-        self.multi_modal_projector = G3MoEMultiModalProjector(config)
-        self.vocab_size = config.text_config.vocab_size
-
-        language_model = AutoModel.from_config(config=config.text_config, **kwargs)
-        self.language_model = language_model
-
-        self.pad_token_id = self.config.pad_token_id if self.config.pad_token_id is not None else -1
-        self.post_init()
-
-    def get_input_embeddings(self):
-        return self.language_model.get_input_embeddings()
-
-    def set_input_embeddings(self, value):
-        self.language_model.set_input_embeddings(value)
-
-    def _update_causal_mask(
-        self,
-        attention_mask,
-        token_type_ids,
-        past_key_values,
-        cache_position,
-        input_tensor,
-        is_training: bool = False,
-    ):
-        if self.config.text_config.attn_implementation == "flash_attention_2":
-            return attention_mask
-
-        if attention_mask is not None and attention_mask.dim() == 4:
-            # In this case we assume that the mask comes already in inverted
-            # form and requires no inversion or slicing.
-            return attention_mask
-
-        using_static_cache = isinstance(past_key_values, StaticCache)
-        min_dtype = torch.finfo(self.dtype).min
-        inputs_lead_dim, sequence_length = input_tensor.shape[:2]
-        if using_static_cache:
-            target_length = past_key_values.get_max_cache_shape()
-        elif isinstance(past_key_values, HybridCache):
-            target_length = past_key_values.get_max_cache_shape()
-        else:
-            target_length = (
-                attention_mask.shape[-1]
-                if isinstance(attention_mask, torch.Tensor)
-                else cache_position[0] + sequence_length + 1
-            )
-
-        if attention_mask is not None and attention_mask.dim() == 4:
-            # In this case we assume that the mask comes already in inverted form and requires no inversion or slicing.
-            return attention_mask
-
-        causal_mask = torch.full(
-            (sequence_length, target_length), fill_value=min_dtype, dtype=self.dtype, device=cache_position.device
-        )
-
-        # Causal diagonal mask only if training, otherwise attend to the whole prefix. Training-specific attn for prefix is handled below
-        if sequence_length != 1:
-            causal_mask = torch.triu(causal_mask, diagonal=1)
-
-        causal_mask *= torch.arange(target_length, device=cache_position.device) > cache_position.reshape(-1, 1)
-        causal_mask = causal_mask[None, None, :, :].expand(inputs_lead_dim, 1, -1, -1)
-
-        # Apply bidirectional mask on images if token type ids are provided
-        if token_type_ids is not None and sequence_length != 1:
-            token_type_mask = token_type_ids.unsqueeze(1) == token_type_ids.unsqueeze(2)
-            token_type_mask[token_type_ids == 0] = False  # if text token do not change anything
-
-            # Find where a new image block starts: 1 if image and previous not image
-            # The images cannot attend to future images, but can attend to all prev images and to itself bidirectionally
-            is_image = token_type_ids == 1
-            new_image_start = is_image & ~nn.functional.pad(is_image, (1, 0), value=0)[:, :-1]
-            image_group_ids = torch.cumsum(new_image_start.int(), dim=1) - 1
-            image_group_ids = torch.where(is_image, image_group_ids, torch.full_like(token_type_ids, -1))
-
-            same_image_mask = image_group_ids.unsqueeze(1) == image_group_ids.unsqueeze(2)
-            same_image_mask[image_group_ids == -1] = False  # remove non-image
-            image_mask = (token_type_mask & same_image_mask).unsqueeze(1).to(causal_mask.device, dtype=torch.bool)
-
-            causal_mask = causal_mask.clone()
-            causal_mask[:, :, :, :sequence_length] = causal_mask[:, :, :, :sequence_length].masked_fill(
-                image_mask, 0.0
-            )
-
-        if attention_mask is not None:
-            causal_mask = causal_mask.clone()  # copy to contiguous memory for in-place edit
-            mask_length = attention_mask.shape[-1]
-
-            # Then apply padding mask (will mask pad tokens)
-            padding_mask = causal_mask[:, :, :, :mask_length] + attention_mask[:, None, None, :].to(causal_mask.device)
-            padding_mask = padding_mask == 0
-            causal_mask[:, :, :, :mask_length] = causal_mask[:, :, :, :mask_length].masked_fill(
-                padding_mask, min_dtype
-            )
-
-        return causal_mask
-
-    def get_image_features(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        """
-        Projects the last hidden state from the vision model into language model space.
-
-        Args:
-            pixel_values (`torch.FloatTensor]` of shape `(batch_size, channels, height, width)`)
-               The tensors corresponding to the input images.
-        Returns:
-            image_features (`torch.Tensor`): Image feature tensor of shape `(num_images, image_length, embed_dim)`).
-        """
-        vision_outputs = self.vision_tower(pixel_values=pixel_values).last_hidden_state
-        image_features = self.multi_modal_projector(vision_outputs)
-        return image_features
-
-    @can_return_tuple
-    @auto_docstring
-    def forward(
-        self,
-        input_ids: torch.LongTensor = None,
-        pixel_values: torch.FloatTensor = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Union[List[torch.FloatTensor], Cache]] = None,
-        token_type_ids: Optional[torch.LongTensor] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        **lm_kwargs,
-    ) -> Union[Tuple, G3MoEModelOutputWithPast]:
-        r"""
-        labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
-            Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
-            config.text_config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
-            (masked), the loss is only computed for the tokens with labels in `[0, ..., config.text_config.vocab_size]`.
-
-        Example:
-
-        ```python
-        >>> from PIL import Image
-        >>> import requests
-        >>> from transformers import AutoProcessor, G3MoEForConditionalGeneration
-
-        >>> model = G3MoEForConditionalGeneration.from_pretrained("google/gemma32-3b-mix-224")
-        >>> processor = AutoProcessor.from_pretrained("google/gemma32-3b-mix-224")
-
-        >>> prompt = "Where is the cat standing?"
-        >>> url = "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/pipeline-cat-chonk.jpeg"
-        >>> image = Image.open(requests.get(url, stream=True).raw)
-
-        >>> inputs = processor(images=image, text=prompt,  return_tensors="pt")
-
-        >>> # Generate
-        >>> generate_ids = model.generate(**inputs,)
-        >>> processor.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
-        "Where is the cat standing?\nsnow"
-        ```"""
-        if (input_ids is None) ^ (inputs_embeds is not None):
-            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
-
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-        is_training = token_type_ids is not None and labels is not None
-
-        # Replace image id woth PAD if the image token if OOV, to avoid index-errors
-        if input_ids is not None and self.config.image_token_id >= self.vocab_size:
-            special_image_mask = input_ids == self.config.image_token_id
-            llm_input_ids = input_ids.clone()
-            llm_input_ids[special_image_mask] = 0
-        else:
-            llm_input_ids = input_ids
-
-        if inputs_embeds is None:
-            inputs_embeds = self.get_input_embeddings()(llm_input_ids)
-
-        if cache_position is None:
-            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
-            cache_position = torch.arange(
-                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
-            )
-                
-        # Merge text and images
-        if pixel_values is not None:
-            image_features = self.get_image_features(pixel_values)
-            image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
-            special_image_mask = self.get_placeholder_mask(
-                input_ids, inputs_embeds=inputs_embeds, image_features=image_features
-            )
-            inputs_embeds = inputs_embeds.masked_scatter(special_image_mask, image_features)
-
-        # It may already have been prepared by e.g. `generate`
-        if not isinstance(causal_mask_mapping := attention_mask, dict):
-            # Prepare mask arguments
-            mask_kwargs = {
-                "config": self.config.get_text_config(),
-                "input_embeds": inputs_embeds,
-                "attention_mask": attention_mask,
-                "cache_position": cache_position,
-                "past_key_values": past_key_values,
-                "position_ids": position_ids,
-            }
-            if token_type_ids is not None and inputs_embeds.shape[1] != 1:
-                # We need to pass an additional mask function to account for token type ids, and it needs to be an `or`
-
-                # First find where a new image block starts: 1 if image and previous not image
-                # The images cannot attend to future images, but can attend to all prev images and to itself bidirectionally
-                is_image = (token_type_ids == 1).to(cache_position.device)
-                new_image_start = is_image & ~nn.functional.pad(is_image, (1, 0), value=0)[:, :-1]
-                image_group_ids = torch.cumsum(new_image_start.int(), dim=1) - 1
-                image_group_ids = torch.where(is_image, image_group_ids, torch.full_like(token_type_ids, -1))
-                mask_kwargs["or_mask_function"] = token_type_ids_mask_function(
-                    token_type_ids.to(cache_position.device), image_group_ids, self.config.mm_tokens_per_image
-                )
-
-            # Create the masks
-            causal_mask_mapping = {
-                "full_attention": create_causal_mask(**mask_kwargs),
-                "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
-            }
-        
-        outputs = self.language_model(
-            attention_mask=causal_mask_mapping,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=True,
-            cache_position=cache_position,
-            **lm_kwargs,
-        )
-
-        return G3MoEModelOutputWithPast(
-            last_hidden_state=outputs.last_hidden_state,
-            past_key_values=outputs.past_key_values if use_cache else None,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
-            image_hidden_states=image_features if pixel_values is not None else None,
-            aux_loss=outputs.aux_loss,
-            router_logits=outputs.router_logits,
+            ortho_loss=ortho_loss,
+            speciality_loss=outputs.speciality_loss,
+            cosine_similarities=outputs.cosine_similarities,
+            # hn_context 제거 - 차원 문제로 인해 사용하지 않음
         )
 
 
@@ -2361,6 +1806,249 @@ class G3MoEMultiModalProjector(nn.Module):
         return projected_vision_outputs.type_as(vision_outputs)
 
 
+def token_type_ids_mask_function(
+    token_type_ids: Optional[torch.Tensor],
+    image_group_ids: Optional[torch.Tensor],
+    tokens_per_image: int,
+) -> Optional[Callable]:
+    """
+    This function adds the correct offsets to the `q_idx` and `kv_idx` as the torch API can only accept lengths,
+    not start and end indices.
+    """
+    # Do not return an additional mask in this case
+    if token_type_ids is None:
+        return None
+
+    def inner_mask(batch_idx: int, head_idx: int, q_idx: int, kv_idx: int) -> bool:
+        # If it's 1 for both query and key/value, we are in an image block
+        # NOTE: static cache shape goes beyond input seq length, while token_type_ids.shape[1] == input seq length
+        # Since vmap doesn't support `if statement` we workaround it with `torch.where`
+        safe_idx = torch.where(kv_idx < token_type_ids.shape[1], kv_idx, 0)
+        token_type_ids_at_kv_idx = token_type_ids[batch_idx, safe_idx]
+        token_type_ids_at_kv_idx = torch.where(kv_idx < token_type_ids.shape[1], token_type_ids_at_kv_idx, 0)
+
+        image_group_ids_at_kv_idx = image_group_ids[batch_idx, safe_idx]
+        image_group_ids_at_kv_idx = torch.where(kv_idx < image_group_ids.shape[1], image_group_ids_at_kv_idx, -1)
+
+        is_image_block = (token_type_ids[batch_idx, q_idx] == 1) & (token_type_ids_at_kv_idx == 1)
+        same_image_block = image_group_ids[batch_idx, q_idx] == image_group_ids_at_kv_idx
+
+        # This is bidirectional attention whenever we are dealing with image tokens
+        return is_image_block & same_image_block
+
+    return inner_mask
+
+
+@auto_docstring(
+    custom_intro="""
+    The Base G3MoE model which consists of a vision backbone and a language model withou language modeling head.,
+    """
+)
+class G3MoEModel(G3MoEPreTrainedModel):
+    _checkpoint_conversion_mapping = {"language_model.model": "language_model"}
+    # we are filtering the logits/labels so we shouldn't divide the loss based on num_items_in_batch
+    accepts_loss_kwargs = False
+
+    def __init__(self, config: G3MoEConfig):
+        super().__init__(config)
+        self.vision_tower = AutoModel.from_config(config=config.vision_config)
+        self.multi_modal_projector = G3MoEMultiModalProjector(config=config)
+        self.vocab_size = config.text_config.vocab_size
+
+        language_model = AutoModel.from_config(config=config.text_config)
+        self.language_model = language_model
+        self.pad_token_id = self.config.pad_token_id if self.config.pad_token_id is not None else -1
+        self.post_init()
+
+    def get_input_embeddings(self):
+        return self.language_model.get_input_embeddings()
+
+    def set_input_embeddings(self, value):
+        self.language_model.set_input_embeddings(value)
+
+    def set_decoder(self, decoder):
+        self.language_model = decoder
+
+    def get_decoder(self):
+        return self.language_model
+
+    def get_image_features(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        """
+        Projects the last hidden state from the vision model into language model space.
+
+        Args:
+            pixel_values (`torch.FloatTensor]` of shape `(batch_size, channels, height, width)`)
+               The tensors corresponding to the input images.
+        Returns:
+            image_features (`torch.Tensor`): Image feature tensor of shape `(num_images, image_length, embed_dim)`).
+        """
+        vision_outputs = self.vision_tower(pixel_values=pixel_values).last_hidden_state
+        image_features = self.multi_modal_projector(vision_outputs)
+        return image_features
+
+    def get_placeholder_mask(
+        self, input_ids: torch.LongTensor, inputs_embeds: torch.FloatTensor, image_features: torch.FloatTensor
+    ):
+        """
+        Obtains multimodal placeholder mask from `input_ids` or `inputs_embeds`, and checks that the placeholder token count is
+        equal to the length of multimodal features. If the lengths are different, an error is raised.
+        """
+        if input_ids is None:
+            special_image_mask = inputs_embeds == self.get_input_embeddings()(
+                torch.tensor(self.config.image_token_id, dtype=torch.long, device=inputs_embeds.device)
+            )
+            special_image_mask = special_image_mask.all(-1)
+        else:
+            special_image_mask = input_ids == self.config.image_token_id
+
+        n_image_tokens = special_image_mask.sum()
+        special_image_mask = special_image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
+        n_image_features = image_features.shape[0] * image_features.shape[1]
+        if inputs_embeds[special_image_mask].numel() != image_features.numel():
+            raise ValueError(
+                f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {n_image_features}"
+            )
+        return special_image_mask
+
+    @can_return_tuple
+    @auto_docstring
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        pixel_values: torch.FloatTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Union[list[torch.FloatTensor], Cache]] = None,
+        token_type_ids: Optional[torch.LongTensor] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        **lm_kwargs,
+    ) -> Union[tuple, G3MoEModelOutputWithPast]:
+        r"""
+        labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
+            Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
+            config.text_config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
+            (masked), the loss is only computed for the tokens with labels in `[0, ..., config.text_config.vocab_size]`.
+
+        Example:
+
+        ```python
+        >>> from PIL import Image
+        >>> import requests
+        >>> from transformers import AutoProcessor, G3MoEForConditionalGeneration
+
+        >>> model = G3MoEForConditionalGeneration.from_pretrained("google/gemma32-3b-mix-224")
+        >>> processor = AutoProcessor.from_pretrained("google/gemma32-3b-mix-224")
+
+        >>> prompt = "Where is the cat standing?"
+        >>> url = "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/pipeline-cat-chonk.jpeg"
+        >>> image = Image.open(requests.get(url, stream=True).raw)
+
+        >>> inputs = processor(images=image, text=prompt,  return_tensors="pt")
+
+        >>> # Generate
+        >>> generate_ids = model.generate(**inputs,)
+        >>> processor.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
+        "Where is the cat standing?\nsnow"
+        ```"""
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        # Replace image id with PAD if the image token if OOV, to avoid index-errors
+        if input_ids is not None and self.config.image_token_id >= self.vocab_size:
+            special_image_mask = input_ids == self.config.image_token_id
+            llm_input_ids = input_ids.clone()
+            llm_input_ids[special_image_mask] = 0
+        else:
+            llm_input_ids = input_ids
+
+        if inputs_embeds is None:
+            inputs_embeds = self.get_input_embeddings()(llm_input_ids)
+
+        if cache_position is None:
+            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            cache_position = torch.arange(
+                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
+            )
+
+        # Merge text and images
+        if pixel_values is not None:
+            image_features = self.get_image_features(pixel_values)
+            image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
+            special_image_mask = self.get_placeholder_mask(
+                input_ids, inputs_embeds=inputs_embeds, image_features=image_features
+            )
+            inputs_embeds = inputs_embeds.masked_scatter(special_image_mask, image_features)
+
+        # It may already have been prepared by e.g. `generate`
+        if not isinstance(causal_mask_mapping := attention_mask, dict):
+            # Prepare mask arguments
+            mask_kwargs = {
+                "config": self.config.get_text_config(),
+                "input_embeds": inputs_embeds,
+                "attention_mask": attention_mask,
+                "cache_position": cache_position,
+                "past_key_values": past_key_values,
+                "position_ids": position_ids,
+            }
+            if token_type_ids is not None and inputs_embeds.shape[1] != 1:
+                # We need to pass an additional mask function to account for token type ids, and it needs to be an `or`
+
+                # First find where a new image block starts: 1 if image and previous not image
+                # The images cannot attend to future images, but can attend to all prev images and to itself bidirectionally
+                is_image = (token_type_ids == 1).to(cache_position.device)
+                new_image_start = is_image & ~nn.functional.pad(is_image, (1, 0), value=0)[:, :-1]
+                image_group_ids = torch.cumsum(new_image_start.int(), dim=1) - 1
+                image_group_ids = torch.where(
+                    is_image, image_group_ids, torch.full_like(token_type_ids, -1, device=is_image.device)
+                )
+                mask_kwargs["or_mask_function"] = token_type_ids_mask_function(
+                    token_type_ids.to(cache_position.device), image_group_ids, self.config.mm_tokens_per_image
+                )
+
+            # Create the masks
+            causal_mask_mapping = {
+                "full_attention": create_causal_mask(**mask_kwargs),
+                "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
+            }
+
+        outputs = self.language_model(
+            attention_mask=causal_mask_mapping,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=True,
+            cache_position=cache_position,
+            **lm_kwargs,
+        )
+
+        return G3MoEModelOutputWithPast(
+            last_hidden_state=outputs.last_hidden_state,
+            past_key_values=outputs.past_key_values if use_cache else None,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+            image_hidden_states=image_features if pixel_values is not None else None,
+            aux_loss=outputs.aux_loss,
+            router_logits=outputs.router_logits,
+            ortho_loss=outputs.ortho_loss,
+            speciality_loss=outputs.speciality_loss,
+        )
+
+
 @add_start_docstrings(
     """The G3MoE model which consists of a vision backbone and a language model.""",
     G3MoE_START_DOCSTRING,
@@ -2376,7 +2064,8 @@ class G3MoEForConditionalGeneration(G3MoEPreTrainedModel, GenerationMixin):
   
     def __init__(self, config: G3MoEConfig, **kwargs):
         super().__init__(config)
-        self.model = G3MoEModel(config, **kwargs)
+        print(kwargs)
+        self.model = G3MoEModel(config)
         self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
         self.post_init()
 
@@ -2386,13 +2075,16 @@ class G3MoEForConditionalGeneration(G3MoEPreTrainedModel, GenerationMixin):
     def set_input_embeddings(self, value):
         self.model.set_input_embeddings(value)
 
-    def get_output_embeddings(self):
-        return self.lm_head
+    def set_decoder(self, decoder):
+        self.model.set_decoder(decoder)
 
-    def set_output_embeddings(self, new_embeddings):
-        self.lm_head = new_embeddings
+    def get_decoder(self):
+        return self.model.get_decoder()
 
-    # Make modules available throught conditional class for BC
+    def get_image_features(self, pixel_values):
+        return self.model.get_image_features(pixel_values)
+
+    # Make modules available through conditional class for BC
     @property
     def language_model(self):
         return self.model.language_model
@@ -2475,7 +2167,7 @@ class G3MoEForConditionalGeneration(G3MoEPreTrainedModel, GenerationMixin):
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        outputs = self.model(
+        outputs: G3MoEModelOutputWithPast = self.model(
             input_ids=input_ids,
             pixel_values=pixel_values,
             token_type_ids=token_type_ids,
@@ -2491,13 +2183,18 @@ class G3MoEForConditionalGeneration(G3MoEPreTrainedModel, GenerationMixin):
             cache_position=cache_position,
             **lm_kwargs,
         )
-
-        hidden_states = outputs[0]
+        hidden_states = outputs.last_hidden_state
         # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])
-
+        if self.config.final_logit_softcapping is not None:
+            logits = logits / self.config.final_logit_softcapping
+            logits = torch.tanh(logits)
+            logits = logits * self.config.final_logit_softcapping
+            
         loss = None
+        aux_loss = None
+        ortho_loss = None
         if labels is not None:
             # Upcast to float if we need to compute the loss to avoid potential precision issues
             logits = logits.float()
@@ -2518,6 +2215,46 @@ class G3MoEForConditionalGeneration(G3MoEPreTrainedModel, GenerationMixin):
             flat_logits = shift_logits.view(-1, self.config.text_config.vocab_size)
             flat_labels = shift_labels.view(-1).to(shift_logits.device)
             loss = loss_fct(flat_logits, flat_labels)
+                            # Speciality loss 추가 (스칼라 값으로 변환)
+            if outputs.speciality_loss is not None:
+                # speciality_loss는 이미 스칼라이므로 그대로 사용
+                loss += outputs.speciality_loss * 0.01  # 가중치 적용
+            
+            # Cosine similarities loss (평균값으로 변환)
+            if outputs.cosine_similarities is not None:
+                cosine_loss = outputs.cosine_similarities.mean()
+                loss += cosine_loss * 0.005  # 가중치 적용
+            
+            # Orthogonalization loss for expert weights to encourage functional diversity
+            if self.training and self.model.config.ortho_loss_coef > 0:
+                ortho_loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
+                num_moe_layers = 0
+                for layer in self.model.layers:
+                    if layer.is_dense_replacement and hasattr(layer.moe, "experts"):
+                        num_moe_layers += 1
+                        expert_weights = [expert.down_proj.weight for expert in layer.moe.experts]
+                        ortho_loss += calculate_ortho_loss_for_experts(expert_weights)
+
+                if num_moe_layers > 0:
+                    ortho_loss = ortho_loss / num_moe_layers  # Average over layers
+                    loss += self.model.config.ortho_loss_coef * ortho_loss
+                    ortho_loss += _orthogonal_constraint_loss(
+                        self.model.config.num_experts_per_tok, 
+                        outputs.router_logits
+                    )
+
+            if outputs.router_logits is not None:
+                # Add router z-loss to prevent router from being too confident
+                aux_loss = load_balancing_loss_func(
+                    outputs.router_logits,
+                    self.model.config.n_routed_experts,
+                    self.model.config.num_experts_per_tok,
+                    attention_mask,
+                    router_z_loss_coef=self.model.config.router_z_loss_coef,
+                    router_entropy_coef=getattr(self.model.config, "router_entropy_coef", 0.0),
+                    usage_uniformity_coef=getattr(self.model.config, "usage_uniformity_coef", 0.0),
+                )
+                loss += self.model.config.router_aux_loss_coef * aux_loss
 
         if not return_dict:
             output = (logits,) + outputs[1:]
@@ -2531,6 +2268,7 @@ class G3MoEForConditionalGeneration(G3MoEPreTrainedModel, GenerationMixin):
             attentions=outputs.attentions,
             image_hidden_states=outputs.image_hidden_states,
             aux_loss=outputs.aux_loss,
+            ortho_loss=ortho_loss,
             router_logits=outputs.router_logits,
         )
 
@@ -2569,61 +2307,42 @@ class G3MoEForConditionalGeneration(G3MoEPreTrainedModel, GenerationMixin):
             model_inputs["pixel_values"] = pixel_values
 
         return model_inputs
-
+    
     @staticmethod
-    def _prepare_4d_causal_attention_mask_with_cache_position(
-        attention_mask: torch.Tensor,
-        sequence_length: int,
-        target_length: int,
-        dtype: torch.dtype,
+    def create_masks_for_generate(
+        config: PretrainedConfig,
+        input_embeds: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
         cache_position: torch.Tensor,
-        batch_size: int,
+        past_key_values: Optional[Cache],
+        position_ids: Optional[torch.Tensor],
+        token_type_ids: Optional[torch.Tensor] = None,
         **kwargs,
-    ):
-        """
-        Creates a causal 4D mask of shape `(batch_size, 1, query_length, key_value_length)` from a 2D mask of shape
-        `(batch_size, key_value_length)`, or if the input `attention_mask` is already 4D, do nothing.
+    ) -> dict:
+        # Prepare mask arguments
+        mask_kwargs = {
+            "config": config.get_text_config(),
+            "input_embeds": input_embeds,
+            "attention_mask": attention_mask,
+            "cache_position": cache_position,
+            "past_key_values": past_key_values,
+            "position_ids": position_ids,
+        }
+        # Add the token type ids mask for generate as well
+        if token_type_ids is not None and input_embeds.shape[1] != 1:
+            # We need to pass an additional mask function to account for token type ids, and it needs to be an `or`
 
-        Args:
-            attention_mask (`torch.Tensor`):
-                A 2D attention mask of shape `(batch_size, key_value_length)` or a 4D attention mask of shape
-                `(batch_size, 1, query_length, key_value_length)`.
-            sequence_length (`int`):
-                The sequence length being processed.
-            target_length (`int`):
-                The target length: when generating with static cache, the mask should be as long as the static cache,
-                to account for the 0 padding, the part of the cache that is not filled yet.
-            dtype (`torch.dtype`):
-                The dtype to use for the 4D attention mask.
-            cache_position (`torch.Tensor`):
-                Indices depicting the position of the input sequence tokens in the sequence.
-            batch_size (`torch.Tensor`):
-                Batch size.
-        """
-        if attention_mask is not None and attention_mask.dim() == 4:
-            # In this case we assume that the mask comes already in inverted form and requires no inversion or slicing.
-            causal_mask = attention_mask
-        else:
-            min_dtype = torch.finfo(dtype).min
-            causal_mask = torch.full(
-                (sequence_length, target_length), fill_value=min_dtype, dtype=dtype, device=cache_position.device
+            # First find where a new image block starts: 1 if image and previous not image
+            # The images cannot attend to future images, but can attend to all prev images and to itself bidirectionally
+            is_image = (token_type_ids == 1).to(cache_position.device)
+            new_image_start = is_image & ~nn.functional.pad(is_image, (1, 0), value=0)[:, :-1]
+            image_group_ids = torch.cumsum(new_image_start.int(), dim=1) - 1
+            image_group_ids = torch.where(is_image, image_group_ids, torch.full_like(token_type_ids, -1))
+            mask_kwargs["or_mask_function"] = token_type_ids_mask_function(
+                token_type_ids.to(cache_position.device), image_group_ids, config.mm_tokens_per_image
             )
-            if sequence_length != 1:
-                causal_mask = torch.triu(causal_mask, diagonal=1)
-            causal_mask *= torch.arange(target_length, device=cache_position.device) > cache_position.reshape(-1, 1)
-            causal_mask = causal_mask[None, None, :, :].expand(batch_size, 1, -1, -1)
-            if attention_mask is not None:
-                causal_mask = causal_mask.clone()  # copy to contiguous memory for in-place edit
-                mask_length = attention_mask.shape[-1]
-                padding_mask = causal_mask[:, :, :, :mask_length] + attention_mask[:, None, None, :].to(
-                    causal_mask.device
-                )
-                padding_mask = padding_mask == 0
-                causal_mask[:, :, :, :mask_length] = causal_mask[:, :, :, :mask_length].masked_fill(
-                    padding_mask, min_dtype
-                )
 
-        return causal_mask
+        return create_masks_for_generate(**mask_kwargs)
 
 
 __all__ = [
