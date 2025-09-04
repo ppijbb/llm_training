@@ -127,6 +127,16 @@ class TorchMoECallback:
                         if torch.is_tensor(val):
                             val = val.detach().to('cpu')
                         lightweight_entry['avg_routing_entropy'] = val
+                    if 'ortho_loss' in routing_info and routing_info['ortho_loss'] is not None:
+                        val = routing_info['ortho_loss']
+                        if torch.is_tensor(val):
+                            val = val.detach().to('cpu')
+                        lightweight_entry['ortho_loss'] = val
+                    if 'aux_loss' in routing_info and routing_info['aux_loss'] is not None:
+                        val = routing_info['aux_loss']
+                        if torch.is_tensor(val):
+                            val = val.detach().to('cpu')
+                        lightweight_entry['aux_loss'] = val
                     self.layer_outputs[layer_name] = lightweight_entry
                     if self.step % 100 == 0:  # 100스텝마다 디버깅
                         self._log_debug(f"{layer_name}: extracted {list(routing_info.keys())}")
@@ -230,6 +240,11 @@ class TorchMoECallback:
                 probs = probs.view(-1, probs.size(-1))
             token_entropy = -torch.sum(probs * torch.log(probs + 1e-10), dim=-1)
             routing_info['avg_routing_entropy'] = token_entropy.mean()
+        
+        if hasattr(output, 'ortho_loss'):
+            routing_info['ortho_loss'] = output.ortho_loss
+        if hasattr(output, 'aux_loss'):
+            routing_info['aux_loss'] = output.aux_loss
 
         return routing_info if routing_info else None
     
@@ -618,4 +633,4 @@ def create_moe_callback_for_pytorch(
         **kwargs
     )
     
-    return callback.register_model(model) 
+    return callback.register_model(model)
