@@ -16,6 +16,8 @@ def process_content(contents_list):
         processed_contents.append({"type": key, key: contents_list[key][index]})
     return processed_contents
 
+total_tokens = 0
+
 def processing(
     example, # Changed from 'examples' to 'example' to reflect single row
     tokenizer,
@@ -41,7 +43,12 @@ def processing(
                 "content": process_content(c)
                 } 
                 for r, c in zip(conversation["role"], conversation["content"])]
+            result = tokenizer.apply_chat_template(conversation, tokenize=True)
 
+            tokens_by_seq = len(result)
+            assert bool(result), "Tokenization failed"
+            global total_tokens
+            total_tokens += tokens_by_seq
         else:
             return None # Skip this example
     
@@ -57,7 +64,8 @@ def processing(
 
 tokenizer = AutoTokenizer.from_pretrained("Gunulhona/Gemma-3-4B")
 data = load_dataset("Gunulhona/open_m_3")
-data = data['train'].map(processing, batched=False, fn_kwargs={"tokenizer": tokenizer},)
+data['train'] = data['train'].map(processing, batched=False, fn_kwargs={"tokenizer": tokenizer},)
+print("Processed total tokens: ", total_tokens)
 test = data['train'].select(range(3))
 print(test['messages'])
 data.push_to_hub("Gunulhona/open_m_3")
