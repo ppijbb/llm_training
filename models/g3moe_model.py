@@ -1694,10 +1694,10 @@ class G3MoEForCausalLM(G3MoEPreTrainedModel, GenerationMixin):
         # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])
-        if self.config.final_logit_softcapping is not None:
-            logits = logits / self.config.final_logit_softcapping
+        if self.config.text_config.final_logit_softcapping is not None:
+            logits = logits / self.config.text_config.final_logit_softcapping
             logits = torch.tanh(logits)
-            logits = logits * self.config.final_logit_softcapping
+            logits = logits * self.config.text_config.final_logit_softcapping
 
         loss = None
         aux_loss = None
@@ -1717,10 +1717,10 @@ class G3MoEForCausalLM(G3MoEPreTrainedModel, GenerationMixin):
             # HN context loss는 제거 (이미 speciality_loss에 포함됨)
                 
             # Orthogonalization loss for expert weights to encourage functional diversity
-            if self.training and self.model.config.ortho_loss_coef > 0:
+            if self.training and self.config.text_config.ortho_loss_coef > 0:
                 ortho_loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
                 num_moe_layers = 0
-                self.model.layer
+                
                 for layer in self.model.layers:
                     if layer.is_dense_replacement and hasattr(layer.moe, "experts"):
                         num_moe_layers += 1
@@ -1729,9 +1729,9 @@ class G3MoEForCausalLM(G3MoEPreTrainedModel, GenerationMixin):
 
                 if num_moe_layers > 0:
                     ortho_loss = ortho_loss / num_moe_layers  # Average over layers
-                    loss += self.model.config.ortho_loss_coef * ortho_loss
+                    loss += self.config.text_config.ortho_loss_coef * ortho_loss
                     ortho_loss += _orthogonal_constraint_loss(
-                        self.model.config.num_experts_per_tok, 
+                        self.model.config.n_routed_experts, 
                         outputs.router_logits
                     )
 
@@ -2064,7 +2064,6 @@ class G3MoEForConditionalGeneration(G3MoEPreTrainedModel, GenerationMixin):
   
     def __init__(self, config: G3MoEConfig, **kwargs):
         super().__init__(config)
-        print(kwargs)
         self.model = G3MoEModel(config)
         self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
         self.post_init()
@@ -2187,10 +2186,10 @@ class G3MoEForConditionalGeneration(G3MoEPreTrainedModel, GenerationMixin):
         # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])
-        if self.config.final_logit_softcapping is not None:
-            logits = logits / self.config.final_logit_softcapping
+        if self.config.text_config.final_logit_softcapping is not None:
+            logits = logits / self.config.text_config.final_logit_softcapping
             logits = torch.tanh(logits)
-            logits = logits * self.config.final_logit_softcapping
+            logits = logits * self.config.text_config.final_logit_softcapping
             
         loss = None
         aux_loss = None
@@ -2226,10 +2225,10 @@ class G3MoEForConditionalGeneration(G3MoEPreTrainedModel, GenerationMixin):
                 loss += cosine_loss * 0.005  # 가중치 적용
             
             # Orthogonalization loss for expert weights to encourage functional diversity
-            if self.training and self.model.config.ortho_loss_coef > 0:
+            if self.training and self.config.text_config.ortho_loss_coef > 0:
                 ortho_loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
                 num_moe_layers = 0
-                for layer in self.model.layers:
+                for layer in self.language_model.layers:
                     if layer.is_dense_replacement and hasattr(layer.moe, "experts"):
                         num_moe_layers += 1
                         expert_weights = [expert.down_proj.weight for expert in layer.moe.experts]
@@ -2237,9 +2236,9 @@ class G3MoEForConditionalGeneration(G3MoEPreTrainedModel, GenerationMixin):
 
                 if num_moe_layers > 0:
                     ortho_loss = ortho_loss / num_moe_layers  # Average over layers
-                    loss += self.model.config.ortho_loss_coef * ortho_loss
+                    loss += self.config.text_config.ortho_loss_coef * ortho_loss
                     ortho_loss += _orthogonal_constraint_loss(
-                        self.model.config.num_experts_per_tok, 
+                        self.config.text_config.n_routed_experts, 
                         outputs.router_logits
                     )
 
@@ -2247,14 +2246,14 @@ class G3MoEForConditionalGeneration(G3MoEPreTrainedModel, GenerationMixin):
                 # Add router z-loss to prevent router from being too confident
                 aux_loss = load_balancing_loss_func(
                     outputs.router_logits,
-                    self.model.config.n_routed_experts,
-                    self.model.config.num_experts_per_tok,
+                    self.config.text_config.n_routed_experts,
+                    self.config.text_config.num_experts_per_tok,
                     attention_mask,
-                    router_z_loss_coef=self.model.config.router_z_loss_coef,
-                    router_entropy_coef=getattr(self.model.config, "router_entropy_coef", 0.0),
-                    usage_uniformity_coef=getattr(self.model.config, "usage_uniformity_coef", 0.0),
+                    router_z_loss_coef=self.config.text_config.router_z_loss_coef,
+                    router_entropy_coef=getattr(self.config.text_config, "router_entropy_coef", 0.0),
+                    usage_uniformity_coef=getattr(self.config.text_config, "usage_uniformity_coef", 0.0),
                 )
-                loss += self.model.config.router_aux_loss_coef * aux_loss
+                loss += self.config.text_config.router_aux_loss_coef * aux_loss
 
         if not return_dict:
             output = (logits,) + outputs[1:]
