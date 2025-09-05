@@ -254,7 +254,8 @@ class TorchMoECallback:
     
     def on_step_end(self, **kwargs):
         """Step 종료 시 호출"""
-        self.step += 1
+        if self.is_main_process:
+            self.step += 1
         
         if not self.layer_outputs:
             self._log_debug(f"Step {self.step}: no routing info captured.")
@@ -294,7 +295,8 @@ class TorchMoECallback:
             
             expert_assignments = routing_info.get('expert_assignments')
             routing_probs = routing_info.get('routing_probs')
-            num_experts = routing_info.get('num_experts', self.num_experts)  # 기본값
+            # 일관된 num_experts 사용 (스텝마다 변하지 않도록)
+            num_experts = self.num_experts
             
             if expert_assignments is not None:
                 if expert_assignments.is_cuda: # GPU tensor인 경우에만
@@ -389,7 +391,21 @@ class TorchMoECallback:
             
             for layer_name in self.expert_usage_history:
                 if len(self.expert_usage_history[layer_name]) > 10:
-                    usage_matrix = torch.stack(list(self.expert_usage_history[layer_name]))
+                    # 모든 텐서를 동일한 크기로 맞추기 위해 최대 크기로 패딩
+                    usage_tensors = list(self.expert_usage_history[layer_name])
+                    max_size = max(tensor.size(0) for tensor in usage_tensors)
+                    
+                    # 각 텐서를 최대 크기로 패딩
+                    padded_tensors = []
+                    for tensor in usage_tensors:
+                        if tensor.size(0) < max_size:
+                            padding = torch.zeros(max_size - tensor.size(0), dtype=tensor.dtype)
+                            padded_tensor = torch.cat([tensor, padding])
+                        else:
+                            padded_tensor = tensor
+                        padded_tensors.append(padded_tensor)
+                    
+                    usage_matrix = torch.stack(padded_tensors)
                     usage_matrix = usage_matrix.float()
                     
                     # 정규화
