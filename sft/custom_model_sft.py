@@ -33,7 +33,7 @@ import wandb
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Import custom modules  
-from models import G3MoEForCausalLM, G3MoEConfig, G3MoEForConditionalGeneration
+from models import G3MoEForCausalLM, G3MoEConfig, G3MoEForConditionalGeneration, G3MoETextConfig, G3MoETextModel, G3MoEModel
 from data.base_model_sft_dataset import get_dataset, create_multimodal_collate_fn
 from data.simple_sft_dataset import get_simple_sft_dataset, create_simple_collate_fn, smoltalk_dataset, orca_mini_dataset
 
@@ -46,14 +46,22 @@ from eval.moe_monitoring_callback import create_moe_callback_for_transformers
 
 # Register custom optimizers with DeepSpeed
 register_custom_optimizers()
+try:
+    # AutoConfig.register("g3moe", G3MoEConfig)
+    AutoConfig.register("g3moe", G3MoEConfig)
+    AutoConfig.register("g3moe_text", G3MoETextConfig)
+    AutoModel.register(G3MoEConfig, G3MoEModel)
+    AutoModel.register(G3MoETextConfig, G3MoETextModel)
+    AutoModelForCausalLM.register(G3MoETextConfig, G3MoEForCausalLM)
 
-# AutoConfig.register("g3moe", G3MoEConfig)
-AutoConfig.register("g3moe", G3MoEConfig)
-AutoConfig.register("g3moe_text", G3MoETextConfig)
-AutoModel.register(G3MoEConfig, G3MoEModel)
-AutoModel.register(G3MoETextConfig, G3MoETextModel)
-AutoModelForCausalLM.register(G3MoETextConfig, G3MoEForCausalLM)
-
+    from transformers.modeling_utils import VLMS
+    VLMS.append("g3moe")
+except Exception as e:
+    import traceback
+    traceback.format_exc()
+    print(f"Failed to register G3MoE model: {e}")
+    print("G3MoE cannot train without registering model... exiting...")
+    raise e
 
 logging.enable_progress_bar()
 logging.set_verbosity_warning()
@@ -519,24 +527,24 @@ def main(
     trainer.add_callback(
         create_moe_callback_for_transformers(
             num_experts=model_config["g3moe_params"]["n_routed_experts"],
-            log_every_n_steps=50,       # 50 스텝마다 로그 기록
-            logger=wandb,               # 사용할 로거 지정 (wandb)
-            log_to_console=True,        # 콘솔에도 주요 메트릭 출력
-            # === (선택사항) ===
-            log_heatmap_every=500,      # 500 스텝마다 Expert 사용률 히트맵 로깅
+            log_every_n_steps=1,           # 50 스텝마다 로그 기록
+            logger=wandb,                  # 사용할 로거 지정 (wandb)
+            log_to_console=True,           # 콘솔에도 주요 메트릭 출력
+                                           # === (선택사항) ===
+            log_heatmap_every=5,           # 500 스텝마다 Expert 사용률 히트맵 로깅
             alert_threshold_imbalance=4.0, # 특정 Expert 사용률이 평균의 4배를 초과하면 경고
             unused_expert_threshold=0.25,  # 25% 이상의 Expert가 미사용되면 경고
             entropy_threshold=0.1,         # 라우팅 엔트로피가 0.1 미만이면 경고
             save_detailed_logs=False       # 상세 JSON 로그 저장 여부
         ))
-    trainer.add_callback(
-        ModelEvalCallback(
-            trainer=trainer,  # Will be set by Trainer
-            enable_benchmarks=True,  # Enable benchmark evaluation
-            benchmarks_to_run=['mmlu', 'hellaswag', 'gsm8k', 'truthfulqa', 'arc', 'piqa'],  # Run multiple benchmarks
-            benchmark_eval_frequency=training_config["eval_steps"],  # Run benchmarks every 2 epochs
-            mme_max_samples=10,  # Limit MME samples for faster evaluation
-        ))
+    # trainer.add_callback(
+    #     ModelEvalCallback(
+    #         trainer=trainer,  # Will be set by Trainer
+    #         enable_benchmarks=True,  # Enable benchmark evaluation
+    #         benchmarks_to_run=['mmlu', 'hellaswag', 'gsm8k', 'truthfulqa', 'arc', 'piqa'],  # Run multiple benchmarks
+    #         benchmark_eval_frequency=training_config["eval_steps"],  # Run benchmarks every 2 epochs
+    #         mme_max_samples=10,  # Limit MME samples for faster evaluation
+    #     ))
     trainer.add_callback(
         IFEvalCallback(
             eval_dataset_name="google/IFEval",

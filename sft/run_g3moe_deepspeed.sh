@@ -12,9 +12,9 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-echo -e "${GREEN}========================================${NC}"
-echo -e "${GREEN}    G3MoE SFT DeepSpeed Training       ${NC}"
-echo -e "${GREEN}========================================${NC}"
+echo -e "${GREEN}================================================================================${NC}"
+echo -e "${GREEN}        Multi Modal G3MoE SFT DeepSpeed Training with 120K Context Length       ${NC}"
+echo -e "${GREEN}================================================================================${NC}"
 
 # Get script directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -62,27 +62,44 @@ export PYTHONPATH="$PROJECT_ROOT:$PYTHONPATH"
 if [ -z "$CUDA_VISIBLE_DEVICES" ]; then
     export CUDA_VISIBLE_DEVICES=$(seq 0 $((NUM_GPUS-1)) | paste -sd, -)
 fi
-export TOKENIZERS_PARALLELISM=false
 
+export PYTHONUNBUFFERED=1
+export TOKENIZERS_PARALLELISM=false
 # For 120K context length, increase memory limits
 export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:1024
 # export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export CUDA_LAUNCH_BLOCKING="1"
-export TORCH_USE_CUDA_DSA="1"
-export FLASH_ATTENTION_2_ENABLED="1"
+# Reduce likelihood of misleading sync stalls
+export CUDA_LAUNCH_BLOCKING=1
+export TORCH_USE_CUDA_DSA=1
+export FLASH_ATTENTION_2_ENABLED=true
 export OMP_NUM_THREADS=$(nproc)  # 논리 코어 전체
-# export TORCH_DISTRIBUTED_DEBUG=DETAIL
-# export NCCL_DEBUG=INFO
+
+export TORCH_DISTRIBUTED_DEBUG=OFF
+export NCCL_DEBUG=WARN
+export DEEPSPEED_LOG_LEVEL=DEBUG
+export WANDB_LOG_MODEL=end
+
+export TORCH_DISTRIBUTED_NCCL_ASYNC_ERROR_HANDLING=1
+export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+export NCCL_SHM_DISABLE=1
+export NCCL_IB_DISABLE=1
+export NCCL_BLOCKING_WAIT=1 
 export NCCL_ASYNC_ERROR_HANDLING=1
-export DEEPSPEED_AUTOTP=0
-export DS_AUTOTP=0
-export DEEPSPEED_ENABLE_TP=0
-export DS_ENABLE_TP=0
-export ACCELERATE_USE_DEEPSPEED=true
+export DEEPSPEED_AUTOTP=1
+export DS_AUTOTP=1
+export DEEPSPEED_ENABLE_TP=1
+export DS_ENABLE_TP=1
+export ACCELERATE_USE_DEEPSPEED=1
 export ACCELERATE_DISTRIBUTED_TYPE=DEEPSPEED
-export CUDA_VISIBLE_DEVICES=0,1
-
-
+export ACCELERATE_DISABLE_RICH=0
+export TORCH_CUDA_ARCH_LIST="8.0"
+export SAFETENSORS_FAST_GPU=1
+export HF_ENABLE_PARALLEL_LOADING=1
+export HF_PARALLEL_LOADING_WORKERS=$NUM_GPUS
+export HF_DATASETS_OFFLINE=0
+export PROFILE_TRAINING=0
+export HF_DATASETS_CACHE="/mnt/disks/local-ssd/datasets_cache"
+export WANDB_DISABLED_IN_SUBPROCESS=true
 # Create output directory
 OUTPUT_DIR=$(python3 -c "import json; print(json.load(open('$CONFIG_FILE'))['training_config']['output_dir'])")
 mkdir -p "$OUTPUT_DIR"
@@ -95,6 +112,7 @@ echo -e "${YELLOW}Checking dependencies...${NC}"
 for package in torch transformers trl peft datasets wandb deepspeed; do
     if ! .venv/bin/python3 -c "import $package" 2>/dev/null; then
         echo -e "${RED}Error: $package is not installed${NC}"
+        .venv/bin/python3 -c "import $package" 2>&1 | sed 's/^/    /'
         echo "Please install required packages:"
         echo "pip install torch transformers trl peft datasets wandb deepspeed"
         exit 1
@@ -138,15 +156,11 @@ cd "$PROJECT_ROOT"
 # To run with multiple GPUs, use the following command:
 # torchrun --nproc_per_node=$NUM_GPUS $SCRIPT_DIR/custom_model_sft.py --config $CONFIG_FILE
 
-if [ "$NUM_GPUS" -eq 1 ]; then
-    echo -e "${GREEN}Starting single-GPU DeepSpeed training...${NC}"
-    TRAIN_CMD="uv run accelerate launch --config_file $SCRIPT_DIR/config/accelerate.yaml $SCRIPT_DIR/custom_model_sft.py --config $CONFIG_FILE"
-    
-else
-    echo -e "${GREEN}Starting multi-GPU DeepSpeed training with $NUM_GPUS GPUs...${NC}"
-    TRAIN_CMD="uv run accelerate launch --config_file $SCRIPT_DIR/config/accelerate.yaml \
+
+echo -e "${GREEN}Starting DeepSpeed training with $NUM_GPUS GPUs...${NC}"
+TRAIN_CMD="uv run accelerate launch \
+    --config_file $SCRIPT_DIR/config/accelerate.yaml \
         $SCRIPT_DIR/custom_model_sft.py --config $CONFIG_FILE"
-fi
 
 echo -e "${BLUE}Command:${NC} $TRAIN_CMD"
 echo ""
@@ -198,3 +212,4 @@ if torch.cuda.is_available():
 echo -e "${GREEN}========================================${NC}"
 echo -e "${GREEN}      DeepSpeed Training Complete!     ${NC}"
 echo -e "${GREEN}========================================${NC}" 
+rm -rf $OUTPUT_DIR 
