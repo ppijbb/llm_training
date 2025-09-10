@@ -1,56 +1,139 @@
 {
+    "train_batch_size": "auto",
+    "train_micro_batch_size_per_gpu": 1,
+    "gradient_accumulation_steps": "auto",
+    "gradient_clipping": 1.0,
+    "steps_per_print": 10,
+    "wall_clock_breakdown": false,
+    "communication_data_type": "bf16",
+    "data_types": {
+        "grad_accum_dtype": "bf16"
+    },
+    "pipeline_parallelism": {
+        "enabled": true,
+        "partition_method": "uniform",
+        "num_partitions": 2
+      },
+      "tensor_parallelism": {
+        "tp_size": 1
+      },
     "fp16": {
-        "enabled": false
+        "enabled": false,
+        "auto_cast": false,
+        "loss_scale": 0,
+        "initial_scale_power": 16,
+        "loss_scale_window": 1000,
+        "hysteresis": 2,
+        "consecutive_hysteresis": false,
+        "min_loss_scale": 1
     },
     "bf16": {
         "enabled": true
     },
     "optimizer": {
-        "type": "Adamw",
+        "type": "AdamW",
         "params": {
             "lr": "auto",
             "weight_decay": "auto"
         }
     },
+    "sparse_attention": {
+        "mode": "fixed",
+        "block": 16,
+        "different_layout_per_head": true,
+        "num_local_blocks": 4,
+        "num_global_blocks": 1,
+        "attention": "bidirectional",
+        "horizontal_global_attention": false,
+        "num_different_global_patterns": 4,
+        "num_random_blocks": 0,
+        "local_window_blocks": [4],
+        "global_block_indices": [0],
+        "global_block_end_indices": null,
+        "num_sliding_window_blocks": 3
+    },
     "scheduler": {
-        "type": "WarmupDecayLR",
+        "type": "WarmupCosineLR",
         "params": {
-            "warmup_min_lr": "auto",
-            "warmup_max_lr": "auto",
             "warmup_num_steps": "auto",
-            "total_num_steps": "auto"
+            "total_num_steps": "auto",
+            "warmup_type": "log"
         }
     },
     "activation_checkpointing": {
         "partition_activations": true,
-        "cpu_checkpointing": false,
-        "contiguous_memory_optimization": true
+        "cpu_checkpointing": true,
+        "contiguous_memory_optimization": true,
+        "synchronize_checkpoint_boundary": true
    },
     "zero_optimization": {
         "stage": 3,
+        "offload_optimizer": {
+            "device": "none",
+            "nvme_path": "/mnt/disks/local-ssd/offload",
+            "pin_memory": false
+        },
+        "offload_param": {
+            "device": "cpu",
+            "nvme_path": "/mnt/disks/local-ssd/offload",
+            "buffer_count": 5,
+            "pin_memory": false,
+            "buffer_size": 5e9
+        },
+        "zero_quantized_weights": false,
+        "zero_quantized_gradients": false,
+        "zero_quantized_nontrainable_weights": false,
+        "pipeline_loading_checkpoint": false,
         "zero_hpz_partition_size": 1,
-        "overlap_comm": false,
+        "overlap_comm": true,
         "contiguous_gradients": true,
-        "sub_group_size": 1e12,
-        "reduce_bucket_size": 5e8,
-        "allgather_bucket_size": 5e8,
-        "stage3_prefetch_bucket_size": 5e8,
-        "stage3_param_persistence_threshold": 1e5,
-        "stage3_max_live_parameters": 1e8,
-        "stage3_max_reuse_distance": 1e8,
+        "allgather_partitions": true,
+        "reduce_scatter": true,
+        "sub_group_size": 1e8,
+        "reduce_bucket_size": 5e7,
+        "allgather_bucket_size": 5e7,
+        "stage3_param_persistence_threshold": 1e10,
+        "stage3_max_live_parameters": 5e7,
+        "stage3_max_reuse_distance": 5e9,
+        "stage3_prefetch_bucket_size": 1e7,
         "stage3_gather_16bit_weights_on_model_save": true
     },
-    
-    "train_batch_size": "auto",
-    "train_micro_batch_size_per_gpu": "auto",
-    "gradient_accumulation_steps": "auto",
-    "gradient_clipping": 1.0,
-    "steps_per_print": 2000,
-    "wall_clock_breakdown": false,
-    "data_types": {
-        "grad_accum_dtype": "bf16"
+    "aio": {
+        "block_size": 1048576,
+        "queue_depth": 32,
+        "thread_count": 4,
+        "single_submit": false,
+        "overlap_events": true
+    },
+    "curriculum_learning": {
+        "enabled": true,
+        "curriculum_type": "seqlen",
+        "min_difficulty": 8192,
+        "max_difficulty": 131072,
+        "schedule_type": "fixed_linear",
+        "schedule_config": {
+          "total_curriculum_step": 15000,
+          "difficulty_step": 8
+        }
+    },
+    "comms_logger": {
+        "enabled": true,
+        "verbose": false,
+        "prof_all": true,
+        "debug": true
+    },
+    "flops_profiler": {
+        "enabled": false,
+        "profile_step": 1,
+        "module_depth": -1,
+        "top_modules": 1,
+        "detailed": true,
+        "output_file": null
     },
     "wandb": {
-        "enabled": true
+        "enabled": true,
+        "project": "g3moe-sft",
+        "group": null,
+        "team": null
     }
 } 

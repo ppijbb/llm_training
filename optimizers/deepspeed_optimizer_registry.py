@@ -27,7 +27,7 @@ _REGISTERED = False
 def _safe_append_supported_name(ds_config_cls, name: str) -> None:
     """Safely add an optimizer name to DeepSpeed's supported list/set if available."""
     try:
-        container = getattr(ds_config_cls, 'supported_optimizer_names', None)
+        container = getattr(ds_config_cls, 'DEEPSPEED_OPTIMIZERS', None)
         if container is None:
             return
         # Handle list or set
@@ -53,7 +53,7 @@ def register_custom_optimizers() -> None:
         return
     try:
         import deepspeed
-        from deepspeed.runtime.config import DeepSpeedConfig
+        import deepspeed.runtime.config as DeepSpeedConfig
         import importlib
 
         # Bind classes into a stable namespace DeepSpeed inspects
@@ -85,13 +85,13 @@ def register_custom_optimizers() -> None:
                         cont.add(name)
             except Exception:
                 # Best-effort only
-                pass
+                raise Exception(f"Failed to register custom optimizers: {exc}")
 
         print("✅ DeepSpeed custom optimizers registered (namespace + all known whitelists)")
         _REGISTERED = True
     except Exception as exc:
         # Don't crash if DS is unavailable at import; user may be on CPU or no-DS path
-        print(f"⚠️ Skipping DeepSpeed optimizer registration: {exc}")
+        raise Exception(f"⚠️ Error DeepSpeed optimizer registration: {exc}")
 
 
 def get_optimizer_class(optimizer_name: str):

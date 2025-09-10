@@ -89,6 +89,58 @@ def setup_deepspeed_environment():
     print("DeepSpeed environment variables set")
 
 
+def clear_gpu_memory():
+    """Clear GPU memory and run garbage collection"""
+    import gc
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+    gc.collect()
+
+
+def eval_with_memory_optimization(trainer):
+    """Memory-optimized evaluation function"""
+    print("🔧 Memory-optimized evaluation 시작...")
+    
+    # GPU 메모리 정리
+    clear_gpu_memory()
+    
+    # 모델을 eval 모드로 설정하고 메모리 최적화
+    trainer.model.eval()
+    
+    # eval 시에는 gradient checkpointing 비활성화
+    original_gc = trainer.args.gradient_checkpointing
+    trainer.args.gradient_checkpointing = False
+    
+    try:
+        with torch.no_grad():
+            # eval 실행
+            eval_results = trainer.evaluate()
+            
+        # 결과 반환
+        return eval_results
+        
+    except RuntimeError as e:
+        if "CUDA out of memory" in str(e):
+            print("❌ Eval 중 CUDA OOM 발생! 메모리 정리 후 재시도...")
+            clear_gpu_memory()
+            # 더 작은 배치로 재시도
+            original_eval_batch_size = trainer.args.per_device_eval_batch_size
+            trainer.args.per_device_eval_batch_size = 1
+            try:
+                with torch.no_grad():
+                    eval_results = trainer.evaluate()
+                return eval_results
+            finally:
+                trainer.args.per_device_eval_batch_size = original_eval_batch_size
+        else:
+            raise e
+    finally:
+        # 원래 설정 복원
+        trainer.args.gradient_checkpointing = original_gc
+        clear_gpu_memory()
+
+
 def setup_model_and_tokenizer(model_config: Dict[str, Any]):
     """Setup G3MoE model and tokenizer"""
     
@@ -545,11 +597,11 @@ def main(
     #         benchmark_eval_frequency=training_config["eval_steps"],  # Run benchmarks every 2 epochs
     #         mme_max_samples=10,  # Limit MME samples for faster evaluation
     #     ))
-    trainer.add_callback(
-        IFEvalCallback(
-            eval_dataset_name="google/IFEval",
-            max_samples=500
-        ))
+    # trainer.add_callback(
+    #     IFEvalCallback(
+    #         eval_dataset_name="google/IFEval",
+    #         max_samples=100
+    #     ))
 
     # Print training info
     print("\n" + "="*50)
@@ -594,7 +646,24 @@ def main(
                 traceback.print_exc()
                 print(f"⚠️ Profiler error: {e}")
     else:
-        trainer.train()
+        try:
+            # eval 최적화를 위한 커스텀 eval 함수 설정
+            original_eval_fn = getattr(trainer, 'evaluate', None)
+            trainer.evaluate = lambda: eval_with_memory_optimization(trainer)
+            
+            trainer.train()
+        except RuntimeError as e:
+            if "CUDA out of memory" in str(e):
+                print("❌ CUDA OOM 발생! 메모리 정리 후 재시도...")
+                clear_gpu_memory()
+                print("GPU 메모리 정리 완료. 다시 시도해주세요.")
+                raise e
+            else:
+                raise e
+        finally:
+            # 원래 eval 함수 복원
+            if original_eval_fn:
+                trainer.evaluate = original_eval_fn
 
     # Save final model
     print("Saving final model...")

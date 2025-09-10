@@ -413,4 +413,5 @@ def get_custom_optimizer(optimizer_name: str, model_params, **kwargs):
         raise ValueError(f"Unknown optimizer: {optimizer_name}. Available: {list(optimizer_map.keys())}")
     
     optimizer_class = optimizer_map[optimizer_name.lower()]
-    return optimizer_class(model_params, **kwargs) 
+    return optimizer_class(model_params, **kwargs)
+    

@@ -5,6 +5,7 @@ from collections import defaultdict, deque
 from typing import Dict, Any, Optional, Callable
 import json
 import time
+import os
 
 def _is_main_process() -> bool:
     """Best-effort check for rank-0 to gate logging/plotting on distributed runs."""
@@ -14,11 +15,20 @@ def _is_main_process() -> bool:
             return dist.get_rank() == 0
     except Exception:
         pass
+    
+    # 환경변수로도 체크 (DeepSpeed 등에서 사용)
+    try:
+        rank = int(os.getenv("RANK", "0"))
+        return rank == 0
+    except (ValueError, TypeError):
+        pass
+    
     return True
 
 class TorchMoECallback:
     """Pure PyTorch MoE monitoring callback"""
-    
+    use_defalut_step_processor = True
+
     def __init__(
         self,
         num_experts: int,
@@ -66,7 +76,7 @@ class TorchMoECallback:
     def _log_debug(self, message: str):
         """내부 디버그 메시지 로깅"""
         if self.debug_logging and self.log_to_console:
-            self._log_debug(f"[MoE Debug] {message}")
+            print(f"[MoE Debug] {message}")
     
     def register_model(self, model: torch.nn.Module):
         """모델에 hooks 등록"""
@@ -252,9 +262,12 @@ class TorchMoECallback:
         """Step 시작 시 호출"""
         self.layer_outputs.clear()
     
-    def on_step_end(self, **kwargs):
+    def on_step_end(self, current_step: Optional[int] = None, **kwargs):
         """Step 종료 시 호출"""
-        if self.is_main_process:
+        # step 업데이트
+        if current_step is not None:
+            self.step = current_step
+        elif self.use_defalut_step_processor:
             self.step += 1
         
         if not self.layer_outputs:
@@ -342,6 +355,10 @@ class TorchMoECallback:
     
     def _log_metrics(self, metrics):
         """메트릭 로깅"""
+        # rank 0에서만 로깅 수행
+        if not self.is_main_process:
+            return
+            
         log_data = {}
         
         # 레이어별 메트릭
@@ -365,16 +382,17 @@ class TorchMoECallback:
                 'moe/step': self.step
             })
         
-        # 로거에 전송 (rank 0 전용)
-        if self.logger and self.is_main_process:
+        # 로거에 전송 (rank 0에서만)
+        if self.logger:
             if hasattr(self.logger, 'log'):
+                # WandB에 step과 함께 로그 전송
                 self.logger.log(log_data, step=self.step)
             elif hasattr(self.logger, 'add_scalars'):  # TensorBoard
                 for key, value in log_data.items():
                     self.logger.add_scalar(key, value, self.step)
         
-        # 콘솔 출력 (rank 0 전용)
-        if self.log_to_console and self.is_main_process:
+        # 콘솔 출력
+        if self.log_to_console:
             self._log_debug(f"Step {self.step} MoE Metrics:")
             for key, value in log_data.items():
                 if 'avg_' in key or 'total_' in key:
@@ -382,7 +400,7 @@ class TorchMoECallback:
     
     def _log_heatmaps(self):
         """Expert 사용률 히트맵 로깅"""
-        # 무거운 작업은 rank 0에서만 실행
+        # rank 0에서만 실행
         if not self.is_main_process:
             return
         try:
@@ -421,7 +439,7 @@ class TorchMoECallback:
                     plt.xlabel('Time Steps')
                     plt.ylabel('Expert Index')
                     
-                    if self.logger and hasattr(self.logger, 'log') and self.is_main_process:
+                    if self.logger and hasattr(self.logger, 'log'):
                         import wandb
                         self.logger.log({
                             f'moe/{layer_name}/usage_heatmap': wandb.Image(plt)
@@ -482,6 +500,10 @@ class TorchMoECallback:
     
     def _handle_alerts(self, alerts):
         """경고 처리"""
+        # rank 0에서만 로깅 수행
+        if not self.is_main_process:
+            return
+            
         for alert in alerts:
             self.alerts_history.append({
                 'step': self.step,
@@ -489,10 +511,10 @@ class TorchMoECallback:
                 **alert
             })
             
-            if self.log_to_console and self.is_main_process:
+            if self.log_to_console:
                 self._log_debug(f"⚠️  MoE Alert at step {self.step}: {alert['message']}")
             
-            if self.logger and hasattr(self.logger, 'log') and self.is_main_process:
+            if self.logger and hasattr(self.logger, 'log'):
                 self.logger.log({
                     f'alerts/{alert["type"]}': 1,
                     f'alerts/{alert["layer"]}_severity': alert.get('severity', 1)
@@ -548,6 +570,7 @@ class TransformersMoECallbackWrapper(TrainerCallback):
     def __init__(self, torch_callback: TorchMoECallback):
         self.torch_callback = torch_callback
         self._model_registered = False
+        self.torch_callback.use_defalut_step_processor = False
     
     def on_train_begin(
         self, 
@@ -582,8 +605,12 @@ class TransformersMoECallbackWrapper(TrainerCallback):
         **kwargs
     ):
         """Step 종료"""
-        # PyTorch callback 호출
-        self.torch_callback.on_step_end()
+        # rank 0에서만 MoE 콜백 실행
+        if not self.torch_callback.is_main_process:
+            return
+            
+        # PyTorch callback 호출 - Transformers의 global_step 사용
+        self.torch_callback.on_step_end(current_step=state.global_step)
         
         # logs에 MoE 메트릭 추가 (선택사항)
         if logs is not None and hasattr(self.torch_callback, 'last_metrics'):

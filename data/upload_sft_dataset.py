@@ -1,4 +1,5 @@
-from datasets import load_dataset, concatenate_datasets, Dataset, Features, Value, Sequence, Image as ImageFeature, load_from_disk, DatasetDict
+from datasets import Dataset, Features, Value, Sequence, Image as ImageFeature, DatasetDict
+from datasets import load_dataset, concatenate_datasets,load_from_disk, get_dataset_config_names, get_dataset_split_names
 from huggingface_hub import HfApi
 import json
 from typing import List, Dict, Any, Optional, cast
@@ -92,18 +93,18 @@ DATASET_MODE_MAPPING = {
 
 # 멀티모달 데이터셋 목록
 dataset_configs = [
-    ("HuggingFaceTB/smoltalk", "all"),
+    ("HuggingFaceTB/smoltalk", None),  # 모든 config 처리
     ("R0k1e/UltraLink", None),
     ("PrincetonPLI/Instruct-SkillMix-SDD", None),
     ("allenai/WildChat-1M", None),
     ("nvidia/OpenCodeInstruct", None),
-    ("microsoft/orca-agentinstruct-1M-v1", "default"),  # default config 사용
-    ("MaziyarPanahi/Llama-Nemotron-Post-Training-Dataset-v1-ShareGPT", "default"),  # default config 사용
-    ("nvidia/Llama-Nemotron-Post-Training-Dataset", "SFT"),  # SFT config 사용
-    ("open-r1/Mixture-of-Thoughts", "all"),
-    ("Salesforce/blip3-kale", "core"),
+    ("microsoft/orca-agentinstruct-1M-v1", None),  # 모든 config 처리
+    ("MaziyarPanahi/Llama-Nemotron-Post-Training-Dataset-v1-ShareGPT", None),  # 모든 config 처리
+    ("nvidia/Llama-Nemotron-Post-Training-Dataset", None),  # 모든 config 처리
+    ("open-r1/Mixture-of-Thoughts", None),  # 모든 config 처리
+    ("Salesforce/blip3-kale", None),  # 모든 config 처리
     ("liuhaotian/LLaVA-Instruct-150K", None),
-    ("Lin-Chen/ShareGPT4V", "ShareGPT4V"),
+    ("Lin-Chen/ShareGPT4V", None),  # 모든 config 처리
     # 추가: Hermes-3, Nemotron VLM v1
     ("NousResearch/Hermes-3-Dataset", None),
     ("nvidia/Llama-Nemotron-VLM-Dataset-v1", None)
@@ -146,7 +147,7 @@ def add_system_prompt_to_messages(messages: List[Dict[str, Any]], system_prompt:
     # 기존 시스템 프롬프트와 새로운 시스템 프롬프트 병합
     if existing_system_prompt:
         # 기존 시스템 프롬프트가 있으면 병합
-        combined_system_prompt = f"{existing_system_prompt}\n\n{system_prompt}{mode_instruction}"
+        combined_system_prompt = f"{system_prompt}{mode_instruction}\n\n{existing_system_prompt}"
     else:
         # 기존 시스템 프롬프트가 없으면 새로운 것만 사용
         combined_system_prompt = system_prompt + mode_instruction
@@ -473,12 +474,12 @@ def convert_to_target_format(
                                 if seg:
                                     content_list.append({"type": "text", "text": seg})
                                 if sidx != len(segments) - 1:
-                                    content_list.append({"type": "image", "text": None})
+                                    content_list.append({"type": "image", "text": ""})
                         else:
                             content_list.append({"type": "text", "text": text_content})
                     # 첫 turn에 이미지가 존재하지만 텍스트에 <image> 토큰이 전혀 없는 경우, image item을 추가
                     if role == "user" and i == 0 and result["images"] and not any(it.get('type') == 'image' for it in content_list):
-                        content_list.append({"type": "image", "text": None})
+                        content_list.append({"type": "image", "text": ""})
 
                     if content_list:
                         result["messages"].append({
@@ -519,6 +520,34 @@ def convert_to_target_format(
         
         # 시스템 프롬프트를 메시지 맨 앞에 추가
         result["messages"] = add_system_prompt_to_messages(result["messages"], system_prompt, dataset_name)
+        
+        # conversations 필드 생성 (Hermes 스타일)
+        conversations = []
+        for m in result["messages"]:
+            if m.get("role") == "system":
+                continue  # 시스템 메시지는 conversations에서 제외
+            frm = "human" if m.get("role") == "user" else ("gpt" if m.get("role") == "assistant" else m.get("role"))
+            parts: List[str] = []
+            
+            content_list = m.get("content", [])
+            if isinstance(content_list, list):
+                for it in content_list:
+                    if not isinstance(it, dict):
+                        continue
+                    if it.get("type") == "text":
+                        txt = str(it.get("text") or "")
+                        if txt:
+                            parts.append(txt)
+                    elif it.get("type") == "image":
+                        img_ref = it.get("image") or ""
+                        parts.append(f"<image:{img_ref}>" if img_ref else "<image>")
+            elif isinstance(content_list, str):
+                parts.append(content_list)
+            
+            if parts:  # 빈 메시지는 제외
+                conversations.append({"from": frm, "value": "\n".join(parts)})
+        
+        result["conversations"] = conversations
             
         return result
 
@@ -583,213 +612,234 @@ def process_dataset(
 ):
     """데이터셋을 처리하여 목표 형식으로 변환합니다. (병렬 처리 추가)"""
     try:
-        # 특정 데이터셋들의 split 설정
+        # 데이터셋의 모든 구성(config) 이름 가져오기
+        config_names = get_dataset_config_names(dataset_name)
+        print(f"📋 {dataset_name}의 사용 가능한 config: {config_names}")
+        
+        # 특정 데이터셋들의 config 우선순위 설정
         if dataset_name == "microsoft/orca-agentinstruct-1M-v1":
-            split_candidates = ["creative_content", "train"]
+            config_priority = ["default", "creative_content"] + [c for c in config_names if c not in ["default", "creative_content"]]
         elif dataset_name == "MaziyarPanahi/Llama-Nemotron-Post-Training-Dataset-v1-ShareGPT":
-            split_candidates = ["chat", "train"]
+            config_priority = ["default", "chat"] + [c for c in config_names if c not in ["default", "chat"]]
         elif dataset_name == "nvidia/Llama-Nemotron-Post-Training-Dataset":
-            split_candidates = ["chat", "train"]
+            config_priority = ["SFT", "chat"] + [c for c in config_names if c not in ["SFT", "chat"]]
         elif dataset_name == "nvidia/Llama-Nemotron-VLM-Dataset-v1":
-            # 다양한 서브스플릿 존재: captioning_x, ocr_x, vqa_x 등
-            # 이 데이터셋은 split 정보 불일치 문제가 있어서 특별 처리
-            split_candidates = ["train"]
+            config_priority = ["default"] + [c for c in config_names if c != "default"]
+        elif dataset_name == "Salesforce/blip3-kale":
+            config_priority = ["core"] + [c for c in config_names if c != "core"]
+        elif dataset_name == "Lin-Chen/ShareGPT4V":
+            config_priority = ["ShareGPT4V"] + [c for c in config_names if c != "ShareGPT4V"]
         else:
-            split_candidates = ["train"]
+            # 기본적으로 모든 config를 순서대로 처리
+            config_priority = config_names
         
-        # 데이터셋 로드 (여러 후보 split 순회)
-        full_dataset = None
-        last_err = None
-        
-        # 특정 데이터셋들은 streaming=False로 처리 (split 정보 불일치 문제 해결)
-        use_streaming = True
-        special_handling = False
-        
-        if dataset_name == "nvidia/Llama-Nemotron-VLM-Dataset-v1":
-            use_streaming = False
-            special_handling = True
-            print(f"ℹ️ {dataset_name}: split 정보 불일치 문제로 인해 특별 처리 모드 활성화")
-        
-        for split in split_candidates:
-            try:
-                if config_name:
-                    full_dataset = load_dataset(dataset_name, config_name, split=split, streaming=use_streaming)
-                else:
-                    full_dataset = load_dataset(dataset_name, split=split, streaming=use_streaming)
-                break
-            except Exception as e:
-                last_err = e
-                print(f"⚠️ split '{split}' 로드 실패: {e}")
-                continue
-                
-        if full_dataset is None:
-            # Nemotron VLM 처럼 다양한 split이 있을 경우 전체 split을 불러와 순회
-            try:
-                ds_all = load_dataset(dataset_name, config_name) if config_name else load_dataset(dataset_name)
-                # 가능한 첫 split 선택
-                for split_name in ds_all.keys():
-                    try:
-                        full_dataset = load_dataset(dataset_name, config_name, split=split_name, streaming=use_streaming) if config_name else load_dataset(dataset_name, split=split_name, streaming=use_streaming)
-                        print(f"✅ split '{split_name}'로 진행")
-                        break
-                    except Exception as e:
-                        print(f"⚠️ split '{split_name}' 로드 실패: {e}")
-                        continue
-            except Exception as e2:
-                print(f"❌ 데이터셋 split 탐색 실패: {e2}")
-                # split 정보 불일치 문제가 있는 경우 전체 데이터셋을 한 번에 로드 시도
-                if "split" in str(e2).lower() or "expected" in str(e2).lower():
-                    print(f"🔄 split 정보 불일치 문제 감지. 전체 데이터셋을 한 번에 로드 시도...")
-                    
-                            # 특별 처리 모드인 경우 huggingface_hub에서 split 정보를 먼저 확인
-        if special_handling:
-            print(f"🔄 특별 처리 모드: huggingface_hub에서 split 정보 확인 중...")
-            try:
-                api = HfApi()
-                # 데이터셋의 split 정보를 먼저 확인
-                dataset_info = api.dataset_info(dataset_name)
-                available_splits = list(dataset_info.splits.keys())
-                print(f"✅ 사용 가능한 split: {available_splits}")
-                
-                # 사용 가능한 split 중에서 첫 번째를 선택하여 로드
-                if available_splits:
-                    selected_split = available_splits[0]
-                    print(f"🔄 선택된 split: {selected_split}")
-                    
-                    try:
-                        if config_name:
-                            full_dataset = load_dataset(dataset_name, config_name, split=selected_split, streaming=use_streaming)
-                        else:
-                            full_dataset = load_dataset(dataset_name, split=selected_split, streaming=use_streaming)
-                        print(f"✅ {selected_split} split 로드 성공!")
-                    except Exception as split_e:
-                        print(f"⚠️ {selected_split} split 로드 실패: {split_e}")
-                        # 다른 split들도 시도
-                        for split_name in available_splits[1:]:
-                            try:
-                                print(f"🔄 {split_name} split 시도 중...")
-                                if config_name:
-                                    full_dataset = load_dataset(dataset_name, config_name, split=split_name, streaming=use_streaming)
-                                else:
-                                    full_dataset = load_dataset(dataset_name, split=split_name, streaming=use_streaming)
-                                print(f"✅ {split_name} split 로드 성공!")
-                                break
-                            except Exception as other_split_e:
-                                print(f"⚠️ {split_name} split 실패: {other_split_e}")
-                                continue
-                        else:
-                            print(f"❌ 모든 split 로드 실패")
-                            return
-                else:
-                    print(f"❌ 사용 가능한 split이 없습니다")
-                    return
-                    
-            except Exception as e3:
-                print(f"⚠️ huggingface_hub에서 split 정보 가져오기 실패: {e3}")
-                # fallback: 기존 방식으로 시도
-                try:
-                    if config_name:
-                        full_dataset = load_dataset(dataset_name, config_name, trust_remote_code=True, streaming=use_streaming)
-                    else:
-                        full_dataset = load_dataset(dataset_name, trust_remote_code=True, streaming=use_streaming)
-                    print(f"✅ trust_remote_code=True로 데이터셋 로드 성공")
-                except Exception as e4:
-                    print(f"❌ fallback 방식도 실패: {e4}")
-                    return
+        # config_name이 지정된 경우 해당 config만 처리
+        if config_name:
+            if config_name in config_names:
+                config_priority = [config_name]
             else:
-                # 일반적인 fallback 시도
-                try:
-                    if config_name:
-                        full_dataset = load_dataset(dataset_name, config_name, streaming=use_streaming)
-                    else:
-                        full_dataset = load_dataset(dataset_name, streaming=use_streaming)
-                    print(f"✅ 전체 데이터셋 로드 성공")
-                except Exception as e3:
-                    print(f"❌ 전체 데이터셋 로드도 실패: {e3}")
-                    return
-                    
-        if full_dataset is None:
-            print(f"❌ 데이터셋 로드 실패(모든 split): {last_err}")
-            return
-
+                print(f"⚠️ 지정된 config '{config_name}'이 존재하지 않습니다. 사용 가능한 config: {config_names}")
+                return
+        
         success_count = 0
         total_count = 0
-        batch_size = max(8, num_workers)  # 배치 크기를 워커 수에 맞춤
-        current_batch = []
         
-        # 진행 상황 표시를 위한 tqdm 설정
-        desc = f"{dataset_name.split('/')[-1]}"
-        if config_name:
-            desc += f"({config_name})"
-        
-        # leave=False를 추가하여 완료 후 진행 막대가 사라지도록 함
-        progress_bar = tqdm(desc=desc, unit="samples", leave=False)
-        
-        # 데이터 처리 (streaming 여부에 따라 다르게 처리)
-        if use_streaming:
-            # 스트리밍 데이터 처리
-            for sample in full_dataset:
+        # 각 config별로 처리
+        for current_config in config_priority:
+            print(f"\n🔄 Config '{current_config}' 처리 중...")
+            
+            try:
+                # 현재 config의 모든 split 이름 가져오기
+                split_names = get_dataset_split_names(dataset_name, config_name=current_config)
+                print(f"   📋 사용 가능한 split: {split_names}")
+                
+                # 특정 데이터셋들의 split 우선순위 설정
+                if dataset_name == "microsoft/orca-agentinstruct-1M-v1":
+                    split_priority = ["creative_content", "train"] + [s for s in split_names if s not in ["creative_content", "train"]]
+                elif dataset_name == "MaziyarPanahi/Llama-Nemotron-Post-Training-Dataset-v1-ShareGPT":
+                    split_priority = ["chat", "train"] + [s for s in split_names if s not in ["chat", "train"]]
+                elif dataset_name == "nvidia/Llama-Nemotron-Post-Training-Dataset":
+                    split_priority = ["chat", "train"] + [s for s in split_names if s not in ["chat", "train"]]
+                elif dataset_name == "nvidia/Llama-Nemotron-VLM-Dataset-v1":
+                    # VLM v1은 다양한 서브스플릿이 있음: captioning_x, ocr_x, vqa_x 등
+                    split_priority = ["train"] + [s for s in split_names if s != "train"]
+                else:
+                    # 기본적으로 train split을 우선, 그 다음 다른 split들
+                    split_priority = split_names 
+                
+                # 특정 데이터셋들은 streaming=False로 처리 (split 정보 불일치 문제 해결)
+                use_streaming = True
+                special_handling = False
+                
+                if dataset_name == "nvidia/Llama-Nemotron-VLM-Dataset-v1":
+                    use_streaming = False
+                    special_handling = True
+                    print(f"   ℹ️ split 정보 불일치 문제로 인해 특별 처리 모드 활성화")
+                
+                # 각 split별로 데이터셋 로드 시도
+                full_dataset = None
+                last_err = None
+                
+                for split in split_priority:
+                    try:
+                        print(f"   🔄 Split '{split}' 로드 시도 중...")
+                        full_dataset = load_dataset(dataset_name, current_config, split=split, streaming=use_streaming)
+                        print(f"   ✅ Split '{split}' 로드 성공!")
+                        break
+                    except Exception as e:
+                        last_err = e
+                        print(f"   ⚠️ Split '{split}' 로드 실패: {e}")
+                        continue
+                
+                # split 로드가 실패한 경우 fallback 시도
+                if full_dataset is None:
+                    print(f"   🔄 모든 split 로드 실패. fallback 방식 시도 중...")
+                    
+                    # 특별 처리 모드인 경우 huggingface_hub에서 split 정보를 먼저 확인
+                    if special_handling:
+                        try:
+                            api = HfApi()
+                            dataset_info = api.dataset_info(dataset_name)
+                            available_splits = list(dataset_info.splits.keys())
+                            print(f"   📋 huggingface_hub에서 확인된 split: {available_splits}")
+                            
+                            if available_splits:
+                                for split_name in available_splits:
+                                    try:
+                                        print(f"   🔄 {split_name} split 시도 중...")
+                                        full_dataset = load_dataset(dataset_name, current_config, split=split_name, streaming=use_streaming)
+                                        print(f"   ✅ {split_name} split 로드 성공!")
+                                        break
+                                    except Exception as split_e:
+                                        print(f"   ⚠️ {split_name} split 실패: {split_e}")
+                                        continue
+                        except Exception as e3:
+                            print(f"   ⚠️ huggingface_hub에서 split 정보 가져오기 실패: {e3}")
+                    
+                    # 여전히 실패한 경우 trust_remote_code로 시도
+                    if full_dataset is None:
+                        try:
+                            print(f"   🔄 trust_remote_code=True로 시도 중...")
+                            full_dataset = load_dataset(dataset_name, current_config, trust_remote_code=True, streaming=use_streaming)
+                            print(f"   ✅ trust_remote_code=True로 데이터셋 로드 성공")
+                        except Exception as e4:
+                            print(f"   ⚠️ trust_remote_code 방식도 실패: {e4}")
+                    
+                    # 마지막 fallback: 전체 데이터셋 로드
+                    if full_dataset is None:
+                        try:
+                            print(f"   🔄 전체 데이터셋 로드 시도 중...")
+                            full_dataset = load_dataset(dataset_name, current_config, streaming=use_streaming)
+                            print(f"   ✅ 전체 데이터셋 로드 성공")
+                        except Exception as e5:
+                            print(f"   ❌ 모든 방식 실패: {e5}")
+                            continue
+                
+                if full_dataset is None:
+                    print(f"   ❌ Config '{current_config}' 로드 실패. 다음 config로 진행...")
+                    continue
+                
+                # 현재 config의 데이터 처리
+                config_success_count = 0
+                config_total_count = 0
+                batch_size = max(8, num_workers)
+                current_batch = []
+                
+                # 진행 상황 표시를 위한 tqdm 설정
+                desc = f"{dataset_name.split('/')[-1]}({current_config})"
+                progress_bar = tqdm(desc=desc, unit="samples", leave=False)
+                
+                # 데이터 처리 (streaming 여부에 따라 다르게 처리)
+                if use_streaming:
+                    # 스트리밍 데이터 처리
+                    for sample in full_dataset:
+                        if max_samples and total_count >= max_samples:
+                            break
+                        
+                        current_batch.append(sample)
+                        total_count += 1
+                        config_total_count += 1
+                        
+                        # 배치가 찼거나 마지막 샘플인 경우 처리
+                        if len(current_batch) >= batch_size or (max_samples and total_count >= max_samples):
+                            # 배치 처리
+                            batch_results = process_samples_batch(current_batch, dataset_name, num_workers)
+                            
+                            if batch_results:
+                                config_success_count += len(batch_results)
+                                success_count += len(batch_results)
+                                yield batch_results
+                            
+                            progress_bar.update(len(current_batch))
+                            progress_bar.set_postfix({
+                                "processed": f"{config_success_count}/{config_total_count}",
+                                "success_rate": f"{config_success_count/config_total_count*100:.1f}%"
+                            })
+                            
+                            current_batch = []
+                    
+                    # 남은 배치 처리
+                    if current_batch:
+                        batch_results = process_samples_batch(current_batch, dataset_name, num_workers)
+                        if batch_results:
+                            config_success_count += len(batch_results)
+                            success_count += len(batch_results)
+                            yield batch_results
+                        progress_bar.update(len(current_batch))
+                else:
+                    # 일반 Dataset 객체 처리 (전체 데이터를 한 번에 처리)
+                    total_samples_in_dataset = len(full_dataset)
+                    if max_samples:
+                        total_samples_in_dataset = min(total_samples_in_dataset, max_samples - total_count)
+                    
+                    print(f"   📊 전체 {total_samples_in_dataset}개 샘플을 배치로 처리 중...")
+                    
+                    # 전체 데이터를 배치 단위로 처리
+                    for i in range(0, total_samples_in_dataset, batch_size):
+                        if max_samples and total_count >= max_samples:
+                            break
+                            
+                        end_idx = min(i + batch_size, total_samples_in_dataset)
+                        batch_samples = list(full_dataset.select(range(i, end_idx)))
+                        
+                        # 배치 처리
+                        batch_results = process_samples_batch(batch_samples, dataset_name, num_workers)
+                        
+                        if batch_results:
+                            config_success_count += len(batch_results)
+                            success_count += len(batch_results)
+                            yield batch_results
+                        
+                        config_total_count = end_idx
+                        total_count += len(batch_samples)
+                        progress_bar.update(len(batch_samples))
+                        progress_bar.set_postfix({
+                            "processed": f"{config_success_count}/{config_total_count}",
+                            "success_rate": f"{config_success_count/config_total_count*100:.1f}%"
+                        })
+                
+                progress_bar.close()
+                
+                # 현재 config 완료 메시지
+                if config_total_count > 0:
+                    yield f"✅ {dataset_name}({current_config}): {config_success_count}/{config_total_count} 샘플 변환 완료 (성공률: {config_success_count/config_total_count*100:.1f}%)"
+                else:
+                    yield f"ℹ️ {dataset_name}({current_config}): 처리할 샘플 없음"
+                
+                # max_samples에 도달한 경우 중단
                 if max_samples and total_count >= max_samples:
+                    print(f"   🎯 최대 샘플 수({max_samples})에 도달하여 중단")
                     break
                 
-                current_batch.append(sample)
-                total_count += 1
-                
-                # 배치가 찼거나 마지막 샘플인 경우 처리
-                if len(current_batch) >= batch_size or (max_samples and total_count >= max_samples):
-                    # 배치 처리
-                    batch_results = process_samples_batch(current_batch, dataset_name, num_workers)
-                    
-                    if batch_results:
-                        success_count += len(batch_results)
-                        yield batch_results
-                    
-                    progress_bar.update(len(current_batch))
-                    progress_bar.set_postfix({
-                        "processed": f"{success_count}/{total_count}",
-                        "success_rate": f"{success_count/total_count*100:.1f}%"
-                    })
-                    
-                    current_batch = []
-            
-            # 남은 배치 처리
-            if current_batch:
-                batch_results = process_samples_batch(current_batch, dataset_name, num_workers)
-                if batch_results:
-                    success_count += len(batch_results)
-                    yield batch_results
-                progress_bar.update(len(current_batch))
+            except Exception as e:
+                print(f"   ❌ Config '{current_config}' 처리 중 오류: {str(e)}")
+                continue
+        
+        # 전체 완료 메시지
+        if total_count > 0:
+            yield f"🎉 {dataset_name}: 모든 config 처리 완료 - 총 {success_count}/{total_count} 샘플 변환 완료 (성공률: {success_count/total_count*100:.1f}%)"
         else:
-            # 일반 Dataset 객체 처리 (전체 데이터를 한 번에 처리)
-            total_samples_in_dataset = len(full_dataset)
-            if max_samples:
-                total_samples_in_dataset = min(total_samples_in_dataset, max_samples)
-            
-            print(f"📊 전체 {total_samples_in_dataset}개 샘플을 배치로 처리 중...")
-            
-            # 전체 데이터를 배치 단위로 처리
-            for i in range(0, total_samples_in_dataset, batch_size):
-                end_idx = min(i + batch_size, total_samples_in_dataset)
-                batch_samples = list(full_dataset.select(range(i, end_idx)))
-                
-                # 배치 처리
-                batch_results = process_samples_batch(batch_samples, dataset_name, num_workers)
-                
-                if batch_results:
-                    success_count += len(batch_results)
-                    yield batch_results
-                
-                total_count = end_idx
-                progress_bar.update(len(batch_samples))
-                progress_bar.set_postfix({
-                    "processed": f"{success_count}/{total_count}",
-                    "success_rate": f"{success_count/total_count*100:.1f}%"
-                })
-        
-        progress_bar.close()
-        
-        # 완료 메시지를 반환값으로 변경하여 나중에 한 번에 출력하도록 함
-        yield f"✅ {dataset_name}: {success_count}/{total_count} 샘플 변환 완료 (성공률: {success_count/total_count*100:.1f}%)" if total_count > 0 else f"ℹ️ {dataset_name}: 처리할 샘플 없음"
+            yield f"ℹ️ {dataset_name}: 모든 config에서 처리할 샘플 없음"
 
     except Exception as e:
         yield f"❌ {dataset_name} 처리 중 오류: {str(e)}"
@@ -802,39 +852,108 @@ def generate_cleaned_records(file_path: str):
     with open(file_path, 'r', encoding='utf-8') as f:
         # tqdm will show processing speed (it/s) without a total count,
         # which avoids reading the file twice.
-        for line in tqdm(f, desc="Streaming and cleaning records"):
+        for line_num, line in enumerate(tqdm(f, desc="Streaming and cleaning records")):
             try:
                 record = json.loads(line)
                 
-                # Clean the 'messages' field in-place for efficiency
-                # messages -> conversations로 이행. 기존 messages는 무시하고 conversations만 유지
-                if 'messages' in record and isinstance(record['messages'], list):
+                # 데이터 구조 검증 및 정제
+                cleaned_record = {}
+                
+                # conversations 필드 처리 (우선순위 1)
+                if 'conversations' in record and isinstance(record['conversations'], list):
+                    cleaned_record['conversations'] = record['conversations']
+                # messages 필드가 있는 경우 conversations로 변환 (우선순위 2)
+                elif 'messages' in record and isinstance(record['messages'], list):
                     conversations = []
                     for m in record['messages']:
+                        if not isinstance(m, dict):
+                            continue
                         role = m.get('role', '')
                         # 시스템 메시지는 conversations에서 제외 (시스템 프롬프트는 별도로 처리)
                         if role == 'system':
                             continue
                         frm = 'human' if role == 'user' else ('gpt' if role == 'assistant' else role)
                         parts: List[str] = []
-                        for it in m.get('content', []) or []:
-                            if not isinstance(it, dict):
-                                continue
-                            if it.get('type') == 'text':
-                                txt = str(it.get('text') or '')
-                                if txt:
-                                    parts.append(txt)
-                            elif it.get('type') == 'image':
-                                img_ref = it.get('image') or ''
-                                parts.append(f"<image:{img_ref}>" if img_ref else "<image>")
-                        conversations.append({'from': frm, 'value': '\n'.join(parts)})
-                    record['conversations'] = conversations
-                    del record['messages']
+                        
+                        content = m.get('content', [])
+                        if isinstance(content, list):
+                            for it in content:
+                                if not isinstance(it, dict):
+                                    continue
+                                if it.get('type') == 'text':
+                                    txt = str(it.get('text') or '')
+                                    if txt:
+                                        parts.append(txt)
+                                elif it.get('type') == 'image':
+                                    img_ref = it.get('image') or ''
+                                    parts.append(f"<image:{img_ref}>" if img_ref else "<image>")
+                        elif isinstance(content, str):
+                            parts.append(content)
+                        
+                        if parts:  # 빈 메시지는 제외
+                            conversations.append({'from': frm, 'value': '\n'.join(parts)})
+                    
+                    cleaned_record['conversations'] = conversations
+                else:
+                    # conversations나 messages가 없는 경우 빈 리스트로 설정
+                    cleaned_record['conversations'] = []
+                
+                # images 필드 처리
+                if 'images' in record and isinstance(record['images'], list):
+                    cleaned_record['images'] = record['images']
+                else:
+                    cleaned_record['images'] = []
+                
+                # source_dataset 필드 처리
+                if 'source_dataset' in record:
+                    cleaned_record['source_dataset'] = str(record['source_dataset'])
+                else:
+                    cleaned_record['source_dataset'] = 'unknown'
+                
+                # original_data 필드 처리
+                if 'original_data' in record:
+                    cleaned_record['original_data'] = str(record['original_data'])
+                else:
+                    cleaned_record['original_data'] = '{}'
+                
+                # 데이터 구조 검증
+                if not isinstance(cleaned_record['conversations'], list):
+                    print(f"❌ 라인 {line_num}: conversations가 리스트가 아님 - {type(cleaned_record['conversations'])}")
+                    print(f"   원본 데이터: {record}")
+                    raise ValueError(f"conversations 필드가 리스트가 아님: {type(cleaned_record['conversations'])}")
+                
+                if not isinstance(cleaned_record['images'], list):
+                    print(f"❌ 라인 {line_num}: images가 리스트가 아님 - {type(cleaned_record['images'])}")
+                    print(f"   원본 데이터: {record}")
+                    raise ValueError(f"images 필드가 리스트가 아님: {type(cleaned_record['images'])}")
+                
+                # conversations 내부 구조 검증
+                for i, conv in enumerate(cleaned_record['conversations']):
+                    if not isinstance(conv, dict):
+                        print(f"❌ 라인 {line_num}: conversations[{i}]가 딕셔너리가 아님 - {type(conv)}")
+                        print(f"   원본 데이터: {record}")
+                        raise ValueError(f"conversations[{i}]가 딕셔너리가 아님: {type(conv)}")
+                    
+                    if 'from' not in conv or 'value' not in conv:
+                        print(f"❌ 라인 {line_num}: conversations[{i}]에 필수 필드 누락 - {conv}")
+                        print(f"   원본 데이터: {record}")
+                        raise ValueError(f"conversations[{i}]에 필수 필드 누락: {conv}")
+                
+                # 디버깅: 최종 cleaned_record 구조 출력
+                print(f"🔍 라인 {line_num}: 최종 cleaned_record 구조")
+                print(f"   conversations 타입: {type(cleaned_record['conversations'])}")
+                print(f"   conversations 길이: {len(cleaned_record['conversations'])}")
+                print(f"   images 타입: {type(cleaned_record['images'])}")
+                print(f"   images 길이: {len(cleaned_record['images'])}")
+                
+                yield cleaned_record
 
-                yield record
-
-            except (json.JSONDecodeError, TypeError):
-                print(f"Skipping malformed line: {line.strip()}")
+            except (json.JSONDecodeError, TypeError) as e:
+                print(f"⚠️ 라인 {line_num} 건너뛰기 (JSON 파싱 오류): {e}")
+                continue
+            except Exception as e:
+                print(f"⚠️ 라인 {line_num} 건너뛰기 (예상치 못한 오류): {e}")
+                continue
 
 def merge_and_create_dataset(
     output_name: str = "unified-multimodal-sft", 
@@ -873,6 +992,12 @@ def merge_and_create_dataset(
         for dataset_name, config_name in dataset_progress:
             dataset_progress.set_description(f"처리중: {dataset_name.split('/')[-1]}")
             try:
+                # config_name이 None인 경우 모든 config를 처리
+                if config_name is None:
+                    print(f"🔄 {dataset_name}: 모든 config 처리 중...")
+                else:
+                    print(f"🔄 {dataset_name}: config '{config_name}' 처리 중...")
+                
                 for result in process_dataset(dataset_name, config_name, max_samples_per_dataset, num_workers):
                     if isinstance(result, list): # 배치 결과
                         for sample in result:
@@ -909,30 +1034,22 @@ def merge_and_create_dataset(
                             except Exception:
                                 pass
 
-                            # Hermes 스타일 'conversations' 필드 동시 생성 (viewer 호환)
-                            try:
-                                conversations = []
-                                for m in sample.get("messages", []):
-                                    role = m.get("role", "")
-                                    frm = "human" if role == "user" else ("gpt" if role == "assistant" else role)
-                                    parts: List[str] = []
-                                    for it in m.get("content", []) or []:
-                                        if not isinstance(it, dict):
-                                            continue
-                                        if it.get("type") == "text":
-                                            txt = str(it.get("text") or "")
-                                            if txt:
-                                                parts.append(txt)
-                                        elif it.get("type") == "image":
-                                            img_ref = it.get("image") or ""
-                                            if img_ref:
-                                                parts.append(f"<image:{img_ref}>")
-                                            else:
-                                                parts.append("<image>")
-                                    conversations.append({"from": frm, "value": "\n".join(parts)})
-                                sample["conversations"] = conversations
-                            except Exception:
-                                pass
+                            # conversations 필드는 이미 convert_to_target_format에서 생성됨
+                            # 중복 생성 방지
+                            
+                            # 디버깅: 저장할 샘플 구조 확인
+                            if total_samples < 3:  # 처음 3개 샘플만 출력
+                                print(f"🔍 저장할 샘플 {total_samples + 1}:")
+                                print(f"   키: {list(sample.keys())}")
+                                if 'conversations' in sample:
+                                    print(f"   conversations 타입: {type(sample['conversations'])}")
+                                    print(f"   conversations 길이: {len(sample['conversations'])}")
+                                    if sample['conversations']:
+                                        first_conv = sample['conversations'][0]
+                                        print(f"   첫 번째 conversation: {type(first_conv)} - {first_conv}")
+                                if 'images' in sample:
+                                    print(f"   images 타입: {type(sample['images'])}")
+                                    print(f"   images 길이: {len(sample['images'])}")
                             
                             # original_data를 안전하게 JSON 문자열로 변환
                             try:
@@ -996,50 +1113,85 @@ def merge_and_create_dataset(
 
     # 1. 제너레이터를 사용하여 스트리밍 방식으로 데이터 로드 및 정제
     tqdm.write("   - 스트리밍 방식으로 데이터 로드 및 정제 중...")
-    iterable_dataset = Dataset.from_generator(
-        generate_cleaned_records,
-        features=features,
-        gen_kwargs={"file_path": jsonl_path},
-    )
-    # IterableDataset을 일반 Dataset으로 변환하여 .map()과 .filter() 사용
-    dataset = Dataset.from_list(list(tqdm(iterable_dataset, desc="Converting to standard dataset")))
+    
+    # 먼저 데이터를 리스트로 수집하여 구조 검증
+    cleaned_records = []
+    for record in tqdm(generate_cleaned_records(jsonl_path), desc="Loading and validating records"):
+        cleaned_records.append(record)
+    
+    if not cleaned_records:
+        print("❌ 정제된 레코드가 없습니다.")
+        return None
+    
+    # 첫 번째 레코드로 스키마 검증
+    first_record = cleaned_records[0]
+    print(f"🔍 첫 번째 레코드 구조: {list(first_record.keys())}")
+    print(f"   conversations 타입: {type(first_record.get('conversations'))}")
+    print(f"   images 타입: {type(first_record.get('images'))}")
+    
+    # 데이터셋 생성 - 완전히 다른 접근 방법 사용
+    try:
+        # 데이터를 평면화하여 처리
+        flattened_data = {}
+        for i, record in enumerate(cleaned_records):
+            for key, value in record.items():
+                if key not in flattened_data:
+                    flattened_data[key] = []
+                flattened_data[key].append(value)
+        
+        print(f"📊 데이터 평면화 완료: {len(flattened_data)}개 필드")
+        
+        # Dataset.from_dict 사용
+        dataset = Dataset.from_dict(flattened_data)
+        print(f"✅ Dataset.from_dict로 데이터셋 생성 성공: {len(dataset)}개 샘플")
+        
+    except Exception as e:
+        print(f"❌ 데이터셋 생성 실패: {e}")
+        print("❌ 오류 발생으로 업로드 중단")
+        return None
 
-    # 2. 이미지 경로를 실제 이미지 객체로 변환 (상대 경로 기준 설정)
+    # 이미지 경로는 문자열 리스트로 유지하고, 아래 캐스팅 단계에서 ImageFeature로 변환합니다.
     staging_dir_abs = os.path.abspath(staging_dir)
-    def resolve_and_load_images(example):
-        if example['images']:
-            # 절대 경로로 변환하고 이미지 로드
-            loaded_images = []
-            for img_path in example['images']:
-                full_path = os.path.join(staging_dir_abs, img_path)
-                if os.path.exists(full_path):
-                    try:
-                        img = Image.open(full_path)
-                        loaded_images.append(img.convert('RGB'))
-                    except Exception as e:
-                        print(f"이미지 로드 실패: {full_path} - {e}")
-                        loaded_images.append(None)
-                else:
-                    loaded_images.append(None)
-            example['images'] = loaded_images
-        # 메시지 내 image 경로는 그대로 두고(문자열), 이후 캐스팅으로 처리하거나 업로드에서 ImageFeature로 처리
+
+    # 이미지 경로를 절대경로로 변환 후 Image Feature로 캐스팅
+    def make_image_paths_absolute(example):
+        try:
+            if 'images' in example and isinstance(example['images'], list):
+                example['images'] = [
+                    os.path.join(staging_dir_abs, p) if isinstance(p, str) else p
+                    for p in example['images']
+                ]
+        except Exception:
+            pass
         return example
 
-    # 이미지 경로를 변환하고, None인 이미지를 필터링 (다중 처리로 가속)
-    tqdm.write(f"   - 이미지 로드 중 (워커: {num_workers})...")
-    dataset = dataset.map(resolve_and_load_images, num_proc=num_workers)
-    dataset = dataset.filter(lambda example: not (example.get('images') and None in example['images']), num_proc=num_workers)
-
-    # 최종적으로 Image Feature로 캐스팅
-    tqdm.write("   - 이미지 데이터 타입 변환 중...")
-    unified_dataset = dataset.cast_column("images", Sequence(ImageFeature()))
+    tqdm.write("   - 이미지 경로 절대화 및 타입 변환 중...")
+    try:
+        dataset = dataset.map(make_image_paths_absolute, num_proc=min(num_workers, 4))
+        # 이미지 파일 존재 여부 검증: 이미지가 있으면 모두 존재해야 함. 없으면 빈 리스트 허용
+        dataset = dataset.filter(
+            lambda ex: (not ex.get('images')) or all(isinstance(p, str) and os.path.exists(p) for p in ex['images']),
+            num_proc=min(num_workers, 4)
+        )
+        unified_dataset = dataset.cast_column("images", Sequence(ImageFeature()))
+        print(f"✅ 이미지 경로 절대화 및 Image Feature 캐스팅 성공")
+    except Exception as e:
+        print(f"❌ Image Feature 캐스팅 실패: {e}")
+        print("❌ 오류 발생으로 업로드 중단")
+        return None
 
     # 캐시 정리
     with cache_lock:
         image_cache.clear()
     
-    unified_dataset.save_to_disk(final_save_path)
-    tqdm.write(f"   - 최종 데이터셋 경로: {final_save_path}")
+    # 최종 저장
+    try:
+        unified_dataset.save_to_disk(final_save_path)
+        tqdm.write(f"   - 최종 데이터셋 경로: {final_save_path}")
+        print(f"✅ 데이터셋 저장 완료: {len(unified_dataset)}개 샘플")
+    except Exception as e:
+        print(f"❌ 데이터셋 저장 실패: {e}")
+        return None
     
     return final_save_path
 
@@ -1115,6 +1267,16 @@ def upload_dataset_to_hub(
                                     conversations.append({'from': frm, 'value': content_value})
                             record['conversations'] = conversations
 
+                        # 기록 일관성: messages 키 제거
+                        if 'messages' in record:
+                            record.pop('messages', None)
+
+                        # 보장: conversations, images 키 존재 및 타입
+                        if 'conversations' not in record or not isinstance(record['conversations'], list):
+                            record['conversations'] = []
+                        if 'images' not in record or not isinstance(record['images'], list):
+                            record['images'] = []
+
                         # 이미지 경로를 실제 이미지로 변환
                         if 'images' in record and isinstance(record['images'], list):
                             loaded_images = []
@@ -1149,7 +1311,7 @@ def upload_dataset_to_hub(
                         
                         record['system_prompt'] = system_prompt
                         record['dataset_mode'] = dataset_mode
-                        
+
                         yield record
                         
                         # 메모리 정리를 위해 주기적으로 가비지 컬렉션
@@ -1180,7 +1342,7 @@ def upload_dataset_to_hub(
         # 스트리밍 방식으로 데이터셋 생성 (메모리 효율적)
         iterable_dataset = Dataset.from_generator(
             data_generator,
-            features=features
+            # features=features
         )
         
         # 메모리 효율적인 청크 단위 처리
@@ -1191,7 +1353,7 @@ def upload_dataset_to_hub(
         current_chunk = []
         chunk_num = 0
         # 청크 저장 디렉토리 보장 (이미지 포함 저장 시 경로 필요)
-        temp_chunk_dir = "/mnt/disks/data/tmp"
+        temp_chunk_dir = "/mnt/disks/local-ssd/tmp"
         os.makedirs(temp_chunk_dir, exist_ok=True)
         
         for record in tqdm(iterable_dataset, desc="Processing records"):
