@@ -140,7 +140,7 @@ def test_time_scaling_experiment():
     
     # Prepare test input
     tokenizer = AutoProcessor.from_pretrained(base_model_name)
-    with open("/home/conan_jung/workspace/llm_training/sft/config/chat_template.txt", "r") as f:
+    with open("/home/conan/workspace/llm_training/sft/config/chat_template.txt", "r") as f:
         tokenizer.chat_template = f.read()
     
     test_text = """

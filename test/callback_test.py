@@ -90,7 +90,7 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
     
     # Set chat template with error handling
     try:
-        with open("/home/conan_jung/workspace/llm_training/sft/config/chat_template.txt", "r") as f:
+        with open("/home/conan/workspace/llm_training/sft/config/chat_template.txt", "r") as f:
             chat_template = f.read()
         
         # AutoProcessor인 경우 tokenizer 속성에 설정

@@ -23,7 +23,7 @@ print(model)
 
 
  
-with open("/home/conan_jung/workspace/llm_training/sft/config/chat_template.txt", "r") as f:
+with open("/home/conan/workspace/llm_training/sft/config/chat_template.txt", "r") as f:
     processor.chat_template = f.read()
     # logging.set_verbosity_warning()
 test_text = f"""

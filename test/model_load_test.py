@@ -103,7 +103,7 @@ def main():
         ).to("cuda").eval()
     # test_model = PeftModel.from_pretrained(test_model, "/mnt/disks/local-ssd/training_logs/outputs/")
     tokenizer = AutoProcessor.from_pretrained(base_model_name, use_fast=True)
-    with open("/home/conan_jung/workspace/llm_training/sft/config/chat_template.txt", "r") as f:
+    with open("/home/conan/workspace/llm_training/sft/config/chat_template.txt", "r") as f:
         tokenizer.chat_template = f.read()
     # logging.set_verbosity_warning()
     test_text = f"""

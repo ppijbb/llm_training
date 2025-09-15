@@ -7,7 +7,7 @@
     "lora_r": 64,
     "lora_alpha": 32,
     "lora_dropout": 0.1,
-    "deepspeed_config": "/home/conan_jung/workspace/llm_training/sft/config/deepspeed_muon_optimizer.json",
+    "deepspeed_config": "/home/conan/workspace/llm_training/sft/config/deepspeed_muon_optimizer.json",
     "g3moe_params": {
       "n_shared_experts": 1,
       "n_routed_experts": 8,
@@ -38,7 +38,7 @@
     "streaming": false
   },
   "training_config": {
-    "output_dir": "/mnt/disks/local-ssd/training_logs/outputs",
+    "output_dir": "/mls/conan/training_logs/outputs",
     "num_train_epochs": 3,
     "per_device_train_batch_size": 1,
     "per_device_eval_batch_size": 1,
@@ -64,8 +64,8 @@
     "assistant_only_loss": false,
     "completion_only_loss": false,
     "activation_offloading": false,
-    "packing": true,
-    "padding_free": true,
+    "packing": false,
+    "padding_free": false,
     "dataloader_pin_memory": false,
     "remove_unused_columns": false,
     "dataloader_drop_last": true,

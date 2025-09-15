@@ -315,7 +315,7 @@ def processing(
 
 if __name__ == "__main__":
     tokenizer = AutoProcessor.from_pretrained("google/gemma-3-4b-it")
-    with open("/home/conan_jung/workspace/llm_training/sft/config/chat_template.txt", "r") as f:
+    with open("/home/conan/workspace/llm_training/sft/config/chat_template.txt", "r") as f:
         chat_template = f.read()
     tokenizer.chat_template = chat_template
     dataset = get_dataset(tokenizer=tokenizer)
