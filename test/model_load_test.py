@@ -55,7 +55,7 @@ base_config = AutoConfig.from_pretrained(base_model_name, trust_remote_code=True
 base_config = base_config.to_dict()
 moe_config = {
         "n_shared_experts": 1,
-        "n_routed_experts": 5, # 256, 15, 6
+        "n_routed_experts": 6, # 256, 15, 6
         "n_group": 4,
         "topk_group": 8,
         # "num_key_value_heads": base_config['text_config']['num_attention_heads'],

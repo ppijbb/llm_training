@@ -7,6 +7,7 @@ from typing import Dict, Any, List, Optional
 import traceback
 import gc
 import os
+import random
 
 # Configure logger
 logger = logging.getLogger(__name__)
@@ -18,7 +19,6 @@ logger.addHandler(handler)
 
 def get_simple_sft_dataset(
     dataset_name: str = "HuggingFaceTB/smoltalk", 
-    config_name: str = "default",
     tokenizer=None,
     max_length: int = 2048,
     max_samples: int = 1000,
@@ -28,143 +28,129 @@ def get_simple_sft_dataset(
 ):
     """
     메모리 효율적인 SFT 데이터셋을 로드합니다.
-    streaming=True로 설정하여 메모리 사용량을 최소화합니다.
+    모든 config를 순차적으로 처리하여 메모리 사용량을 최소화합니다.
     """
     if tokenizer is None:
         raise ValueError("Tokenizer must be provided")
     
     logger.info(f"📦 메모리 효율적 로딩: {dataset_name}")
-    logger.info(f"   - config_name: {config_name}")
     logger.info(f"   - max_samples: {max_samples}")
     logger.info(f"   - streaming: {use_streaming}")
     logger.info(f"   - chunk_size: {chunk_size}")
     
-    # 메모리 효율적인 데이터셋 로드 (모든 config 처리)
+    log_memory_usage("데이터셋 로딩 시작")
+    
+    # 모든 config를 순차적으로 처리
     try:
-        # 사용 가능한 config 목록 가져오기
         available_configs = get_dataset_config_names(dataset_name)
+        selected_configs = []
+        for i in range(25):
+            random.shuffle(available_configs)
+            selected_configs += [random.choice(available_configs)]
+        available_configs = selected_configs
         logger.info(f"   📋 사용 가능한 configs: {len(available_configs)}개")
+        logger.info(f"   🎯 모든 config 사용: {len(available_configs)}개")
         
-        # config_name이 "default"이거나 None인 경우 모든 config 사용
-        if config_name == "default" or config_name is None:
-            selected_configs = available_configs
-            logger.info(f"   🎯 모든 config 사용: {len(selected_configs)}개")
-        else:
-            selected_configs = [config_name] if config_name in available_configs else available_configs
-            if config_name not in available_configs:
-                logger.warning(f"   ⚠️ 지정된 config '{config_name}'가 없습니다. 모든 config 사용: {len(available_configs)}개")
+        # config당 샘플 수를 균등하게 분배
+        samples_per_config = max(1, max_samples // len(available_configs))
+        logger.info(f"   📊 Config당 샘플 수: {samples_per_config}개")
         
-        # 모든 config에서 데이터 수집
-        all_samples = []
-        samples_per_config = max_samples // len(selected_configs) if len(selected_configs) > 0 else max_samples
+        train_samples = []
+        test_samples = []
+        total_processed = 0
         
-        for i, config in enumerate(selected_configs):
+        # tqdm으로 진행 상황 표시
+        config_pbar = tqdm(available_configs, desc="Config 처리", unit="config")
+        
+        # 각 config를 순차적으로 처리 (메모리 절약)
+        for i, config in enumerate(config_pbar):
+            if total_processed >= max_samples:
+                break
+                
             try:
-                logger.info(f"   📦 Config {i+1}/{len(selected_configs)}: {config}")
+                config_pbar.set_description(f"Config {i+1}/{len(available_configs)}: {config[:30]}...")
                 
-                if use_streaming:
-                    config_dataset = load_dataset(
-                        path=dataset_name, 
-                        name=config,
-                        split="train", 
-                        streaming=True
-                    )
-                    config_dataset = config_dataset.take(samples_per_config)
-                else:
-                    config_dataset = load_dataset(
-                        path=dataset_name, 
-                        name=config,
-                        split="train", 
-                        streaming=False
-                    )
-                    config_dataset = config_dataset.shuffle(seed=42)
-                    if len(config_dataset) > samples_per_config:
-                        config_dataset = config_dataset.select(range(samples_per_config))
+                # 스트리밍으로 데이터셋 로드
+                config_dataset = load_dataset(
+                    path=dataset_name, 
+                    name=config,
+                    split="train", 
+                    streaming=True
+                )
                 
-                # 샘플 수집
-                config_samples = []
-                for j, sample in enumerate(config_dataset):
-                    if j >= samples_per_config:
+                # config에서 샘플 스트리밍 처리
+                config_processed = 0
+                sample_pbar = tqdm(total=samples_per_config, desc=f"샘플 처리", unit="sample", leave=False)
+                
+                for sample in config_dataset:
+                    if config_processed >= samples_per_config or total_processed >= max_samples:
                         break
-                    config_samples.append(sample)
+                    
+                    # 샘플 변환
+                    converted = convert_sample_to_messages(sample, dataset_name)
+                    if converted:
+                        # 훈련/테스트 분할
+                        is_train = (total_processed % int(1/test_size)) != 0
+                        
+                        if is_train:
+                            train_samples.append(converted)
+                        else:
+                            test_samples.append(converted)
+                        
+                        total_processed += 1
+                        config_processed += 1
+                        
+                        # tqdm 업데이트
+                        sample_pbar.update(1)
+                        memory_gb = get_memory_usage()
+                        sample_pbar.set_postfix({
+                            "총 처리": f"{total_processed}/{max_samples}",
+                            "Train": len(train_samples),
+                            "Test": len(test_samples),
+                            "메모리": f"{memory_gb:.1f}GB"
+                        })
                 
-                all_samples.extend(config_samples)
-                logger.info(f"   ✅ {config} 완료: {len(config_samples)}개 샘플")
+                sample_pbar.close()
                 
                 # 메모리 정리
-                del config_dataset, config_samples
+                del config_dataset
                 gc.collect()
                 
             except Exception as e:
-                logger.warning(f"   ⚠️ Config {config} 실패: {e}")
+                tqdm.write(f"⚠️ Config {config} 실패: {e}")
                 continue
         
-        if not all_samples:
-            raise ValueError("모든 config에서 샘플을 가져올 수 없습니다.")
+        config_pbar.close()
         
-        # 최종 샘플 수 제한
-        if len(all_samples) > max_samples:
-            all_samples = all_samples[:max_samples]
-        
-        logger.info(f"   ✅ 전체 데이터셋 로드 성공: {len(all_samples)}개 샘플")
-        
-        # 샘플을 데이터셋으로 변환
-        from datasets import Dataset
-        dataset = Dataset.from_list(all_samples)
+        logger.info(f"✅ 샘플 수집 완료: Train {len(train_samples)}개, Test {len(test_samples)}개")
         
     except Exception as e:
-        logger.error(f"❌ 데이터셋 로드 실패: {e}")
-        # 사용 가능한 config 목록을 에러 메시지에 포함
-        try:
-            available_configs = get_dataset_config_names(dataset_name)
-            logger.error(f"   사용 가능한 configs: {available_configs[:10]}...")
-        except:
-            pass
+        logger.error(f"❌ 데이터셋 로딩 실패: {e}")
         raise Exception(f"😢 데이터셋 로딩 시도가 실패했습니다.")
-    
-    # 메모리 효율적인 샘플 처리
-    logger.info(f"   📊 샘플 변환 시작 (총 {len(dataset)}개)")
-    
-    train_samples = []
-    test_samples = []
-    converted_count = 0
-    skipped_count = 0
-    
-    # 훈련/테스트 분할을 위한 인덱스 계산
-    split_idx = int(len(dataset) * (1 - test_size))
-    
-    for i, sample in enumerate(dataset):
-        # 청크 단위로 메모리 정리
-        if i % chunk_size == 0 and i > 0:
-            gc.collect()
-            logger.debug(f"      - 청크 {i//chunk_size}: 처리됨 {converted_count}, 건너뜀 {skipped_count}")
-        
-        # 데이터셋별 메시지 형식 변환
-        converted = convert_sample_to_messages(sample, dataset_name)
-        if converted:
-            # 훈련/테스트 분할
-            if i < split_idx:
-                train_samples.append(converted)
-            else:
-                test_samples.append(converted)
-            converted_count += 1
-        else:
-            skipped_count += 1
-            if skipped_count <= 5:  # 처음 5개 실패한 샘플만 출력
-                logger.warning(f"      ⚠️ 샘플 {i} 변환 실패")
-    
-    logger.info(f"✅ 샘플 변환 완료: Train {len(train_samples)}개, Test {len(test_samples)}개 (변환: {converted_count}, 건너뜀: {skipped_count})")
     
     if len(train_samples) == 0:
         raise ValueError("변환된 훈련 샘플이 없습니다. 데이터셋 형식을 확인하세요.")
     
-    # Dataset으로 변환
+    # Dataset으로 변환 (최소한의 메모리 사용)
+    print("📊 Dataset 변환 시작...")
+    
     from datasets import Dataset, DatasetDict
     
-    train_dataset = Dataset.from_list(train_samples)
-    test_dataset = Dataset.from_list(test_samples)
+    # tqdm으로 Dataset 변환 진행 상황 표시
+    with tqdm(total=2, desc="Dataset 변환", unit="dataset") as pbar:
+        pbar.set_description("Train Dataset 생성")
+        train_dataset = Dataset.from_list(train_samples)
+        pbar.update(1)
+        
+        pbar.set_description("Test Dataset 생성")
+        test_dataset = Dataset.from_list(test_samples)
+        pbar.update(1)
     
-    logger.info("📊 메모리 효율적 데이터셋 생성 완료")
+    # 원본 리스트 메모리 해제
+    del train_samples, test_samples
+    gc.collect()
+    
+    print("✅ 메모리 효율적 데이터셋 생성 완료")
     
     return DatasetDict({
         "train": train_dataset,
@@ -173,17 +159,23 @@ def get_simple_sft_dataset(
 
 
 
-
 def convert_sample_to_messages(sample: Dict[str, Any], dataset_name: str) -> Optional[Dict[str, Any]]:
     """샘플을 messages 형식으로 변환"""
     
     if dataset_name == "HuggingFaceTB/smoltalk" or "smoltalk" in dataset_name.lower():
         if "messages" in sample and isinstance(sample["messages"], list):
-            return {"messages": sample["messages"], "image": sample.get("image", None)}
+            img = sample.get("image", [])
+            if not isinstance(img, list):
+                img = [img]
+            return {"messages": sample["messages"], "image": img}
     
     elif "orca-agentinstruct" in dataset_name:
         if "messages" in sample and isinstance(sample["messages"], list):
-            sample.update({"messages": sample["messages"], "images": sample.get("image", None)})
+            img = sample.get("image", [])
+            if not isinstance(img, list):
+                img = [img]
+            
+            sample.update({"messages": sample["messages"], "images": img})
             return sample
     
     # 기본 instruction-output 형식 처리
@@ -192,7 +184,10 @@ def convert_sample_to_messages(sample: Dict[str, Any], dataset_name: str) -> Opt
             {"role": "user", "content": [{"type": "image"}, {"type": "text", "text":sample["instruction"]}]},
             {"role": "assistant", "content": sample["output"]}
         ]
-        return{"messages": messages, "images": sample.get("image", None)}
+        img = sample.get("image", [])
+        if not isinstance(img, list):
+            img = [img]
+        return{"messages": messages, "images": img}
     
     # conversations 형식 처리
     if "conversations" in sample and isinstance(sample["conversations"], list):
@@ -200,20 +195,27 @@ def convert_sample_to_messages(sample: Dict[str, Any], dataset_name: str) -> Opt
         for conv in sample["conversations"]:
             if isinstance(conv, dict) and "from" in conv and "value" in conv:
                 role = "user" if conv["from"] in ["human", "user"] else "assistant"
-                messages.append({"role": role, "content": [{"type": "image"},{"type": "text", "text": conv["value"]}]})
+                messages.append({"role": role, "content": [{"type": "image"}, {"type": "text", "text": conv["value"]}]})
         if messages:
-            return {"messages": messages, "images": sample.get("image", None)}
+            img = sample.get("image", [])
+            if not isinstance(img, list):
+                img = [img]
+            return {"messages": messages, "images": img}
     
     # text 필드만 있는 경우 (단순한 텍스트)
     if "text" in sample and isinstance(sample["text"], str):
         # 간단한 대화로 변환
         messages = [
-            {"role": "user", "content": [{"type": "image"},{"type": "text", "text": "Continue the following text:"}]},
+            {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "Continue the following text:"}]},
             {"role": "assistant", "content": sample["text"]}
         ]
-        return {"messages": messages, "images": sample.get("image", None)}
+        img = sample.get("image", [])
+        if not isinstance(img, list):
+            img = [img]
+        return {"messages": messages, "images": img}
     
     return None
+
 
 def process_sample(sample: Dict[str, Any], tokenizer, max_length: int):
     """샘플을 토크나이즈하여 훈련 형식으로 변환"""
@@ -423,11 +425,10 @@ def smoltalk_dataset(tokenizer, max_samples: int = 500, use_streaming: bool = Tr
     log_memory_usage("SmolTalk 데이터셋 시작")
     dataset = get_simple_sft_dataset(
         dataset_name="HuggingFaceTB/smoltalk",
-        config_name="all", 
         tokenizer=tokenizer,
         max_samples=max_samples,
         use_streaming=use_streaming,
-        chunk_size=50  # 작은 청크 크기로 메모리 절약
+        chunk_size=50
     )
     log_memory_usage("SmolTalk 데이터셋 완료")
     return dataset
@@ -437,7 +438,6 @@ def orca_mini_dataset(tokenizer, max_samples: int = 500, use_streaming: bool = T
     log_memory_usage("Orca 데이터셋 시작")
     dataset = get_simple_sft_dataset(
         dataset_name="microsoft/orca-agentinstruct-1M-v1",
-        config_name="creative_content",
         tokenizer=tokenizer, 
         max_samples=max_samples,
         use_streaming=use_streaming,
@@ -450,18 +450,17 @@ def create_memory_efficient_dataset(
     dataset_name: str,
     tokenizer,
     max_samples: int = 1000,
-    chunk_size: int = 100,
-    config_name: str = "default"
+    chunk_size: int = 50,
+    use_streaming: bool = True
 ):
     """메모리 효율적인 데이터셋 생성기"""
     log_memory_usage(f"{dataset_name} 데이터셋 시작")
     
     dataset = get_simple_sft_dataset(
         dataset_name=dataset_name,
-        config_name=config_name,
         tokenizer=tokenizer,
         max_samples=max_samples,
-        use_streaming=True,
+        use_streaming=use_streaming,
         chunk_size=chunk_size
     )
     
@@ -496,10 +495,18 @@ if __name__ == "__main__":
     
     log_memory_usage("토크나이저 로드 후")
     
-    # SmolTalk 데이터셋 테스트
+    # Config 처리 확인을 위한 테스트
     try:
-        logger.info("📦 SmolTalk 데이터셋 테스트")
-        dataset = smoltalk_dataset(tokenizer, max_samples=50, use_streaming=True)
+        logger.info("📋 사용 가능한 config 확인")
+        configs = get_available_configs("HuggingFaceTB/smoltalk")
+        logger.info(f"총 {len(configs)}개 config 발견")
+    except Exception as e:
+        logger.error(f"Config 확인 실패: {e}")
+    
+    # SmolTalk 데이터셋 테스트 (스트리밍) - 모든 config 처리
+    try:
+        logger.info("📦 SmolTalk 데이터셋 테스트 (스트리밍 - 모든 config)")
+        dataset = smoltalk_dataset(tokenizer, max_samples=100, use_streaming=True)
         log_memory_usage("SmolTalk 데이터셋 생성 후")
         
         logger.info(f"데이터셋 생성 완료: {dataset}")
@@ -514,5 +521,16 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error(f"SmolTalk 데이터셋 테스트 실패: {e}")
     
+    # 일반 데이터셋 테스트 (비스트리밍)
+    try:
+        logger.info("📦 SmolTalk 데이터셋 테스트 (일반)")
+        dataset2 = smoltalk_dataset(tokenizer, max_samples=100, use_streaming=False)
+        log_memory_usage("SmolTalk 일반 데이터셋 생성 후")
+        
+        logger.info(f"일반 데이터셋 생성 완료: {dataset2}")
+            
+    except Exception as e:
+        logger.error(f"SmolTalk 일반 데이터셋 테스트 실패: {e}")
+    
     log_memory_usage("테스트 완료")
-    logger.info("✅ 메모리 효율적 테스트 완료") 
+    logger.info("✅ 메모리 효율적 테스트 완료")

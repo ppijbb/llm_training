@@ -173,7 +173,7 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
     
     # Set chat template with error handling
     try:
-        with open("/home/conan_jung/workspace/llm_training/sft/config/chat_template.txt", "r") as f:
+        with open("/home/conan/workspace/llm_training/sft/config/chat_template.txt", "r") as f:
             chat_template = f.read()
         
         # AutoProcessor인 경우 tokenizer 속성에 설정
@@ -378,7 +378,7 @@ def setup_dataset(data_config: Dict[str, Any], tokenizer):
         print(f"  - chat_template 길이: {len(str(tokenizer.chat_template))}")
     else:
         print(f"  - ⚠️ chat_template이 설정되지 않음!")
-    with open("/home/conan_jung/workspace/llm_training/sft/config/chat_template.txt", "r") as f:
+    with open("/home/conan/workspace/llm_training/sft/config/chat_template.txt", "r") as f:
         chat_template = f.read()
         
         # AutoProcessor인 경우 tokenizer 속성에 설정
@@ -399,7 +399,8 @@ def setup_dataset(data_config: Dict[str, Any], tokenizer):
                 tokenizer=tokenizer,
                 max_length=max_seq_length,
                 max_samples=max_samples,
-                test_size=test_size
+                test_size=test_size,
+                use_streaming=True
             )
             collate_fn = None # create_simple_collate_fn(tokenizer)
         else:
@@ -551,7 +552,7 @@ def main(
     # SFTTrainer에서 사용할 수 있도록 데이터셋 형태를 한번 더 확인
     print("데이터셋 샘플 확인:")
     print(f"  - 첫 번째 훈련 샘플 키: {list(train_dataset[0].keys())}")
-    print(f"  - 첫 번째 샘플 input_ids 길이: {len(train_dataset[0]['input_ids'])}")
+    # print(f"  - 첫 번째 샘플 input_ids 길이: {len(train_dataset[0]['input_ids'])}")
     
     trainer = SFTTrainer( 
         model=model,

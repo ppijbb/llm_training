@@ -287,6 +287,7 @@ class G3MoEModelOutputWithPast(BaseModelOutputWithPast):
     speciality_loss: Optional[torch.FloatTensor] = None
     cosine_similarities: Optional[torch.FloatTensor] = None
     ortho_loss: Optional[torch.FloatTensor] = None
+    expression_loss: Optional[torch.FloatTensor] = None
 
 
 @dataclass
@@ -333,6 +334,7 @@ class G3MoECausalLMOutputWithPast(ModelOutput):
     router_logits: Optional[torch.FloatTensor] = None
     speciality_loss: Optional[torch.FloatTensor] = None
     cosine_similarities: Optional[torch.FloatTensor] = None
+    expression_loss: Optional[torch.FloatTensor] = None
     # hn_context 제거 - 차원 문제로 인해 사용하지 않음
 
 
@@ -405,6 +407,140 @@ class mp(torch.autograd.Function):
         )
 
 
+class ExpressionProjector(nn.Module):
+    """
+    Expression projector for expert specialization with pre-computed orthogonal matrix
+    Encourages each expert to learn unique expression patterns through orthogonal projection
+    """
+
+    def __init__(self, input_dim, output_dim, num_experts, method='precomputed'):
+        super().__init__()
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.num_experts = num_experts
+        self.method = method
+        
+        if method == 'precomputed':
+            # Use nn.Linear for standard weight initialization
+            self.linear_projection = nn.Linear(input_dim, output_dim, bias=False)
+            # Initialize with orthogonal-like weights using proper initialization
+        else:
+            # Base projection matrix for training-time orthogonalization
+            self.projection_matrix = nn.Parameter(torch.randn(input_dim, output_dim) * 0.1)
+            
+        # Newton-Schulz iteration parameters (for training only)
+        self.ns_steps = 5
+        self.ns_coeffs = (3.4445, -4.7750, 2.0315)  # (a, b, c)
+        
+        # Orthogonal constraint strength
+        self.ortho_strength = 0.1
+        
+
+    def _initialize_orthogonal_matrix(self, input_dim, output_dim):
+        """Initialize a random orthogonal matrix"""
+        # BF16/FP8/FP4에서는 SVD/QR이 불안정하므로 단순한 random matrix 사용
+        # 실제로는 "quasi-orthogonal" matrix로 충분함
+        scale = (2.0 / (input_dim + output_dim)) ** 0.5
+        return torch.randn(input_dim, output_dim) * scale
+    
+    def _initialize_linear_weights(self):
+        """Initialize linear projection weights properly"""
+        # Use PyTorch's built-in orthogonal initialization
+        # This handles dtype and device compatibility automatically
+        torch.nn.init.orthogonal_(self.linear_projection.weight)
+        
+        # Scale down the weights for better stability
+        with torch.no_grad():
+            self.linear_projection.weight.data *= 0.1
+        
+    def newton_schulz_orthogonalize(self, G, steps=None):
+        """Newton-Schulz iteration for orthogonalization"""
+        if steps is None:
+            steps = self.ns_steps
+            
+        a, b, c = self.ns_coeffs
+        X = G
+        
+        # Ensure spectral norm is at most 1
+        X = X / (X.norm() + 1e-7)
+        
+        # Perform NS iterations
+        for _ in range(steps):
+            A = X @ X.T
+            B = b * A + c * A @ A
+            X = a * X + B @ X
+            
+        return X
+    
+    def qr_orthogonalize(self, G):
+        """QR decomposition for orthogonalization"""
+        Q, R = torch.linalg.qr(G, mode='reduced')
+        return Q
+    
+    def svd_orthogonalize(self, G):
+        """SVD-based orthogonalization"""
+        U, S, V = torch.linalg.svd(G, full_matrices=False)
+        return U @ V.T
+    
+    def forward(self, x):
+        """
+        Forward pass with orthogonal projection
+        x: [batch_size, input_dim]
+        """
+        if self.method == 'precomputed':
+            # Fast inference: use linear projection
+            orthogonal_logits = self.linear_projection(x)
+            # L2 normalization for unit vectors
+            orthogonal_logits = F.normalize(orthogonal_logits, p=2, dim=-1)
+            return orthogonal_logits
+            
+        elif self.method == 'newton_schulz' and self.training:
+            # Training only: Newton-Schulz iteration for orthogonalization
+            P_ortho = self.newton_schulz_orthogonalize(self.projection_matrix)
+            orthogonal_logits = torch.matmul(x, P_ortho)
+            orthogonal_logits = F.normalize(orthogonal_logits, p=2, dim=-1)
+            return orthogonal_logits
+            
+        elif self.method == 'qr' and self.training:
+            # Training only: QR decomposition
+            P_ortho = self.qr_orthogonalize(self.projection_matrix)
+            orthogonal_logits = torch.matmul(x, P_ortho)
+            orthogonal_logits = F.normalize(orthogonal_logits, p=2, dim=-1)
+            return orthogonal_logits
+            
+        elif self.method == 'svd' and self.training:
+            # Training only: SVD-based orthogonalization
+            P_ortho = self.svd_orthogonalize(self.projection_matrix)
+            orthogonal_logits = torch.matmul(x, P_ortho)
+            orthogonal_logits = F.normalize(orthogonal_logits, p=2, dim=-1)
+            return orthogonal_logits
+            
+        else:  # 'linear' or inference fallback
+            # Simple linear projection (fastest)
+            orthogonal_logits = torch.matmul(x, self.projection_matrix)
+            orthogonal_logits = F.normalize(orthogonal_logits, p=2, dim=-1)
+            return orthogonal_logits
+    
+    def orthogonal_loss(self):
+        """Compute orthogonal constraint loss"""
+        if self.method == 'precomputed':
+            # For precomputed, use the linear projection weights
+            gram_matrix = torch.matmul(self.linear_projection.weight, self.linear_projection.weight.T)
+            identity = torch.eye(gram_matrix.size(0), device=gram_matrix.device, dtype=gram_matrix.dtype)
+            ortho_loss = torch.pow(torch.norm(gram_matrix - identity, p='fro'), 2)
+            return self.ortho_strength * ortho_loss
+            
+        elif self.method == 'linear':
+            return torch.tensor(0.0, device=self.projection_matrix.device)
+            
+        else:
+            # For other methods, use projection matrix
+            gram_matrix = torch.matmul(self.projection_matrix, self.projection_matrix.T)
+            identity = torch.eye(gram_matrix.size(0), device=gram_matrix.device, dtype=gram_matrix.dtype)
+            ortho_loss = torch.pow(torch.norm(gram_matrix - identity, p='fro'), 2)
+            return self.ortho_strength * ortho_loss
+
+
 def sparsemixer(scores, top_k, jitter_eps, training):
     assert top_k == 2
 
@@ -428,6 +564,11 @@ def sparsemixer(scores, top_k, jitter_eps, training):
         
     # compute scores for gradients
     masked_gates = torch.softmax(masked_gates, dim=-1)
+    
+    # Ensure selected_experts indices are within bounds
+    num_experts = masked_gates.size(-1)
+    selected_experts = torch.clamp(selected_experts, 0, num_experts - 1)
+    
     multiplier_o = masked_gates.gather(dim=-1, index=selected_experts)
     
     if training:
@@ -475,6 +616,10 @@ def sparsemixer(scores, top_k, jitter_eps, training):
         selected_experts_top2 = max_ind
     # compute scores for gradients
     masked_gates_top2 = torch.softmax(masked_gates_top2, dim=-1)
+    
+    # Ensure selected_experts_top2 indices are within bounds
+    selected_experts_top2 = torch.clamp(selected_experts_top2, 0, num_experts - 1)
+    
     multiplier_top2_o = masked_gates_top2.gather(dim=-1, index=selected_experts_top2)
     
     if training: 
@@ -513,17 +658,93 @@ class G3MoERouter(nn.Module):
         self.hidden_size = config.hidden_size
         self.num_experts = config.n_routed_experts
         self.router_dim = config.router_dim
+        self.balancing_strength = getattr(config, "balancing_strength", 0.01)
+        self.ema_aplha = getattr(config, "ema_alpha", 0.99)
+        self.register_buffer("expert_load_ema", torch.zeros(self.num_experts), persistent=True)
 
-        self.router = nn.GRU(
+        self.load_balancer = nn.GRU(
             input_size=self.hidden_size,
             hidden_size=self.num_experts * self.router_dim,
             num_layers=1,
             bias=False,
             batch_first=True,
         )
+        
+        # Global expression projector: hidden_size → router_dim
+        # Precomputed method for efficient inference
+        self.expression_projector = ExpressionProjector(
+            self.hidden_size, 
+            self.router_dim, 
+            self.num_experts, 
+            method='precomputed'
+        )
 
-    def forward(self, x, hn):
-        return self.router(x, hn)
+    def forward(self, x, hn, top_k=2, jitter_eps=0.01, training=True):
+        # GRU를 통한 전역 라우팅 (hn 활용)
+        routing_logits, hn = self.load_balancer(x, hn)
+        input_shape = routing_logits.shape[:-1]
+        hidden_shape = (*input_shape, -1, self.router_dim)
+
+        # Enhanced expression projection for expert specialization
+        expression_logits = self.expression_projector(x)
+        expression_logits = expression_logits.view(hidden_shape)
+        
+        routing_logits = routing_logits.view(hidden_shape)
+        routing_logits = F.normalize(routing_logits, dim=-1)
+        
+        # Enhanced Gram matrix calculation with hn context
+        # routing_logits: [batch*seq, num_experts, router_dim]
+        # Reshape to [batch, seq, num_experts, router_dim] for bmm
+        batch_size, seq_len = input_shape
+        routing_logits_reshaped = routing_logits.view(batch_size, seq_len, self.num_experts, self.router_dim)
+        
+        # Compute Gram matrix for each sequence position
+        gram = torch.matmul(routing_logits_reshaped, routing_logits_reshaped.transpose(-2, -1))
+        # gram: [batch, seq, num_experts, num_experts]
+        
+        routing_i = torch.eye(self.num_experts, device=routing_logits.device)
+        
+        # Speciality penalty: encourage orthogonal expert representations
+        speciality_penalty = torch.mean((F.normalize(gram - routing_i.unsqueeze(0).unsqueeze(0), dim=-1) ** 2).sum(dim=(-2,-1)))
+        
+        # Cosine similarity between expression and routing logits
+        cosine_similarities = 1.0 - F.cosine_similarity(expression_logits, routing_logits, dim=-1)
+        
+        # routing_logits 대신 cosine_similarities를 기반으로 한 도메인 스코어 반환
+        # 이렇게 하면 각 expert의 표현 정보가 더 잘 반영됨
+        # speciality_penalty: [batch, seq] -> [batch, seq, 1, 1] for broadcasting
+        domain_scores = cosine_similarities * (1.0 + speciality_penalty.unsqueeze(-1).unsqueeze(-1))
+        
+        # Sparsemixer를 통한 최종 expert 선택 및 가중치 계산
+        # domain_scores를 [batch*seq, num_experts] 형태로 변환
+        batch_size, seq_len = input_shape
+        domain_scores_flat = domain_scores.view(batch_size * seq_len, self.num_experts)
+        
+        multiplier, selected_experts = sparsemixer(
+            domain_scores_flat, 
+            top_k=top_k, 
+            jitter_eps=jitter_eps, 
+            training=training
+        )
+                # ---- Adaptive filter logic for load balancing (applied during training) ----
+        if self.training:
+            with torch.no_grad():
+                total_load = self.expert_load_ema.sum()
+                if total_load > 0:
+                    # Normalize EMA load to get balancing scores
+                    load_balancing_scores = self.expert_load_ema / total_load
+                else:
+                    load_balancing_scores = torch.zeros_like(self.expert_load_ema)
+                
+                # Penalize experts with high load by adjusting multiplier
+                # The strength of the penalty is controlled by balancing_strength
+                adjustment = load_balancing_scores * self.balancing_strength * self.num_experts
+                # multiplier에 load balancing 적용
+                multiplier = multiplier - adjustment.unsqueeze(0).unsqueeze(-1)
+        # Compute expression loss for the projection matrix
+        expression_loss = self.expression_projector.orthogonal_loss()
+        
+        return multiplier, selected_experts, expression_logits, hn, speciality_penalty, cosine_similarities, expression_loss
 
 iterations = 0
 class G3MoEGRINMoE(nn.Module):
@@ -542,17 +763,16 @@ class G3MoEGRINMoE(nn.Module):
         self.iter = iterations
         self.router = global_router
         # self.router = nn.Linear(config.hidden_size, config.n_routed_experts, bias=False)
-        setattr(self.router, "_is_g3moe_router", True)
         self.experts = nn.ModuleList([G3MoEMLP(config) for _ in range(self.num_experts)])
         self.shared_experts = G3MoEMLP(config=config, intermediate_size=config.intermediate_size * config.n_shared_experts)
 
         self.router_jitter_noise = getattr(config, 'router_jitter_noise', 0.01)
         self.input_jitter_noise = getattr(config, 'input_jitter_noise', 0.0)   
-        
+
+        setattr(self.router, "_is_g3moe_router", True)
+        setattr(self.router.expression_projector, "_is_g3moe_expression_projector", True)
+
         # Adaptive filter parameters for load balancing
-        self.ema_alpha = getattr(config, "ema_alpha", 0.99)
-        self.balancing_strength = getattr(config, "balancing_strength", 0.01)
-        self.register_buffer("expert_load_ema", torch.zeros(self.num_experts), persistent=True)
         
         # Enhanced Expert Utilization
         self.register_buffer("expert_specialization_ema", torch.zeros(self.num_experts, self.hidden_dim), persistent=True)
@@ -564,9 +784,7 @@ class G3MoEGRINMoE(nn.Module):
         if self.freeze_shared_experts:
             self._freeze_shared_experts()
     
-        # Orthogonal projector: hidden_size → num_experts
-        self.orthogonal_projector = nn.Linear(self.hidden_dim, self.router_dim, bias=False)
-        setattr(self.orthogonal_projector, "_is_g3moe_router", True)
+        # Orthogonal projector는 이제 global router에서 처리됨
         self.ortho_strength = getattr(config, 'ortho_strength', 1.0)
 
     
@@ -593,113 +811,37 @@ class G3MoEGRINMoE(nn.Module):
         self.freeze_shared_experts = False
 
     @torch._dynamo.disable  # Disable torch.compile for this method due to data-dependent branching
-    def forward(self, hidden_states: torch.Tensor, global_routing_logits: torch.Tensor) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+    def forward(self, hidden_states: torch.Tensor, global_routing_logits: torch.Tensor) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
         residual = hidden_states
         final_hidden_states, routing_info = self._sparse_routing(hidden_states, global_routing_logits)
-        router_logits, hn, speciality_loss, cosine_similarities = routing_info
+        router_logits, hn, speciality_loss, cosine_similarities, expression_loss = routing_info
         with torch.no_grad():
             # print( f'residual in rank {torch.distributed.get_rank()}', residual.shape, residual.dtype)
             pretriained_residual = self.shared_experts(residual)
-        final_hidden_states = final_hidden_states# + pretriained_residual * 1.0
+        final_hidden_states = final_hidden_states + pretriained_residual * 1.0
         if self.training:
             final_hidden_states = final_hidden_states.requires_grad_(True)
             if router_logits is not None:
                 router_logits = router_logits.requires_grad_(True)
-        return final_hidden_states, (router_logits, hn, speciality_loss, cosine_similarities)    
+        return final_hidden_states, (router_logits, hn, speciality_loss, cosine_similarities, expression_loss)    
     
-    def _speciality_routing(self, hidden_states: torch.Tensor, global_routing_hn: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Enhanced orthogonal projection을 사용해서 각 전문가별 라우터 출력 생성
-        hn을 활용하여 전역 문맥을 고려한 라우팅
-        """
-        # GRU를 통한 전역 라우팅 (hn 활용)
-        routing_logits, hn = self.router(hidden_states, global_routing_hn)
-        input_shape = routing_logits.shape[:-1]
-        hidden_shape = (*input_shape, -1, self.router_dim)
-
-        # Orthogonal projection for expert specialization
-        orthogonal_logits = self.orthogonal_projector(hidden_states)
-        orthogonal_logits = F.normalize(orthogonal_logits, dim=-1)
-        orthogonal_logits = orthogonal_logits.view(hidden_shape)
-        
-        routing_logits = routing_logits.view(hidden_shape)
-        routing_logits = F.normalize(routing_logits, dim=-1)
-        
-        # Enhanced Gram matrix calculation with hn context
-        gram = torch.bmm(routing_logits, routing_logits.transpose(1, 2))
-        routing_i = torch.eye(self.num_experts, device=routing_logits.device)
-        
-        # Speciality penalty: encourage orthogonal expert representations
-        speciality_penalty = torch.mean((F.normalize(gram - routing_i, dim=-1) ** 2).sum(dim=(1,2)))
-        
-        # Cosine similarity between orthogonal and routing logits
-        cosine_similarities = F.cosine_similarity(orthogonal_logits, routing_logits, dim=-1)
-        
-        # routing_logits 대신 cosine_similarities를 기반으로 한 도메인 스코어 반환
-        # 이렇게 하면 각 expert의 도메인 정보가 더 잘 반영됨
-        domain_scores = cosine_similarities * (1.0 + speciality_penalty.unsqueeze(-1))
-        
-        return domain_scores, orthogonal_logits, hn, speciality_penalty, cosine_similarities
-
-    def _calculate_orthogonal_bonus(self, hidden_states: torch.Tensor, orthogonal_logits: torch.Tensor, cosine_similarities: torch.Tensor) -> torch.Tensor:
-        """
-        Orthogonal projection을 활용한 전문성 보너스 계산
-        """
-        # orthogonal_logits: [batch*seq, num_experts, router_dim]
-        # cosine_similarities: [batch*seq, num_experts]
-        batch_size = hidden_states.shape[0]
-        # 각 expert의 orthogonal representation과의 유사도
-        orthogonal_bonus = cosine_similarities.unsqueeze(-1) * orthogonal_logits.reshape(batch_size, -1, self.router_dim).mean(dim=-1)
-        
-        return orthogonal_bonus
-
     @torch._dynamo.disable  # Disable torch.compile for this method due to data-dependent branching
-    def _sparse_routing(self, hidden_states: torch.Tensor, global_routing_logits: torch.Tensor) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+    def _sparse_routing(self, hidden_states: torch.Tensor, global_routing_logits: torch.Tensor) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         if self.training and self.input_jitter_noise > 0:
             hidden_states *= torch.empty_like(hidden_states).uniform_(1.0 - self.input_jitter_noise, 1.0 + self.input_jitter_noise)
-        hidden_states = hidden_states.view(-1, hidden_dim)
-        # router_logits: (batch * sequence_length, n_experts)
-        router_logits, orthogonal_logits, hn, speciality_loss, cosine_similarities = self._speciality_routing(hidden_states, global_routing_logits)
-        # ---- Enhanced Routing Logic ----
-        # if self.training:
-        #     # HN-based specialization bonus 제거 (hn_context 문제로 인해)
-        #     # hn_specialization_bonus = self._calculate_hn_specialization_bonus(
-        #     #     hidden_states, hn_context, cosine_similarities
-        #     # )
-        #     # router_logits += hn_specialization_bonus * self.specialization_strength
-            
-        #     # Orthogonal specialization bonus
-        #     orthogonal_bonus = self._calculate_orthogonal_bonus(
-        #         hidden_states, orthogonal_logits, cosine_similarities
-        #     )
-        #     router_logits += orthogonal_bonus * self.ortho_strength
-
-        # Apply temperature scaling
-        router_logits /= F.softplus(self.routing_temperature) + 0.1
-        # ---- End of Enhanced Routing Logic ----
         
-        # ---- Adaptive filter logic for load balancing (applied during training) ----
-        if self.training:
-            with torch.no_grad():
-                total_load = self.expert_load_ema.sum()
-                if total_load > 0:
-                    # Normalize EMA load to get balancing scores
-                    load_balancing_scores = self.expert_load_ema / total_load
-                else:
-                    load_balancing_scores = torch.zeros_like(self.expert_load_ema)
-                
-                # Penalize experts with high load by subtracting from logits
-                # The strength of the penalty is controlled by balancing_strength
-                adjustment = load_balancing_scores * self.balancing_strength * self.num_experts
-                router_logits = router_logits - adjustment.unsqueeze(0)
-        # ---- End of adaptive filter logic ----
-        routing_weights, selected_experts = sparsemixer(
-            router_logits, 
-            top_k=self.top_k, 
-            jitter_eps=self.router_jitter_noise, 
-            training=self.training,
+        # Global router에서 전체 라우팅 처리 (GRU + expression projection + sparsemixer)
+        router_output = self.router(
+            hidden_states, 
+            global_routing_logits,
+            top_k=self.top_k,
+            jitter_eps=self.router_jitter_noise,
+            training=self.training
         )
+        routing_weights, selected_experts, expression_logits, hn, speciality_loss, cosine_similarities, expression_loss = router_output
+        # ---- End of adaptive filter logic ----
+        # multiplier와 selected_experts는 이미 global router에서 sparsemixer를 통해 계산됨
         assert routing_weights.isnan().sum() == 0, f"{self.iter} layer routing_weights is nan Line: 826"
         # ---- EMA load update logic (applied during training) ----
         if self.training:
@@ -707,7 +849,7 @@ class G3MoEGRINMoE(nn.Module):
                 # Count how many tokens were routed to each expert in this batch
                 current_load = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).sum(dim=[0, 1]).float()
                 # Update EMA of expert loads
-                self.expert_load_ema.mul_(self.ema_alpha).add_(current_load, alpha=1.0 - self.ema_alpha)
+                self.expert_load_ema.mul_(self.router.ema_alpha).add_(current_load, alpha=1.0 - self.router.ema_alpha)
         # ---- End of EMA load update logic ----
 
         final_hidden_states = torch.zeros(
@@ -733,8 +875,9 @@ class G3MoEGRINMoE(nn.Module):
                 # Index the correct hidden states and compute the expert hidden state for
                 # the current expert. We need to make sure to multiply the output hidden
                 # states by `routing_weights` on the corresponding tokens (top-1 and top-2)
-                current_state = hidden_states[None, top_x_list].reshape(-1, hidden_dim)
-                current_hidden_states = expert_layer(current_state) * routing_weights[top_x_list, idx_list, None]
+                hidden_states_flat = hidden_states.view(batch_size * sequence_length, hidden_dim)
+                current_state = hidden_states_flat[top_x_list]
+                current_hidden_states = expert_layer(current_state) * routing_weights[top_x_list, idx_list].unsqueeze(-1)
 
                 # However `index_add_` only support torch tensors for indexing so we'll use
                 # the `top_x` tensor here.
@@ -744,11 +887,11 @@ class G3MoEGRINMoE(nn.Module):
                 if self.training:
                     with torch.no_grad():
                         current_mean_hidden = hidden_states[top_x_list].mean(dim=0)
-                        self.expert_specialization_ema[expert_idx].mul_(self.ema_alpha).add_(current_mean_hidden, alpha=1.0 - self.ema_alpha)
+                        self.expert_specialization_ema[expert_idx].mul_(self.router.ema_alpha).add_(current_mean_hidden, alpha=1.0 - self.router.ema_alpha)
                 # --- End Update Specialization EMA ---
 
         final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
-        return final_hidden_states, (router_logits, hn, speciality_loss, cosine_similarities)
+        return final_hidden_states, (routing_weights, hn, speciality_loss, cosine_similarities, expression_loss)
 
 
 class G3MoERMSNorm(nn.Module):
@@ -1051,10 +1194,10 @@ class G3MoEDecoderLayer(GradientCheckpointingLayer):
         residual = hidden_states
         hidden_states = self.pre_feedforward_layernorm(hidden_states)
         if self.layer_idx >= self.config.first_k_dense_replace:
-            hidden_states, (router_logits, hn, speciality_loss, cosine_similarities) = self.moe(hidden_states, global_routing_hn)
+            hidden_states, (router_logits, hn, speciality_loss, cosine_similarities, expression_loss) = self.moe(hidden_states, global_routing_hn)
         else:
             with torch.no_grad():
-                hidden_states, (router_logits, hn, speciality_loss, cosine_similarities) = self.moe(hidden_states), (None, None, None, None)
+                hidden_states, (router_logits, hn, speciality_loss, cosine_similarities, expression_loss) = self.moe(hidden_states), (None,)*5
         hidden_states = self.post_feedforward_layernorm(hidden_states)
         if self.training:
             hidden_states = hidden_states.requires_grad_(True)
@@ -1064,7 +1207,7 @@ class G3MoEDecoderLayer(GradientCheckpointingLayer):
         outputs = (hidden_states,)
         if output_attentions:
             outputs += (self_attn_weights,)
-        outputs += ((router_logits, hn, speciality_loss, cosine_similarities),)
+        outputs += ((router_logits, hn, speciality_loss, cosine_similarities, expression_loss),)
         return outputs
 
 
@@ -1147,8 +1290,21 @@ class G3MoEPreTrainedModel(PreTrainedModel):
             else:
                 # Do not touch non-router linears here to avoid re-initializing experts or base MLPs
                 pass
+        elif isinstance(module, ExpressionProjector):
+            logging.get_logger('transformers').debug(f"Initializing expression projector layer with Xavier uniform: {module}")
+            if module.method == "precomputed":
+                original_dtype = module.linear_projection.weight.dtype
+                module.to(torch.float32)
+                nn.init.orthogonal_(module.linear_projection.weight)
+                if module.linear_projection.bias is not None:
+                    module.linear_projection.bias.data.zero_()
+                module.to(original_dtype)
+            else:
+                nn.init.xavier_uniform_(module.projection_matrix.weight)
+                if module.projection_matrix.bias is not None:
+                    module.projection_matrix.bias.data.zero_()
         elif isinstance(module, G3MoEMultiModalProjector):
-            nn.init.xavier_uniform_(module.mm_input_projection_weight.data)
+            nn.init.xavier_uniform_(module.mm_input_projection_weight)
         elif isinstance(module, nn.GRU):
             for name, param in module.named_parameters():
                 if 'weight_ih' in name:
@@ -1559,6 +1715,7 @@ class G3MoETextModel(G3MoEPreTrainedModel):
                 global_routing_hn = routing_result[1]
                 speciality_loss = routing_result[2]
                 cosine_similarities = routing_result[3]
+                expression_loss = routing_result[4]
 
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
@@ -1576,6 +1733,7 @@ class G3MoETextModel(G3MoEPreTrainedModel):
             router_logits=router_logits,
             speciality_loss=speciality_loss,
             cosine_similarities=cosine_similarities,
+            expression_loss=expression_loss,
         )
 
 
@@ -1702,6 +1860,7 @@ class G3MoEForCausalLM(G3MoEPreTrainedModel, GenerationMixin):
         loss = None
         aux_loss = None
         ortho_loss = None
+        expression_loss = None
         if labels is not None:
             loss = self.loss_function(logits, labels, self.vocab_size, **loss_kwargs)
             # Speciality loss 추가 (스칼라 값으로 변환)
@@ -1715,6 +1874,9 @@ class G3MoEForCausalLM(G3MoEPreTrainedModel, GenerationMixin):
                 loss += cosine_loss * 0.005  # 가중치 적용
             
             # HN context loss는 제거 (이미 speciality_loss에 포함됨)
+            if outputs.expression_loss is not None:
+                expression_loss = outputs.expression_loss.mean()
+                loss += expression_loss * 0.005  # 가중치 적용
                 
             # Orthogonalization loss for expert weights to encourage functional diversity
             if self.training and self.config.text_config.ortho_loss_coef > 0:
@@ -2194,6 +2356,7 @@ class G3MoEForConditionalGeneration(G3MoEPreTrainedModel, GenerationMixin):
         loss = None
         aux_loss = None
         ortho_loss = None
+        expression_loss = None
         if labels is not None:
             # Upcast to float if we need to compute the loss to avoid potential precision issues
             logits = logits.float()
@@ -2224,6 +2387,10 @@ class G3MoEForConditionalGeneration(G3MoEPreTrainedModel, GenerationMixin):
                 cosine_loss = outputs.cosine_similarities.mean()
                 loss += cosine_loss * 0.005  # 가중치 적용
             
+            if outputs.expression_loss is not None:
+                expression_loss = outputs.expression_loss.mean()
+                loss += expression_loss * 0.005  # 가중치 적용
+                
             # Orthogonalization loss for expert weights to encourage functional diversity
             if self.training and self.config.text_config.ortho_loss_coef > 0:
                 ortho_loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
