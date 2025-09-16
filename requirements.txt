@@ -71,6 +71,7 @@ optimum>=1.24.0
 outlines>=1.2.3
 pandas>=2.2.3
 pandasgui>=0.2.14
+psutil>=7.0.0
 peft~=0.15.0
 pillow>=11.1.0
 plotly>=6.0.0
