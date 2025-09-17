@@ -92,7 +92,7 @@ def main():
         pretrained_model_name_or_path=base_model_name,
         config=model_config,
         torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
+        attn_implementation="flash_attention_3",
         # trust_remote_code=True,
         # quantization_config=BitsAndBytesConfig(
         #     load_in_4bit=True,
