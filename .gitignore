@@ -18,3 +18,7 @@ unsloth_training_checkpoints/
 *logs
 activate
 mlruns
+.bashrc
+uv.lock
+pyproject.toml
+.python-version
