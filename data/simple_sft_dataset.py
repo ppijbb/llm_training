@@ -88,18 +88,29 @@ def get_simple_sft_dataset(
                     
                     # 샘플 변환
                     converted = convert_sample_to_messages(sample, dataset_name)
+                    if "images" in converted:
+                        for img in converted["images"]:
+                            if img is None:
+                                converted = None
+                    if "messages" in converted:
+                        user_msg_len = len([msg for msg in converted["messages"] if msg["role"] == "user"])
+                        images_len = len(["images"])
+                        if user_msg_len > 1 and images_len > 1:
+                            print(converted)
+                            converted = None
+
                     if converted:
                         # 훈련/테스트 분할
                         is_train = (total_processed % int(1/test_size)) != 0
                         
-                        if is_train:
+                        if is_train :
                             train_samples.append(converted)
                         else:
                             test_samples.append(converted)
-                        
+
                         total_processed += 1
                         config_processed += 1
-                        
+
                         # tqdm 업데이트
                         sample_pbar.update(1)
                         memory_gb = get_memory_usage()
@@ -158,7 +169,6 @@ def get_simple_sft_dataset(
     })
 
 
-
 def convert_sample_to_messages(sample: Dict[str, Any], dataset_name: str) -> Optional[Dict[str, Any]]:
     """샘플을 messages 형식으로 변환"""
     
@@ -181,7 +191,7 @@ def convert_sample_to_messages(sample: Dict[str, Any], dataset_name: str) -> Opt
     # 기본 instruction-output 형식 처리
     if "instruction" in sample and "output" in sample:
         messages = [
-            {"role": "user", "content": [{"type": "image"}, {"type": "text", "text":sample["instruction"]}]},
+            {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": sample["instruction"]}]},
             {"role": "assistant", "content": sample["output"]}
         ]
         img = sample.get("image", [])
@@ -192,10 +202,16 @@ def convert_sample_to_messages(sample: Dict[str, Any], dataset_name: str) -> Opt
     # conversations 형식 처리
     if "conversations" in sample and isinstance(sample["conversations"], list):
         messages = []
+        first_user_message_found = False
         for conv in sample["conversations"]:
             if isinstance(conv, dict) and "from" in conv and "value" in conv:
                 role = "user" if conv["from"] in ["human", "user"] else "assistant"
-                messages.append({"role": role, "content": [{"type": "image"}, {"type": "text", "text": conv["value"]}]})
+                content = []
+                if role == "user" and not first_user_message_found:
+                    content.append({"type": "image"})
+                    first_user_message_found = True
+                content.append({"type": "text", "text": conv["value"]})
+                messages.append({"role": role, "content": content})
         if messages:
             img = sample.get("image", [])
             if not isinstance(img, list):

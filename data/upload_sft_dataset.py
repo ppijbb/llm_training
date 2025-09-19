@@ -417,12 +417,12 @@ def convert_to_target_format(
                         break
             caption = str(sample.get("caption") or sample.get("response") or sample.get("value") or "").strip()
             if caption:
-                user_content: List[Dict[str, Any]] = [{"type": "text", "text": "Describe this image.", "image": ""}]
+                user_content: List[Dict[str, Any]] = [{"type": "image"}]
                 if result["images"]:
-                    user_content.append({"type": "image", "text": "", "image": ""})
+                    user_content.append({"type": "image"})
                 result["messages"] = [
                     {"role": "user", "content": user_content},
-                    {"role": "assistant", "content": [{"type": "text", "text": caption, "image": ""}]}
+                    {"role": "assistant", "content": [{"type": "text", "text": caption}, {"type":"image"}]}
                 ]
 
         elif dataset_name == "open-r1/Mixture-of-Thoughts":
