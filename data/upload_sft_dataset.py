@@ -306,8 +306,8 @@ def convert_to_target_format(
     dataset_name: str
 ) -> Optional[Dict[str, Any]]:
     """
-    각 데이터셋의 샘플을 목표 형식으로 변환합니다.
-    - messages: List[{ role: string, content: List[{type: "text"|"image", text: string}] }]
+    각 데이터셋의 샘플을 목표 형식으로 변환합니다. (Hugging Face TRL Vision Dataset 형식)
+    - messages: List[{ role: string, content: List[{type: "text", text: string} | {type: "image"}] }]
     - images: [PIL.Image] (멀티모달에서만)
     """
 
@@ -417,12 +417,13 @@ def convert_to_target_format(
                         break
             caption = str(sample.get("caption") or sample.get("response") or sample.get("value") or "").strip()
             if caption:
-                user_content: List[Dict[str, Any]] = [{"type": "image"}]
+                user_content: List[Dict[str, Any]] = []
                 if result["images"]:
                     user_content.append({"type": "image"})
+                user_content.append({"type": "text", "text": "Describe this image."})
                 result["messages"] = [
                     {"role": "user", "content": user_content},
-                    {"role": "assistant", "content": [{"type": "text", "text": caption}, {"type":"image"}]}
+                    {"role": "assistant", "content": [{"type": "text", "text": caption}]}
                 ]
 
         elif dataset_name == "open-r1/Mixture-of-Thoughts":
@@ -474,12 +475,12 @@ def convert_to_target_format(
                                 if seg:
                                     content_list.append({"type": "text", "text": seg})
                                 if sidx != len(segments) - 1:
-                                    content_list.append({"type": "image", "text": ""})
+                                    content_list.append({"type": "image"})
                         else:
                             content_list.append({"type": "text", "text": text_content})
                     # 첫 turn에 이미지가 존재하지만 텍스트에 <image> 토큰이 전혀 없는 경우, image item을 추가
                     if role == "user" and i == 0 and result["images"] and not any(it.get('type') == 'image' for it in content_list):
-                        content_list.append({"type": "image", "text": ""})
+                        content_list.insert(0, {"type": "image"})
 
                     if content_list:
                         result["messages"].append({
@@ -504,14 +505,14 @@ def convert_to_target_format(
                 caption = str(sample.get("cogvlm_caption", "")).strip()
 
             if caption:
-                user_content: List[Dict[str, Any]] = [{"type": "text", "text": "Describe this image.", "image": ""}]
+                user_content: List[Dict[str, Any]] = []
                 if result["images"]:
-                    # content.image에 상대 경로를 넣을 수 있으나, 이 시점에서는 이미지 파일명이 아직 없으므로 빈 문자열 유지
-                    user_content.append({"type": "image", "text": "", "image": ""})
+                    user_content.append({"type": "image"})
+                user_content.append({"type": "text", "text": "Describe this image."})
 
                 result["messages"] = [
                     {"role": "user", "content": user_content},
-                    {"role": "assistant", "content": [{"type": "text", "text": caption, "image": ""}]}
+                    {"role": "assistant", "content": [{"type": "text", "text": caption}]}
                 ]
 
         # 빈 messages인 경우 None 반환
@@ -526,7 +527,7 @@ def convert_to_target_format(
         for m in result["messages"]:
             if m.get("role") == "system":
                 continue  # 시스템 메시지는 conversations에서 제외
-            frm = "human" if m.get("role") == "user" else ("gpt" if m.get("role") == "assistant" else m.get("role"))
+            frm = "user" if m.get("role") == "user" else ("assistant" if m.get("role") == "assistant" else m.get("role"))
             parts: List[str] = []
             
             content_list = m.get("content", [])
@@ -545,7 +546,7 @@ def convert_to_target_format(
                 parts.append(content_list)
             
             if parts:  # 빈 메시지는 제외
-                conversations.append({"from": frm, "value": "\n".join(parts)})
+                conversations.append({"role": frm, "content": "\n".join(parts)})
         
         result["conversations"] = conversations
             
@@ -872,7 +873,7 @@ def generate_cleaned_records(file_path: str):
                         # 시스템 메시지는 conversations에서 제외 (시스템 프롬프트는 별도로 처리)
                         if role == 'system':
                             continue
-                        frm = 'human' if role == 'user' else ('gpt' if role == 'assistant' else role)
+                        frm = 'user' if role == 'user' else ('assistant' if role == 'assistant' else role)
                         parts: List[str] = []
                         
                         content = m.get('content', [])
@@ -891,7 +892,7 @@ def generate_cleaned_records(file_path: str):
                             parts.append(content)
                         
                         if parts:  # 빈 메시지는 제외
-                            conversations.append({'from': frm, 'value': '\n'.join(parts)})
+                            conversations.append({'role': frm, 'content': '\n'.join(parts)})
                     
                     cleaned_record['conversations'] = conversations
                 else:
@@ -934,7 +935,7 @@ def generate_cleaned_records(file_path: str):
                         print(f"   원본 데이터: {record}")
                         raise ValueError(f"conversations[{i}]가 딕셔너리가 아님: {type(conv)}")
                     
-                    if 'from' not in conv or 'value' not in conv:
+                    if ('from' not in conv or 'value' not in conv) and ('role' not in conv or 'content' not in conv):
                         print(f"❌ 라인 {line_num}: conversations[{i}]에 필수 필드 누락 - {conv}")
                         print(f"   원본 데이터: {record}")
                         raise ValueError(f"conversations[{i}]에 필수 필드 누락: {conv}")
@@ -1098,8 +1099,8 @@ def merge_and_create_dataset(
     features = Features({
         'conversations': Sequence(
             Features({
-                'from': Value('string'),
-                'value': Value('string')
+                'role': Value('string'),
+                'content': Value('string')
             })
         ),
         'images': Sequence(Value('string')), # 먼저 문자열 경로로 로드
@@ -1233,7 +1234,7 @@ def upload_dataset_to_hub(
     print(f"📊 청크 크기: {chunk_size}, 워커 수: {num_workers}")
     
     try:
-        # 이미지를 포함한 데이터셋 생성
+        # 이미지를 포함한 데이터셋 생성1
         def data_generator():
             staging_dir_abs = os.path.dirname(jsonl_path)
             with open(jsonl_path, 'r', encoding='utf-8') as f:
@@ -1241,15 +1242,29 @@ def upload_dataset_to_hub(
                     try:
                         record = json.loads(line.strip())
                         
-                        # conversations 필드가 이미 올바른 형태로 되어 있으므로 그대로 사용
+                        # conversations 필드가 from/value 형식이면 role/content로 변환
+                        if 'conversations' in record and isinstance(record['conversations'], list):
+                            # from/value 형식인지 확인 (첫 번째 항목으로 판단)
+                            if record['conversations'] and 'from' in record['conversations'][0]:
+                                converted_conversations = []
+                                for conv in record['conversations']:
+                                    if isinstance(conv, dict) and 'from' in conv and 'value' in conv:
+                                        # from을 role로, value를 content로 변환
+                                        role = 'user' if conv['from'] in ['human', 'user'] else ('assistant' if conv['from'] in ['gpt', 'assistant'] else conv['from'])
+                                        converted_conversations.append({
+                                            'role': role,
+                                            'content': conv['value']
+                                        })
+                                record['conversations'] = converted_conversations
+                        
                         # messages 필드가 있다면 conversations로 변환
-                        if 'messages' in record and isinstance(record['messages'], list) and 'conversations' not in record:
+                        elif 'messages' in record and isinstance(record['messages'], list) and 'conversations' not in record:
                             conversations = []
                             for message in record['messages']:
                                 role = message.get('role', '')
                                 if role == 'system':
                                     continue  # 시스템 메시지는 제외
-                                frm = 'human' if role == 'user' else ('gpt' if role == 'assistant' else role)
+                                frm = 'user' if role == 'user' else ('assistant' if role == 'assistant' else role)
                                 content_value = message.get('content', [])
                                 if isinstance(content_value, list):
                                     parts = []
@@ -1262,9 +1277,9 @@ def upload_dataset_to_hub(
                                             elif item.get('type') == 'image':
                                                 img_ref = item.get('image') or ''
                                                 parts.append(f"<image:{img_ref}>" if img_ref else "<image>")
-                                    conversations.append({'from': frm, 'value': '\n'.join(parts)})
+                                    conversations.append({'role': frm, 'content': '\n'.join(parts)})
                                 elif isinstance(content_value, str):
-                                    conversations.append({'from': frm, 'value': content_value})
+                                    conversations.append({'role': frm, 'content': content_value})
                             record['conversations'] = conversations
 
                         # 기록 일관성: messages 키 제거
@@ -1327,8 +1342,8 @@ def upload_dataset_to_hub(
         features = Features({
             'conversations': Sequence(
                 Features({
-                    'from': Value('string'),
-                    'value': Value('string')
+                    'role': Value('string'),
+                    'content': Value('string')
                 })
             ),
             'images': Sequence(ImageFeature()),
@@ -1353,7 +1368,7 @@ def upload_dataset_to_hub(
         current_chunk = []
         chunk_num = 0
         # 청크 저장 디렉토리 보장 (이미지 포함 저장 시 경로 필요)
-        temp_chunk_dir = "/mnt/disks/local-ssd/tmp"
+        temp_chunk_dir = "/mnt/sdb/tmp"
         os.makedirs(temp_chunk_dir, exist_ok=True)
         
         for record in tqdm(iterable_dataset, desc="Processing records"):

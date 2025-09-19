@@ -16,12 +16,12 @@ uv run python data/upload_sft_dataset.py \
     merge \
         --output_name=open_m_3 \
         --num_workers=16 \
-        --local_path /mnt/disks/local-ssd/ \
+        --local_path /mnt/sdb/ \
         --max_samples 100
 
 uv run python data/upload_sft_dataset.py \
     upload \
-        --dataset_path /mnt/disks/local-ssd/open_m_3 \
+        --dataset_path /mnt/sdb/open_m_3 \
         --repo_id Gunulhona/t_test \
         --num_workers 16 \
         --chunk_size 10000 \
