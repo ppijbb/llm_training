@@ -1,5 +1,6 @@
 import sys
 import os
+import copy
 import torch
 from tqdm.auto import tqdm
 import logging
@@ -58,7 +59,6 @@ moe_config = {
         "n_routed_experts": 6, # 256, 15, 6
         "n_group": 4,
         "topk_group": 8,
-        # "num_key_value_heads": base_config['text_config']['num_attention_heads'],
         "num_experts_per_tok": 2,
         "first_k_dense_replace": 18,
         "router_aux_loss_coef": 0.001,
@@ -70,12 +70,14 @@ moe_config = {
             "rope_type": "yarn",
             "factor": 8.0
         },
-        # "intermediate_size": base_config['text_config']['hidden_size'],
         "use_bfloat16": True
     }
+if "text_config" not in base_config:
+    base_config['text_config'] = copy.deepcopy(base_config)
+
 base_config['text_config'].update(moe_config)
 base_config.update(base_config['text_config'])
-model_config = G3MoEConfig (**base_config)
+model_config = G3MoEConfig(**base_config)
 model_config.model_type = "gemma3"
 model_config.text_config.model_type = "gemma3_text"
 # BitsAndBytesConfig int-4 config
@@ -84,6 +86,100 @@ model_config.architectures = [
     # "G3MoEModel", 
     # "G3MoEForCausalLM"
     ]
+
+
+def test_train_forward():
+    """Tests the model's forward pass in training mode."""
+    print("\n--- Starting Training Mode Forward Pass Test ---")
+
+    # 1. Load model for training test
+    print("Loading model for training test...")
+    train_test_model = model_architecture.from_pretrained(
+        pretrained_model_name_or_path=base_model_name,
+        config=model_config,
+        torch_dtype=torch.bfloat16,
+        attn_implementation="flash_attention_3",
+    ).to("cuda")
+    train_test_model.train()
+    print("Model loaded and set to training mode.")
+
+    # 2. Create dummy inputs
+    print("Creating dummy inputs...")
+    tokenizer = AutoProcessor.from_pretrained(base_model_name, use_fast=True)
+    
+    try:
+        image_size = train_test_model.config.vision_config.image_size
+    except AttributeError:
+        print("Could not find vision_config.image_size, defaulting to a standard size.")
+        image_size = 224 # A common default
+
+    test_input = tokenizer.apply_chat_template(
+        [
+            {
+                "role": "system",
+                "content": [
+                    {"type": "text", "text": "You are a helpful assistant."}
+                ]
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe this image in Korean."},
+                    # {"type": "image", "url": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/p-blog/candy.JPG"},
+                    # {"type": "image", "url": "https://huggingface.co/spaces/merve/chameleon-7b/resolve/main/bee.jpg"},
+                    {"type": "image"}
+                ]
+            }
+        ],
+        # tokenize=True,
+        add_generation_prompt=True,
+        # return_tensors="pt",
+        # return_dict=True,
+    )
+
+    # Load images
+    # image = load_image("https://cdn.britannica.com/61/93061-050-99147DCE/Statue-of-Liberty-Island-New-York-Bay.jpg")
+    image = load_image("https://huggingface.co/spaces/merve/chameleon-7b/resolve/main/bee.jpg")
+    
+    inputs = tokenizer(
+        text=test_input.replace("<bos>", "")[:-1],
+        images=image,
+        return_tensors="pt").to(train_test_model.device)
+
+    if "token_type_ids" in inputs:
+        del inputs["token_type_ids"]
+        
+    # Create labels for loss calculation
+    inputs["labels"] = inputs.input_ids.clone()
+    print(f"Inputs created with input_ids shape: {inputs.input_ids.shape}")
+
+    # 3. Forward and backward pass
+    try:
+        print("Performing forward pass...")
+        outputs = train_test_model(**inputs)
+        loss = outputs.loss
+        print(f"Forward pass successful. Loss: {loss.item()}")
+
+        print("Performing backward pass...")
+        loss.backward()
+        print("Backward pass successful.")
+
+        # 4. Check for gradients
+        grad_found = False
+        for name, param in train_test_model.named_parameters():
+            if param.requires_grad and param.grad is not None:
+                print(f"Gradient found for parameter: {name}. Mean grad: {param.grad.abs().mean().item()}")
+                grad_found = True
+                break
+        if not grad_found:
+            print("Warning: No gradients were found after backward pass. Check model setup.")
+
+    except Exception as e:
+        print(f"An error occurred during forward/backward pass: {e}")
+        import traceback
+        traceback.print_exc()
+
+    print("--- Training Mode Forward Pass Test Finished ---\n")
 
 
 def main():
@@ -102,7 +198,7 @@ def main():
         #     bnb_4bit_quant_storage=torch.bfloat16)
         ).to("cuda").eval()
     # test_model = PeftModel.from_pretrained(test_model, "/mnt/disks/local-ssd/training_logs/outputs/")
-    tokenizer = AutoProcessor.from_pretrained(base_model_name, use_fast=True)
+    tokenizer = AutoProcessor.from_pretrained("google/gemma-3-4b-it", use_fast=True)
     with open("/home/conan/workspace/llm_training/sft/config/chat_template.txt", "r") as f:
         tokenizer.chat_template = f.read()
     # logging.set_verbosity_warning()
@@ -128,8 +224,9 @@ this is the test text message. now you must instruct the model to generate a res
                 "role": "user",
                 "content": [
                     {"type": "text", "text": "Describe this image in Korean."},
-                    # {"type": "image", "url": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/p-blog/candy.JPG"}                
-                    {"type": "image", "url": "https://huggingface.co/spaces/merve/chameleon-7b/resolve/main/bee.jpg"}
+                    # {"type": "image", "url": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/p-blog/candy.JPG"},
+                    # {"type": "image", "url": "https://huggingface.co/spaces/merve/chameleon-7b/resolve/main/bee.jpg"},
+                    {"type": "image"}
                 ]
             }
         ],
@@ -140,12 +237,12 @@ this is the test text message. now you must instruct the model to generate a res
     )
 
     # Load images
-    image1 = load_image("https://cdn.britannica.com/61/93061-050-99147DCE/Statue-of-Liberty-Island-New-York-Bay.jpg")
-    image2 = load_image("https://huggingface.co/spaces/merve/chameleon-7b/resolve/main/bee.jpg")
+    image = load_image("https://cdn.britannica.com/61/93061-050-99147DCE/Statue-of-Liberty-Island-New-York-Bay.jpg")
+    # image = load_image("https://huggingface.co/spaces/merve/chameleon-7b/resolve/main/bee.jpg")
     
     inputs = tokenizer(
         text=test_input.replace("<bos>", "")[:-1],
-        images=image2,
+        images=image,
         return_tensors="pt").to(test_model.device)
     
     if "token_type_ids" in inputs:
@@ -261,6 +358,7 @@ def check_params_diff():
 
 if __name__ == "__main__":
     # check_params_diff()
+    test_train_forward()
     main()
     # model_1 = G3MoEForConditionalGeneration.from_pretrained(base_model_name, config=model_config, dtype=torch.bfloat16)
     # model_2 = Gemma3ForConditionalGeneration.from_pretrained(base_model_name, dtype=torch.bfloat16)

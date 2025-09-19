@@ -659,7 +659,7 @@ class G3MoERouter(nn.Module):
         self.num_experts = config.n_routed_experts
         self.router_dim = config.router_dim
         self.balancing_strength = getattr(config, "balancing_strength", 0.01)
-        self.ema_aplha = getattr(config, "ema_alpha", 0.99)
+        self.ema_alpha = getattr(config, "ema_alpha", 0.99)
         self.register_buffer("expert_load_ema", torch.zeros(self.num_experts), persistent=True)
 
         self.load_balancer = nn.GRU(
@@ -726,7 +726,11 @@ class G3MoERouter(nn.Module):
             jitter_eps=jitter_eps, 
             training=training
         )
-                # ---- Adaptive filter logic for load balancing (applied during training) ----
+
+        # Compute expression loss for the projection matrix
+        expression_loss = self.expression_projector.orthogonal_loss()
+
+        # ---- Adaptive filter logic for load balancing (applied during training) ----
         if self.training:
             with torch.no_grad():
                 total_load = self.expert_load_ema.sum()
@@ -740,10 +744,13 @@ class G3MoERouter(nn.Module):
                 # The strength of the penalty is controlled by balancing_strength
                 adjustment = load_balancing_scores * self.balancing_strength * self.num_experts
                 # multiplier에 load balancing 적용
-                multiplier = multiplier - adjustment.unsqueeze(0).unsqueeze(-1)
-        # Compute expression loss for the projection matrix
-        expression_loss = self.expression_projector.orthogonal_loss()
-        
+                multiplier = multiplier - adjustment[selected_experts]
+
+                # Count how many tokens were routed to each expert in this batch
+                current_load = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).sum(dim=[0, 1]).float()
+                # Update EMA of expert loads
+                self.expert_load_ema.mul_(self.ema_alpha).add_(current_load, alpha=1.0 - self.ema_alpha)
+
         return multiplier, selected_experts, expression_logits, hn, speciality_penalty, cosine_similarities, expression_loss
 
 iterations = 0
@@ -840,17 +847,9 @@ class G3MoEGRINMoE(nn.Module):
             training=self.training
         )
         routing_weights, selected_experts, expression_logits, hn, speciality_loss, cosine_similarities, expression_loss = router_output
-        # ---- End of adaptive filter logic ----
+
         # multiplier와 selected_experts는 이미 global router에서 sparsemixer를 통해 계산됨
         assert routing_weights.isnan().sum() == 0, f"{self.iter} layer routing_weights is nan Line: 826"
-        # ---- EMA load update logic (applied during training) ----
-        if self.training:
-            with torch.no_grad():
-                # Count how many tokens were routed to each expert in this batch
-                current_load = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).sum(dim=[0, 1]).float()
-                # Update EMA of expert loads
-                self.expert_load_ema.mul_(self.router.ema_alpha).add_(current_load, alpha=1.0 - self.router.ema_alpha)
-        # ---- End of EMA load update logic ----
 
         final_hidden_states = torch.zeros(
             (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
@@ -886,7 +885,9 @@ class G3MoEGRINMoE(nn.Module):
                 # --- Update Specialization EMA ---
                 if self.training:
                     with torch.no_grad():
-                        current_mean_hidden = hidden_states[top_x_list].mean(dim=0)
+                        # Flatten hidden_states to 2D for proper indexing
+                        hidden_states_flat = hidden_states.view(-1, hidden_states.size(-1))
+                        current_mean_hidden = hidden_states_flat[top_x_list].mean(dim=0)
                         self.expert_specialization_ema[expert_idx].mul_(self.router.ema_alpha).add_(current_mean_hidden, alpha=1.0 - self.router.ema_alpha)
                 # --- End Update Specialization EMA ---
 
@@ -1239,6 +1240,7 @@ class G3MoEPreTrainedModel(PreTrainedModel):
         "SiglipMultiheadAttentionPoolingHead",
     ]
     _skip_keys_device_placement = ["past_key_values"]
+    _supports_flash_attn = True
     _supports_flash_attn_2 = True
     _supports_sdpa = True
     _supports_flex_attn = True
@@ -2405,7 +2407,7 @@ class G3MoEForConditionalGeneration(G3MoEPreTrainedModel, GenerationMixin):
                     ortho_loss = ortho_loss / num_moe_layers  # Average over layers
                     loss += self.config.text_config.ortho_loss_coef * ortho_loss
                     ortho_loss += _orthogonal_constraint_loss(
-                        self.config.text_config.n_routed_experts, 
+                        self.config.text_config.num_experts_per_tok,
                         outputs.router_logits
                     )
 

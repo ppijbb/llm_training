@@ -98,7 +98,7 @@ def clear_gpu_memory():
     gc.collect()
 
 
-def eval_with_memory_optimization(trainer):
+def eval_with_memory_optimization(trainer, original_eval_fn, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
     """Memory-optimized evaluation function"""
     print("🔧 Memory-optimized evaluation 시작...")
     
@@ -114,8 +114,12 @@ def eval_with_memory_optimization(trainer):
     
     try:
         with torch.no_grad():
-            # eval 실행
-            eval_results = trainer.evaluate()
+            # 원래 evaluate 함수 호출 (무한 재귀 방지)
+            eval_results = original_eval_fn(
+                eval_dataset=eval_dataset, 
+                ignore_keys=ignore_keys, 
+                metric_key_prefix=metric_key_prefix
+            )
             
         # 결과 반환
         return eval_results
@@ -129,7 +133,11 @@ def eval_with_memory_optimization(trainer):
             trainer.args.per_device_eval_batch_size = 1
             try:
                 with torch.no_grad():
-                    eval_results = trainer.evaluate()
+                    eval_results = original_eval_fn(
+                        eval_dataset=eval_dataset, 
+                        ignore_keys=ignore_keys, 
+                        metric_key_prefix=metric_key_prefix
+                    )
                 return eval_results
             finally:
                 trainer.args.per_device_eval_batch_size = original_eval_batch_size
@@ -650,7 +658,7 @@ def main(
         try:
             # eval 최적화를 위한 커스텀 eval 함수 설정
             original_eval_fn = getattr(trainer, 'evaluate', None)
-            trainer.evaluate = lambda: eval_with_memory_optimization(trainer)
+            trainer.evaluate = lambda eval_dataset=None, ignore_keys=None, metric_key_prefix="eval": eval_with_memory_optimization(trainer, original_eval_fn, eval_dataset=eval_dataset, ignore_keys=ignore_keys, metric_key_prefix=metric_key_prefix)
             
             trainer.train()
         except RuntimeError as e:
