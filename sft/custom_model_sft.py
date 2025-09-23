@@ -373,7 +373,7 @@ def setup_dataset(data_config: Dict[str, Any], tokenizer):
     """Setup training dataset"""    
     dataset_name = data_config.get("dataset_name", "HuggingFaceTB/smoltalk")
     max_samples = data_config.get("max_samples", 100000)
-    max_seq_length = data_config.get("max_seq_length", 131072)
+    max_seq_length = data_config.get("max_seq_length", 131072) or 131072
     test_size = data_config.get("test_size", 0.1)
     
     print(f"Loading simple SFT dataset: {dataset_name}")
