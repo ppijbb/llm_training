@@ -9,6 +9,9 @@ import json
 import torch
 import traceback
 import argparse
+import logging
+import time
+from datetime import datetime
 from typing import Dict, Any
 from torchinfo import summary
 from PIL import Image
@@ -20,7 +23,7 @@ from transformers import (
     AutoModel,
     AutoModelForCausalLM
 )
-from transformers import logging
+from transformers import logging as transformers_logging
 
 from transformers.trainer_utils import set_seed
 from trl import SFTTrainer, SFTConfig
@@ -35,7 +38,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # Import custom modules  
 from models import G3MoEForCausalLM, G3MoEConfig, G3MoEForConditionalGeneration, G3MoETextConfig, G3MoETextModel, G3MoEModel
 from data.base_model_sft_dataset import get_dataset, create_multimodal_collate_fn
-from data.simple_sft_dataset import get_simple_sft_dataset, create_simple_collate_fn, smoltalk_dataset, orca_mini_dataset
+from data.simple_sft_dataset import get_simple_sft_dataset, create_simple_collate_fn, smoltalk_dataset, orca_mini_dataset, validate_image_data
 
 from training_utils.utils import format_parameters, load_config, setup_deepspeed_environment
 from optimizers.custom_optimizers import get_custom_optimizer
@@ -63,8 +66,132 @@ except Exception as e:
     print("G3MoE cannot train without registering model... exiting...")
     raise e
 
-logging.enable_progress_bar()
-logging.set_verbosity_warning()
+transformers_logging.enable_progress_bar()
+transformers_logging.set_verbosity_warning()
+
+# Setup comprehensive logging system
+def setup_logging(log_dir: str = "logs", log_level: str = "INFO"):
+    """Setup comprehensive logging system for training monitoring"""
+    os.makedirs(log_dir, exist_ok=True)
+    
+    # Create timestamp for log files
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # Configure root logger
+    logger = logging.getLogger()
+    logger.setLevel(getattr(logging, log_level.upper()))
+    
+    # Clear existing handlers
+    for handler in logger.handlers[:]:
+        logger.removeHandler(handler)
+    
+    # Create formatters
+    detailed_formatter = logging.Formatter(
+        '%(asctime)s | %(levelname)-8s | %(name)-20s | %(funcName)-15s:%(lineno)-4d | %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    
+    simple_formatter = logging.Formatter(
+        '%(asctime)s | %(levelname)-8s | %(message)s',
+        datefmt='%H:%M:%S'
+    )
+    
+    # File handler for detailed logs
+    file_handler = logging.FileHandler(
+        os.path.join(log_dir, f"training_detailed_{timestamp}.log"),
+        encoding='utf-8'
+    )
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(detailed_formatter)
+    logger.addHandler(file_handler)
+    
+    # File handler for error logs
+    error_handler = logging.FileHandler(
+        os.path.join(log_dir, f"training_errors_{timestamp}.log"),
+        encoding='utf-8'
+    )
+    error_handler.setLevel(logging.ERROR)
+    error_handler.setFormatter(detailed_formatter)
+    logger.addHandler(error_handler)
+    
+    # Console handler for important messages
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(simple_formatter)
+    logger.addHandler(console_handler)
+    
+    return logger
+
+# Global logger instance
+logger = setup_logging()
+
+def log_gpu_memory(logger, stage: str, device: int = 0):
+    """Log detailed GPU memory information"""
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated(device) / 1024**3  # GB
+        reserved = torch.cuda.memory_reserved(device) / 1024**3    # GB
+        max_allocated = torch.cuda.max_memory_allocated(device) / 1024**3  # GB
+        max_reserved = torch.cuda.max_memory_reserved(device) / 1024**3    # GB
+        
+        logger.info(f"🔧 GPU Memory [{stage}] - Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB")
+        logger.debug(f"🔧 GPU Memory [{stage}] - Max Allocated: {max_allocated:.2f}GB, Max Reserved: {max_reserved:.2f}GB")
+        
+        return {
+            'allocated': allocated,
+            'reserved': reserved,
+            'max_allocated': max_allocated,
+            'max_reserved': max_reserved
+        }
+    return None
+
+def log_training_progress(logger, trainer, step: int = None, epoch: float = None, loss: float = None):
+    """Log detailed training progress information"""
+    if hasattr(trainer, 'state') and trainer.state is not None:
+        state = trainer.state
+        current_step = step or state.global_step
+        current_epoch = epoch or state.epoch
+        current_loss = loss or getattr(state, 'log_history', [{}])[-1].get('train_loss', 'N/A')
+        
+        logger.info(f"📊 Training Progress - Step: {current_step}, Epoch: {current_epoch:.3f}, Loss: {current_loss}")
+        
+        # Log learning rate if available
+        if hasattr(trainer, 'lr_scheduler') and trainer.lr_scheduler is not None:
+            lr = trainer.lr_scheduler.get_last_lr()[0] if hasattr(trainer.lr_scheduler, 'get_last_lr') else 'N/A'
+            logger.debug(f"📊 Learning Rate: {lr}")
+        
+        # Log gradient norm if available
+        if hasattr(trainer, 'accelerator') and trainer.accelerator is not None:
+            if hasattr(trainer.accelerator, 'unwrap_model'):
+                model = trainer.accelerator.unwrap_model(trainer.model)
+                total_norm = 0
+                param_count = 0
+                for p in model.parameters():
+                    if p.grad is not None:
+                        param_norm = p.grad.data.norm(2)
+                        total_norm += param_norm.item() ** 2
+                        param_count += 1
+                if param_count > 0:
+                    total_norm = total_norm ** (1. / 2)
+                    logger.debug(f"📊 Gradient Norm: {total_norm:.6f}")
+
+def log_error_context(logger, error: Exception, context: str = ""):
+    """Log detailed error context with system state"""
+    logger.error(f"❌ Error in {context}: {str(error)}")
+    logger.error(f"❌ Error type: {type(error).__name__}")
+    
+    # Log traceback
+    logger.error(f"❌ Traceback:\n{traceback.format_exc()}")
+    
+    # Log GPU memory state
+    if torch.cuda.is_available():
+        memory_info = log_gpu_memory(logger, "ERROR")
+        if memory_info:
+            logger.error(f"❌ GPU Memory at error - Allocated: {memory_info['allocated']:.2f}GB, Reserved: {memory_info['reserved']:.2f}GB")
+    
+    # Log system state
+    logger.error(f"❌ System state - CUDA available: {torch.cuda.is_available()}, Device count: {torch.cuda.device_count()}")
+    if torch.cuda.is_available():
+        logger.error(f"❌ Current device: {torch.cuda.current_device()}, Device name: {torch.cuda.get_device_name()}")
 
 def load_config(config_path: str):
     """간단한 config 로더"""
@@ -90,29 +217,60 @@ def setup_deepspeed_environment():
 
 
 def clear_gpu_memory():
-    """Clear GPU memory and run garbage collection"""
+    """Clear GPU memory and run garbage collection with detailed logging"""
     import gc
+    logger.info("🧹 Starting GPU memory cleanup...")
+    
+    # Log memory before cleanup
+    memory_before = log_gpu_memory(logger, "BEFORE_CLEANUP")
+    
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
-    gc.collect()
+        logger.debug("🧹 CUDA cache cleared and synchronized")
+    
+    # Force garbage collection
+    collected = gc.collect()
+    logger.debug(f"🧹 Garbage collection freed {collected} objects")
+    
+    # Log memory after cleanup
+    memory_after = log_gpu_memory(logger, "AFTER_CLEANUP")
+    
+    if memory_before and memory_after:
+        freed_allocated = memory_before['allocated'] - memory_after['allocated']
+        freed_reserved = memory_before['reserved'] - memory_after['reserved']
+        logger.info(f"🧹 Memory cleanup completed - Freed: {freed_allocated:.2f}GB allocated, {freed_reserved:.2f}GB reserved")
+    else:
+        logger.info("🧹 Memory cleanup completed")
 
 
 def eval_with_memory_optimization(trainer, original_eval_fn, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
-    """Memory-optimized evaluation function"""
-    print("🔧 Memory-optimized evaluation 시작...")
+    """Memory-optimized evaluation function with detailed logging"""
+    logger.info("🔧 Starting memory-optimized evaluation...")
+    
+    # Log evaluation context
+    if hasattr(trainer, 'state') and trainer.state is not None:
+        logger.info(f"🔧 Evaluation context - Step: {trainer.state.global_step}, Epoch: {trainer.state.epoch:.3f}")
+    
+    # Log memory before evaluation
+    memory_before = log_gpu_memory(logger, "BEFORE_EVAL")
     
     # GPU 메모리 정리
     clear_gpu_memory()
     
     # 모델을 eval 모드로 설정하고 메모리 최적화
+    logger.debug("🔧 Setting model to eval mode...")
     trainer.model.eval()
     
     # eval 시에는 gradient checkpointing 비활성화
     original_gc = trainer.args.gradient_checkpointing
     trainer.args.gradient_checkpointing = False
+    logger.debug(f"🔧 Disabled gradient checkpointing for evaluation (was: {original_gc})")
     
     try:
+        logger.info("🔧 Starting evaluation with torch.no_grad()...")
+        start_time = time.time()
+        
         with torch.no_grad():
             # 원래 evaluate 함수 호출 (무한 재귀 방지)
             eval_results = original_eval_fn(
@@ -120,63 +278,64 @@ def eval_with_memory_optimization(trainer, original_eval_fn, eval_dataset=None, 
                 ignore_keys=ignore_keys, 
                 metric_key_prefix=metric_key_prefix
             )
-            
+        
+        eval_time = time.time() - start_time
+        logger.info(f"🔧 Evaluation completed in {eval_time:.2f} seconds")
+        
+        # Log evaluation results
+        if eval_results:
+            logger.info(f"🔧 Evaluation results: {eval_results}")
+        
+        # Log memory after evaluation
+        memory_after = log_gpu_memory(logger, "AFTER_EVAL")
+        
         # 결과 반환
         return eval_results
         
-    except RuntimeError as e:
-        if "CUDA out of memory" in str(e):
-            print("❌ Eval 중 CUDA OOM 발생! 메모리 정리 후 재시도...")
-            clear_gpu_memory()
-            # 더 작은 배치로 재시도
-            original_eval_batch_size = trainer.args.per_device_eval_batch_size
-            trainer.args.per_device_eval_batch_size = 1
-            try:
-                with torch.no_grad():
-                    eval_results = original_eval_fn(
-                        eval_dataset=eval_dataset, 
-                        ignore_keys=ignore_keys, 
-                        metric_key_prefix=metric_key_prefix
-                    )
-                return eval_results
-            finally:
-                trainer.args.per_device_eval_batch_size = original_eval_batch_size
-        else:
-            raise e
+    except Exception as e:
+        logger.error(f"❌ Error during evaluation: {str(e)}")
+        log_error_context(logger, e, "memory_optimized_evaluation")
+        raise e
+        
     finally:
         # 원래 설정 복원
+        logger.debug(f"🔧 Restoring gradient checkpointing to: {original_gc}")
         trainer.args.gradient_checkpointing = original_gc
         clear_gpu_memory()
 
 
 def setup_model_and_tokenizer(model_config: Dict[str, Any]):
-    """Setup G3MoE model and tokenizer"""
+    """Setup G3MoE model and tokenizer with detailed logging"""
+    logger.info("🚀 Starting model and tokenizer setup...")
     
     # NOTE: Delay DeepSpeed env setup until AFTER model load to avoid HF ZeRO-3 init slow path
+    logger.info("🔧 Setting up DeepSpeed environment...")
     setup_deepspeed_environment()
+    
     # Load tokenizer - 안정적인 로딩 로직
     tokenizer_path = model_config.get("tokenizer_name_or_path") or model_config["model_name_or_path"]
-    print(f"토크나이저 로딩 시도: {tokenizer_path}")
+    logger.info(f"🔤 Loading tokenizer from: {tokenizer_path}")
     
     tokenizer = None
     try:
-        print("  - AutoProcessor 시도...")
+        logger.debug("  - Attempting AutoProcessor...")
         tokenizer = AutoProcessor.from_pretrained(
             tokenizer_path,
             trust_remote_code=model_config["trust_remote_code"]
         )
-        print("  ✅ AutoProcessor 로드 성공")
+        logger.info("  ✅ AutoProcessor loaded successfully")
     except Exception as e:
-        print(f"  ❌ AutoProcessor 실패: {e}")
+        logger.warning(f"  ❌ AutoProcessor failed: {e}")
         try:
-            print("  - AutoTokenizer 시도...")
+            logger.debug("  - Attempting AutoTokenizer...")
             tokenizer = AutoTokenizer.from_pretrained(
                 tokenizer_path,
                 trust_remote_code=model_config["trust_remote_code"]
             )
-            print("  ✅ AutoTokenizer 로드 성공")
+            logger.info("  ✅ AutoTokenizer loaded successfully")
         except Exception as e2:
-            print(f"  ❌ AutoTokenizer도 실패: {e2}")
+            logger.error(f"  ❌ AutoTokenizer also failed: {e2}")
+            log_error_context(logger, e2, "tokenizer_loading")
             raise RuntimeError(f"토크나이저 로딩 실패: {e2}")
     
     # Set chat template with error handling
@@ -302,24 +461,49 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
         print(f"Using auto device mapping for {torch.cuda.device_count()} GPUs")
     
     # Load G3MoE model with the configured parameters
-    print("Loading G3MoE model...")
-    model = G3MoEForConditionalGeneration.from_pretrained(
-        model_config["model_name_or_path"],
-        config=config,
-        torch_dtype=torch.bfloat16, # Using bfloat16
-        trust_remote_code=model_config["trust_remote_code"],
-        device_map=device_map,
-        low_cpu_mem_usage=True,
-        offload_state_dict=True,
-        use_cache=False,
-        gradient_checkpointing=False,
-        # load_in_4bit=True,
-        attn_implementation=attn_implementation
-    )
-    print("✓ G3MoE model loaded successfully")
-    print(f"  - Attn implementation: {attn_implementation}")
-    total_params = model.num_parameters()
-    print(f"  - Total parameters: {format_parameters(total_params)}")
+    logger.info("🤖 Loading G3MoE model...")
+    logger.info(f"🤖 Model path: {model_config['model_name_or_path']}")
+    logger.info(f"🤖 Device map: {device_map}")
+    logger.info(f"🤖 Attention implementation: {attn_implementation}")
+    
+    # Log memory before model loading
+    memory_before = log_gpu_memory(logger, "BEFORE_MODEL_LOAD")
+    
+    try:
+        start_time = time.time()
+        model = G3MoEForConditionalGeneration.from_pretrained(
+            model_config["model_name_or_path"],
+            config=config,
+            torch_dtype=torch.bfloat16, # Using bfloat16
+            trust_remote_code=model_config["trust_remote_code"],
+            device_map=device_map,
+            low_cpu_mem_usage=True,
+            offload_state_dict=True,
+            use_cache=False,
+            gradient_checkpointing=False,
+            # load_in_4bit=True,
+            attn_implementation=attn_implementation
+        )
+        load_time = time.time() - start_time
+        logger.info(f"✅ G3MoE model loaded successfully in {load_time:.2f} seconds")
+        logger.info(f"  - Attn implementation: {attn_implementation}")
+        
+        # Log memory after model loading
+        memory_after = log_gpu_memory(logger, "AFTER_MODEL_LOAD")
+        
+        total_params = model.num_parameters()
+        logger.info(f"  - Total parameters: {format_parameters(total_params)}")
+        
+        # Log model device placement
+        if hasattr(model, 'device'):
+            logger.info(f"  - Model device: {model.device}")
+        elif hasattr(model, 'hf_device_map'):
+            logger.info(f"  - Model device map: {model.hf_device_map}")
+            
+    except Exception as e:
+        logger.error(f"❌ Failed to load G3MoE model: {str(e)}")
+        log_error_context(logger, e, "model_loading")
+        raise e
 
     # Setup LoRA if requested
     if model_config["use_lora"]:
@@ -410,7 +594,8 @@ def setup_dataset(data_config: Dict[str, Any], tokenizer):
                 test_size=test_size,
                 use_streaming=True
             )
-            collate_fn = None # create_simple_collate_fn(tokenizer)
+            # 이미지 중첩 리스트 문제 해결을 위한 커스텀 data collator 사용
+            collate_fn = create_simple_collate_fn(tokenizer)
         else:
             # open_m_3 데이터셋 로더 시도
             dataset = get_dataset(
@@ -477,17 +662,17 @@ def create_training_args(
             print(f"DeepSpeed zero stage: {zero.get('stage')}")
             print(f"DeepSpeed offload_optimizer.device: {off_opt}")
             print(f"DeepSpeed offload_param.device: {off_param}")
-            assert off_opt in {"none", None, ""} and off_param in {"none", None, ""}, (
-                "DeepSpeed CPU offload detected in config but must be disabled (device='none')."
-            )
+            # assert off_opt in {"none", None, ""} and off_param in {"none", None, ""}, (
+            #     "DeepSpeed CPU offload detected in config but must be disabled (device='none')."
+            # )
             # Workaround: ZeRO-3 + gradient checkpointing can trigger duplicate ds_id assertion
             try:
                 zero_stage = int(zero.get("stage", 0) or 0)
             except Exception:
                 zero_stage = 0
-            if zero_stage == 3 and getattr(training_args, "gradient_checkpointing", False):
-                print("⚠️ Detected ZeRO-3 with gradient checkpointing enabled. Disabling to avoid ds_id assertion.")
-                training_args.gradient_checkpointing = False
+            # if zero_stage == 3 and getattr(training_args, "gradient_checkpointing", False):
+            #     print("⚠️ Detected ZeRO-3 with gradient checkpointing enabled. Disabling to avoid ds_id assertion.")
+            #     training_args.gradient_checkpointing = False
         except Exception as e:
             print(f"⚠️ DeepSpeed config validation warning: {e}")
     
@@ -585,6 +770,7 @@ def main(
                 print("✓ Disabled gradient checkpointing for DeepSpeed ZeRO-3 compatibility")
     except Exception as _:
         pass
+    # Add MoE monitoring callback
     trainer.add_callback(
         create_moe_callback_for_transformers(
             num_experts=model_config["g3moe_params"]["n_routed_experts"],
@@ -598,6 +784,58 @@ def main(
             entropy_threshold=0.1,         # 라우팅 엔트로피가 0.1 미만이면 경고
             save_detailed_logs=False       # 상세 JSON 로그 저장 여부
         ))
+    
+    # Add custom training progress callback
+    from transformers import TrainerCallback
+    class DetailedTrainingCallback(TrainerCallback):
+        def __init__(self, logger):
+            self.logger = logger
+            self.last_log_time = time.time()
+            self.log_interval = 10  # Log every 10 seconds during training
+            
+        def on_step_begin(self, args, state, control, **kwargs):
+            current_time = time.time()
+            if current_time - self.last_log_time >= self.log_interval:
+                log_training_progress(
+                    self.logger, 
+                    kwargs.get('trainer'), 
+                    step=state.global_step, 
+                    epoch=state.epoch)
+                log_gpu_memory(self.logger, f"STEP_{state.global_step}")
+                self.last_log_time = current_time
+                
+        def on_step_end(self, args, state, control, **kwargs):
+            # Log every 10 steps for detailed monitoring
+            if state.global_step % 10 == 0:
+                self.logger.debug(f"📊 Step {state.global_step} completed")
+                
+        def on_epoch_begin(self, args, state, control, **kwargs):
+            self.logger.info(f"📅 Starting epoch {int(state.epoch)}")
+            log_gpu_memory(self.logger, f"EPOCH_{int(state.epoch)}_START")
+            
+        def on_epoch_end(self, args, state, control, **kwargs):
+            self.logger.info(f"📅 Completed epoch {int(state.epoch)}")
+            log_gpu_memory(self.logger, f"EPOCH_{int(state.epoch)}_END")
+            
+        def on_train_begin(self, args, state, control, **kwargs):
+            self.logger.info("🚀 Training started")
+            log_gpu_memory(self.logger, "TRAINING_BEGIN")
+            
+        def on_train_end(self, args, state, control, **kwargs):
+            self.logger.info("✅ Training ended")
+            log_gpu_memory(self.logger, "TRAINING_END")
+            
+        def on_log(self, args, state, control, logs=None, **kwargs):
+            if logs:
+                # Log important metrics
+                if 'train_loss' in logs:
+                    self.logger.info(f"📊 Train Loss: {logs['train_loss']:.6f}")
+                if 'learning_rate' in logs:
+                    self.logger.debug(f"📊 Learning Rate: {logs['learning_rate']:.2e}")
+                if 'grad_norm' in logs:
+                    self.logger.debug(f"📊 Gradient Norm: {logs['grad_norm']:.6f}")
+    
+    trainer.add_callback(DetailedTrainingCallback(logger))
     # trainer.add_callback(
     #     ModelEvalCallback(
     #         trainer=trainer,  # Will be set by Trainer
@@ -657,21 +895,85 @@ def main(
     else:
         try:
             # eval 최적화를 위한 커스텀 eval 함수 설정
+            logger.info("🔧 Setting up memory-optimized evaluation...")
             original_eval_fn = getattr(trainer, 'evaluate', None)
             trainer.evaluate = lambda eval_dataset=None, ignore_keys=None, metric_key_prefix="eval": eval_with_memory_optimization(trainer, original_eval_fn, eval_dataset=eval_dataset, ignore_keys=ignore_keys, metric_key_prefix=metric_key_prefix)
             
+            # Log training start
+            logger.info("🚀 Starting training...")
+            logger.info(f"🚀 Training configuration:")
+            logger.info(f"  - Epochs: {training_config['num_train_epochs']}")
+            logger.info(f"  - Batch size per device: {training_config['per_device_train_batch_size']}")
+            logger.info(f"  - Gradient accumulation steps: {training_config['gradient_accumulation_steps']}")
+            logger.info(f"  - Learning rate: {training_config['learning_rate']}")
+            logger.info(f"  - Max sequence length: {data_config['max_seq_length']}")
+            
+            # Log initial memory state
+            log_gpu_memory(logger, "TRAINING_START")
+            
+            # Start training with progress monitoring
+            start_time = time.time()
             trainer.train()
+            training_time = time.time() - start_time
+            
+            logger.info(f"✅ Training completed successfully in {training_time:.2f} seconds")
+            
         except RuntimeError as e:
-            if "CUDA out of memory" in str(e):
-                print("❌ CUDA OOM 발생! 메모리 정리 후 재시도...")
+            error_msg = str(e)
+            logger.error(f"❌ RuntimeError during training: {error_msg}")
+            
+            if "CUDA out of memory" in error_msg:
+                logger.error("❌ CUDA OOM 발생! 상세 정보를 수집합니다...")
+                
+                # Log detailed memory state at OOM
+                log_gpu_memory(logger, "OOM_ERROR")
+                
+                # Log training state at OOM
+                if hasattr(trainer, 'state') and trainer.state is not None:
+                    state = trainer.state
+                    logger.error(f"❌ Training state at OOM:")
+                    logger.error(f"  - Global step: {state.global_step}")
+                    logger.error(f"  - Epoch: {state.epoch:.3f}")
+                    logger.error(f"  - Current loss: {getattr(state, 'log_history', [{}])[-1].get('train_loss', 'N/A')}")
+                
+                # Log model state
+                logger.error(f"❌ Model state at OOM:")
+                logger.error(f"  - Model device: {next(trainer.model.parameters()).device}")
+                logger.error(f"  - Model dtype: {next(trainer.model.parameters()).dtype}")
+                logger.error(f"  - Model requires_grad: {next(trainer.model.parameters()).requires_grad}")
+                
+                # Log batch information
+                if hasattr(trainer, 'train_dataloader'):
+                    try:
+                        batch_size = trainer.per_device_train_batch_size
+                        grad_accum = trainer.gradient_accumulation_steps
+                        effective_batch = batch_size * grad_accum
+                        logger.error(f"❌ Batch configuration at OOM:")
+                        logger.error(f"  - Per device batch size: {batch_size}")
+                        logger.error(f"  - Gradient accumulation: {grad_accum}")
+                        logger.error(f"  - Effective batch size: {effective_batch}")
+                    except Exception as batch_e:
+                        logger.error(f"❌ Could not get batch info: {batch_e}")
+                
+                logger.error("❌ 메모리 정리 후 재시도...")
                 clear_gpu_memory()
-                print("GPU 메모리 정리 완료. 다시 시도해주세요.")
-                raise e
+                logger.error("❌ GPU 메모리 정리 완료. 다시 시도해주세요.")
+                
             else:
-                raise e
+                logger.error(f"❌ Other RuntimeError: {error_msg}")
+                log_error_context(logger, e, "training_runtime_error")
+            
+            raise e
+            
+        except Exception as e:
+            logger.error(f"❌ Unexpected error during training: {str(e)}")
+            log_error_context(logger, e, "training_unexpected_error")
+            raise e
+            
         finally:
             # 원래 eval 함수 복원
             if original_eval_fn:
+                logger.debug("🔧 Restoring original evaluation function...")
                 trainer.evaluate = original_eval_fn
 
     # Save final model
@@ -719,8 +1021,15 @@ if __name__ == "__main__":
         main(model_config, data_config, training_config)
 
     except Exception as e:
-        import traceback
-        traceback.print_exc()
-        print(torch.cuda.memory_summary())
-        print(torch.cuda.max_memory_allocated())
-        print(torch.cuda.max_memory_reserved())
+        logger.error(f"❌ Fatal error in main: {str(e)}")
+        log_error_context(logger, e, "main_function")
+        
+        # Log final memory state
+        if torch.cuda.is_available():
+            logger.error("❌ Final GPU memory state:")
+            logger.error(f"❌ Memory summary:\n{torch.cuda.memory_summary()}")
+            logger.error(f"❌ Max memory allocated: {torch.cuda.max_memory_allocated() / 1024**3:.2f}GB")
+            logger.error(f"❌ Max memory reserved: {torch.cuda.max_memory_reserved() / 1024**3:.2f}GB")
+        
+        # Re-raise the exception
+        raise e

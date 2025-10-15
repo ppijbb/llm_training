@@ -8,6 +8,12 @@ import traceback
 import gc
 import os
 import random
+import tempfile
+import pathlib
+import shutil
+import json
+from PIL import Image
+from datasets import Dataset, DatasetDict, load_dataset, Image as DatasetImage, Sequence, Features
 
 # Configure logger
 logger = logging.getLogger(__name__)
@@ -24,23 +30,29 @@ def get_simple_sft_dataset(
     max_samples: int = 1000,
     test_size: float = 0.1,
     use_streaming: bool = True,
-    chunk_size: int = 100
+    chunk_size: int = 1000
 ):
     """
     메모리 효율적인 SFT 데이터셋을 로드합니다.
     모든 config를 순차적으로 처리하여 메모리 사용량을 최소화합니다.
+    데이터를 청크 단위로 디스크에 저장하여 메모리 초과를 방지합니다.
     """
     if tokenizer is None:
         raise ValueError("Tokenizer must be provided")
     
-    logger.info(f"📦 메모리 효율적 로딩: {dataset_name}")
+    logger.info(f"📦 메모리 효율적 로딩 (V2 - JSONL): {dataset_name}")
     logger.info(f"   - max_samples: {max_samples}")
     logger.info(f"   - streaming: {use_streaming}")
-    logger.info(f"   - chunk_size: {chunk_size}")
     
     log_memory_usage("데이터셋 로딩 시작")
     
-    # 모든 config를 순차적으로 처리
+    base_temp_dir = "/mls/conan/tmp"
+    os.makedirs(base_temp_dir, exist_ok=True)
+    temp_dir = tempfile.mkdtemp(dir=base_temp_dir)
+    logger.info(f"📂 임시 디렉토리 생성: {temp_dir}")
+    images_dir = os.path.join(temp_dir, "images")
+    os.makedirs(images_dir, exist_ok=True)
+
     try:
         available_configs = get_dataset_config_names(dataset_name)
         selected_configs = []
@@ -51,141 +63,188 @@ def get_simple_sft_dataset(
         logger.info(f"   📋 사용 가능한 configs: {len(available_configs)}개")
         logger.info(f"   🎯 모든 config 사용: {len(available_configs)}개")
         
-        # config당 샘플 수를 균등하게 분배
         samples_per_config = max(1, max_samples // len(available_configs))
         logger.info(f"   📊 Config당 샘플 수: {samples_per_config}개")
         
-        train_samples = []
-        test_samples = []
         total_processed = 0
+        image_counter = 0
+        train_count, test_count = 0, 0
         
-        # tqdm으로 진행 상황 표시
-        config_pbar = tqdm(available_configs, desc="Config 처리", unit="config")
-        
-        # 각 config를 순차적으로 처리 (메모리 절약)
-        for i, config in enumerate(config_pbar):
-            if total_processed >= max_samples:
-                break
-                
-            try:
-                config_pbar.set_description(f"Config {i+1}/{len(available_configs)}: {config[:30]}...")
-                
-                # 스트리밍으로 데이터셋 로드
-                config_dataset = load_dataset(
-                    path=dataset_name, 
-                    name=config,
-                    split="train", 
-                    streaming=True
-                )
-                
-                # config에서 샘플 스트리밍 처리
-                config_processed = 0
-                sample_pbar = tqdm(total=samples_per_config, desc=f"샘플 처리", unit="sample", leave=False)
-                
-                for sample in config_dataset:
-                    if config_processed >= samples_per_config or total_processed >= max_samples:
-                        break
-                    
-                    # 샘플 변환
-                    converted = convert_sample_to_messages(sample, dataset_name)
-                    if "images" in converted:
-                        for img in converted["images"]:
-                            if img is None:
-                                converted = None
-                    if "messages" in converted:
-                        user_msg_len = len([msg for msg in converted["messages"] if msg["role"] == "user"])
-                        images_len = len(["images"])
-                        if user_msg_len > 1 and images_len > 1:
-                            print(converted)
-                            converted = None
+        train_jsonl_path = os.path.join(temp_dir, "train.jsonl")
+        test_jsonl_path = os.path.join(temp_dir, "test.jsonl")
 
-                    if converted:
-                        # 훈련/테스트 분할
+        with open(train_jsonl_path, "w", encoding="utf-8") as train_f, \
+             open(test_jsonl_path, "w", encoding="utf-8") as test_f:
+            
+            config_pbar = tqdm(available_configs, desc="Config 처리", unit="config")
+            
+            for i, config in enumerate(config_pbar):
+                if total_processed >= max_samples:
+                    break
+                    
+                try:
+                    config_pbar.set_description(f"Config {i+1}/{len(available_configs)}: {config[:30]}...")
+                    
+                    config_dataset = load_dataset(
+                        path=dataset_name, 
+                        name=config,
+                        split="train", 
+                        streaming=True
+                    )
+                    
+                    sample_pbar = tqdm(total=samples_per_config, desc=f"샘플 처리", unit="sample", leave=False)
+                    
+                    for sample in config_dataset:
+                        if total_processed >= max_samples:
+                            break
+                        
+                        converted = convert_sample_to_messages(sample, dataset_name)
+                        if not converted:
+                            continue
+
+                        # 이미지가 있는지 먼저 확인 - 이미지가 없으면 샘플 건너뜀
+                        if "images" not in converted or not converted["images"]:
+                            logger.debug(f"⚠️ 이미지가 없는 샘플 건너뜀: {sample}")
+                            continue
+                        
+                        # 이미지 리스트가 중첩된 경우 평면화
+                        flattened_images = validate_image_data(converted["images"])
+                        if not flattened_images:
+                            logger.debug(f"⚠️ 유효한 이미지가 없는 샘플 건너뜀: {sample}")
+                            continue
+
+                        # 이미지 파일로 저장하고 경로로 대체
+                        image_paths = []
+                        valid_sample = True
+                        
+                        for img_obj in flattened_images:
+                            if isinstance(img_obj, Image.Image):
+                                try:
+                                    img_path = os.path.join(images_dir, f"{image_counter}.png")
+                                    img_obj.save(img_path, "PNG")
+                                    image_paths.append(img_path)
+                                    image_counter += 1
+                                except Exception as img_e:
+                                    logger.warning(f"⚠️ 이미지 저장 실패, 샘플 건너뜀: {img_e}")
+                                    valid_sample = False
+                                    break
+                            elif img_obj is not None:
+                                # None이 아닌 다른 타입의 이미지 객체 처리
+                                logger.warning(f"⚠️ 지원되지 않는 이미지 타입: {type(img_obj)}")
+                                valid_sample = False
+                                break
+                        
+                        if not valid_sample or not image_paths:
+                            logger.debug(f"⚠️ 이미지 처리 실패로 샘플 건너뜀: {sample}")
+                            continue
+                        
+                        converted["images"] = image_paths
+
                         is_train = (total_processed % int(1/test_size)) != 0
                         
-                        if is_train :
-                            train_samples.append(converted)
+                        if is_train:
+                            train_f.write(json.dumps(converted) + "\n")
+                            train_count += 1
                         else:
-                            test_samples.append(converted)
+                            test_f.write(json.dumps(converted) + "\n")
+                            test_count += 1
 
                         total_processed += 1
-                        config_processed += 1
-
-                        # tqdm 업데이트
+                        
                         sample_pbar.update(1)
                         memory_gb = get_memory_usage()
                         sample_pbar.set_postfix({
                             "총 처리": f"{total_processed}/{max_samples}",
-                            "Train": len(train_samples),
-                            "Test": len(test_samples),
+                            "Train": train_count,
+                            "Test": test_count,
                             "메모리": f"{memory_gb:.1f}GB"
                         })
-                
-                sample_pbar.close()
-                
-                # 메모리 정리
-                del config_dataset
-                gc.collect()
-                
-            except Exception as e:
-                tqdm.write(f"⚠️ Config {config} 실패: {e}")
-                continue
+                    
+                    sample_pbar.close()
+                    del config_dataset
+                    gc.collect()
+                    
+                except Exception as e:
+                    tqdm.write(f"⚠️ Config {config} 실패: {e}")
+                    continue
+            
+            config_pbar.close()
+
+        logger.info(f"✅ 샘플 수집 및 디스크 저장 완료: Train {train_count}개, Test {test_count}개")
         
-        config_pbar.close()
+        data_files = {}
+        if train_count > 0:
+            data_files["train"] = train_jsonl_path
+        if test_count > 0:
+            data_files["test"] = test_jsonl_path
+
+        if not data_files:
+            raise ValueError("변환된 훈련 샘플이 없습니다. 데이터셋 형식을 확인하세요.")
         
-        logger.info(f"✅ 샘플 수집 완료: Train {len(train_samples)}개, Test {len(test_samples)}개")
+        logger.info("🧠 JSONL 파일로부터 데이터셋 로딩...")
+        dataset_dict = load_dataset("json", data_files=data_files)
         
+        logger.info("🖼️ 이미지 경로를 이미지 객체로 캐스팅 (lazy loading)...")
+        for split in dataset_dict:
+            # 새로운 Features 객체 생성
+            current_features = dataset_dict[split].features
+            new_features = current_features.copy()
+            if 'images' in new_features and isinstance(new_features['images'], Sequence):
+                # 중첩 리스트 문제를 방지하기 위해 이미지 데이터 전처리
+                def preprocess_images(example):
+                    """이미지 데이터 전처리 - 중첩 리스트 평면화"""
+                    if 'images' in example and example['images']:
+                        example['images'] = validate_image_data(example['images'])
+                    return example
+                
+                # 이미지 전처리 적용
+                dataset_dict[split] = dataset_dict[split].map(preprocess_images)
+                new_features['images'] = Sequence(DatasetImage(decode=True))
+                dataset_dict[split] = dataset_dict[split].cast(new_features)
+
+        logger.info("✅ 메모리 효율적 데이터셋 생성 완료")
+        
+        return dataset_dict
+
     except Exception as e:
         logger.error(f"❌ 데이터셋 로딩 실패: {e}")
-        raise Exception(f"😢 데이터셋 로딩 시도가 실패했습니다.")
-    
-    if len(train_samples) == 0:
-        raise ValueError("변환된 훈련 샘플이 없습니다. 데이터셋 형식을 확인하세요.")
-    
-    # Dataset으로 변환 (최소한의 메모리 사용)
-    print("📊 Dataset 변환 시작...")
-    
-    from datasets import Dataset, DatasetDict
-    
-    # tqdm으로 Dataset 변환 진행 상황 표시
-    with tqdm(total=2, desc="Dataset 변환", unit="dataset") as pbar:
-        pbar.set_description("Train Dataset 생성")
-        train_dataset = Dataset.from_list(train_samples)
-        pbar.update(1)
-        
-        pbar.set_description("Test Dataset 생성")
-        test_dataset = Dataset.from_list(test_samples)
-        pbar.update(1)
-    
-    # 원본 리스트 메모리 해제
-    del train_samples, test_samples
-    gc.collect()
-    
-    print("✅ 메모리 효율적 데이터셋 생성 완료")
-    
-    return DatasetDict({
-        "train": train_dataset,
-        "test": test_dataset
-    })
+        traceback.print_exc()
+        # On failure, clean up immediately
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise Exception(f"😢 데이터셋 로딩 시도가 실패했습니다.") from e
 
 
 def convert_sample_to_messages(sample: Dict[str, Any], dataset_name: str) -> Optional[Dict[str, Any]]:
     """샘플을 messages 형식으로 변환"""
     
+    # safe_flatten_images 함수 사용
+    
     if dataset_name == "HuggingFaceTB/smoltalk" or "smoltalk" in dataset_name.lower():
         if "messages" in sample and isinstance(sample["messages"], list):
             img = sample.get("image", [])
             if not isinstance(img, list):
-                img = [img]
-            return {"messages": sample["messages"], "image": img}
+                img = [img] if img is not None else []
+            # 중첩 리스트 평면화 및 None 값 제거
+            img = validate_image_data(img)
+            # 이미지가 없으면 None 반환 (샘플 건너뜀)
+            if not img:
+                return None
+            
+            # 메시지 검증 및 최적화
+            messages = validate_messages(sample["messages"])
+            return {"messages": messages, "images": img}
     
     elif "orca-agentinstruct" in dataset_name:
         if "messages" in sample and isinstance(sample["messages"], list):
             img = sample.get("image", [])
             if not isinstance(img, list):
-                img = [img]
+                img = [img] if img is not None else []
+            # 중첩 리스트 평면화 및 None 값 제거
+            img = validate_image_data(img)
             
-            sample.update({"messages": sample["messages"], "images": img})
+            # 메시지 검증 및 최적화
+            messages = validate_messages(sample["messages"])
+            sample.update({"messages": messages, "images": img})
             return sample
     
     # 기본 instruction-output 형식 처리
@@ -196,8 +255,13 @@ def convert_sample_to_messages(sample: Dict[str, Any], dataset_name: str) -> Opt
         ]
         img = sample.get("image", [])
         if not isinstance(img, list):
-            img = [img]
-        return{"messages": messages, "images": img}
+            img = [img] if img is not None else []
+        # 중첩 리스트 평면화 및 None 값 제거
+        img = validate_image_data(img)
+        # 이미지가 없으면 None 반환 (샘플 건너뜀)
+        if not img:
+            return None
+        return {"messages": messages, "images": img}
     
     # conversations 형식 처리
     if "conversations" in sample and isinstance(sample["conversations"], list):
@@ -215,7 +279,9 @@ def convert_sample_to_messages(sample: Dict[str, Any], dataset_name: str) -> Opt
         if messages:
             img = sample.get("image", [])
             if not isinstance(img, list):
-                img = [img]
+                img = [img] if img is not None else []
+            # 중첩 리스트 평면화 및 None 값 제거
+            img = validate_image_data(img)
             return {"messages": messages, "images": img}
     
     # text 필드만 있는 경우 (단순한 텍스트)
@@ -227,7 +293,12 @@ def convert_sample_to_messages(sample: Dict[str, Any], dataset_name: str) -> Opt
         ]
         img = sample.get("image", [])
         if not isinstance(img, list):
-            img = [img]
+            img = [img] if img is not None else []
+        # 중첩 리스트 평면화 및 None 값 제거
+        img = validate_image_data(img)
+        # 이미지가 없으면 None 반환 (샘플 건너뜀)
+        if not img:
+            return None
         return {"messages": messages, "images": img}
     
     return None
@@ -330,6 +401,8 @@ def create_memory_efficient_collate_fn(tokenizer, max_length: int = 2048):
     else:
         actual_tokenizer = tokenizer
     
+    # safe_flatten_images 함수 사용
+    
     def collate_fn(examples):
         # 메모리 효율적인 배치 처리
         batch_input_ids = []
@@ -337,14 +410,26 @@ def create_memory_efficient_collate_fn(tokenizer, max_length: int = 2048):
         
         for ex in examples:
             if "messages" in ex:
+                # 이미지 데이터가 있는 경우 안전하게 처리
+                if "images" in ex and ex["images"]:
+                    # 중첩 리스트 문제 해결
+                    ex["images"] = validate_image_data(ex["images"])
+                
                 # 실시간 토크나이징 (메모리 효율적)
                 try:
-                    tokenized = actual_tokenizer.apply_chat_template(
+                    # 먼저 텍스트로 변환
+                    text = actual_tokenizer.apply_chat_template(
                         ex["messages"],
-                        tokenize=True,
-                        add_generation_prompt=False,
+                        tokenize=False,
+                        add_generation_prompt=False
+                    )
+                    
+                    # 그 다음 토크나이징
+                    tokenized = actual_tokenizer(
+                        text,
                         max_length=max_length,
                         truncation=True,
+                        padding=False,
                         return_tensors="pt"
                     )
                     
@@ -391,37 +476,110 @@ def create_memory_efficient_collate_fn(tokenizer, max_length: int = 2048):
     
     return collate_fn
 
-def create_simple_collate_fn(tokenizer):
-    """간단한 collate function (기존 호환성 유지)"""
-    tokenizer = tokenizer.tokenizer
-    def collate_fn(examples):
-        # input_ids와 attention_mask 추출
-        input_ids = [torch.tensor(ex["input_ids"]) for ex in examples if "input_ids" in ex]
-        attention_mask = [torch.tensor(ex["attention_mask"]) for ex in examples if "attention_mask" in ex]
-        
-        if not input_ids:
-            return None
-        
-        # 패딩 처리
-        from torch.nn.utils.rnn import pad_sequence
-        
-        input_ids = pad_sequence(input_ids, batch_first=True, padding_value=tokenizer.pad_token_id or tokenizer.eos_token_id)
-        attention_mask = pad_sequence(attention_mask, batch_first=True, padding_value=0)
-        
-        # labels는 input_ids와 동일 (causal LM)
-        labels = input_ids.clone()
-        
-        # 패딩 토큰은 loss 계산에서 제외
-        pad_token_id = tokenizer.pad_token_id or tokenizer.eos_token_id
-        labels[labels == pad_token_id] = -100
-        
-        return {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "labels": labels
-        }
+def create_simple_collate_fn(processor):
+    """SFTTrainer용 커스텀 data collator - 이미지 중첩 리스트 문제 해결"""
+    from trl.trainer.sft_trainer import DataCollatorForVisionLanguageModeling
     
-    return collate_fn
+    class CustomSFTDataCollator(DataCollatorForVisionLanguageModeling):
+        def __init__(self, processor):
+            super().__init__()
+            self.processor = processor
+            
+        def __call__(self, features):
+            # 이미지 데이터 검증 - 이미지가 없는 샘플은 오류 발생
+            assert features is not None, "features is None"
+            batch_images = []
+            batch_messages = []
+
+            for i, feature in enumerate(features):
+                if "messages" in feature:
+                    feature["messages"] = validate_messages(feature["messages"])
+                    # batch_messages.append(
+                    #     self.processor.apply_chat_template(
+                    #         feature["messages"], 
+                    #         add_generation_prompt=False, 
+                    #         tokenize=False)
+                    #     )
+                if 'images' not in feature or not feature['images']:
+                    raise ValueError(f"샘플 {i}에 이미지가 없습니다! 모든 샘플은 이미지를 포함해야 합니다.")
+                
+                # 중첩 리스트 문제 해결
+                feature['images'] = validate_image_data(feature['images'])
+                if not feature['images']:
+                    raise ValueError(f"샘플 {i}의 이미지가 유효하지 않습니다!")
+                # batch_images.append(feature['images'])
+            # processor를 사용하여 데이터 처리
+            try:
+                return self.torch_call(
+                    examples=features
+                )
+
+                # return self.processor(
+                #     images=safe_flatten_images(batch_images),
+                #     text=batch_messages)
+
+
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                print(f"⚠️ Processor 처리 중 오류: {e}")
+                print(features)
+                # 오류 발생 시 기본 처리
+                return features
+    
+    return CustomSFTDataCollator(processor)
+
+def validate_messages(messages):
+    """메시지 데이터의 유효성을 검사하고 중첩 리스트 문제를 해결합니다."""
+    for message in messages:
+        content = message.get("content")
+        if not content or not isinstance(content, list):
+            continue
+            
+        # 빠른 필터링: image 타입에서 text 키만 제거
+        for item in content:
+            if (isinstance(item, dict) and 
+                item.get("type") == "image" and 
+                "text" in item):
+                item.pop("text", None)
+    
+    return messages
+
+def safe_flatten_images(images):
+    """
+    이미지 리스트를 안전하게 평면화하여 중첩 리스트 문제를 해결합니다.
+    transformers의 image_utils.py에서 발생하는 ValueError를 방지합니다.
+    """
+    if not images:
+        return []
+    
+    flattened = []
+    for img in images:
+        if isinstance(img, list):
+            # 중첩된 리스트인 경우 재귀적으로 평면화
+            flattened.extend(safe_flatten_images(img))
+        elif img is not None:
+            flattened.append(img)
+    
+    return flattened
+
+def validate_image_data(images):
+    """
+    이미지 데이터의 유효성을 검사하고 중첩 리스트 문제를 해결합니다.
+    """
+    if images is None:
+        return []
+    
+    if not images:
+        return []
+    
+    # 중첩 리스트 평면화
+    flattened = safe_flatten_images(images)
+    
+    # None 값 제거
+    valid_images = [img for img in flattened if img is not None]
+    
+    return valid_images
 
 def get_memory_usage():
     """현재 메모리 사용량을 반환합니다."""
