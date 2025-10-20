@@ -211,7 +211,6 @@ class IFEvalCallback(TrainerCallback):
             
             # Clean up GPU memory
             del prompts_tok, outputs_tok
-            torch.cuda.empty_cache()
 
         # Process special tokens in responses if needed
         special_tokens = tokenizer.all_special_tokens

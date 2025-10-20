@@ -63,12 +63,48 @@ def create_multimodal_collate_fn(processor):
                 images_list.append(images)
             
             # Process texts and images together
-            batch = processor(
-                text=texts, 
-                images=images_list, 
-                return_tensors="pt", 
-                padding=True
-            )
+            # 빈 이미지 리스트 필터링
+            valid_indices = []
+            filtered_texts = []
+            filtered_images = []
+            
+            for i, (text, images) in enumerate(zip(texts, images_list)):
+                # 이미지가 있고 유효한 경우만 포함
+                if images and len(images) > 0 and all(isinstance(img, Image.Image) for img in images):
+                    valid_indices.append(i)
+                    filtered_texts.append(text)
+                    filtered_images.append(images)
+                elif not images or len(images) == 0:
+                    # 이미지가 없는 경우 텍스트만 처리
+                    valid_indices.append(i)
+                    filtered_texts.append(text)
+                    filtered_images.append([])
+                else:
+                    logger.warning(f"⚠️ 샘플 {i}의 이미지가 유효하지 않아 건너뜀")
+            
+            if not filtered_texts:
+                logger.warning("⚠️ 유효한 샘플이 없어 배치를 건너뜀")
+                return None
+            
+            try:
+                batch = processor(
+                    text=filtered_texts, 
+                    images=filtered_images if any(img for img in filtered_images) else None, 
+                    return_tensors="pt", 
+                    padding=True
+                )
+            except Exception as e:
+                logger.error(f"❌ Processor 처리 실패: {e}")
+                # 이미지 없이 텍스트만 처리 시도
+                try:
+                    batch = processor(
+                        text=filtered_texts, 
+                        return_tensors="pt", 
+                        padding=True
+                    )
+                except Exception as e2:
+                    logger.error(f"❌ 텍스트만 처리도 실패: {e2}")
+                    return None
             
             # The labels are the input_ids, and we mask the padding tokens in the loss computation
             labels = batch["input_ids"].clone()

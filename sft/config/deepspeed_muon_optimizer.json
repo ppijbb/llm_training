@@ -1,8 +1,8 @@
 {
     "train_batch_size": "auto",
-    "train_micro_batch_size_per_gpu": 1,
+    "train_micro_batch_size_per_gpu": "auto",
     "gradient_accumulation_steps": "auto",
-    "gradient_clipping": 1.0,
+    "gradient_clipping": "auto",
     "steps_per_print": 10,
     "wall_clock_breakdown": false,
     "communication_data_type": "bf16",
@@ -10,12 +10,12 @@
         "grad_accum_dtype": "bf16"
     },
     "pipeline_parallelism": {
-        "enabled": true,
+        "enabled": false,
         "partition_method": "uniform",
         "num_partitions": 2
       },
       "tensor_parallelism": {
-        "tp_size": 1
+        "tp_size": 2
       },
     "fp16": {
         "enabled": false,
@@ -30,6 +30,7 @@
     "bf16": {
         "enabled": true
     },
+
     "optimizer": {
         "type": "AdamW",
         "params": {
@@ -46,7 +47,7 @@
         "attention": "bidirectional",
         "horizontal_global_attention": false,
         "num_different_global_patterns": 4,
-        "num_random_blocks": 0,
+        "num_random_blocks": 0, 
         "local_window_blocks": [4],
         "global_block_indices": [0],
         "global_block_end_indices": null,
@@ -69,14 +70,14 @@
     "zero_optimization": {
         "stage": 3,
         "offload_optimizer": {
-            "device": "none",
-            "nvme_path": "/mnt/disks/local-ssd/offload",
-            "pin_memory": false
+            "device": "cpu",
+            "nvme_path": "/mls/conan/offload",
+            "pin_memory": true
         },
         "offload_param": {
             "device": "cpu",
-            "nvme_path": "/mnt/disks/local-ssd/offload",
-            "buffer_count": 5,
+            "nvme_path": "/mls/conan/offload",
+            "buffer_count": 10,
             "pin_memory": false,
             "buffer_size": 5e9
         },
@@ -89,14 +90,14 @@
         "contiguous_gradients": true,
         "allgather_partitions": true,
         "reduce_scatter": true,
-        "sub_group_size": 1e8,
-        "reduce_bucket_size": 5e7,
-        "allgather_bucket_size": 5e7,
-        "stage3_param_persistence_threshold": 1e10,
-        "stage3_max_live_parameters": 5e7,
-        "stage3_max_reuse_distance": 5e9,
+        "sub_group_size": 1e6,
+        "reduce_bucket_size": 2e8,
+        "allgather_bucket_size": 2e8,
+        "stage3_param_persistence_threshold": 1e6,
+        "stage3_max_live_parameters": 5e8,
+        "stage3_max_reuse_distance": 5e8,
         "stage3_prefetch_bucket_size": 1e7,
-        "stage3_gather_16bit_weights_on_model_save": true
+        "stage3_gather_16bit_weights_on_model_save": false
     },
     "aio": {
         "block_size": 1048576,
@@ -108,8 +109,8 @@
     "curriculum_learning": {
         "enabled": true,
         "curriculum_type": "seqlen",
-        "min_difficulty": 8192,
-        "max_difficulty": 131072,
+        "min_difficulty": 65536,
+        "max_difficulty": 128000,
         "schedule_type": "fixed_linear",
         "schedule_config": {
           "total_curriculum_step": 15000,
@@ -117,18 +118,18 @@
         }
     },
     "comms_logger": {
-        "enabled": true,
+        "enabled": false,
         "verbose": false,
-        "prof_all": true,
-        "debug": true
+        "prof_all": false,
+        "debug": false
     },
     "flops_profiler": {
         "enabled": false,
         "profile_step": 1,
         "module_depth": -1,
-        "top_modules": 1,
+        "top_modules": 3,
         "detailed": true,
-        "output_file": null
+        "output_file": "/mls/conan/flops_profiler.txt"
     },
     "wandb": {
         "enabled": true,

@@ -19,4 +19,4 @@ main_training_function: main
 deepspeed_config:
   deepspeed_config_file: /home/conan/workspace/llm_training/sft/config/deepspeed_muon_optimizer.json
   deepspeed_moe_layer_cls_names: G3MoEGRINMoE
-  zero3_init_flag: false
+  zero3_init_flag: true

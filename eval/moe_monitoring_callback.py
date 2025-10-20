@@ -287,7 +287,6 @@ class TorchMoECallback:
         if self.save_detailed_logs:
             self._save_detailed_log(step_metrics, current_step)
 
-        torch.cuda.empty_cache()
 
     @torch.no_grad()
     def _calculate_step_metrics(self):
@@ -612,6 +611,12 @@ class TransformersMoECallbackWrapper(TrainerCallback):
                         moe_metrics[f'moe_{layer_name}_{metric_name}'] = value
             
             logs.update(moe_metrics)
+
+        try:
+            import deepspeed.accelerator as ds_acc
+            ds_acc.get_accelerator().empty_cache()
+        except Exception:
+            pass
     
     def on_train_end(
         self, 

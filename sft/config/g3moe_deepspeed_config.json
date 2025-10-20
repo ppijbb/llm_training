@@ -27,36 +27,36 @@
         "rope_type": "yarn",
         "factor": 8.0
       },
-      "attn_implementation": "eager"
+      "attn_implementation": "flash_attention_2"
     }
   },
   "data_config": {
     "dataset_name": "lmms-lab/LLaVA-OneVision-Data",
     "max_seq_length": null,
-    "test_size": 0.3,
+    "test_size": 0.01,
     "text_only": false,
     "streaming": false
   },
   "training_config": {
     "output_dir": "/mls/conan/training_logs/outputs",
-    "num_train_epochs": 3,
+    "num_train_epochs": 5,
     "per_device_train_batch_size": 1,
     "per_device_eval_batch_size": 1,
-    "eval_accumulation_steps": 4,
-    "gradient_accumulation_steps": 1,
+    "eval_accumulation_steps": 1,
+    "gradient_accumulation_steps": 128,
     "learning_rate": 5e-5,
     "weight_decay": 0.01,
     "lr_scheduler_type": "cosine",
     "warmup_ratio": 0.1,
-    "logging_steps": 10,
-    "eval_steps": 100,
-    "save_steps": 2000,
-    "save_total_limit": 3,
+    "logging_steps": 1,
+    "eval_steps": 1000,
+    "save_steps": 1000,
+    "save_total_limit": 2,
     "eval_strategy": "steps",
     "load_best_model_at_end": true,
     "metric_for_best_model": "eval_loss",
     "greater_is_better": false,
-    "dataset_num_proc": 16,
+    "dataset_num_proc": 4,
     "fp16": false,
     "bf16": true,
     "bf16_full_eval": true,
@@ -76,11 +76,11 @@
     },
     "report_to": ["wandb"],
     "run_name": "g3moe-deepspeed-sft",
-    "seed": 777,
+    "seed": 126,
     "log_on_each_node": false,
     "max_grad_norm": 1.0,
-    "ddp_find_unused_parameters": true,
-    "ddp_broadcast_buffers": true,
+    "ddp_find_unused_parameters": false,
+    "ddp_broadcast_buffers": false,
     "use_liger_kernel": false
   }
 }
