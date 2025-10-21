@@ -1,0 +1,16 @@
+{
+    "model_name": "unsloth/Qwen3-0.6B-bnb-4bit",
+    "max_seq_length": 2048,
+    "learning_rate": 5e-7,
+    "num_train_epochs": 3,
+    "per_device_train_batch_size": 2,
+    "per_device_eval_batch_size": 2,
+    "gradient_accumulation_steps": 4,
+    "max_samples": 1000,
+    "output_dir": "./grpo_outputs",
+    "beta": 0.1,
+    "gamma": 1.0,
+    "group_size": 4,
+    "reward_function_type": "systematic",
+    "reward_config_name": "balanced"
+  }
