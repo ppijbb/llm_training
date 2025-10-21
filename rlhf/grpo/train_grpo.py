@@ -338,7 +338,7 @@ def main():
         
         # Create configuration
         config = create_config_from_args(args)
-        logger.info(f"⚙️ Configuration: {config.model_init_kwargs.model_name}")
+        logger.info(f"⚙️ Configuration: {config.model_init_kwargs.get('model_name')}")
         
         # Validate configuration
         manager = ConfigManager()
