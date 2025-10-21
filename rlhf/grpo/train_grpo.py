@@ -30,7 +30,8 @@ from pathlib import Path
 # Add current directory to path for imports
 sys.path.append(str(Path(__file__).parent))
 
-from grpo_trainer import GRPOTrainer, GRPOConfig
+from grpo_trainer import UnslothGRPOTrainer, create_grpo_trainer
+from trl import GRPOConfig
 from data_loader import GRPODataLoader, create_grpo_dataloader
 from config import (
     create_default_config, 
@@ -279,14 +280,16 @@ def create_config_from_args(args) -> GRPOConfig:
     return config
 
 
-def load_dataset(args, config: GRPOConfig):
+def load_dataset(args, config: GRPOConfig, dataset_config):
     """Load dataset based on arguments"""
     logger.info("📦 Loading dataset")
     
     # Create data loader
+    model_name = config.model_init_kwargs.get("model_name", "unsloth/Qwen3-0.6B-bnb-4bit")
+    max_length = getattr(config, 'max_prompt_length', 2048)
     data_loader = GRPODataLoader(
-        model_name=config.model_name,
-        max_length=config.max_seq_length,
+        model_name=model_name,
+        max_length=max_length,
         batch_size=config.per_device_train_batch_size,
         use_processor=False
     )
@@ -296,10 +299,12 @@ def load_dataset(args, config: GRPOConfig):
         logger.info(f"📁 Loading custom data from {args.custom_data}")
         dataset = data_loader.load_custom_dataset(args.custom_data)
     else:
-        logger.info(f"📦 Loading dataset: {config.dataset_name}")
+        dataset_name = dataset_config.get("dataset_name", "HuggingFaceH4/ultrafeedback_binarized")
+        max_samples = dataset_config.get("max_samples", 1000)
+        logger.info(f"📦 Loading dataset: {dataset_name}")
         dataset = data_loader.load_dataset(
-            dataset_name=config.dataset_name,
-            max_samples=config.max_samples,
+            dataset_name=dataset_name,
+            max_samples=max_samples,
             streaming=False
         )
     
@@ -346,19 +351,15 @@ def main():
         logger.info(f"📁 Output directory: {config.output_dir}")
         
         # Load dataset
-        train_dataset, eval_dataset = load_dataset(args, config)
+        train_dataset, eval_dataset = load_dataset(args)
         
         if len(train_dataset) == 0:
             logger.error("❌ No training data found")
             return 1
         
-        # Create trainer
-        trainer = GRPOTrainer(config)
+        # Create trainer with reward configuration
+        trainer = create_grpo_trainer(config)
         logger.info("✅ GRPO Trainer created")
-        
-        # Load model
-        trainer.load_model()
-        logger.info("✅ Model loaded")
         
         if args.eval_only:
             # Only run evaluation
@@ -373,17 +374,17 @@ def main():
         else:
             # Run training
             logger.info("🚀 Starting training")
-            
+
             # Resume from checkpoint if specified
             if args.resume_from_checkpoint:
                 logger.info(f"🔄 Resuming from checkpoint: {args.resume_from_checkpoint}")
                 # Note: Actual checkpoint resuming would need to be implemented
-            
+
             # Start training
             training_result = trainer.train(train_dataset, eval_dataset)
-            
+
             logger.info("✅ Training completed")
-            
+
             # Save model
             trainer.save_model()
             logger.info("💾 Model saved")
