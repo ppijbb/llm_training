@@ -46,30 +46,15 @@ class UnslothGRPOTrainer:
     def _initialize_reward_functions(self):
         """Initialize reward functions for TRL GRPOTrainer"""
         try:
-            # Get reward configuration
-            reward_function_type = self.config.get("reward_function_type", "systematic")
-            reward_config_name = self.config.get("reward_config_name", "default")
-            custom_reward_config = self.config.get("custom_reward_config", None)
-            
-            if custom_reward_config:
-                # Use custom configuration
-                reward_function = RewardFunctionFactory.create_reward_function(
-                    reward_function_type,
-                    custom_reward_config
-                )
-            else:
-                # Use predefined configuration
-                reward_function = create_reward_function(
-                    reward_function_type,
-                    reward_config_name
-                )
-            
+            # Use default systematic reward function
+            reward_function = create_reward_function("systematic", "default")
+
             # Convert to TRL-compatible reward function format
             trl_reward_func = self._convert_to_trl_reward_function(reward_function)
             self.reward_functions = [trl_reward_func]
-            
+
             logger.info(f"✅ Reward functions initialized: {[f.__name__ for f in self.reward_functions]}")
-            
+
         except Exception as e:
             logger.error(f"❌ Failed to initialize reward functions: {e}")
             raise

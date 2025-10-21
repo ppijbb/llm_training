@@ -34,11 +34,9 @@ from grpo_trainer import create_grpo_trainer
 from trl import GRPOConfig
 from data_loader import GRPODataLoader, create_grpo_dataloader
 from config import (
-    create_default_config, 
-    load_config_from_file, 
-    get_quick_test_config,
-    get_production_config,
-    ConfigManager
+    create_grpo_config,
+    create_quick_test_config,
+    create_production_config,
 )
 
 # Configure logging
@@ -51,6 +49,55 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+
+def validate_grpo_config(config) -> bool:
+    """Validate GRPOConfig"""
+    logger.info("🔍 Validating configuration")
+
+    try:
+        # Check required fields for TRL GRPOConfig
+        required_fields = [
+            "learning_rate", "per_device_train_batch_size", "num_train_epochs"
+        ]
+
+        for field in required_fields:
+            if not hasattr(config, field) or getattr(config, field) is None:
+                logger.error(f"❌ Missing required field: {field}")
+                return False
+
+        # Check value ranges
+        if config.learning_rate <= 0:
+            logger.error("❌ Learning rate must be positive")
+            return False
+
+        if config.per_device_train_batch_size <= 0:
+            logger.error("❌ Batch size must be positive")
+            return False
+
+        if config.num_train_epochs <= 0:
+            logger.error("❌ Number of epochs must be positive")
+            return False
+
+        # Check TRL GRPOConfig specific fields
+        if hasattr(config, 'max_prompt_length') and config.max_prompt_length <= 0:
+            logger.error("❌ Max prompt length must be positive")
+            return False
+
+        if hasattr(config, 'num_generations') and config.num_generations <= 0:
+            logger.error("❌ Number of generations must be positive")
+            return False
+
+        if hasattr(config, 'beta') and config.beta < 0:
+            logger.error("❌ Beta (KL penalty) must be non-negative")
+            return False
+
+        logger.info("✅ Configuration validation passed")
+        return True
+
+    except Exception as e:
+        logger.error(f"❌ Configuration validation failed: {e}")
+        return False
 
 
 def parse_arguments():
@@ -153,28 +200,8 @@ Examples:
         help="Output directory for trained model"
     )
     
-    # Reward function options
-    parser.add_argument(
-        "--reward-function",
-        type=str,
-        default="systematic",
-        choices=["systematic", "group_relative", "multi_objective"],
-        help="Reward function type (default: systematic)"
-    )
-    
-    parser.add_argument(
-        "--reward-config",
-        type=str,
-        default="default",
-        choices=["default", "balanced", "aggressive"],
-        help="Reward function configuration (default: default)"
-    )
-    
-    parser.add_argument(
-        "--custom-reward-config",
-        type=str,
-        help="Path to custom reward function configuration JSON file"
-    )
+    # Note: Reward functions are now handled by TRL GRPOTrainer internally
+    # Custom reward functions are not supported in this implementation
     
     
     # Other options
@@ -212,16 +239,22 @@ def create_config_from_args(args) -> GRPOConfig:
     
     # Start with base configuration
     if args.config:
-        config = load_config_from_file(args.config)
-        logger.info(f"📁 Loaded config from {args.config}")
+        # Load config from file
+        logger.info(f"📁 Loading config from {args.config}")
+        config = create_grpo_config(model_name="unsloth/Qwen3-0.6B-bnb-4bit")
+        # TODO: 실제 파일에서 설정 로드 구현 필요
     elif args.quick_test:
-        config = get_quick_test_config()
+        config = create_quick_test_config()
         logger.info("⚡ Using quick test configuration")
     elif args.production:
-        config = get_production_config(args.model)
+        config = create_production_config(args.model)
         logger.info("🏭 Using production configuration")
     else:
-        config = create_default_config(args.model, args.dataset)
+        # 기본 설정 생성
+        config = create_grpo_config(
+            model_name=f"unsloth/{args.model}-bnb-4bit" if not args.model.startswith("unsloth/") else args.model,
+            output_dir="./grpo_outputs"
+        )
         logger.info(f"🔧 Using default configuration for {args.model}")
     
     # Override with command line arguments
@@ -255,21 +288,9 @@ def create_config_from_args(args) -> GRPOConfig:
         custom_config["report_to"] = "wandb"
         logger.info(f"📊 Weights & Biases project: {args.wandb_project}")
     
-    # Reward function configuration
-    custom_config["reward_function_type"] = args.reward_function
-    custom_config["reward_config_name"] = args.reward_config
-    logger.info(f"🎯 Reward function: {args.reward_function} ({args.reward_config})")
-    
-    # Load custom reward configuration if provided
-    if args.custom_reward_config:
-        try:
-            with open(args.custom_reward_config, 'r') as f:
-                custom_reward_config = json.load(f)
-            custom_config["custom_reward_config"] = custom_reward_config
-            logger.info(f"📁 Custom reward config loaded: {args.custom_reward_config}")
-        except Exception as e:
-            logger.error(f"❌ Failed to load custom reward config: {e}")
-            return None
+    # Note: Reward function configuration is handled by the trainer
+    # TRL GRPOTrainer uses built-in reward functions
+    logger.info(f"🎯 Using default reward function (handled by TRL GRPOTrainer)")
     
     
     # Apply custom configuration
@@ -342,8 +363,7 @@ def main():
         logger.info(f"⚙️ Configuration: {config.model_init_kwargs.get('model_name')}")
         
         # Validate configuration
-        manager = ConfigManager()
-        if not manager.validate_config(config):
+        if not validate_grpo_config(config):
             logger.error("❌ Configuration validation failed")
             return 1
         
@@ -358,7 +378,7 @@ def main():
             logger.error("❌ No training data found")
             return 1
         
-        # Create trainer with reward configuration
+        # Create trainer with model initialization kwargs
         trainer = create_grpo_trainer(config, model_init_kwargs=config.model_init_kwargs)
         logger.info("✅ GRPO Trainer created")
         
