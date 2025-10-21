@@ -315,16 +315,17 @@ def load_dataset(args, config: GRPOConfig):
     if len(train_dataset) > 100:  # Only split if we have enough data
         train_size = int(0.9 * len(train_dataset))
         eval_size = len(train_dataset) - train_size
-        
-        train_dataset = train_dataset.select(range(train_size))
-        eval_dataset = train_dataset.select(range(train_size, train_size + eval_size))
+        splits = dataset.train_test_split(test_size=eval_size)
+        train_dataset = splits["train"]
+        eval_dataset = splits["test"]
         
         logger.info(f"📊 Dataset split: {len(train_dataset)} train, {len(eval_dataset)} eval")
     else:
+        train_dataset = dataset
         eval_dataset = None
         logger.info(f"📊 Using full dataset for training: {len(train_dataset)} samples")
     
-    return train_dataset, eval_dataset
+    return train_dataset, eval_dataset.select(range(eval_size))
 
 
 def main():
