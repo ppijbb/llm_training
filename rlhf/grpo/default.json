@@ -12,5 +12,8 @@
     "gamma": 1.0,
     "group_size": 4,
     "reward_function_type": "systematic",
-    "reward_config_name": "balanced"
+    "reward_config_name": "balanced",
+    "use_vllm": true,
+    "vllm_mode": "chocolate",
+    "vllm_enable_sleep_mode": true
   }

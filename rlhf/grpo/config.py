@@ -32,6 +32,9 @@ DEFAULT_CONFIGS = {
         "num_generations": 8,
         "max_completion_length": 256,
         "loss_type": "grpo",
+        "use_vllm": True,
+        "vllm_mode": "chocolate",
+        "vllm_enable_sleep_mode": True
     },
 
     "llama-3.2-1B": {
@@ -51,6 +54,9 @@ DEFAULT_CONFIGS = {
         "num_generations": 8,
         "max_completion_length": 256,
         "loss_type": "grpo",
+        "use_vllm": True,
+        "vllm_mode": "chocolate",
+        "vllm_enable_sleep_mode": True
     },
 
     "gemma-3n-E2B": {
@@ -70,6 +76,9 @@ DEFAULT_CONFIGS = {
         "num_generations": 8,
         "max_completion_length": 256,
         "loss_type": "grpo",
+        "use_vllm": True,
+        "vllm_mode": "chocolate",
+        "vllm_enable_sleep_mode": True
     },
 
     "gpt-oss": {
@@ -89,6 +98,9 @@ DEFAULT_CONFIGS = {
         "num_generations": 8,
         "max_completion_length": 256,
         "loss_type": "grpo",
+        "use_vllm": True,
+        "vllm_mode": "chocolate",
+        "vllm_enable_sleep_mode": True
     }
 }
 
@@ -162,7 +174,7 @@ class ConfigManager:
             with open(config_path, 'r') as f:
                 config_dict = json.load(f)
             
-            self.config = GRPOConfig(**config_dict)
+            self.config = GRPOConfig(**{k:v for k, v in config_dict.items() if k in GRPOConfig.__annotations__})
             logger.info("✅ Config loaded successfully")
             return self.config
             
