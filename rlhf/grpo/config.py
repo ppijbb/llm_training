@@ -18,6 +18,7 @@ DEFAULT_CONFIGS = {
     "Qwen3-0.6B": {
         "model_init_kwargs": {"model_name": "unsloth/Qwen3-0.6B-bnb-4bit"},
         "max_prompt_length": 2048,
+        "max_completion_length": 2048,
         "per_device_train_batch_size": 2,
         "per_device_eval_batch_size": 2,
         "gradient_accumulation_steps": 4,
@@ -30,7 +31,6 @@ DEFAULT_CONFIGS = {
         "eval_steps": 500,
         "beta": 0.1,
         "num_generations": 8,
-        "max_completion_length": 256,
         "loss_type": "grpo",
         "use_vllm": True,
         "vllm_mode": "chocolate",
@@ -40,6 +40,7 @@ DEFAULT_CONFIGS = {
     "llama-3.2-1B": {
         "model_init_kwargs": {"model_name": "unsloth/llama-3.2-1B-bnb-4bit"},
         "max_prompt_length": 2048,
+        "max_completion_length": 2048,
         "per_device_train_batch_size": 1,
         "per_device_eval_batch_size": 1,
         "gradient_accumulation_steps": 8,
@@ -74,7 +75,6 @@ DEFAULT_CONFIGS = {
         "eval_steps": 500,
         "beta": 0.1,
         "num_generations": 8,
-        "max_completion_length": 256,
         "loss_type": "grpo",
         "use_vllm": True,
         "vllm_mode": "chocolate",
@@ -84,6 +84,7 @@ DEFAULT_CONFIGS = {
     "gpt-oss": {
         "model_init_kwargs": {"model_name": "unsloth/gpt-oss-20b-bnb-4bit"},
         "max_prompt_length": 2048,
+        "max_completion_length": 2048,
         "per_device_train_batch_size": 2,
         "per_device_eval_batch_size": 2,
         "gradient_accumulation_steps": 4,
@@ -96,7 +97,6 @@ DEFAULT_CONFIGS = {
         "eval_steps": 500,
         "beta": 0.1,
         "num_generations": 8,
-        "max_completion_length": 256,
         "loss_type": "grpo",
         "use_vllm": True,
         "vllm_mode": "chocolate",

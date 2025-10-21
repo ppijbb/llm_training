@@ -1,6 +1,7 @@
 {
     "model_init_kwargs": {"model_name": "unsloth/Qwen3-0.6B-bnb-4bit"},
-    "max_seq_length": 2048,
+    "max_prompt_length": 2048,
+    "max_completion_length": 2048,
     "learning_rate": 5e-7,
     "num_train_epochs": 3,
     "per_device_train_batch_size": 2,
