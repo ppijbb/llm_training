@@ -280,7 +280,7 @@ def create_config_from_args(args) -> GRPOConfig:
     return config
 
 
-def load_dataset(args, config: GRPOConfig, dataset_config):
+def load_dataset(args, config: GRPOConfig):
     """Load dataset based on arguments"""
     logger.info("📦 Loading dataset")
     
@@ -299,8 +299,8 @@ def load_dataset(args, config: GRPOConfig, dataset_config):
         logger.info(f"📁 Loading custom data from {args.custom_data}")
         dataset = data_loader.load_custom_dataset(args.custom_data)
     else:
-        dataset_name = dataset_config.get("dataset_name", "HuggingFaceH4/ultrafeedback_binarized")
-        max_samples = dataset_config.get("max_samples", 1000)
+        dataset_name = "HuggingFaceH4/ultrafeedback_binarized"
+        max_samples = 1000
         logger.info(f"📦 Loading dataset: {dataset_name}")
         dataset = data_loader.load_dataset(
             dataset_name=dataset_name,
