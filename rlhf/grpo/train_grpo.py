@@ -30,7 +30,7 @@ from pathlib import Path
 # Add current directory to path for imports
 sys.path.append(str(Path(__file__).parent))
 
-from grpo_trainer import UnslothGRPOTrainer, create_grpo_trainer
+from grpo_trainer import create_grpo_trainer
 from trl import GRPOConfig
 from data_loader import GRPODataLoader, create_grpo_dataloader
 from config import (
@@ -338,7 +338,7 @@ def main():
         
         # Create configuration
         config = create_config_from_args(args)
-        logger.info(f"⚙️ Configuration: {config.model_name}")
+        logger.info(f"⚙️ Configuration: {config.model_init_kwargs.model_name}")
         
         # Validate configuration
         manager = ConfigManager()
