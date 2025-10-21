@@ -174,7 +174,7 @@ class ConfigManager:
             with open(config_path, 'r') as f:
                 config_dict = json.load(f)
             
-            self.config = GRPOConfig(**config_dict)
+            self.config = GRPOConfig(**{k:v for k, v in config_dict.items() if k in GRPOConfig.__annotations__})
             if "model_init_kwargs" in config_dict:
                 self.config.model_init_kwargs = config_dict["model_init_kwargs"]
             logger.info("✅ Config loaded successfully")
