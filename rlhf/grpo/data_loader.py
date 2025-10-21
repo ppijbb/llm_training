@@ -1,48 +1,34 @@
 """
-Data loader for GRPO training with HuggingFace datasets
+TRL 표준 데이터 로더 for GRPO training
 """
 
 import logging
-from typing import Dict, Any, List, Optional, Union
+from typing import Dict, Any, List, Optional
 from datasets import load_dataset, Dataset, DatasetDict
 from transformers import AutoTokenizer, AutoProcessor
-import torch
-from torch.utils.data import DataLoader
 import json
-import os
 
 logger = logging.getLogger(__name__)
 
 class GRPODataLoader:
-    """Data loader for GRPO training with HuggingFace datasets"""
-    
+    """TRL 표준 데이터 로더 for GRPO training"""
+
     def __init__(
         self,
         model_name: str = "unsloth/Qwen3-0.6B-bnb-4bit",
-        max_length: int = 2048,
-        batch_size: int = 4,
-        num_workers: int = 4,
-        use_processor: bool = False
+        max_length: int = 2048
     ):
         self.model_name = model_name
         self.max_length = max_length
-        self.batch_size = batch_size
-        self.num_workers = num_workers
-        self.use_processor = use_processor
-        
-        # Load tokenizer or processor
-        if use_processor:
-            self.processor = AutoProcessor.from_pretrained(model_name)
-            self.tokenizer = self.processor.tokenizer
-        else:
-            self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-            self.processor = None
-            
+
+        # Load tokenizer only (TRL handles the rest)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+
         # Set pad token if not exists
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
-            
-        logger.info(f"✅ DataLoader initialized with model: {model_name}")
+
+        logger.info(f"✅ TRL DataLoader initialized with model: {model_name}")
     
     def load_dataset(
         self, 
@@ -103,129 +89,75 @@ class GRPODataLoader:
             logger.error(f"❌ Failed to load custom dataset: {e}")
             raise
     
-    def prepare_grpo_data(self, dataset: Dataset, dataset_type: str = "ultrafeedback") -> Dataset:
+    def prepare_grpo_data(self, dataset: Dataset) -> Dataset:
         """
-        Prepare dataset for GRPO training
-        
-        Args:
-            dataset: Input dataset
-            dataset_type: Type of dataset (ultrafeedback, custom, etc.)
+        TRL 표준 데이터 형식으로 변환
+
+        TRL GRPO는 다음 형식의 데이터를 기대합니다:
+        - prompt/chosen/rejected 필드
+        또는
+        - messages 필드 (대화 형식)
         """
-        logger.info(f"🔄 Preparing GRPO data for {dataset_type} dataset")
-        
-        def process_ultrafeedback(example):
-            """Process UltraFeedback dataset format"""
-            chosen = example.get("chosen", [])
-            rejected = example.get("rejected", [])
-            
-            if not chosen or not rejected:
-                return None
-                
-            # Extract messages from chosen and rejected responses
-            chosen_messages = chosen[-1]["content"] if chosen else ""
-            rejected_messages = rejected[-1]["content"] if rejected else ""
-            
-            return {
-                "prompt": chosen[0]["content"] if chosen else "",
-                "chosen": chosen_messages,
-                "rejected": rejected_messages,
-                "messages": [
-                    {"role": "user", "content": chosen[0]["content"] if chosen else ""},
-                    {"role": "assistant", "content": chosen_messages}
-                ]
-            }
-        
-        def process_custom(example):
-            """Process custom dataset format"""
-            # Assume custom format has prompt, chosen, rejected fields
-            return {
-                "prompt": example.get("prompt", ""),
-                "chosen": example.get("chosen", ""),
-                "rejected": example.get("rejected", ""),
-                "messages": [
-                    {"role": "user", "content": example.get("prompt", "")},
-                    {"role": "assistant", "content": example.get("chosen", "")}
-                ]
-            }
-        
-        # Choose processing function based on dataset type
-        if dataset_type == "ultrafeedback":
-            process_func = process_ultrafeedback
-        else:
-            process_func = process_custom
-        
-        # Process dataset
+        logger.info("🔄 Converting to TRL standard format")
+
+        def convert_to_trl_format(example):
+            """Convert to TRL standard format"""
+            # 이미 TRL 형식이면 그대로 반환
+            if "prompt" in example and "chosen" in example and "rejected" in example:
+                return example
+
+            # UltraFeedback 형식 변환
+            if "chosen" in example and "rejected" in example:
+                chosen = example["chosen"]
+                rejected = example["rejected"]
+
+                if isinstance(chosen, list) and isinstance(rejected, list):
+                    # chosen과 rejected가 리스트인 경우 (메시지 형식)
+                    chosen_text = chosen[-1]["content"] if chosen else ""
+                    rejected_text = rejected[-1]["content"] if rejected else ""
+                    prompt = chosen[0]["content"] if chosen else ""
+
+                    return {
+                        "prompt": prompt,
+                        "chosen": chosen_text,
+                        "rejected": rejected_text
+                    }
+
+            # 기본적으로 원본 반환 (TRL이 처리)
+            return example
+
+        # 데이터 변환
         processed_dataset = dataset.map(
-            process_func,
-            remove_columns=dataset.column_names,
-            desc="Processing GRPO data"
+            convert_to_trl_format,
+            desc="Converting to TRL format"
         )
-        
-        # Filter out None values
-        processed_dataset = processed_dataset.filter(lambda x: x is not None)
-        
-        logger.info(f"✅ Processed {len(processed_dataset)} samples for GRPO training")
+
+        logger.info(f"✅ Converted {len(processed_dataset)} samples to TRL format")
         return processed_dataset
-    
-    def create_dataloader(
-        self, 
-        dataset: Dataset, 
-        shuffle: bool = True,
-        collate_fn: Optional[callable] = None
-    ) -> DataLoader:
-        """
-        Create PyTorch DataLoader
-        
-        Args:
-            dataset: Processed dataset
-            shuffle: Whether to shuffle data
-            collate_fn: Custom collate function
-        """
-        if collate_fn is None:
-            collate_fn = self._default_collate_fn
-            
-        dataloader = DataLoader(
-            dataset,
-            batch_size=self.batch_size,
-            shuffle=shuffle,
-            num_workers=self.num_workers,
-            collate_fn=collate_fn,
-            pin_memory=True
-        )
-        
-        logger.info(f"✅ DataLoader created with batch_size={self.batch_size}")
-        return dataloader
-    
-    def _default_collate_fn(self, batch):
-        """Default collate function for GRPO training"""
-        # This is a placeholder - actual implementation depends on the model
-        return batch
     
     def get_sample_data(self, dataset_name: str = "HuggingFaceH4/ultrafeedback_binarized") -> Dict[str, Any]:
         """
-        Get sample data for testing
-        
+        샘플 데이터를 가져와서 TRL 형식 확인
+
         Args:
-            dataset_name: Dataset name to sample from
+            dataset_name: 확인할 데이터셋 이름
         """
         logger.info(f"🔍 Getting sample data from {dataset_name}")
-        
+
         try:
-            # Load small sample
-            dataset = self.load_dataset(dataset_name, max_samples=10)
-            
-            # Process for GRPO
-            processed = self.prepare_grpo_data(dataset, "ultrafeedback")
-            
-            # Return first sample
-            if len(processed) > 0:
-                sample = processed[0]
+            # 작은 샘플 로드
+            dataset = self.load_dataset(dataset_name, max_samples=5)
+
+            # 첫 번째 샘플 반환
+            if len(dataset) > 0:
+                sample = dict(dataset[0])
                 logger.info("✅ Sample data retrieved successfully")
+                logger.info(f"📋 Sample keys: {list(sample.keys())}")
                 return sample
             else:
                 logger.warning("⚠️ No samples found in dataset")
                 return {}
-                
+
         except Exception as e:
             logger.error(f"❌ Failed to get sample data: {e}")
             return {}
@@ -235,38 +167,30 @@ def create_grpo_dataloader(
     model_name: str = "unsloth/Qwen3-0.6B-bnb-4bit",
     dataset_name: str = "HuggingFaceH4/ultrafeedback_binarized",
     max_samples: int = 1000,
-    batch_size: int = 4,
-    max_length: int = 2048,
-    use_processor: bool = False
+    max_length: int = 2048
 ) -> tuple[GRPODataLoader, Dataset]:
     """
-    Create GRPO data loader and load dataset
-    
+    TRL 표준 데이터 로더 생성 및 데이터셋 로드
+
     Args:
-        model_name: Name of the model
-        dataset_name: Name of the dataset
-        max_samples: Maximum number of samples
-        batch_size: Batch size for training
-        max_length: Maximum sequence length
-        use_processor: Whether to use processor instead of tokenizer
-    
+        model_name: 모델 이름
+        dataset_name: 데이터셋 이름
+        max_samples: 최대 샘플 수
+        max_length: 최대 시퀀스 길이
+
     Returns:
-        Tuple of (data_loader, dataset)
+        (data_loader, dataset) 튜플
     """
-    # Create data loader
+    # 데이터 로더 생성
     data_loader = GRPODataLoader(
         model_name=model_name,
-        max_length=max_length,
-        batch_size=batch_size,
-        use_processor=use_processor
+        max_length=max_length
     )
-    
-    # Load dataset
+
+    # 데이터셋 로드 및 TRL 형식으로 변환
     dataset = data_loader.load_dataset(dataset_name, max_samples=max_samples)
-    
-    # Prepare for GRPO
-    processed_dataset = data_loader.prepare_grpo_data(dataset, "ultrafeedback")
-    
+    processed_dataset = data_loader.prepare_grpo_data(dataset)
+
     return data_loader, processed_dataset
 
 

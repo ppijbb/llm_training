@@ -1,58 +1,64 @@
 # GRPO (Group Relative Policy Optimization) Training
 
-Unsloth를 사용한 GRPO 훈련을 위한 모듈입니다. HuggingFace 데이터셋을 사용하여 효율적인 GRPO 훈련을 수행할 수 있습니다.
+TRL의 표준 GRPO 트레이너를 사용하여 효율적인 강화 학습을 수행하는 모듈입니다. TRL의 표준 데이터 형식과 설정을 따릅니다.
 
 ## 🚀 빠른 시작
 
 ### 1. 환경 설정
 
 ```bash
-# 의존성 설치
-pip install -r requirements.txt
-
-# 또는 개별 설치
+# TRL 표준 의존성 설치
 pip install torch transformers datasets accelerate
 pip install "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git"
-pip install trl peft bitsandbytes wandb
+pip install trl wandb
+
+# 또는 requirements.txt 사용
+pip install -r requirements.txt
 ```
 
 ### 2. 기본 훈련
 
 ```bash
-# 빠른 테스트 (100개 샘플, 1 에포크)
+# 빠른 테스트
 python train_grpo.py --quick-test
 
-# 기본 훈련 (Llama 3.1 8B + UltraFeedback)
-python train_grpo.py --model llama-3.1-8b --dataset ultrafeedback
+# 정확성 기반 보상 함수로 훈련
+python train_grpo.py --reward-function accuracy
 
-# 프로덕션 훈련 (더 큰 데이터셋)
-python train_grpo.py --production --model llama-3.1-8b
+# 여러 보상 함수로 훈련
+python train_grpo.py --reward-function accuracy length
+
+# 기본 훈련 (TRL 표준 데이터셋 사용)
+python train_grpo.py --max-samples 1000
+
+# 프로덕션 훈련
+python train_grpo.py --production
 ```
 
 ### 3. 커스텀 데이터로 훈련
 
 ```bash
-# JSONL 파일 사용
-python train_grpo.py --custom-data /path/to/your_data.jsonl --model llama-3.1-8b
+# JSONL 파일 사용 (TRL 표준 형식)
+python train_grpo.py --custom-data /path/to/your_data.jsonl
 
-# 설정 파일 사용
-python train_grpo.py --config my_config.json
+# 데이터 형식 예시:
+# {"prompt": "질문", "chosen": "선호 답변", "rejected": "비선호 답변"}
 ```
 
-### 4. 보상 함수 커스터마이징
+# 정확성 기반 보상 함수 사용
+python train_grpo.py --reward-function accuracy
 
-```bash
-# 시스템적 보상 함수 사용
-python train_grpo.py --reward-function systematic --reward-config balanced
+# 길이 기반 보상 함수 사용
+python train_grpo.py --reward-function length
 
-# 그룹 상대 보상 함수 사용
-python train_grpo.py --reward-function group_relative --reward-config aggressive
+# 사용자 정의 보상 함수 사용
+python train_grpo.py --reward-function custom
 
-# 다중 목표 보상 함수 사용
-python train_grpo.py --reward-function multi_objective --reward-config default
+# 여러 보상 함수 결합 사용
+python train_grpo.py --reward-function accuracy length custom
 
-# 커스텀 보상 함수 설정 파일 사용
-python train_grpo.py --custom-reward-config my_reward_config.json
+# 설정 파일과 함께 사용
+python train_grpo.py --reward-function accuracy --reward-config config/reward_config.json
 ```
 
 
@@ -91,11 +97,9 @@ python train_grpo.py [OPTIONS]
   --learning-rate LR    학습률
   --batch-size N        배치 크기
   --output-dir PATH     출력 디렉토리
-  --reward-function {systematic,group_relative,multi_objective}
-                        보상 함수 타입 (기본: systematic)
-  --reward-config {default,balanced,aggressive}
-                        보상 함수 설정 (기본: default)
-  --custom-reward-config PATH
+  --reward-function {accuracy,length,custom}
+                        보상 함수 타입 (기본: accuracy)
+  --reward-config PATH  보상 함수 설정 파일 경로 (JSON)
                         커스텀 보상 함수 설정 파일
   --wandb-project NAME  Weights & Biases 프로젝트 이름
   --no-wandb           Weights & Biases 비활성화
@@ -127,13 +131,20 @@ python train_grpo.py [OPTIONS]
 
 ### 보상 함수 설정 예제
 
+`config/reward_config.json`:
 ```json
 {
-  "consistency_weight": 0.4,
-  "coherence_weight": 0.3,
-  "helpfulness_weight": 0.3,
-  "temperature": 0.8,
-  "custom_penalty": 0.05
+  "accuracy": {
+    "correct_keywords": ["correct", "right", "yes", "정확", "맞아"]
+  },
+  "length": {
+    "optimal_length": 150,
+    "length_weight": 0.1
+  },
+  "custom": {
+    "reward_scale": 1.0,
+    "penalty_scale": -0.5
+  }
 }
 ```
 

@@ -24,7 +24,7 @@ import logging
 import os
 import sys
 import json
-from typing import Optional, Dict, Any
+from typing import List
 from pathlib import Path
 
 # Add current directory to path for imports
@@ -38,6 +38,7 @@ from config import (
     create_quick_test_config,
     create_production_config,
 )
+from reward_functions import create_reward_function, combine_reward_functions
 
 # Configure logging
 logging.basicConfig(
@@ -200,8 +201,21 @@ Examples:
         help="Output directory for trained model"
     )
     
-    # Note: Reward functions are now handled by TRL GRPOTrainer internally
-    # Custom reward functions are not supported in this implementation
+    # Reward function configuration
+    parser.add_argument(
+        "--reward-function",
+        type=str,
+        nargs="+",
+        default=["accuracy"],
+        choices=["accuracy", "length", "custom"],
+        help="Reward function types to use (default: accuracy)"
+    )
+
+    parser.add_argument(
+        "--reward-config",
+        type=str,
+        help="Path to reward function configuration file (JSON)"
+    )
     
     
     # Other options
@@ -302,51 +316,67 @@ def create_config_from_args(args) -> GRPOConfig:
 
 
 def load_dataset(args, config: GRPOConfig):
-    """Load dataset based on arguments"""
-    logger.info("📦 Loading dataset")
-    
-    # Create data loader
+    """TRL 표준 데이터셋 로딩"""
+    logger.info("📦 Loading dataset with TRL standard")
+
+    # 데이터 로더 생성 (간소화된 버전)
     model_name = config.model_init_kwargs.get("model_name", "unsloth/Qwen3-0.6B-bnb-4bit")
     max_length = getattr(config, 'max_prompt_length', 2048)
-    data_loader = GRPODataLoader(
-        model_name=model_name,
-        max_length=max_length,
-        batch_size=config.per_device_train_batch_size,
-        use_processor=False
-    )
-    
-    # Load dataset
+
+    # TRL 표준 데이터 로딩
     if args.custom_data:
         logger.info(f"📁 Loading custom data from {args.custom_data}")
+        data_loader = GRPODataLoader(model_name, max_length)
         dataset = data_loader.load_custom_dataset(args.custom_data)
     else:
         dataset_name = "HuggingFaceH4/ultrafeedback_binarized"
-        max_samples = 1000
+        max_samples = getattr(args, 'max_samples', 1000)
         logger.info(f"📦 Loading dataset: {dataset_name}")
-        dataset = data_loader.load_dataset(
-            dataset_name=dataset_name,
-            max_samples=max_samples,
-            streaming=False
-        )
-    
-    # Prepare for GRPO
-    train_dataset = data_loader.prepare_grpo_data(dataset, "ultrafeedback")
-    
-    # Split into train/eval if needed
-    if len(train_dataset) > 100:  # Only split if we have enough data
+        data_loader = GRPODataLoader(model_name, max_length)
+        dataset = data_loader.load_dataset(dataset_name, max_samples=max_samples)
+
+    # TRL 표준 형식으로 변환
+    train_dataset = data_loader.prepare_grpo_data(dataset)
+
+    # 학습/평가 데이터 분할 (TRL 기본 방식)
+    if len(train_dataset) > 100:
         train_size = int(0.9 * len(train_dataset))
         eval_size = len(train_dataset) - train_size
-        splits = dataset.train_test_split(test_size=eval_size)
-        train_dataset = splits["train"]
-        eval_dataset = splits["test"]
+        train_dataset = train_dataset.select(range(train_size))
+        eval_dataset = train_dataset.select(range(train_size, train_size + eval_size))
 
         logger.info(f"📊 Dataset split: {len(train_dataset)} train, {len(eval_dataset)} eval")
     else:
-        train_dataset = dataset
         eval_dataset = None
         logger.info(f"📊 Using full dataset for training: {len(train_dataset)} samples")
-    
-    return train_dataset, eval_dataset.select(range(eval_size))
+
+    return train_dataset, eval_dataset
+
+
+def create_reward_functions(args) -> List:
+    """커스텀 보상 함수들 생성"""
+    logger.info("🎯 Creating reward functions")
+
+    reward_functions = []
+
+    # 설정 파일에서 보상 함수 설정 로드
+    config = {}
+    if args.reward_config and os.path.exists(args.reward_config):
+        try:
+            with open(args.reward_config, 'r') as f:
+                config = json.load(f)
+            logger.info(f"📁 Loaded reward config from {args.reward_config}")
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to load reward config: {e}")
+
+    # 각 보상 함수 타입에 대해 생성
+    for reward_type in args.reward_function:
+        reward_func = create_reward_function(reward_type, config.get(reward_type, {}))
+        reward_functions.append(reward_func)
+        logger.info(f"✅ Created {reward_type} reward function")
+
+    logger.info(f"🎯 Total reward functions: {len(reward_functions)}")
+    return reward_functions
 
 
 def main():
@@ -373,13 +403,16 @@ def main():
         
         # Load dataset
         train_dataset, eval_dataset = load_dataset(args, config)
-        
+
         if len(train_dataset) == 0:
             logger.error("❌ No training data found")
             return 1
-        
-        # Create trainer with model initialization kwargs
-        trainer = create_grpo_trainer(config, model_init_kwargs=config.model_init_kwargs)
+
+        # Create reward functions
+        reward_functions = create_reward_functions(args)
+
+        # Create trainer with model initialization kwargs and reward functions
+        trainer = create_grpo_trainer(config, model_init_kwargs=config.model_init_kwargs, reward_functions=reward_functions)
         logger.info("✅ GRPO Trainer created")
         
         if args.eval_only:

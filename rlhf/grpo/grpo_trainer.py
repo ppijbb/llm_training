@@ -7,7 +7,7 @@ This module provides GRPO training functionality using TRL's GRPOTrainer and Uns
 import logging
 import torch
 import numpy as np
-from typing import Dict, Any, List, Optional, Callable
+from typing import Dict, Any, List, Optional
 
 # Import TRL components
 from trl import GRPOTrainer, GRPOConfig
@@ -15,68 +15,59 @@ from trl import GRPOTrainer, GRPOConfig
 # Import Unsloth for model loading
 from unsloth import FastLanguageModel
 
-# Import custom reward functions
-from reward_functions import (
-    BaseRewardFunction,
-    RewardFunctionFactory,
-    create_reward_function,
-    REWARD_CONFIGS
-)
+# Import custom reward functions for TRL compatibility
+from reward_functions import BaseRewardFunction
 
 logger = logging.getLogger(__name__)
+
+
+class CustomGRPOTrainer(GRPOTrainer):
+    """TRL GRPOTrainer를 상속받은 커스텀 트레이너"""
+
+    def __init__(self, reward_functions: List[BaseRewardFunction] = None, *args, **kwargs):
+        self.custom_reward_functions = reward_functions or []
+        super().__init__(*args, **kwargs)
+
+    def compute_rewards(self, completions, **kwargs):
+        """커스텀 보상 함수를 사용한 보상 계산"""
+        if not self.custom_reward_functions:
+            # 기본 TRL 보상 함수 사용
+            return super().compute_rewards(completions, **kwargs)
+
+        # 커스텀 보상 함수들 실행
+        all_rewards = []
+        for reward_func in self.custom_reward_functions:
+            rewards = reward_func(completions, **kwargs)
+            all_rewards.append(rewards)
+
+        # 보상 평균 계산
+        if all_rewards:
+            final_rewards = []
+            for i in range(len(completions)):
+                avg_reward = sum(rewards[i] for rewards in all_rewards) / len(all_rewards)
+                final_rewards.append(avg_reward)
+            return final_rewards
+
+        return super().compute_rewards(completions, **kwargs)
 
 
 class UnslothGRPOTrainer:
     """GRPO Trainer using TRL's GRPOTrainer with Unsloth optimizations"""
     
-    def __init__(self, config: GRPOConfig, model_init_kwargs: Optional[Dict[str, Any]] = None):
+    def __init__(self, config: GRPOConfig, model_init_kwargs: Optional[Dict[str, Any]] = None, reward_functions: List[BaseRewardFunction] = None):
         self.config = config
         self.model_init_kwargs = model_init_kwargs or {}
         self.model = None
         self.tokenizer = None
-        self.reward_functions = []
+        self.reward_functions = reward_functions or []
         self.trainer = None
-        
+
         # Initialize components
-        self._initialize_reward_functions()
         self._load_model()
-        
+
         logger.info("✅ Unsloth GRPO Trainer initialized successfully")
     
-    def _initialize_reward_functions(self):
-        """Initialize reward functions for TRL GRPOTrainer"""
-        try:
-            # Use default systematic reward function
-            reward_function = create_reward_function("systematic", "default")
-
-            # Convert to TRL-compatible reward function format
-            trl_reward_func = self._convert_to_trl_reward_function(reward_function)
-            self.reward_functions = [trl_reward_func]
-
-            logger.info(f"✅ Reward functions initialized: {[f.__name__ for f in self.reward_functions]}")
-
-        except Exception as e:
-            logger.error(f"❌ Failed to initialize reward functions: {e}")
-            raise
     
-    def _convert_to_trl_reward_function(self, reward_function: BaseRewardFunction) -> Callable:
-        """Convert custom reward function to TRL-compatible format"""
-        def trl_reward_function(completions, **kwargs):
-            """TRL-compatible reward function format"""
-            # Extract completions and other necessary data
-            chosen_completions = kwargs.get("chosen", [])
-            rejected_completions = kwargs.get("rejected", [])
-            
-            # Compute rewards using the original reward function
-            rewards = reward_function.compute_batch_rewards(
-                chosen_completions=chosen_completions,
-                rejected_completions=rejected_completions,
-                **kwargs
-            )
-            
-            return rewards
-        
-        return trl_reward_function
     
     def _load_model(self):
         """Load model and tokenizer using Unsloth"""
@@ -122,14 +113,15 @@ class UnslothGRPOTrainer:
         logger.info("🔄 Creating TRL GRPOTrainer")
         
         try:
-            # Create trainer
-            self.trainer = GRPOTrainer(
+            # Create custom trainer with reward functions
+            self.trainer = CustomGRPOTrainer(
+                reward_functions=self.reward_functions,
                 model=self.model,
-                reward_funcs=self.reward_functions,
                 args=self._create_training_arguments(),
                 train_dataset=train_dataset,
                 eval_dataset=eval_dataset,
                 tokenizer=self.tokenizer,
+                model_init_kwargs=self.model_init_kwargs,
             )
             
             logger.info("✅ TRL GRPOTrainer created successfully")
@@ -142,7 +134,8 @@ class UnslothGRPOTrainer:
     def _create_training_arguments(self):
         """Create TrainingArguments for TRL GRPOTrainer"""
         from transformers import TrainingArguments
-        
+
+        # model_init_kwargs는 TrainingArguments에서 제거 (별도로 전달)
         return TrainingArguments(
             per_device_train_batch_size=self.config.per_device_train_batch_size,
             per_device_eval_batch_size=self.config.per_device_eval_batch_size,
@@ -209,6 +202,6 @@ class UnslothGRPOTrainer:
             raise
 
 
-def create_grpo_trainer(config: GRPOConfig, model_init_kwargs: Optional[Dict[str, Any]] = None) -> UnslothGRPOTrainer:
-    """Create GRPO trainer with given configuration"""
-    return UnslothGRPOTrainer(config, model_init_kwargs)
+def create_grpo_trainer(config: GRPOConfig, model_init_kwargs: Optional[Dict[str, Any]] = None, reward_functions: Optional[List] = None) -> UnslothGRPOTrainer:
+    """Create GRPO trainer with given configuration and reward functions"""
+    return UnslothGRPOTrainer(config, model_init_kwargs, reward_functions)
