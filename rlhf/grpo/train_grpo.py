@@ -351,7 +351,7 @@ def main():
         logger.info(f"📁 Output directory: {config.output_dir}")
         
         # Load dataset
-        train_dataset, eval_dataset = load_dataset(args)
+        train_dataset, eval_dataset = load_dataset(args, config)
         
         if len(train_dataset) == 0:
             logger.error("❌ No training data found")
