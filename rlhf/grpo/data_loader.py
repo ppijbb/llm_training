@@ -18,7 +18,7 @@ class GRPODataLoader:
     
     def __init__(
         self,
-        model_name: str = "unsloth/llama-3.1-8b-bnb-4bit",
+        model_name: str = "unsloth/Qwen3-0.6B-bnb-4bit",
         max_length: int = 2048,
         batch_size: int = 4,
         num_workers: int = 4,
@@ -232,7 +232,7 @@ class GRPODataLoader:
 
 
 def create_grpo_dataloader(
-    model_name: str = "unsloth/llama-3.1-8b-bnb-4bit",
+    model_name: str = "unsloth/Qwen3-0.6B-bnb-4bit",
     dataset_name: str = "HuggingFaceH4/ultrafeedback_binarized",
     max_samples: int = 1000,
     batch_size: int = 4,

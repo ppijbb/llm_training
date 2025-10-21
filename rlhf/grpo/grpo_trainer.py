@@ -35,7 +35,7 @@ class GRPOConfig:
     """Configuration for GRPO training"""
     
     # Model configuration
-    model_name: str = "unsloth/llama-3.1-8b-bnb-4bit"
+    model_name: str = "unsloth/Qwen3-0.6B-bnb-4bit"
     max_seq_length: int = 2048
     dtype: str = "float16"  # float16, bfloat16, float32
     load_in_4bit: bool = True

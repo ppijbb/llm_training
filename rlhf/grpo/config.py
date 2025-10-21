@@ -19,7 +19,7 @@ except ImportError:
     
     @dataclass
     class GRPOConfig:
-        model_name: str = "unsloth/llama-3.1-8b-bnb-4bit"
+        model_name: str = "unsloth/Qwen3-0.6B-bnb-4bit"
         max_seq_length: int = 2048
         dtype: str = "float16"
         load_in_4bit: bool = True
@@ -61,8 +61,8 @@ except ImportError:
 
 # Default configurations for different model sizes
 DEFAULT_CONFIGS = {
-    "llama-3.1-8b": {
-        "model_name": "unsloth/llama-3.1-8b-bnb-4bit",
+    "Qwen3-0.6B": {
+        "model_name": "unsloth/Qwen3-0.6B-bnb-4bit",
         "max_seq_length": 2048,
         "per_device_train_batch_size": 2,
         "per_device_eval_batch_size": 2,
@@ -79,8 +79,8 @@ DEFAULT_CONFIGS = {
         "group_size": 4,
     },
     
-    "llama-3.1-70b": {
-        "model_name": "unsloth/llama-3.1-70b-bnb-4bit",
+    "llama-3.2-1B": {
+        "model_name": "unsloth/llama-3.2-1B-bnb-4bit",
         "max_seq_length": 2048,
         "per_device_train_batch_size": 1,
         "per_device_eval_batch_size": 1,
@@ -97,8 +97,8 @@ DEFAULT_CONFIGS = {
         "group_size": 4,
     },
     
-    "gemma-2-9b": {
-        "model_name": "unsloth/gemma-2-9b-bnb-4bit",
+    "gemma-3n-E2B": {
+        "model_name": "unsloth/gemma-3n-E2B-bnb-4bit",
         "max_seq_length": 2048,
         "per_device_train_batch_size": 2,
         "per_device_eval_batch_size": 2,
@@ -115,8 +115,8 @@ DEFAULT_CONFIGS = {
         "group_size": 4,
     },
     
-    "qwen2.5-7b": {
-        "model_name": "unsloth/qwen2.5-7b-bnb-4bit",
+    "gpt-oss": {
+        "model_name": "unsloth/gpt-oss-20b-bnb-4bit",
         "max_seq_length": 2048,
         "per_device_train_batch_size": 2,
         "per_device_eval_batch_size": 2,
@@ -209,7 +209,7 @@ class ConfigManager:
     
     def create_config(
         self, 
-        model_name: str = "llama-3.1-8b",
+        model_name: str = "Qwen3-0.6B",
         dataset_name: str = "ultrafeedback",
         custom_config: Optional[Dict[str, Any]] = None
     ) -> GRPOConfig:
@@ -221,7 +221,7 @@ class ConfigManager:
             model_config = DEFAULT_CONFIGS[model_name].copy()
         else:
             logger.warning(f"⚠️ Unknown model {model_name}, using default config")
-            model_config = DEFAULT_CONFIGS["llama-3.1-8b"].copy()
+            model_config = DEFAULT_CONFIGS["Qwen3-0.6B"].copy()
             model_config["model_name"] = model_name
         
         # Get dataset config
@@ -295,10 +295,12 @@ class ConfigManager:
 
 
 def create_default_config(
-    model_name: str = "llama-3.1-8b",
+    model_name: str = "Qwen3-0.6B",
     dataset_name: str = "ultrafeedback",
     output_dir: str = "./grpo_outputs",
-    custom_config: Optional[Dict[str, Any]] = None
+    custom_config: Optional[Dict[str, Any]] = None,
+    *args,
+    **kwargs
 ):
     """Create default configuration"""
     manager = ConfigManager()
@@ -321,7 +323,7 @@ def save_config_to_file(config, output_path: str):
 def get_quick_test_config():
     """Get configuration for quick testing"""
     return create_default_config(
-        model_name="llama-3.1-8b",
+        model_name="Qwen3-0.6B",
         dataset_name="ultrafeedback",
         custom_config={
             "max_samples": 100,
@@ -335,7 +337,7 @@ def get_quick_test_config():
     )
 
 
-def get_production_config(model_name: str = "llama-3.1-8b"):
+def get_production_config(model_name: str = "Qwen3-0.6B"):
     """Get configuration for production training"""
     return create_default_config(
         model_name=model_name,
