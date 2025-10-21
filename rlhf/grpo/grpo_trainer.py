@@ -29,9 +29,9 @@ logger = logging.getLogger(__name__)
 class UnslothGRPOTrainer:
     """GRPO Trainer using TRL's GRPOTrainer with Unsloth optimizations"""
     
-    def __init__(self, config: GRPOConfig, reward_config: Optional[Dict[str, Any]] = None):
+    def __init__(self, config: GRPOConfig, model_init_kwargs: Optional[Dict[str, Any]] = None):
         self.config = config
-        self.reward_config = reward_config or {}
+        self.model_init_kwargs = model_init_kwargs or {}
         self.model = None
         self.tokenizer = None
         self.reward_functions = []
@@ -47,9 +47,9 @@ class UnslothGRPOTrainer:
         """Initialize reward functions for TRL GRPOTrainer"""
         try:
             # Get reward configuration
-            reward_function_type = self.reward_config.get("reward_function_type", "systematic")
-            reward_config_name = self.reward_config.get("reward_config_name", "default")
-            custom_reward_config = self.reward_config.get("custom_reward_config")
+            reward_function_type = self.config.get("reward_function_type", "systematic")
+            reward_config_name = self.config.get("reward_config_name", "default")
+            custom_reward_config = self.config.get("custom_reward_config", None)
             
             if custom_reward_config:
                 # Use custom configuration
@@ -95,7 +95,7 @@ class UnslothGRPOTrainer:
     
     def _load_model(self):
         """Load model and tokenizer using Unsloth"""
-        model_name = self.config.model_init_kwargs.get("model_name", "unsloth/Qwen3-0.6B-bnb-4bit")
+        model_name = self.model_init_kwargs.get("model_name", "unsloth/Qwen3-0.6B-bnb-4bit")
         logger.info(f"🔄 Loading model: {model_name}")
         
         try:
@@ -224,6 +224,6 @@ class UnslothGRPOTrainer:
             raise
 
 
-def create_grpo_trainer(config: GRPOConfig, reward_config: Optional[Dict[str, Any]] = None) -> UnslothGRPOTrainer:
+def create_grpo_trainer(config: GRPOConfig, model_init_kwargs: Optional[Dict[str, Any]] = None) -> UnslothGRPOTrainer:
     """Create GRPO trainer with given configuration"""
-    return UnslothGRPOTrainer(config, reward_config)
+    return UnslothGRPOTrainer(config, model_init_kwargs)

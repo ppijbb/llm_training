@@ -318,7 +318,7 @@ def load_dataset(args, config: GRPOConfig):
         splits = dataset.train_test_split(test_size=eval_size)
         train_dataset = splits["train"]
         eval_dataset = splits["test"]
-        
+
         logger.info(f"📊 Dataset split: {len(train_dataset)} train, {len(eval_dataset)} eval")
     else:
         train_dataset = dataset
@@ -359,7 +359,7 @@ def main():
             return 1
         
         # Create trainer with reward configuration
-        trainer = create_grpo_trainer(config)
+        trainer = create_grpo_trainer(config, model_init_kwargs=config.model_init_kwargs)
         logger.info("✅ GRPO Trainer created")
         
         if args.eval_only:
