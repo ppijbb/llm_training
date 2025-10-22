@@ -107,6 +107,10 @@ class GRPODataLoader:
                 # messages 는 (prompt, chosen, rejected) 조합에서는 사용되지 않음
                 del example["messages"]
 
+            if "prompt" in example:
+                if all([prompt for prompt in example.get("prompt") if type(prompt) == str]):
+                    example["prompt"] = [{"role": "user", "content": prompt} for prompt in example.get("prompt")]
+
             if "prompt" in example and "chosen" in example and "rejected" in example:
                 return example
 
