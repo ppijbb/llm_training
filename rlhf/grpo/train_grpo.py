@@ -336,20 +336,13 @@ def load_dataset(args, config: GRPOConfig):
         dataset = data_loader.load_dataset(dataset_name, max_samples=max_samples)
 
     # TRL 표준 형식으로 변환
-    train_dataset = data_loader.prepare_grpo_data(dataset)
+    dataset = data_loader.prepare_grpo_data(dataset)
+    splited = dataset.train_test_split(test_size=0.1)
+    train_dataset = splited["train"]
+    eval_dataset = splited["test"].shuffle(seed=42).select(range(100))
 
-    # 학습/평가 데이터 분할 (TRL 기본 방식)
-    if len(train_dataset) > 100:
-        train_size = int(0.9 * len(train_dataset))
-        eval_size = len(train_dataset) - train_size
-        train_dataset = train_dataset.select(range(train_size))
-        eval_dataset = train_dataset.select(range(train_size, train_size + eval_size))
-
-        logger.info(f"📊 Dataset split: {len(train_dataset)} train, {len(eval_dataset)} eval")
-    else:
-        eval_dataset = None
-        logger.info(f"📊 Using full dataset for training: {len(train_dataset)} samples")
-
+    logger.info(f"✅ Dataset split: {len(train_dataset)} train, {len(eval_dataset)} eval")
+    
     return train_dataset, eval_dataset
 
 
