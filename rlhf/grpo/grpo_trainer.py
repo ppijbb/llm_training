@@ -134,7 +134,7 @@ class UnslothGRPOTrainer:
             self.trainer = CustomGRPOTrainer(
                 reward_functions=self.reward_functions,
                 model=self.model,
-                args=self._create_training_arguments(),
+                args=self.config,
                 train_dataset=train_dataset,
                 eval_dataset=eval_dataset,
                 tokenizer=self.tokenizer,
@@ -147,40 +147,6 @@ class UnslothGRPOTrainer:
         except Exception as e:
             logger.error(f"❌ Failed to create GRPOTrainer: {e}")
             raise
-    
-    def _create_training_arguments(self):
-        """Create TrainingArguments for TRL GRPOTrainer"""
-        from transformers import TrainingArguments
-
-        # model_init_kwargs는 TrainingArguments에서 제거 (별도로 전달)
-        return TrainingArguments(
-            per_device_train_batch_size=self.config.per_device_train_batch_size,
-            per_device_eval_batch_size=self.config.per_device_eval_batch_size,
-            gradient_accumulation_steps=self.config.gradient_accumulation_steps,
-            warmup_steps=self.config.warmup_steps,
-            max_steps=self.config.max_steps,
-            learning_rate=self.config.learning_rate,
-            fp16=self.config.fp16,
-            bf16=self.config.bf16,
-            logging_steps=self.config.logging_steps,
-            save_steps=self.config.save_steps,
-            eval_steps=self.config.eval_steps,
-            save_total_limit=self.config.save_total_limit,
-            output_dir=self.config.output_dir,
-            logging_dir=self.config.logging_dir,
-            report_to=self.config.report_to,
-            remove_unused_columns=self.config.remove_unused_columns,
-            optim=self.config.optim,
-            lr_scheduler_type=self.config.lr_scheduler_type,
-            weight_decay=self.config.weight_decay,
-            adam_beta1=self.config.adam_beta1,
-            adam_beta2=self.config.adam_beta2,
-            adam_epsilon=self.config.adam_epsilon,
-            max_grad_norm=self.config.max_grad_norm,
-            dataloader_num_workers=self.config.dataloader_num_workers,
-            num_train_epochs=self.config.num_train_epochs,
-            seed=getattr(self.config, 'seed', 42),
-        )
     
     def train(
         self,
