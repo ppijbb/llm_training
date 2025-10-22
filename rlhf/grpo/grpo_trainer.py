@@ -16,7 +16,7 @@ from trl import GRPOTrainer, GRPOConfig
 from unsloth import FastLanguageModel
 
 # Import custom reward functions for TRL compatibility
-from reward_functions import BaseRewardFunction
+from reward_functions import MultiRewardFunction, SingleCustomRewardFunction
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +26,7 @@ class CustomGRPOTrainer(GRPOTrainer):
 
     def __init__(
         self,
-        reward_functions: List[BaseRewardFunction] = None,
+        reward_functions: List[MultiRewardFunction|SingleCustomRewardFunction] = None,
         *args,
         **kwargs
     ):
@@ -67,7 +67,7 @@ class UnslothGRPOTrainer:
         self,
         config: GRPOConfig,
         model_init_kwargs: Optional[Dict[str, Any]] = None,
-        reward_functions: List[BaseRewardFunction] = None
+        reward_functions: List[MultiRewardFunction|SingleCustomRewardFunction] = None
     ):
         self.config = config
         self.model_init_kwargs = model_init_kwargs or {}
