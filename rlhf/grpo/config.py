@@ -21,13 +21,6 @@ def create_grpo_config(
     config = GRPOConfig(
         model_init_kwargs={"model_name": model_name},
         output_dir=output_dir,
-        learning_rate=5e-7,
-        per_device_train_batch_size=2,
-        gradient_accumulation_steps=4,
-        num_generations=8,
-        max_prompt_length=2048,
-        max_completion_length=2048,
-        beta=0.1,
         **kwargs  # 사용자 정의 설정으로 기본값 오버라이드
     )
 
