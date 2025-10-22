@@ -31,6 +31,7 @@ from pathlib import Path
 sys.path.append(str(Path(__file__).parent))
 
 from grpo_trainer import create_grpo_trainer
+from transformers import TrainingArguments
 from trl import GRPOConfig
 from data_loader import GRPODataLoader, create_grpo_dataloader
 from config import (

@@ -30,6 +30,7 @@ class CustomGRPOTrainer(GRPOTrainer):
         *args,
         **kwargs
     ):
+        kwargs['args'].model_init_weights = kwargs["model_init_weights"] if "model_init_weights" in kwargs else {}
         self.custom_reward_functions = reward_functions or []
         super().__init__(reward_funcs=self.custom_reward_functions, *args, **kwargs)
 
@@ -80,8 +81,6 @@ class UnslothGRPOTrainer:
         self._load_model()
 
         logger.info("✅ Unsloth GRPO Trainer initialized successfully")
-    
-    
     
     def _load_model(self):
         """Load model and tokenizer using Unsloth"""
