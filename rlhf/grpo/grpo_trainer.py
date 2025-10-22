@@ -24,11 +24,20 @@ logger = logging.getLogger(__name__)
 class CustomGRPOTrainer(GRPOTrainer):
     """TRL GRPOTrainer를 상속받은 커스텀 트레이너"""
 
-    def __init__(self, reward_functions: List[BaseRewardFunction] = None, *args, **kwargs):
+    def __init__(
+        self,
+        reward_functions: List[BaseRewardFunction] = None,
+        *args,
+        **kwargs
+    ):
         self.custom_reward_functions = reward_functions or []
         super().__init__(*args, **kwargs)
 
-    def compute_rewards(self, completions, **kwargs):
+    def compute_rewards(
+        self,
+        completions,
+        **kwargs
+    ):
         """커스텀 보상 함수를 사용한 보상 계산"""
         if not self.custom_reward_functions:
             # 기본 TRL 보상 함수 사용
@@ -54,7 +63,12 @@ class CustomGRPOTrainer(GRPOTrainer):
 class UnslothGRPOTrainer:
     """GRPO Trainer using TRL's GRPOTrainer with Unsloth optimizations"""
     
-    def __init__(self, config: GRPOConfig, model_init_kwargs: Optional[Dict[str, Any]] = None, reward_functions: List[BaseRewardFunction] = None):
+    def __init__(
+        self,
+        config: GRPOConfig,
+        model_init_kwargs: Optional[Dict[str, Any]] = None,
+        reward_functions: List[BaseRewardFunction] = None
+    ):
         self.config = config
         self.model_init_kwargs = model_init_kwargs or {}
         self.model = None
@@ -108,7 +122,11 @@ class UnslothGRPOTrainer:
             logger.error(f"❌ Failed to load model: {e}")
             raise
     
-    def create_grpo_trainer(self, train_dataset, eval_dataset=None):
+    def create_grpo_trainer(
+        self,
+        train_dataset,
+        eval_dataset=None
+    ):
         """Create TRL GRPOTrainer"""
         logger.info("🔄 Creating TRL GRPOTrainer")
         
@@ -165,7 +183,11 @@ class UnslothGRPOTrainer:
             seed=getattr(self.config, 'seed', 42),
         )
     
-    def train(self, train_dataset, eval_dataset=None):
+    def train(
+        self,
+        train_dataset,
+        eval_dataset=None
+    ):
         """Start GRPO training using TRL"""
         logger.info("🚀 Starting GRPO training with TRL")
         
@@ -183,7 +205,10 @@ class UnslothGRPOTrainer:
             logger.error(f"❌ GRPO training failed: {e}")
             raise
     
-    def save_model(self, output_dir: Optional[str] = None):
+    def save_model(
+        self,
+        output_dir: Optional[str] = None
+    ):
         """Save the trained model"""
         if output_dir is None:
             output_dir = self.config.output_dir
@@ -202,6 +227,10 @@ class UnslothGRPOTrainer:
             raise
 
 
-def create_grpo_trainer(config: GRPOConfig, model_init_kwargs: Optional[Dict[str, Any]] = None, reward_functions: Optional[List] = None) -> UnslothGRPOTrainer:
+def create_grpo_trainer(
+    config: GRPOConfig,
+    model_init_kwargs: Optional[Dict[str, Any]] = None,
+    reward_functions: Optional[List] = None
+) -> UnslothGRPOTrainer:
     """Create GRPO trainer with given configuration and reward functions"""
     return UnslothGRPOTrainer(config, model_init_kwargs, reward_functions)
