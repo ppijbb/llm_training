@@ -30,7 +30,7 @@ class CustomGRPOTrainer(GRPOTrainer):
         *args,
         **kwargs
     ):
-        kwargs['args'].model_init_weights = kwargs["model_init_weights"] if "model_init_weights" in kwargs else {}
+        kwargs['args'].model_init_kwargs = kwargs["model_init_kwargs"] if "model_init_kwargs" in kwargs else {}
         self.custom_reward_functions = reward_functions or []
         super().__init__(reward_funcs=self.custom_reward_functions, *args, **kwargs)
 

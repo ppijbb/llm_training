@@ -3,8 +3,7 @@
 
 단일 또는 다중 보상 함수를 지원하는 통합 보상 시스템입니다.
 """
-
-import torch
+from functools import wraps
 import logging
 from typing import Dict, Any, List, Optional
 from abc import ABC, abstractmethod
@@ -94,8 +93,23 @@ class QualityComponent(RewardComponent):
 
         return max(0, reward)
 
+class BaseRewardFunction:
+    __name__ = "RewardFunction"
 
-class MultiRewardFunction:
+    @abstractmethod
+    def reward_func(self, *args, **kwargs) -> List[float]:
+        raise NotImplementedError("Subclasses must implement this method")
+
+    def __call__(self, *args, **kwargs) -> List[float]:
+        return self.reward_func(*args, **kwargs)
+
+    def __str__(self):
+        return self.__name__
+
+    def __repr__(self):
+        return self.__name__
+
+class MultiRewardFunction(BaseRewardFunction):
     """다중 보상 함수를 지원하는 통합 클래스"""
 
     def __init__(self, components: Optional[List[RewardComponent]] = None, config: Dict[str, Any] = None):
@@ -110,7 +124,7 @@ class MultiRewardFunction:
                 QualityComponent(self.config.get("quality", {}))
             ]
 
-    def __call__(self, completions: List[str], **kwargs) -> List[float]:
+    def reward_func(self, completions: List[str], **kwargs) -> List[float]:
         """TRL GRPOTrainer와 호환되는 다중 보상 계산"""
         rewards = []
 
@@ -142,7 +156,7 @@ class MultiRewardFunction:
         logger.info(f"✅ Removed reward component: {name}")
 
 
-class SingleCustomRewardFunction:
+class SingleCustomRewardFunction(BaseRewardFunction):
     """단일 커스텀 보상 함수"""
 
     def __init__(self, config: Dict[str, Any] = None):
@@ -158,7 +172,7 @@ class SingleCustomRewardFunction:
         self.length_config = self.config.get("length", {})
         self.quality_config = self.config.get("quality", {})
 
-    def __call__(self, completions: List[str], **kwargs) -> List[float]:
+    def reward_func(self, completions: List[str], **kwargs) -> List[float]:
         """단일 통합 보상 계산"""
         rewards = []
 
