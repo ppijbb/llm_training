@@ -1,18 +1,18 @@
 {
+  "accuracy_weight": 0.4,
+  "length_weight": 0.2,
+  "quality_weight": 0.4,
   "accuracy": {
-    "correct_keywords": ["correct", "right", "yes", "정확", "맞아", "그래", "네", "맞습니다", "그렇습니다"],
-    "solution_similarity_threshold": 0.8
+    "correct_keywords": ["correct", "right", "yes", "정확", "맞아", "그래", "네", "맞습니다", "그렇습니다"]
   },
   "length": {
     "optimal_length": 150,
-    "length_weight": 0.1,
-    "min_length": 50,
-    "max_length": 500
+    "length_weight": 0.1
   },
-  "custom": {
+  "quality": {
     "reward_scale": 1.0,
     "penalty_scale": -0.5,
-    "quality_keywords": ["좋아", "훌륭", "완벽", "탁월", "우수"],
-    "negative_keywords": ["모르겠", "잘못", "틀렸", "아니", "아니야"]
+    "quality_keywords": ["좋아", "완벽", "우수"],
+    "negative_keywords": ["모르겠", "잘못", "틀렸"]
   }
 }

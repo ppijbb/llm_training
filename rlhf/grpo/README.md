@@ -22,11 +22,11 @@ pip install -r requirements.txt
 # 빠른 테스트
 python train_grpo.py --quick-test
 
-# 정확성 기반 보상 함수로 훈련
-python train_grpo.py --reward-function accuracy
+# 단일 통합 보상 함수로 훈련 (기본)
+python train_grpo.py --reward-function single
 
-# 여러 보상 함수로 훈련
-python train_grpo.py --reward-function accuracy length
+# 다중 컴포넌트 보상 함수로 훈련
+python train_grpo.py --reward-function multi
 
 # 기본 훈련 (TRL 표준 데이터셋 사용)
 python train_grpo.py --max-samples 1000
@@ -45,20 +45,14 @@ python train_grpo.py --custom-data /path/to/your_data.jsonl
 # {"prompt": "질문", "chosen": "선호 답변", "rejected": "비선호 답변"}
 ```
 
-# 정확성 기반 보상 함수 사용
-python train_grpo.py --reward-function accuracy
+# 단일 통합 보상 함수 사용 (기본)
+python train_grpo.py --reward-function single
 
-# 길이 기반 보상 함수 사용
-python train_grpo.py --reward-function length
-
-# 사용자 정의 보상 함수 사용
-python train_grpo.py --reward-function custom
-
-# 여러 보상 함수 결합 사용
-python train_grpo.py --reward-function accuracy length custom
+# 다중 컴포넌트 보상 함수 사용
+python train_grpo.py --reward-function multi
 
 # 설정 파일과 함께 사용
-python train_grpo.py --reward-function accuracy --reward-config config/reward_config.json
+python train_grpo.py --reward-function single --reward-config config/reward_config.json
 ```
 
 
@@ -97,8 +91,8 @@ python train_grpo.py [OPTIONS]
   --learning-rate LR    학습률
   --batch-size N        배치 크기
   --output-dir PATH     출력 디렉토리
-  --reward-function {accuracy,length,custom}
-                        보상 함수 타입 (기본: accuracy)
+  --reward-function {single,multi}
+                        보상 함수 타입 (기본: single)
   --reward-config PATH  보상 함수 설정 파일 경로 (JSON)
                         커스텀 보상 함수 설정 파일
   --wandb-project NAME  Weights & Biases 프로젝트 이름
@@ -134,6 +128,9 @@ python train_grpo.py [OPTIONS]
 `config/reward_config.json`:
 ```json
 {
+  "accuracy_weight": 0.4,
+  "length_weight": 0.2,
+  "quality_weight": 0.4,
   "accuracy": {
     "correct_keywords": ["correct", "right", "yes", "정확", "맞아"]
   },
@@ -141,9 +138,11 @@ python train_grpo.py [OPTIONS]
     "optimal_length": 150,
     "length_weight": 0.1
   },
-  "custom": {
+  "quality": {
     "reward_scale": 1.0,
-    "penalty_scale": -0.5
+    "penalty_scale": -0.5,
+    "quality_keywords": ["좋아", "완벽", "우수"],
+    "negative_keywords": ["모르겠", "잘못", "틀렸"]
   }
 }
 ```

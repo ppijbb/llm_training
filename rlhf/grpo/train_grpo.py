@@ -38,7 +38,13 @@ from config import (
     create_quick_test_config,
     create_production_config,
 )
-from reward_functions import create_reward_function, combine_reward_functions
+from reward_functions import (
+    create_reward_function,
+    create_multi_reward_function,
+    create_single_reward_function,
+    MultiRewardFunction,
+    SingleCustomRewardFunction
+)
 
 # Configure logging
 logging.basicConfig(
@@ -206,9 +212,9 @@ Examples:
         "--reward-function",
         type=str,
         nargs="+",
-        default=["accuracy"],
-        choices=["accuracy", "length", "custom"],
-        help="Reward function types to use (default: accuracy)"
+        default=["single"],
+        choices=["single", "multi"],
+        help="Reward function types to use: 'single' for unified, 'multi' for multi-component (default: single)"
     )
 
     parser.add_argument(
@@ -347,10 +353,8 @@ def load_dataset(args, config: GRPOConfig):
 
 
 def create_reward_functions(args) -> List:
-    """커스텀 보상 함수들 생성"""
-    logger.info("🎯 Creating reward functions")
-
-    reward_functions = []
+    """통합 보상 함수 생성"""
+    logger.info("🎯 Creating unified reward function")
 
     # 설정 파일에서 보상 함수 설정 로드
     config = {}
@@ -362,11 +366,20 @@ def create_reward_functions(args) -> List:
         except Exception as e:
             logger.warning(f"⚠️ Failed to load reward config: {e}")
 
-    # 각 보상 함수 타입에 대해 생성
+    # 보상 함수 타입에 따라 생성
+    reward_functions = []
     for reward_type in args.reward_function:
-        reward_func = create_reward_function(reward_type, config.get(reward_type, {}))
+        if reward_type == "single":
+            reward_func = create_single_reward_function(config)
+            logger.info("✅ Created single unified reward function")
+        elif reward_type == "multi":
+            reward_func = create_multi_reward_function(config)
+            logger.info("✅ Created multi-component reward function")
+        else:
+            logger.warning(f"Unknown reward type: {reward_type}, using single")
+            reward_func = create_single_reward_function(config)
+
         reward_functions.append(reward_func)
-        logger.info(f"✅ Created {reward_type} reward function")
 
     logger.info(f"🎯 Total reward functions: {len(reward_functions)}")
     return reward_functions
@@ -405,7 +418,10 @@ def main():
         reward_functions = create_reward_functions(args)
 
         # Create trainer with model initialization kwargs and reward functions
-        trainer = create_grpo_trainer(config, model_init_kwargs=config.model_init_kwargs, reward_functions=reward_functions)
+        trainer = create_grpo_trainer(
+            config,
+            model_init_kwargs=config.model_init_kwargs,
+            reward_functions=reward_functions)
         logger.info("✅ GRPO Trainer created")
         
         if args.eval_only:

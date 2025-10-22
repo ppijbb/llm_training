@@ -1,128 +1,204 @@
 """
-TRL과 호환되는 커스텀 Reward Functions
+통합 커스텀 Reward Functions for TRL GRPO
 
-TRL의 GRPOTrainer와 호환되는 커스텀 보상 함수들을 제공합니다.
+단일 또는 다중 보상 함수를 지원하는 통합 보상 시스템입니다.
 """
 
 import torch
 import logging
-from typing import Dict, Any, List, Callable
+from typing import Dict, Any, List, Optional
 from abc import ABC, abstractmethod
 
 logger = logging.getLogger(__name__)
 
 
-class BaseRewardFunction(ABC):
-    """TRL GRPOTrainer와 호환되는 기본 보상 함수 클래스"""
+class RewardComponent(ABC):
+    """보상 계산의 개별 컴포넌트"""
 
-    def __init__(self, name: str, config: Dict[str, Any] = None):
+    def __init__(self, name: str, weight: float = 1.0):
         self.name = name
-        self.config = config or {}
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.weight = weight
 
     @abstractmethod
-    def __call__(self, completions: List[str], **kwargs) -> List[float]:
-        """
-        TRL GRPOTrainer와 호환되는 보상 함수 호출 형식
-
-        Args:
-            completions: 생성된 응답들의 리스트
-            **kwargs: 추가 인자들 (solutions, prompts 등)
-
-        Returns:
-            각 completion에 대한 보상 점수 리스트
-        """
+    def calculate(self, completion: str, **kwargs) -> float:
+        """개별 보상 계산"""
         pass
 
 
-class AccuracyRewardFunction(BaseRewardFunction):
-    """정확성 기반 보상 함수"""
+class AccuracyComponent(RewardComponent):
+    """정확성 보상 컴포넌트"""
 
-    def __init__(self, config: Dict[str, Any] = None):
-        super().__init__("accuracy", config)
-        self.correct_keywords = self.config.get("correct_keywords", ["correct", "right", "yes"])
+    def __init__(self, config: Dict[str, Any] = None, weight: float = 1.0):
+        super().__init__("accuracy", weight)
+        self.correct_keywords = config.get("correct_keywords", ["correct", "right", "yes"]) if config else ["correct", "right", "yes"]
 
-    def __call__(self, completions: List[str], **kwargs) -> List[float]:
-        """정확성 기반 보상 계산"""
-        rewards = []
+    def calculate(self, completion: str, **kwargs) -> float:
         solutions = kwargs.get("solutions", [])
+        completion_lower = completion.lower()
 
-        for completion in completions:
-            reward = 0.0
-            # 정확한 키워드가 포함되어 있는지 확인
-            if any(keyword in completion.lower() for keyword in self.correct_keywords):
-                reward = 1.0
-            elif solutions:
-                # 정답과 유사한지 확인 (간단한 매칭)
-                if any(sol.lower() in completion.lower() or completion.lower() in sol.lower()
-                      for sol in solutions):
-                    reward = 0.8
+        # 정확한 키워드가 포함되어 있는지 확인
+        if any(keyword in completion_lower for keyword in self.correct_keywords):
+            return 1.0
+        elif solutions:
+            # 정답과 유사한지 확인
+            if any(sol.lower() in completion_lower or completion_lower in sol.lower()
+                  for sol in solutions):
+                return 0.8
 
-            rewards.append(reward)
-
-        return rewards
+        return 0.0
 
 
-class LengthRewardFunction(BaseRewardFunction):
-    """길이 기반 보상 함수"""
+class LengthComponent(RewardComponent):
+    """길이 보상 컴포넌트"""
 
-    def __init__(self, config: Dict[str, Any] = None):
-        super().__init__("length", config)
-        self.optimal_length = self.config.get("optimal_length", 100)
-        self.length_weight = self.config.get("length_weight", 0.1)
+    def __init__(self, config: Dict[str, Any] = None, weight: float = 1.0):
+        super().__init__("length", weight)
+        self.optimal_length = config.get("optimal_length", 100) if config else 100
+        self.length_weight = config.get("length_weight", 0.1) if config else 0.1
+
+    def calculate(self, completion: str, **kwargs) -> float:
+        length = len(completion)
+        length_diff = abs(length - self.optimal_length)
+        return max(0, self.length_weight * (self.optimal_length - length_diff))
+
+
+class QualityComponent(RewardComponent):
+    """품질 보상 컴포넌트"""
+
+    def __init__(self, config: Dict[str, Any] = None, weight: float = 1.0):
+        super().__init__("quality", weight)
+        self.reward_scale = config.get("reward_scale", 1.0) if config else 1.0
+        self.penalty_scale = config.get("penalty_scale", -1.0) if config else -1.0
+        self.quality_keywords = config.get("quality_keywords", ["좋아", "완벽", "우수"]) if config else ["좋아", "완벽", "우수"]
+        self.negative_keywords = config.get("negative_keywords", ["모르겠", "잘못", "틀렸"]) if config else ["모르겠", "잘못", "틀렸"]
+
+    def calculate(self, completion: str, **kwargs) -> float:
+        reward = 0.0
+        completion_lower = completion.lower()
+
+        # 충분한 길이 체크
+        if len(completion.strip()) > 10:
+            reward += self.reward_scale * 0.5
+
+        # 문장 완성도 체크
+        if not completion.strip().endswith('.'):
+            reward += self.penalty_scale * 0.2
+
+        # 품질 키워드 체크
+        if any(keyword in completion for keyword in self.quality_keywords):
+            reward += self.reward_scale * 0.3
+
+        # 부정 키워드 체크
+        if any(keyword in completion_lower for keyword in self.negative_keywords):
+            reward += self.penalty_scale * 0.3
+
+        return max(0, reward)
+
+
+class MultiRewardFunction:
+    """다중 보상 함수를 지원하는 통합 클래스"""
+
+    def __init__(self, components: Optional[List[RewardComponent]] = None, config: Dict[str, Any] = None):
+        self.config = config or {}
+        self.components = components or []
+
+        # 기본 컴포넌트들 설정
+        if not self.components:
+            self.components = [
+                AccuracyComponent(self.config.get("accuracy", {})),
+                LengthComponent(self.config.get("length", {})),
+                QualityComponent(self.config.get("quality", {}))
+            ]
 
     def __call__(self, completions: List[str], **kwargs) -> List[float]:
-        """길이 기반 보상 계산"""
+        """TRL GRPOTrainer와 호환되는 다중 보상 계산"""
         rewards = []
 
         for completion in completions:
+            total_reward = 0.0
+
+            # 각 컴포넌트의 보상을 가중합으로 계산
+            for component in self.components:
+                component_reward = component.calculate(completion, **kwargs)
+                total_reward += component_reward * component.weight
+
+            # 정규화 (최대 보상이 1.0이 되도록)
+            max_possible_reward = sum(comp.weight for comp in self.components)
+            if max_possible_reward > 0:
+                total_reward = total_reward / max_possible_reward
+
+            rewards.append(max(0, total_reward))  # 음수 보상 방지
+
+        return rewards
+
+    def add_component(self, component: RewardComponent):
+        """새로운 보상 컴포넌트 추가"""
+        self.components.append(component)
+        logger.info(f"✅ Added reward component: {component.name}")
+
+    def remove_component(self, name: str):
+        """보상 컴포넌트 제거"""
+        self.components = [comp for comp in self.components if comp.name != name]
+        logger.info(f"✅ Removed reward component: {name}")
+
+
+class SingleCustomRewardFunction:
+    """단일 커스텀 보상 함수"""
+
+    def __init__(self, config: Dict[str, Any] = None):
+        self.config = config or {}
+
+        # 통합된 보상 로직 설정
+        self.accuracy_weight = self.config.get("accuracy_weight", 0.4)
+        self.length_weight = self.config.get("length_weight", 0.2)
+        self.quality_weight = self.config.get("quality_weight", 0.4)
+
+        # 각 컴포넌트 설정
+        self.accuracy_config = self.config.get("accuracy", {})
+        self.length_config = self.config.get("length", {})
+        self.quality_config = self.config.get("quality", {})
+
+    def __call__(self, completions: List[str], **kwargs) -> List[float]:
+        """단일 통합 보상 계산"""
+        rewards = []
+
+        for completion in completions:
+            reward = 0.0
+
+            # 정확성 보상
+            if self.accuracy_config.get("correct_keywords"):
+                if any(keyword in completion.lower() for keyword in self.accuracy_config["correct_keywords"]):
+                    reward += self.accuracy_weight * 1.0
+
+            # 길이 보상
+            optimal_length = self.length_config.get("optimal_length", 100)
+            length_weight = self.length_config.get("length_weight", 0.1)
             length = len(completion)
-            # 최적 길이와의 차이로 보상 계산 (음수 보상 가능)
-            length_diff = abs(length - self.optimal_length)
-            reward = max(0, self.length_weight * (self.optimal_length - length_diff))
+            length_diff = abs(length - optimal_length)
+            length_reward = max(0, length_weight * (optimal_length - length_diff))
+            reward += self.length_weight * length_reward
 
-            rewards.append(reward)
+            # 품질 보상
+            quality_reward = 0.0
+            if len(completion.strip()) > 10:
+                quality_reward += self.quality_weight * 0.5
 
-        return rewards
+            if not completion.strip().endswith('.'):
+                quality_reward += self.quality_weight * (-0.2)
 
+            reward += quality_reward
 
-class CustomRewardFunction(BaseRewardFunction):
-    """사용자 정의 보상 함수"""
-
-    def __init__(self, config: Dict[str, Any] = None):
-        super().__init__("custom", config)
-        # 사용자 정의 보상 로직 설정
-        self.reward_scale = self.config.get("reward_scale", 1.0)
-        self.penalty_scale = self.config.get("penalty_scale", -1.0)
-
-    def __call__(self, completions: List[str], **kwargs) -> List[float]:
-        """사용자 정의 보상 계산"""
-        rewards = []
-
-        for completion in completions:
-            reward = 0.0
-
-            # 기본적인 품질 체크 (예시)
-            if len(completion.strip()) > 10:  # 충분한 길이
-                reward += self.reward_scale * 0.5
-
-            if not completion.strip().endswith('.'):  # 문장 완성도
-                reward += self.penalty_scale * 0.2
-
-            # 추가 커스텀 로직은 여기에 구현
-            # 예: 특정 키워드 포함 확인, toxicity 체크 등
-
-            rewards.append(max(0, reward))  # 음수 보상 방지
+            rewards.append(max(0, reward))
 
         return rewards
 
 
-def create_reward_function(reward_type: str, config: Dict[str, Any] = None) -> BaseRewardFunction:
+def create_reward_function(reward_type: str, config: Dict[str, Any] = None):
     """
-    보상 함수 팩토리 함수
+    통합 보상 함수 팩토리 함수
 
     Args:
-        reward_type: 보상 함수 타입 ("accuracy", "length", "custom")
+        reward_type: 보상 함수 타입 ("single", "multi", "accuracy", "length", "quality")
         config: 보상 함수 설정
 
     Returns:
@@ -130,45 +206,26 @@ def create_reward_function(reward_type: str, config: Dict[str, Any] = None) -> B
     """
     config = config or {}
 
-    if reward_type == "accuracy":
-        return AccuracyRewardFunction(config)
+    if reward_type == "single":
+        return SingleCustomRewardFunction(config)
+    elif reward_type == "multi":
+        return MultiRewardFunction(config=config)
+    elif reward_type == "accuracy":
+        return AccuracyComponent(config)
     elif reward_type == "length":
-        return LengthRewardFunction(config)
-    elif reward_type == "custom":
-        return CustomRewardFunction(config)
+        return LengthComponent(config)
+    elif reward_type == "quality":
+        return QualityComponent(config)
     else:
-        logger.warning(f"Unknown reward type: {reward_type}, using custom")
-        return CustomRewardFunction(config)
+        logger.warning(f"Unknown reward type: {reward_type}, using single custom")
+        return SingleCustomRewardFunction(config)
 
 
-def combine_reward_functions(reward_functions: List[BaseRewardFunction]) -> BaseRewardFunction:
-    """
-    여러 보상 함수를 결합하는 함수
+def create_multi_reward_function(config: Dict[str, Any] = None) -> MultiRewardFunction:
+    """다중 보상 함수 생성 (기본 컴포넌트들 포함)"""
+    return MultiRewardFunction(config=config)
 
-    Args:
-        reward_functions: 결합할 보상 함수 리스트
 
-    Returns:
-        결합된 보상 함수
-    """
-    class CombinedRewardFunction(BaseRewardFunction):
-        def __init__(self, functions: List[BaseRewardFunction]):
-            super().__init__("combined", {})
-            self.functions = functions
-
-        def __call__(self, completions: List[str], **kwargs) -> List[float]:
-            # 각 보상 함수의 결과를 평균
-            all_rewards = []
-            for func in self.functions:
-                rewards = func(completions, **kwargs)
-                all_rewards.append(rewards)
-
-            # 보상 평균 계산
-            combined_rewards = []
-            for i in range(len(completions)):
-                avg_reward = sum(rewards[i] for rewards in all_rewards) / len(all_rewards)
-                combined_rewards.append(avg_reward)
-
-            return combined_rewards
-
-    return CombinedRewardFunction(reward_functions)
+def create_single_reward_function(config: Dict[str, Any] = None) -> SingleCustomRewardFunction:
+    """단일 통합 보상 함수 생성"""
+    return SingleCustomRewardFunction(config)

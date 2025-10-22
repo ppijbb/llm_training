@@ -233,4 +233,7 @@ def create_grpo_trainer(
     reward_functions: Optional[List] = None
 ) -> UnslothGRPOTrainer:
     """Create GRPO trainer with given configuration and reward functions"""
-    return UnslothGRPOTrainer(config, model_init_kwargs, reward_functions)
+    return UnslothGRPOTrainer(
+        config=config,
+        model_init_kwargs=model_init_kwargs,
+        reward_functions=reward_functions)
