@@ -110,9 +110,19 @@ class BaseRewardFunction:
         return self.__name__
 
 class MultiRewardFunction(BaseRewardFunction):
-    """다중 보상 함수를 지원하는 통합 클래스"""
+    """
+    다중 보상 함수를 지원하는 통합 클래스
+    
+    reward 처리
+        completion 예시: [{role: "assistant", content: "어쩌고 저쩌고..."}]
+        reward function에서는 위의 completion의 content를 처리하여 보상 부여.
+    """
 
-    def __init__(self, components: Optional[List[RewardComponent]] = None, config: Dict[str, Any] = None):
+    def __init__(
+        self,
+        components: Optional[List[RewardComponent]] = None,
+        config: Dict[str, Any] = None
+    ):
         self.config = config or {}
         self.components = components or []
 
@@ -157,7 +167,13 @@ class MultiRewardFunction(BaseRewardFunction):
 
 
 class SingleCustomRewardFunction(BaseRewardFunction):
-    """단일 커스텀 보상 함수"""
+    """
+    단일 커스텀 보상 함수
+    
+    reward 처리
+        completion 예시: [{role: "assistant", content: "어쩌고 저쩌고..."}]
+        reward function에서는 위의 completion의 content를 처리하여 보상 부여.
+    """
 
     def __init__(self, config: Dict[str, Any] = None):
         self.config = config or {}
@@ -178,26 +194,26 @@ class SingleCustomRewardFunction(BaseRewardFunction):
 
         for completion in completions:
             reward = 0.0
-
+            completion_content = completion[0]["content"]
             # 정확성 보상
             if self.accuracy_config.get("correct_keywords"):
-                if any(keyword in completion.lower() for keyword in self.accuracy_config["correct_keywords"]):
+                if any(keyword in completion_content.lower() for keyword in self.accuracy_config["correct_keywords"]):
                     reward += self.accuracy_weight * 1.0
 
             # 길이 보상
             optimal_length = self.length_config.get("optimal_length", 100)
             length_weight = self.length_config.get("length_weight", 0.1)
-            length = len(completion)
+            length = len(completion_content)
             length_diff = abs(length - optimal_length)
             length_reward = max(0, length_weight * (optimal_length - length_diff))
             reward += self.length_weight * length_reward
 
             # 품질 보상
             quality_reward = 0.0
-            if len(completion.strip()) > 10:
+            if len(completion_content.strip()) > 10:
                 quality_reward += self.quality_weight * 0.5
 
-            if not completion.strip().endswith('.'):
+            if not completion_content.strip().endswith('.'):
                 quality_reward += self.quality_weight * (-0.2)
 
             reward += quality_reward

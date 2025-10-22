@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+import unsloth
+import weave
 from transformers.utils import is_flash_attn_2_available
 import inspect
 
@@ -7,10 +9,6 @@ if is_flash_attn_2_available():
     from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
 
     _flash_supports_window_size = "window_size" in list(inspect.signature(flash_attn_func).parameters)
-
-import unsloth
-import flash_attn
-import weave
 """
 Main script for GRPO training with Unsloth
 
