@@ -31,7 +31,7 @@ class CustomGRPOTrainer(GRPOTrainer):
         **kwargs
     ):
         self.custom_reward_functions = reward_functions or []
-        super().__init__(*args, **kwargs)
+        super().__init__(reward_funcs=self.custom_reward_functions, *args, **kwargs)
 
     def compute_rewards(
         self,
