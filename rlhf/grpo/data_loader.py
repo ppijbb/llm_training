@@ -103,6 +103,10 @@ class GRPODataLoader:
         def convert_to_trl_format(example):
             """Convert to TRL standard format"""
             # 이미 TRL 형식이면 그대로 반환
+            if "messages" in example:
+                # messages 는 (prompt, chosen, rejected) 조합에서는 사용되지 않음
+                del example["messages"]
+
             if "prompt" in example and "chosen" in example and "rejected" in example:
                 return example
 
