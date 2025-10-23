@@ -395,7 +395,7 @@ def load_dataset(args, config: GRPOConfig):
     dataset = data_loader.prepare_grpo_data(dataset)
     splited = dataset.train_test_split(test_size=0.1)
     train_dataset = splited["train"]
-    eval_dataset = splited["test"].shuffle(seed=42).select(range(100))
+    eval_dataset = splited["test"].shuffle(seed=42).select(min(range(100), len(splited["test"])))
 
     logger.info(f"✅ Dataset split: {len(train_dataset)} train, {len(eval_dataset)} eval")
     
