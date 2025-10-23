@@ -19,8 +19,6 @@ def create_grpo_config(
 
     # TRL 표준 기본 설정만 사용
     config = GRPOConfig(
-        model_init_kwargs={"model_name": model_name},
-        output_dir=output_dir,
         **kwargs  # 사용자 정의 설정으로 기본값 오버라이드
     )
 

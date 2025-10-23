@@ -159,6 +159,7 @@ Examples:
     parser.add_argument(
         "--config",
         type=str,
+        default="config/trainer_config.json",
         help="Path to configuration file"
     )
     
@@ -166,6 +167,7 @@ Examples:
     parser.add_argument(
         "--quick-test",
         action="store_true",
+        default=False,
         help="Run quick test with minimal data"
     )
     
