@@ -152,8 +152,8 @@ class GRPODataLoader:
                 if all([prompt for prompt in example.get("prompt") if type(prompt) == str]):
                     example["prompt"] = [{"role": "user", "content": prompt} for prompt in example.get("prompt")]
 
-            if "prompt" in example or("chosen" in example and "rejected" in example):
-                return example
+            if "prompt" in example and not ("chosen" in example and "rejected" in example):
+                return {"prompt": example["prompt"]}
 
             # UltraFeedback 형식 변환
             if "chosen" in example and "rejected" in example:
