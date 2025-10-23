@@ -7,6 +7,8 @@ This module provides GRPO training functionality using TRL's GRPOTrainer and Uns
 import logging
 import torch
 import numpy as np
+import json
+import os
 from typing import Dict, Any, List, Optional
 
 # Import TRL components
@@ -15,10 +17,136 @@ from trl import GRPOTrainer, GRPOConfig
 # Import Unsloth for model loading
 from unsloth import FastLanguageModel
 
+# Import transformers for callbacks
+from transformers import TrainerCallback, TrainingArguments
+
 # Import custom reward functions for TRL compatibility
 from reward_functions import MultiRewardFunction, SingleCustomRewardFunction
 
 logger = logging.getLogger(__name__)
+
+
+class GenerationLoggingCallback(TrainerCallback):
+    """Evaluation 단계에서 생성된 텍스트를 로그로 출력하는 콜백"""
+
+    def __init__(self, output_dir: str = "./generation_logs", max_samples: int = 5):
+        self.output_dir = output_dir
+        self.max_samples = max_samples
+        self.eval_step_count = 0
+
+        # 로그 디렉토리 생성
+        os.makedirs(output_dir, exist_ok=True)
+
+        logger.info(f"📊 Generation logging callback initialized. Output dir: {output_dir}")
+
+    def on_evaluate(self, args: TrainingArguments, state, control, **kwargs):
+        """Evaluation 단계에서 호출됨"""
+        if hasattr(state, 'eval_dataloader') and state.eval_dataloader is not None:
+            self._log_generations(args, state, **kwargs)
+
+    def _log_generations(self, args: TrainingArguments, state, **kwargs):
+        """실제 생성 로그 작성"""
+        model = kwargs.get('model')
+        tokenizer = kwargs.get('tokenizer')
+        eval_dataloader = kwargs.get('eval_dataloader')
+
+        if not model or not tokenizer or not eval_dataloader:
+            return
+
+        self.eval_step_count += 1
+        logger.info(f"🔍 Evaluation step {self.eval_step_count} - Logging generations...")
+
+        # 모델을 evaluation 모드로 전환
+        model.eval()
+
+        generation_logs = []
+        sample_count = 0
+
+        try:
+            # 첫 번째 배치만 처리 (메모리 절약)
+            for batch in eval_dataloader:
+                if sample_count >= self.max_samples:
+                    break
+
+                # 배치에서 입력 데이터 추출
+                if hasattr(batch, 'keys'):
+                    # 데이터셋 형식에 따라 처리
+                    if 'prompt' in batch:
+                        prompts = batch['prompt']
+                    elif 'input_ids' in batch:
+                        # 토큰화된 입력을 텍스트로 변환
+                        input_ids = batch['input_ids']
+                        prompts = [tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
+                    else:
+                        logger.warning("⚠️ Unknown batch format for generation logging")
+                        continue
+                else:
+                    logger.warning("⚠️ Invalid batch format for generation logging")
+                    continue
+
+                # 각 프롬프트에 대해 생성
+                for i, prompt in enumerate(prompts[:self.max_samples - sample_count]):
+                    if sample_count >= self.max_samples:
+                        break
+
+                    try:
+                        # 생성 파라미터 설정
+                        inputs = tokenizer(prompt, return_tensors="pt", padding=True, truncation=True)
+                        inputs = {k: v.to(model.device) for k, v in inputs.items()}
+
+                        # 생성 실행
+                        with torch.no_grad():
+                            outputs = model.generate(
+                                **inputs,
+                                max_new_tokens=100,
+                                num_return_sequences=1,
+                                do_sample=True,
+                                temperature=0.7,
+                                pad_token_id=tokenizer.eos_token_id,
+                                eos_token_id=tokenizer.eos_token_id,
+                            )
+
+                        # 생성된 텍스트 디코딩
+                        generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+                        # 로그 데이터 구성
+                        log_entry = {
+                            "eval_step": self.eval_step_count,
+                            "sample_index": sample_count,
+                            "prompt": prompt[:100] + "..." if len(prompt) > 100 else prompt,
+                            "generated": generated_text[len(prompt):][:200] + "..." if len(generated_text) > len(prompt) + 200 else generated_text[len(prompt):],
+                            "full_response": generated_text[:300] + "..." if len(generated_text) > 300 else generated_text
+                        }
+
+                        generation_logs.append(log_entry)
+                        sample_count += 1
+
+                        logger.info(f"📝 Sample {sample_count}:")
+                        logger.info(f"   Prompt: {log_entry['prompt']}")
+                        logger.info(f"   Generated: {log_entry['generated']}")
+
+                    except Exception as e:
+                        logger.error(f"❌ Error generating for sample {sample_count}: {e}")
+                        sample_count += 1
+                        continue
+
+                break  # 첫 번째 배치만 처리
+
+        except Exception as e:
+            logger.error(f"❌ Error during generation logging: {e}")
+
+        # 로그 파일에 저장
+        if generation_logs:
+            log_file = os.path.join(self.output_dir, f"generation_log_step_{self.eval_step_count}.json")
+            try:
+                with open(log_file, 'w', encoding='utf-8') as f:
+                    json.dump(generation_logs, f, ensure_ascii=False, indent=2)
+                logger.info(f"💾 Generation logs saved to {log_file}")
+            except Exception as e:
+                logger.error(f"❌ Failed to save generation logs: {e}")
+
+        # 모델을 다시 training 모드로 전환
+        model.train()
 
 
 class CustomGRPOTrainer(GRPOTrainer):
@@ -27,11 +155,28 @@ class CustomGRPOTrainer(GRPOTrainer):
     def __init__(
         self,
         reward_functions: List[MultiRewardFunction|SingleCustomRewardFunction] = None,
+        enable_generation_logging: bool = True,
+        generation_log_dir: str = "./generation_logs",
+        max_generation_samples: int = 5,
         *args,
         **kwargs
     ):
         kwargs['args'].model_init_kwargs = kwargs["model_init_kwargs"] if "model_init_kwargs" in kwargs else {}
         self.custom_reward_functions = reward_functions or []
+        self.enable_generation_logging = enable_generation_logging
+
+        # 생성 로깅 콜백 설정
+        if self.enable_generation_logging:
+            self.generation_callback = GenerationLoggingCallback(
+                output_dir=generation_log_dir,
+                max_samples=max_generation_samples
+            )
+            # 콜백을 args에 추가 (Trainer가 콜백을 인식하도록)
+            if 'callbacks' not in kwargs:
+                kwargs['callbacks'] = []
+            kwargs['callbacks'].append(self.generation_callback)
+            logger.info("✅ Generation logging callback added to trainer")
+
         super().__init__(reward_funcs=self.custom_reward_functions, *args, **kwargs)
 
     def compute_rewards(
@@ -63,18 +208,24 @@ class CustomGRPOTrainer(GRPOTrainer):
 
 class UnslothGRPOTrainer:
     """GRPO Trainer using TRL's GRPOTrainer with Unsloth optimizations"""
-    
+
     def __init__(
         self,
         config: GRPOConfig,
         model_init_kwargs: Optional[Dict[str, Any]] = None,
-        reward_functions: List[MultiRewardFunction|SingleCustomRewardFunction] = None
+        reward_functions: List[MultiRewardFunction|SingleCustomRewardFunction] = None,
+        enable_generation_logging: bool = True,
+        generation_log_dir: str = None,
+        max_generation_samples: int = 5
     ):
         self.config = config
         self.model_init_kwargs = model_init_kwargs or {}
         self.model = None
         self.tokenizer = None
         self.reward_functions = reward_functions or []
+        self.enable_generation_logging = enable_generation_logging
+        self.generation_log_dir = generation_log_dir or os.path.join(config.output_dir, "generation_logs")
+        self.max_generation_samples = max_generation_samples
         self.trainer = None
 
         # Initialize components
@@ -94,6 +245,7 @@ class UnslothGRPOTrainer:
                 max_seq_length=getattr(self.config, 'max_prompt_length', 2048),
                 dtype=torch.bfloat16,
                 load_in_4bit=True,
+                device_map="balanced"
             )
             
             # Apply PEFT
@@ -130,9 +282,12 @@ class UnslothGRPOTrainer:
         logger.info("🔄 Creating TRL GRPOTrainer")
         
         try:
-            # Create custom trainer with reward functions
+            # Create custom trainer with reward functions and generation logging
             self.trainer = CustomGRPOTrainer(
                 reward_functions=self.reward_functions,
+                enable_generation_logging=self.enable_generation_logging,
+                generation_log_dir=self.generation_log_dir,
+                max_generation_samples=self.max_generation_samples,
                 model=self.model,
                 args=self.config,
                 train_dataset=train_dataset,
@@ -195,10 +350,16 @@ class UnslothGRPOTrainer:
 def create_grpo_trainer(
     config: GRPOConfig,
     model_init_kwargs: Optional[Dict[str, Any]] = None,
-    reward_functions: Optional[List] = None
+    reward_functions: Optional[List] = None,
+    enable_generation_logging: bool = True,
+    generation_log_dir: str = None,
+    max_generation_samples: int = 5
 ) -> UnslothGRPOTrainer:
-    """Create GRPO trainer with given configuration and reward functions"""
+    """Create GRPO trainer with given configuration, reward functions, and generation logging options"""
     return UnslothGRPOTrainer(
         config=config,
         model_init_kwargs=model_init_kwargs,
-        reward_functions=reward_functions)
+        reward_functions=reward_functions,
+        enable_generation_logging=enable_generation_logging,
+        generation_log_dir=generation_log_dir,
+        max_generation_samples=max_generation_samples)

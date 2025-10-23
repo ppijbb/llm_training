@@ -31,7 +31,7 @@ python train_grpo.py --reward-function multi
 # 기본 훈련 (TRL 표준 데이터셋 사용)
 python train_grpo.py --max-samples 1000
 
-# 프로덕션 훈련
+# 프로덕션 훈련 (생성 로깅 포함)
 python train_grpo.py --production
 ```
 
@@ -100,6 +100,54 @@ python train_grpo.py [OPTIONS]
   --eval-only          평가만 실행
   --resume-from-checkpoint PATH
                         체크포인트에서 재시작
+  --enable-generation-logging
+                        생성 로깅 활성화 (기본값: 활성화)
+  --disable-generation-logging
+                        생성 로깅 비활성화
+  --generation-log-dir PATH
+                        생성 로그 저장 디렉토리 (기본값: {output_dir}/generation_logs)
+  --max-generation-samples N
+                        로깅을 위한 최대 생성 샘플 수 (기본값: 5)
+```
+
+### Generation Logging
+
+학습 중 evaluation 단계에서 생성된 텍스트를 로그로 확인할 수 있습니다:
+
+```bash
+# 기본적으로 활성화됨
+python train_grpo.py --reward-function single
+
+# 비활성화
+python train_grpo.py --disable-generation-logging
+
+# 커스텀 로그 디렉토리 설정
+python train_grpo.py --generation-log-dir ./my_logs
+
+# 생성 샘플 수 조절
+python train_grpo.py --max-generation-samples 10
+```
+
+로그 파일은 `{output_dir}/generation_logs/` 디렉토리에 `generation_log_step_{n}.json` 형태로 저장됩니다.
+
+로그 파일 예시:
+```json
+[
+  {
+    "eval_step": 1,
+    "sample_index": 0,
+    "prompt": "What is the capital of France?",
+    "generated": "The capital of France is Paris. It is located in...",
+    "full_response": "The capital of France is Paris. It is located in the north-central part of the country..."
+  },
+  {
+    "eval_step": 1,
+    "sample_index": 1,
+    "prompt": "Explain quantum computing in simple terms.",
+    "generated": "Quantum computing uses quantum mechanics to perform...",
+    "full_response": "Quantum computing uses quantum mechanics to perform calculations..."
+  }
+]
 ```
 
 ### 설정 파일 예제

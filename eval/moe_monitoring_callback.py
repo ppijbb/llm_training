@@ -26,8 +26,8 @@ def _is_main_process() -> bool:
     return True
 
 class TorchMoECallback:
-    """Pure PyTorch MoE monitoring callback"""
-    
+    """Pure PyTorch MoE monitoring callback with generation logging"""
+
     def __init__(
         self,
         num_experts: int,
@@ -41,7 +41,11 @@ class TorchMoECallback:
         log_to_console: bool = False,
         save_detailed_logs: bool = False,
         log_dir: str = "./moe_logs",
-        debug_logging: bool = False       
+        debug_logging: bool = False,
+        enable_generation_logging: bool = True,
+        generation_log_dir: str = "./moe_generation_logs",
+        max_generation_samples: int = 3,
+        generation_log_every: int = 100
     ):
         self.log_every_n_steps = log_every_n_steps
         self.log_heatmap_every = log_heatmap_every
@@ -56,30 +60,55 @@ class TorchMoECallback:
         self.log_dir = log_dir
         self.debug_logging = debug_logging
         self.is_main_process = _is_main_process()
-        
+
+        # Generation logging 설정
+        self.enable_generation_logging = enable_generation_logging
+        self.generation_log_dir = generation_log_dir
+        self.max_generation_samples = max_generation_samples
+        self.generation_log_every = generation_log_every
+        self.generation_step_count = 0
+
+        # 모델과 토크나이저 (나중에 설정)
+        self.model = None
+        self.tokenizer = None
+
         # 내부 상태 (step 제거)
         self.expert_usage_history = defaultdict(lambda: deque(maxlen=window_size))
         self.routing_stats = defaultdict(list)
         self.alerts_history = []
         self.detailed_logs = []
-        
+
         # hooks 저장소
         self.hooks = []
         self.layer_outputs = {}
-        
+
         if save_detailed_logs:
             import os
             os.makedirs(log_dir, exist_ok=True)
+
+        if enable_generation_logging:
+            import os
+            os.makedirs(generation_log_dir, exist_ok=True)
     
     def _log_debug(self, message: str):
         """내부 디버그 메시지 로깅"""
         if self.debug_logging and self.log_to_console:
             print(f"[MoE Debug] {message}")
     
-    def register_model(self, model: torch.nn.Module):
-        """모델에 hooks 등록"""
+    def register_model(self, model: torch.nn.Module, tokenizer=None):
+        """모델에 hooks 등록하고 토크나이저 설정"""
         self.model = model
+        self.tokenizer = tokenizer
         self._register_hooks()
+
+        if self.enable_generation_logging and tokenizer is None:
+            self._log_debug("Warning: Generation logging enabled but no tokenizer provided")
+
+        return self
+
+    def set_tokenizer(self, tokenizer):
+        """토크나이저 설정"""
+        self.tokenizer = tokenizer
         return self
     
     def _register_hooks(self):
@@ -286,6 +315,123 @@ class TorchMoECallback:
         # 상세 로그 저장
         if self.save_detailed_logs:
             self._save_detailed_log(step_metrics, current_step)
+
+        # 생성 로깅 (설정된 주기마다)
+        if (self.enable_generation_logging and
+            current_step % self.generation_log_every == 0 and
+            self.model is not None and
+            self.tokenizer is not None):
+            self._log_generations(current_step)
+
+    @torch.no_grad()
+    def _log_generations(self, current_step: int):
+        """모델 생성 결과 로깅"""
+        if not self.is_main_process:
+            return
+
+        try:
+            self.generation_step_count += 1
+
+            # 기본 샘플 프롬프트들
+            sample_prompts = [
+                "What is the capital of France?",
+                "Explain quantum computing in simple terms.",
+                "How does photosynthesis work?",
+                "What are the benefits of exercise?"
+            ]
+
+            generation_logs = []
+            sample_count = 0
+
+            # 모델을 evaluation 모드로 전환
+            original_mode = self.model.training
+            self.model.eval()
+
+            for prompt in sample_prompts:
+                if sample_count >= self.max_generation_samples:
+                    break
+
+                try:
+                    # 입력 토큰화
+                    inputs = self.tokenizer(
+                        prompt,
+                        return_tensors="pt",
+                        padding=True,
+                        truncation=True,
+                        max_length=512
+                    )
+                    inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
+
+                    # 생성 실행
+                    outputs = self.model.generate(
+                        **inputs,
+                        max_new_tokens=100,
+                        num_return_sequences=1,
+                        do_sample=True,
+                        temperature=0.7,
+                        pad_token_id=self.tokenizer.eos_token_id,
+                        eos_token_id=self.tokenizer.eos_token_id,
+                    )
+
+                    # 생성된 텍스트 디코딩
+                    input_length = inputs['input_ids'].shape[1]
+                    generated_text = self.tokenizer.decode(
+                        outputs[0][input_length:],
+                        skip_special_tokens=True
+                    )
+
+                    # 로그 데이터 구성
+                    log_entry = {
+                        "step": current_step,
+                        "generation_step": self.generation_step_count,
+                        "sample_index": sample_count,
+                        "prompt": prompt,
+                        "generated": generated_text.strip(),
+                        "full_response": self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+                    }
+
+                    generation_logs.append(log_entry)
+                    sample_count += 1
+
+                    # 콘솔 로그
+                    if self.log_to_console:
+                        self._log_debug(f"Generation sample {sample_count}:")
+                        self._log_debug(f"  Prompt: {prompt}")
+                        self._log_debug(f"  Generated: {generated_text.strip()[:100]}...")
+
+                except Exception as e:
+                    self._log_debug(f"Error generating for sample {sample_count}: {e}")
+                    sample_count += 1
+                    continue
+
+            # 생성 로그 파일 저장
+            if generation_logs:
+                log_file = os.path.join(
+                    self.generation_log_dir,
+                    f"generation_log_step_{current_step}_gen_{self.generation_step_count}.json"
+                )
+
+                with open(log_file, 'w', encoding='utf-8') as f:
+                    json.dump(generation_logs, f, ensure_ascii=False, indent=2)
+
+                self._log_debug(f"Generation logs saved to {log_file}")
+
+                # 로거에 생성 결과 로깅 (Wandb 등)
+                if self.logger and hasattr(self.logger, 'log'):
+                    for i, log_entry in enumerate(generation_logs):
+                        self.logger.log({
+                            f'generation/step_{current_step}/sample_{i}/prompt': log_entry['prompt'],
+                            f'generation/step_{current_step}/sample_{i}/generated': log_entry['generated'][:200] + "..."
+                        }, step=current_step)
+
+            # 모델을 원래 모드로 복원
+            self.model.train(original_mode)
+
+        except Exception as e:
+            self._log_debug(f"Error during generation logging: {e}")
+            # 모델을 다시 training 모드로 전환
+            if self.model is not None:
+                self.model.train()
 
 
     @torch.no_grad()
@@ -561,18 +707,25 @@ class TransformersMoECallbackWrapper(TrainerCallback):
         self._model_registered = False
     
     def on_train_begin(
-        self, 
-        args: TrainingArguments, 
-        state: TrainerState, 
-        control: TrainerControl, 
-        model=None, 
+        self,
+        args: TrainingArguments,
+        state: TrainerState,
+        control: TrainerControl,
+        model=None,
+        tokenizer=None,
         **kwargs
     ):
-        """훈련 시작 시 모델 등록"""
+        """훈련 시작 시 모델과 토크나이저 등록"""
         if model is not None and not self._model_registered:
-            self.torch_callback.register_model(model)
+            self.torch_callback.register_model(model, tokenizer)
             self._model_registered = True
             self.torch_callback._log_debug(f"MoE monitoring registered for model with {len(self.torch_callback.hooks)} MoE layers")
+
+            if self.torch_callback.enable_generation_logging:
+                if tokenizer is not None:
+                    self.torch_callback._log_debug("Generation logging enabled with tokenizer")
+                else:
+                    self.torch_callback._log_debug("Warning: Generation logging enabled but no tokenizer provided")
     
     def on_step_begin(
         self, 
@@ -643,30 +796,47 @@ class TransformersMoECallbackWrapper(TrainerCallback):
 def create_moe_callback_for_transformers(
     log_every_n_steps: int = 100,
     logger=None,
+    enable_generation_logging: bool = True,
+    generation_log_dir: str = "./moe_generation_logs",
+    max_generation_samples: int = 3,
+    generation_log_every: int = 100,
     **kwargs
 ) -> TransformersMoECallbackWrapper:
     """Transformers용 MoE 콜백 생성 편의 함수"""
-    
+
     torch_callback = TorchMoECallback(
         log_every_n_steps=log_every_n_steps,
         logger=logger,
+        enable_generation_logging=enable_generation_logging,
+        generation_log_dir=generation_log_dir,
+        max_generation_samples=max_generation_samples,
+        generation_log_every=generation_log_every,
         **kwargs
     )
-    
+
     return TransformersMoECallbackWrapper(torch_callback)
 
 def create_moe_callback_for_pytorch(
     model: torch.nn.Module,
     log_every_n_steps: int = 100,
     logger=None,
+    tokenizer=None,
+    enable_generation_logging: bool = True,
+    generation_log_dir: str = "./moe_generation_logs",
+    max_generation_samples: int = 3,
+    generation_log_every: int = 100,
     **kwargs
 ) -> TorchMoECallback:
     """순수 PyTorch용 MoE 콜백 생성 편의 함수"""
-    
+
     callback = TorchMoECallback(
         log_every_n_steps=log_every_n_steps,
         logger=logger,
+        enable_generation_logging=enable_generation_logging,
+        generation_log_dir=generation_log_dir,
+        max_generation_samples=max_generation_samples,
+        generation_log_every=generation_log_every,
         **kwargs
     )
-    
-    return callback.register_model(model)
+
+    return callback.register_model(model, tokenizer)

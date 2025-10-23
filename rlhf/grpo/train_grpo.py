@@ -230,23 +230,51 @@ Examples:
         default="grpo-training",
         help="Weights & Biases project name"
     )
-    
+
     parser.add_argument(
         "--no-wandb",
         action="store_true",
         help="Disable Weights & Biases logging"
     )
-    
+
     parser.add_argument(
         "--eval-only",
         action="store_true",
         help="Only run evaluation (requires trained model)"
     )
-    
+
     parser.add_argument(
         "--resume-from-checkpoint",
         type=str,
         help="Resume training from checkpoint"
+    )
+
+    # Generation logging options
+    parser.add_argument(
+        "--enable-generation-logging",
+        action="store_true",
+        default=True,
+        help="Enable generation logging during evaluation (default: enabled)"
+    )
+
+    parser.add_argument(
+        "--disable-generation-logging",
+        action="store_true",
+        help="Disable generation logging during evaluation"
+    )
+
+    parser.add_argument(
+        "--generation-log-dir",
+        type=str,
+        default=None,
+        help="Directory to save generation logs (default: {output_dir}/generation_logs)"
+    )
+
+    parser.add_argument(
+        "--max-generation-samples",
+        type=int,
+        default=5,
+        help="Maximum number of samples to generate for logging (default: 5)"
     )
     
     return parser.parse_args()
@@ -306,18 +334,34 @@ def create_config_from_args(args) -> GRPOConfig:
     else:
         custom_config["report_to"] = "wandb"
         logger.info(f"📊 Weights & Biases project: {args.wandb_project}")
-    
+
     # Note: Reward function configuration is handled by the trainer
     # TRL GRPOTrainer uses built-in reward functions
     logger.info(f"🎯 Using default reward function (handled by TRL GRPOTrainer)")
-    
-    
+
+
     # Apply custom configuration
     if custom_config:
         for key, value in custom_config.items():
             setattr(config, key, value)
-    
+
     return config
+
+
+def get_generation_logging_settings(args) -> tuple[bool, str, int]:
+    """Generation logging 설정을 반환"""
+    # enable/disable 플래그 처리
+    enable_logging = args.enable_generation_logging and not args.disable_generation_logging
+
+    # 로그 디렉토리 설정
+    log_dir = args.generation_log_dir
+    if not log_dir and hasattr(args, 'output_dir') and args.output_dir:
+        log_dir = os.path.join(args.output_dir, "generation_logs")
+
+    # 최대 샘플 수
+    max_samples = args.max_generation_samples
+
+    return enable_logging, log_dir, max_samples
 
 
 def load_dataset(args, config: GRPOConfig):
@@ -416,11 +460,22 @@ def main():
         # Create reward functions
         reward_functions = create_reward_functions(args)
 
-        # Create trainer with model initialization kwargs and reward functions
+        # Get generation logging settings
+        enable_logging, log_dir, max_samples = get_generation_logging_settings(args)
+
+        logger.info(f"📊 Generation logging: {'enabled' if enable_logging else 'disabled'}")
+        if enable_logging:
+            logger.info(f"📁 Generation log directory: {log_dir}")
+            logger.info(f"🔢 Max generation samples: {max_samples}")
+
+        # Create trainer with model initialization kwargs, reward functions, and generation logging
         trainer = create_grpo_trainer(
             config,
             model_init_kwargs=config.model_init_kwargs,
-            reward_functions=reward_functions)
+            reward_functions=reward_functions,
+            enable_generation_logging=enable_logging,
+            generation_log_dir=log_dir,
+            max_generation_samples=max_samples)
         logger.info("✅ GRPO Trainer created")
         
         if args.eval_only:

@@ -6,6 +6,7 @@
 
 - **Expert 사용률 추적**: 각 Expert가 얼마나 자주, 그리고 균등하게 사용되는지 모니터링합니다.
 - **라우팅 패턴 분석**: 토큰이 Expert들에게 어떻게 분배되는지 엔트로피와 같은 지표로 분석합니다.
+- **모델 생성 결과 로깅**: 훈련 중 특정 주기마다 모델의 생성 결과를 샘플링하여 로깅합니다.
 - **실시간 로깅**: `wandb`나 `TensorBoard`와 같은 로깅 도구와 통합하여 시각적인 대시보드를 제공합니다.
 - **자동 경고 시스템**: 미리 정의된 임계값을 초과하는 이상 현상(예: 심각한 불균형)이 발생하면 콘솔에 경고를 출력합니다.
 - **프레임워크 호환성**: `transformers` 라이브러리의 `Trainer`와 순수 `PyTorch` 훈련 루프 모두에서 쉽게 사용할 수 있도록 설계되었습니다.
@@ -122,6 +123,56 @@ aux_loss = calculate_load_balancing_loss(probs, assignments, 8)
 print(f"로드 밸런싱 손실: {aux_loss.item():.4f}")
 ```
 
+### 2.4. 모델 생성 결과 로깅 (Generation Logging)
+
+MoE 모델의 훈련 과정에서 모델의 생성 품질을 추적하는 것은 매우 중요합니다. 콜백은 설정된 주기마다 샘플 프롬프트에 대한 모델의 생성 결과를 자동으로 로깅합니다.
+
+#### 주요 기능:
+- **자동 생성 샘플링**: 설정된 주기마다 고정된 샘플 프롬프트에 대한 생성 수행
+- **다중 형식 로깅**: 콘솔 출력과 파일 저장 동시 지원
+- **Wandb 연동**: 생성 결과가 Wandb 대시보드에 자동 업로드
+- **메모리 효율적**: 모델 모드 전환으로 메모리 사용량 최소화
+
+#### 로깅 주기 설정:
+```python
+# 100 스텝마다 생성 로깅 수행
+callback = TorchMoECallback(
+    # ... 기존 설정들 ...
+    generation_log_every=100,  # 생성 로깅 주기
+    max_generation_samples=3,   # 생성할 샘플 수
+    enable_generation_logging=True
+)
+```
+
+#### 샘플 프롬프트:
+기본적으로 다음과 같은 프롬프트들이 사용됩니다:
+- "What is the capital of France?"
+- "Explain quantum computing in simple terms."
+- "How does photosynthesis work?"
+- "What are the benefits of exercise?"
+
+#### 로그 파일 구조:
+```json
+[
+  {
+    "step": 100,
+    "generation_step": 1,
+    "sample_index": 0,
+    "prompt": "What is the capital of France?",
+    "generated": "The capital of France is Paris...",
+    "full_response": "What is the capital of France? The capital of France is Paris..."
+  }
+]
+```
+
+#### 콘솔 출력 예시:
+```
+[MoE Debug] Generation sample 1:
+[MoE Debug]   Prompt: What is the capital of France?
+[MoE Debug]   Generated: The capital of France is Paris. It is located in...
+[MoE Debug] Generation logs saved to ./moe_generation_logs/generation_log_step_100_gen_1.json
+```
+
 ---
 
 ## 3. `transformers.Trainer`와 함께 사용하기
@@ -150,11 +201,15 @@ import wandb
 # W&B 로거 초기화 (예시)
 wandb.init(project="moe-sft-project", name="g3moe-run-1")
 
-# MoE 모니터링 콜백 생성
+# MoE 모니터링 콜백 생성 (생성 로깅 포함)
 moe_callback = create_moe_callback_for_transformers(
     log_every_n_steps=50,       # 50 스텝마다 로그 기록
     logger=wandb,               # 사용할 로거 지정 (wandb)
     log_to_console=True,        # 콘솔에도 주요 메트릭 출력
+    enable_generation_logging=True,  # 생성 로깅 활성화
+    generation_log_dir="./moe_generation_logs",  # 생성 로그 저장 디렉토리
+    max_generation_samples=3,    # 생성할 샘플 수
+    generation_log_every=200     # 200 스텝마다 생성 로깅 수행
     
     # === 고급 설정 (선택사항) ===
     log_heatmap_every=500,      # 500 스텝마다 Expert 사용률 히트맵 로깅
@@ -219,8 +274,13 @@ wandb.init(project="moe-pytorch-project")
 
 moe_callback = create_moe_callback_for_pytorch(
     model=model,                # **중요**: 모델 인스턴스를 직접 전달
+    tokenizer=tokenizer,        # 토크나이저도 전달 (생성 로깅용)
     log_every_n_steps=100,
-    logger=wandb
+    logger=wandb,
+    enable_generation_logging=True,  # 생성 로깅 활성화
+    generation_log_dir="./moe_generation_logs",  # 생성 로그 저장 디렉토리
+    max_generation_samples=3,    # 생성할 샘플 수
+    generation_log_every=200     # 200 스텝마다 생성 로깅 수행
 )
 ```
 
