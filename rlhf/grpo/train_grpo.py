@@ -381,13 +381,15 @@ def load_dataset(args, config: GRPOConfig):
     if args.custom_data:
         logger.info(f"📁 Loading custom data from {args.custom_data}")
         data_loader = GRPODataLoader(model_name, max_length)
-        dataset = data_loader.load_custom_dataset(args.custom_data)
+        custom_split = getattr(args, 'split', 'train')  # 기본값 설정
+        dataset = data_loader.load_custom_dataset(args.custom_data, split=custom_split)
     else:
         dataset_name = "HuggingFaceH4/ultrafeedback_binarized"
         max_samples = getattr(args, 'max_samples', 1000)
-        logger.info(f"📦 Loading dataset: {dataset_name}")
+        split = getattr(args, 'split', 'train_prefs')  # 기본값 설정
+        logger.info(f"📦 Loading dataset: {dataset_name} (split: {split})")
         data_loader = GRPODataLoader(model_name, max_length)
-        dataset = data_loader.load_dataset(dataset_name, max_samples=max_samples)
+        dataset = data_loader.load_dataset(dataset_name, split=split, max_samples=max_samples)
 
     # TRL 표준 형식으로 변환
     dataset = data_loader.prepare_grpo_data(dataset)

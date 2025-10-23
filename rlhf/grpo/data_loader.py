@@ -31,23 +31,26 @@ class GRPODataLoader:
         logger.info(f"✅ TRL DataLoader initialized with model: {model_name}")
     
     def load_dataset(
-        self, 
+        self,
         dataset_name: str = "HuggingFaceH4/ultrafeedback_binarized",
         split: str = "train_prefs",
         max_samples: Optional[int] = None,
         streaming: bool = False
-    ) -> DatasetDict:
+    ) -> Dataset:
         """
         Load dataset from HuggingFace Hub
-        
+
         Args:
             dataset_name: Name of the dataset on HuggingFace Hub
             split: Dataset split to load
             max_samples: Maximum number of samples to load
             streaming: Whether to use streaming mode
+
+        Returns:
+            Dataset: Loaded dataset (not DatasetDict)
         """
-        logger.info(f"📦 Loading dataset: {dataset_name}")
-        
+        logger.info(f"📦 Loading dataset: {dataset_name} (split: {split})")
+
         try:
             if streaming:
                 dataset = load_dataset(dataset_name, split=split, streaming=True)
@@ -59,37 +62,53 @@ class GRPODataLoader:
                 if max_samples:
                     dataset = dataset.select(range(min(max_samples, len(dataset))))
                 return dataset
-                
+
         except Exception as e:
             logger.error(f"❌ Failed to load dataset {dataset_name}: {e}")
             raise
     
-    def load_custom_dataset(self, data_path: str) -> DatasetDict:
+    def load_custom_dataset(self, data_path: str, split: str = "train") -> Dataset:
         """
         Load custom dataset from local files
-        
+
         Args:
             data_path: Path to the dataset file (JSON, JSONL, CSV, etc.)
+            split: Dataset split to load (default: "train")
+
+        Returns:
+            Dataset: Loaded dataset from specified split
         """
-        logger.info(f"📁 Loading custom dataset from: {data_path}")
-        
+        logger.info(f"📁 Loading custom dataset from: {data_path} (split: {split})")
+
         try:
             if data_path.endswith('.jsonl'):
-                dataset = load_dataset('json', data_files=data_path)
+                dataset_dict = load_dataset('json', data_files=data_path)
             elif data_path.endswith('.json'):
-                dataset = load_dataset('json', data_files=data_path)
+                dataset_dict = load_dataset('json', data_files=data_path)
             elif data_path.endswith('.csv'):
-                dataset = load_dataset('csv', data_files=data_path)
+                dataset_dict = load_dataset('csv', data_files=data_path)
             else:
                 raise ValueError(f"Unsupported file format: {data_path}")
-                
+
+            # Get the specified split (default to first available split if specified split doesn't exist)
+            if split in dataset_dict:
+                dataset = dataset_dict[split]
+            else:
+                # Fallback to first available split
+                available_splits = list(dataset_dict.keys())
+                if available_splits:
+                    dataset = dataset_dict[available_splits[0]]
+                    logger.warning(f"⚠️ Split '{split}' not found, using '{available_splits[0]}' instead")
+                else:
+                    raise ValueError(f"No splits available in dataset: {data_path}")
+
             return dataset
-            
+
         except Exception as e:
             logger.error(f"❌ Failed to load custom dataset: {e}")
             raise
     
-    def prepare_grpo_data(self, dataset: Dataset) -> Dataset:
+    def prepare_grpo_data(self, dataset) -> Dataset:
         """
         TRL 표준 데이터 형식으로 변환
 
@@ -97,8 +116,30 @@ class GRPODataLoader:
         - prompt/chosen/rejected 필드
         또는
         - messages 필드 (대화 형식)
+
+        Args:
+            dataset: Dataset 또는 DatasetDict 객체
+
+        Returns:
+            Dataset: TRL 형식으로 변환된 데이터셋
         """
         logger.info("🔄 Converting to TRL standard format")
+
+        # DatasetDict인 경우 train split 사용
+        if isinstance(dataset, DatasetDict):
+            if "train" in dataset:
+                dataset = dataset["train"]
+            else:
+                # 첫 번째 사용 가능한 split 사용
+                available_splits = list(dataset.keys())
+                if available_splits:
+                    dataset = dataset[available_splits[0]]
+                    logger.warning(f"⚠️ Using split '{available_splits[0]}' from DatasetDict")
+                else:
+                    raise ValueError("No splits available in DatasetDict")
+
+        if not isinstance(dataset, Dataset):
+            raise ValueError(f"Expected Dataset, got {type(dataset)}")
 
         def convert_to_trl_format(example):
             """Convert to TRL standard format"""
@@ -111,7 +152,7 @@ class GRPODataLoader:
                 if all([prompt for prompt in example.get("prompt") if type(prompt) == str]):
                     example["prompt"] = [{"role": "user", "content": prompt} for prompt in example.get("prompt")]
 
-            if "prompt" in example and "chosen" in example and "rejected" in example:
+            if "prompt" in example or("chosen" in example and "rejected" in example):
                 return example
 
             # UltraFeedback 형식 변환
@@ -175,7 +216,8 @@ def create_grpo_dataloader(
     model_name: str = "unsloth/Qwen3-0.6B-bnb-4bit",
     dataset_name: str = "HuggingFaceH4/ultrafeedback_binarized",
     max_samples: int = 1000,
-    max_length: int = 2048
+    max_length: int = 2048,
+    split: str = "train_prefs"
 ) -> tuple[GRPODataLoader, Dataset]:
     """
     TRL 표준 데이터 로더 생성 및 데이터셋 로드
@@ -185,6 +227,7 @@ def create_grpo_dataloader(
         dataset_name: 데이터셋 이름
         max_samples: 최대 샘플 수
         max_length: 최대 시퀀스 길이
+        split: 사용할 데이터셋 분할
 
     Returns:
         (data_loader, dataset) 튜플
@@ -196,7 +239,7 @@ def create_grpo_dataloader(
     )
 
     # 데이터셋 로드 및 TRL 형식으로 변환
-    dataset = data_loader.load_dataset(dataset_name, max_samples=max_samples)
+    dataset = data_loader.load_dataset(dataset_name, split=split, max_samples=max_samples)
     processed_dataset = data_loader.prepare_grpo_data(dataset)
 
     return data_loader, processed_dataset
