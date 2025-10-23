@@ -9,11 +9,7 @@
     "gradient_accumulation_steps": 4,
     "output_dir": "./grpo_outputs",
     "beta": 0.1,
-    "gamma": 1.0,
-    "group_size": 4,
-    "reward_function_type": "systematic",
-    "reward_config_name": "balanced",
     "use_vllm": true,
-    "vllm_mode": "chocolate",
+    "vllm_mode": "colcate",
     "vllm_enable_sleep_mode": true
   }
