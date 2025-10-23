@@ -476,14 +476,15 @@ def create_memory_efficient_collate_fn(tokenizer, max_length: int = 2048):
     
     return collate_fn
 
-def create_simple_collate_fn(processor):
+def create_simple_collate_fn(processor, max_length: int = 2048):
     """SFTTrainer용 커스텀 data collator - 이미지 중첩 리스트 문제 해결"""
     from trl.trainer.sft_trainer import DataCollatorForVisionLanguageModeling
     
     class CustomSFTDataCollator(DataCollatorForVisionLanguageModeling):
-        def __init__(self, processor):
-            super().__init__()
+        def __init__(self, processor, max_length: int = 2048):
+            super().__init__(processor = processor, max_length = max_length)
             self.processor = processor
+            self.max_length = max_length
             
         def __call__(self, features):
             # 이미지 데이터 검증 - 이미지가 없는 샘플은 오류 발생

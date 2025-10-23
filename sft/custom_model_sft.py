@@ -595,7 +595,7 @@ def setup_dataset(data_config: Dict[str, Any], tokenizer):
                 use_streaming=True
             )
             # 이미지 중첩 리스트 문제 해결을 위한 커스텀 data collator 사용
-            collate_fn = create_simple_collate_fn(tokenizer)
+            collate_fn = create_simple_collate_fn(tokenizer, max_length=max_seq_length)
         else:
             # open_m_3 데이터셋 로더 시도
             dataset = get_dataset(
