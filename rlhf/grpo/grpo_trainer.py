@@ -243,7 +243,7 @@ class UnslothGRPOTrainer:
             self.model, self.tokenizer = FastLanguageModel.from_pretrained(
                 model_name=model_name,
                 max_seq_length=getattr(self.config, 'max_prompt_length', 2048),
-                dtype=torch.bfloat16,
+                dtype=torch.float16,
                 load_in_4bit=True,
                 device_map="balanced"
             )
