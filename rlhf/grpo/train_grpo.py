@@ -288,7 +288,10 @@ def create_config_from_args(args) -> GRPOConfig:
     if args.config:
         # Load config from file
         logger.info(f"📁 Loading config from {args.config}")
-        config = create_grpo_config(model_name="unsloth/Qwen3-0.6B-bnb-4bit")
+        with open(args.config, 'r') as f:
+            config = json.load(f)
+            model_name = config["model_init_kwargs"]["model_name"]
+        config = create_grpo_config(model_name=model_name, **config)
         # TODO: 실제 파일에서 설정 로드 구현 필요
     elif args.quick_test:
         config = create_quick_test_config()
@@ -470,7 +473,7 @@ def main():
 
         # Create trainer with model initialization kwargs, reward functions, and generation logging
         trainer = create_grpo_trainer(
-            config,
+            config=config,
             model_init_kwargs=config.model_init_kwargs,
             reward_functions=reward_functions,
             enable_generation_logging=enable_logging,
