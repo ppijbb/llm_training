@@ -720,12 +720,9 @@ class G3MoERouter(nn.Module):
         batch_size, seq_len = input_shape
         domain_scores_flat = domain_scores.view(batch_size * seq_len, self.num_experts)
         
-        multiplier, selected_experts = sparsemixer(
-            domain_scores_flat, 
-            top_k=top_k, 
-            jitter_eps=jitter_eps, 
-            training=training
-        )
+        # Simplified top-k routing to reduce computation
+        top_k_logits, selected_experts = torch.topk(domain_scores_flat, top_k, dim=-1)
+        multiplier = F.softmax(top_k_logits, dim=-1, dtype=torch.float32).type_as(domain_scores_flat)
 
         # Compute expression loss for the projection matrix
         expression_loss = self.expression_projector.orthogonal_loss()

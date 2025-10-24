@@ -194,8 +194,14 @@ class TorchMoECallback:
         # 실제 G3MoE/GRIN 모델 구조에 맞춘 추출
         # output이 (hidden_states, router_logits) 튜플인 경우
         if isinstance(output, tuple) and len(output) == 2:
-            hidden_states, router_logits = output
-            if router_logits is not None:
+            hidden_states, router_info_tuple = output
+            # G3MoEGRINMoE returns a nested tuple: (hidden_states, (router_logits, ...))
+            if isinstance(router_info_tuple, tuple) and len(router_info_tuple) > 0:
+                router_logits = router_info_tuple[0]
+            else:
+                router_logits = router_info_tuple
+
+            if router_logits is not None and torch.is_tensor(router_logits):
                 # Compute expert assignments cheaply; skip storing full probs/logits
                 expert_assignments = router_logits.argmax(dim=-1)
                 routing_info.update({

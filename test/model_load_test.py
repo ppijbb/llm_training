@@ -30,7 +30,7 @@ AutoModel.register(G3MoEConfig, G3MoEModel)
 AutoModel.register(G3MoETextConfig, G3MoETextModel)
 AutoModelForCausalLM.register(G3MoETextConfig, G3MoEForCausalLM)
 VLMS.append("g3moe")
-
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 os.environ["TORCH_COMPILE_DISABLE"] = "1"
 os.environ["TORCHDYNAMO_DISABLE"] = "1"
 os.environ["TRANSFORMERS_VERBOSITY"] = "warning"
