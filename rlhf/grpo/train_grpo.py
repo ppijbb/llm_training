@@ -491,8 +491,8 @@ def main():
             if eval_dataset is None:
                 logger.error("❌ No evaluation dataset available")
                 return 1
-            
-            eval_result = trainer.evaluate(eval_dataset)
+
+            eval_result = trainer.evaluate(eval_dataset=eval_dataset)
             logger.info(f"📊 Evaluation results: {eval_result}")
             
         else:
@@ -516,7 +516,7 @@ def main():
             # Run final evaluation
             if eval_dataset:
                 logger.info("📊 Running final evaluation")
-                eval_result = trainer.evaluate(eval_dataset)
+                eval_result = trainer.evaluate(eval_dataset=eval_dataset)
                 logger.info(f"📊 Final evaluation results: {eval_result}")
         
         logger.info("🎉 GRPO training completed successfully!")

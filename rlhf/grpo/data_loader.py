@@ -6,7 +6,7 @@ import logging
 from typing import Dict, Any, List, Optional
 from datasets import load_dataset, Dataset, DatasetDict
 from transformers import AutoTokenizer, AutoProcessor
-import json
+import trl.trainer
 
 logger = logging.getLogger(__name__)
 

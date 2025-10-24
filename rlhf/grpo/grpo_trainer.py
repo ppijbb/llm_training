@@ -243,7 +243,7 @@ class UnslothGRPOTrainer:
             self.model, self.tokenizer = FastLanguageModel.from_pretrained(
                 model_name=model_name,
                 max_seq_length=getattr(self.config, 'max_prompt_length', 2048),
-                dtype=torch.float16,
+                dtype=None,
                 load_in_4bit=True,
                 device_map="balanced"
             )
@@ -332,18 +332,45 @@ class UnslothGRPOTrainer:
         """Save the trained model"""
         if output_dir is None:
             output_dir = self.config.output_dir
-            
+
         logger.info(f"💾 Saving model to {output_dir}")
-        
+
         try:
             # Save model and tokenizer
             self.model.save_pretrained(output_dir)
             self.tokenizer.save_pretrained(output_dir)
-            
+
             logger.info(f"✅ Model saved to {output_dir}")
-            
+
         except Exception as e:
             logger.error(f"❌ Failed to save model: {e}")
+            raise
+
+    def evaluate(
+        self,
+        eval_dataset=None,
+        output_dir: Optional[str] = None
+    ):
+        """Evaluate the model on the given dataset"""
+        logger.info("📊 Starting evaluation")
+
+        if self.trainer is None:
+            logger.error("❌ Trainer not initialized. Call create_grpo_trainer() first.")
+            raise RuntimeError("Trainer not initialized")
+
+        try:
+            # Use provided output_dir or default from config
+            if output_dir is None:
+                output_dir = self.config.output_dir
+
+            # Run evaluation using TRL trainer
+            eval_results = self.trainer.evaluate(eval_dataset)
+
+            logger.info(f"📊 Evaluation completed: {eval_results}")
+            return eval_results
+
+        except Exception as e:
+            logger.error(f"❌ Evaluation failed: {e}")
             raise
 
 
