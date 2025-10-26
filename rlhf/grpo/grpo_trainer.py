@@ -324,7 +324,34 @@ class UnslothGRPOTrainer:
         except Exception as e:
             logger.error(f"❌ GRPO training failed: {e}")
             raise
-    
+
+    @torch.no_grad()
+    def evaluate(
+        self,
+        eval_dataset=None
+    ):
+        """Evaluate the model on the given dataset"""
+        logger.info("📊 Starting evaluation")
+
+        if self.trainer is None:
+            logger.error("❌ Trainer not initialized. Call create_grpo_trainer() first.")
+            raise RuntimeError("Trainer not initialized")
+
+        try:
+            # Use provided output_dir or default from config
+            if output_dir is None:
+                output_dir = self.config.output_dir
+
+            # Run evaluation using TRL trainer
+            eval_results = self.trainer.evaluate(eval_dataset)
+
+            logger.info(f"📊 Evaluation completed: {eval_results}")
+            return eval_results
+
+        except Exception as e:
+            logger.error(f"❌ Evaluation failed: {e}")
+            raise
+
     def save_model(
         self,
         output_dir: Optional[str] = None
