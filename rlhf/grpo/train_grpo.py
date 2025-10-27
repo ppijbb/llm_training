@@ -22,7 +22,7 @@ import logging
 import os
 import sys
 import json
-from typing import List
+from typing import List, Dict, Any
 from pathlib import Path
 
 # Add current directory to path for imports
@@ -38,8 +38,14 @@ from config import (
     create_production_config,
 )
 from reward.reward_functions import (
-    create_reward_function
+    SingleCustomRewardFunction,
+    MultiRewardFunction,
+    AccuracyComponent,
+    LengthComponent,
+    QualityComponent,
 )
+from reward.cmd_reward_functions import CommandRewardFunction
+
 
 # Configure logging
 logging.basicConfig(
@@ -398,6 +404,34 @@ def load_dataset(args, config: GRPOConfig):
     return train_dataset, eval_dataset
 
 
+def select_reward_function(reward_type: str, config: Dict[str, Any] = None):
+    """
+    통합 보상 함수 팩토리 함수
+
+    Args:
+        reward_type: 보상 함수 타입 ("single", "multi", "accuracy", "length", "quality")
+        config: 보상 함수 설정
+
+    Returns:
+        생성된 보상 함수 인스턴스
+    """
+    config = config or {}
+
+    if reward_type == "single":
+        return SingleCustomRewardFunction(config)
+    elif reward_type == "multi":
+        return MultiRewardFunction(config=config)
+    elif reward_type == "accuracy":
+        return AccuracyComponent(config)
+    elif reward_type == "length":
+        return LengthComponent(config)
+    elif reward_type == "quality":
+        return QualityComponent(config)
+    else:
+        logger.warning(f"Unknown reward type: {reward_type}, using single custom")
+        return SingleCustomRewardFunction(config)
+
+
 def create_reward_functions(args) -> List:
     """통합 보상 함수 생성"""
     logger.info("🎯 Creating unified reward function")
@@ -415,7 +449,7 @@ def create_reward_functions(args) -> List:
     # 보상 함수 타입에 따라 생성
     reward_functions = []
     for reward_type in args.reward_function:
-        reward_func = create_reward_function(reward_type, config)
+        reward_func = select_reward_function(reward_type, config)
         logger.info("✅ Created multi-component reward function")
         reward_functions.append(reward_func)
 

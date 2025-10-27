@@ -1,4 +1,5 @@
 {
+  "type": "cmd",
   "accuracy_weight": 0.4,
   "length_weight": 0.2,
   "quality_weight": 0.4,

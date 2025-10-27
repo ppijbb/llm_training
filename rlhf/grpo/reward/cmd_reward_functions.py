@@ -3,13 +3,11 @@
 
 단일 또는 다중 보상 함수를 지원하는 통합 보상 시스템입니다.
 """
-from functools import wraps
 import logging
 import re
-from typing import Dict, Any, List, Set, Optional
-from abc import ABC, abstractmethod
-from reward_functions import RewardComponent, AccuracyComponent, LengthComponent, QualityComponent
-from reward_functions import MultiRewardFunction, SingleCustomRewardFunction
+from typing import Dict, Any, List, Set
+from reward.reward_functions import RewardComponent, AccuracyComponent, LengthComponent, QualityComponent
+from reward.reward_functions import MultiRewardFunction, SingleCustomRewardFunction
 
 
 logger = logging.getLogger(__name__)
