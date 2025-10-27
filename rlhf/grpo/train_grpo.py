@@ -421,6 +421,8 @@ def select_reward_function(reward_type: str, config: Dict[str, Any] = None):
         return SingleCustomRewardFunction(config)
     elif reward_type == "multi":
         return MultiRewardFunction(config=config)
+    elif reward_type == "cmd":
+        return CommandRewardFunction(config)
     elif reward_type == "accuracy":
         return AccuracyComponent(config)
     elif reward_type == "length":
@@ -428,8 +430,7 @@ def select_reward_function(reward_type: str, config: Dict[str, Any] = None):
     elif reward_type == "quality":
         return QualityComponent(config)
     else:
-        logger.warning(f"Unknown reward type: {reward_type}, using single custom")
-        return SingleCustomRewardFunction(config)
+        raise ValueError(f"Unknown reward type: {reward_type}")
 
 
 def create_reward_functions(args) -> List:

@@ -380,33 +380,3 @@ class CommandRewardFunction(MultiRewardFunction):
             rewards.append(total_reward)
         
         return rewards
-
-
-def create_reward_function(reward_type: str, config: Dict[str, Any] = None):
-    """
-    통합 보상 함수 팩토리 함수
-
-    Args:
-        reward_type: 보상 함수 타입 ("single", "multi", "accuracy", "length", "quality")
-        config: 보상 함수 설정
-
-    Returns:
-        생성된 보상 함수 인스턴스
-    """
-    config = config or {}
-
-    if reward_type == "single":
-        return SingleCustomRewardFunction(config)
-    elif reward_type == "multi":
-        return MultiRewardFunction(config=config)
-    elif reward_type == "cmd":
-        return CommandRewardFunction(config)
-    elif reward_type == "accuracy":
-        return AccuracyComponent(config)
-    elif reward_type == "length":
-        return LengthComponent(config)
-    elif reward_type == "quality":
-        return QualityComponent(config)
-    else:
-        logger.warning(f"Unknown reward type: {reward_type}, using single custom")
-        return SingleCustomRewardFunction(config)
