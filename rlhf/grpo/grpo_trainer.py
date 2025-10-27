@@ -206,7 +206,7 @@ class CustomGRPOTrainer(GRPOTrainer):
         return super().compute_rewards(completions, **kwargs)
 
 
-class UnslothGRPOTrainer:
+class UnslothGRPOTrainWorkflow:
     """GRPO Trainer using TRL's GRPOTrainer with Unsloth optimizations"""
 
     def __init__(
@@ -245,7 +245,8 @@ class UnslothGRPOTrainer:
                 max_seq_length=getattr(self.config, 'max_prompt_length', 2048),
                 dtype=None,
                 load_in_4bit=True,
-                device_map="balanced"
+                device_map="balanced",
+                use_gradient_checkpointing="unsloth",
             )
             
             # Apply PEFT
@@ -262,7 +263,8 @@ class UnslothGRPOTrainer:
                 use_gradient_checkpointing="unsloth",
                 random_state=getattr(self.config, 'seed', 42),
                 use_rslora=False,
-                loftq_config=None,
+                qat_scheme = "int4",
+                loftq_config={},
             )
             
             FastLanguageModel.for_training(self.model)
@@ -365,13 +367,15 @@ class UnslothGRPOTrainer:
         try:
             # Save model and tokenizer
             self.model.save_pretrained(output_dir)
-            self.tokenizer.save_pretrained(output_dir)
-
             logger.info(f"✅ Model saved to {output_dir}")
 
         except Exception as e:
+            self.model.save_pretrained(output_dir)
             logger.error(f"❌ Failed to save model: {e}")
-            raise
+            print(f"Svae model")
+        finally:
+            self.tokenizer.save_pretrained(output_dir)
+
 
     def evaluate(
         self,
@@ -408,9 +412,9 @@ def create_grpo_trainer(
     enable_generation_logging: bool = True,
     generation_log_dir: str = None,
     max_generation_samples: int = 5
-) -> UnslothGRPOTrainer:
+) -> UnslothGRPOTrainWorkflow:
     """Create GRPO trainer with given configuration, reward functions, and generation logging options"""
-    return UnslothGRPOTrainer(
+    return UnslothGRPOTrainWorkflow(
         config=config,
         model_init_kwargs=model_init_kwargs,
         reward_functions=reward_functions,
