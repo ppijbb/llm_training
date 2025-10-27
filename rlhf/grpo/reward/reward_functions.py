@@ -194,7 +194,7 @@ class SingleCustomRewardFunction(BaseRewardFunction):
 
         for completion in completions:
             reward = 0.0
-            completion_content = completion[0]["content"]
+            completion_content = completion["content"]
             # 정확성 보상
             if self.accuracy_config.get("correct_keywords"):
                 if any(keyword in completion_content.lower() for keyword in self.accuracy_config["correct_keywords"]):

@@ -149,7 +149,7 @@ class GRPODataLoader:
                 del example["messages"]
 
             if "prompt" in example:
-                if all([prompt for prompt in example.get("prompt") if type(prompt) == str]):
+                if not all([prompt for prompt in example.get("prompt") if type(prompt) == str and type(prompt) == list]):
                     example["prompt"] = [{"role": "user", "content": prompt} for prompt in example.get("prompt")]
 
             if "prompt" in example and not ("chosen" in example and "rejected" in example):

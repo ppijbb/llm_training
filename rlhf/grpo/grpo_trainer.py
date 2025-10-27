@@ -21,7 +21,7 @@ from unsloth import FastLanguageModel
 from transformers import TrainerCallback, TrainingArguments
 
 # Import custom reward functions for TRL compatibility
-from reward_functions import MultiRewardFunction, SingleCustomRewardFunction
+from reward.reward_functions import MultiRewardFunction, SingleCustomRewardFunction
 
 logger = logging.getLogger(__name__)
 

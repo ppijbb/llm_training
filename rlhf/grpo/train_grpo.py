@@ -37,12 +37,8 @@ from config import (
     create_quick_test_config,
     create_production_config,
 )
-from reward_functions import (
-    create_reward_function,
-    create_multi_reward_function,
-    create_single_reward_function,
-    MultiRewardFunction,
-    SingleCustomRewardFunction
+from reward.reward_functions import (
+    create_reward_function
 )
 
 # Configure logging
@@ -214,7 +210,7 @@ Examples:
         type=str,
         nargs="+",
         default=["single"],
-        choices=["single", "multi"],
+        choices=["single", "multi", "cmd", "accuracy", "length", "quality"],
         help="Reward function types to use: 'single' for unified, 'multi' for multi-component (default: single)"
     )
 
@@ -419,16 +415,8 @@ def create_reward_functions(args) -> List:
     # 보상 함수 타입에 따라 생성
     reward_functions = []
     for reward_type in args.reward_function:
-        if reward_type == "single":
-            reward_func = create_single_reward_function(config)
-            logger.info("✅ Created single unified reward function")
-        elif reward_type == "multi":
-            reward_func = create_multi_reward_function(config)
-            logger.info("✅ Created multi-component reward function")
-        else:
-            logger.warning(f"Unknown reward type: {reward_type}, using single")
-            reward_func = create_single_reward_function(config)
-
+        reward_func = create_reward_function(reward_type, config)
+        logger.info("✅ Created multi-component reward function")
         reward_functions.append(reward_func)
 
     logger.info(f"🎯 Total reward functions: {len(reward_functions)}")
