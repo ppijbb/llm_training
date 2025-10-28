@@ -745,7 +745,7 @@ def main(
     # SFTTrainer에서 사용할 수 있도록 데이터셋 형태를 한번 더 확인
     print("데이터셋 샘플 확인:")
     print(f"  - 첫 번째 훈련 샘플 키: {list(train_dataset[0].keys())}")
-    print(f"  - 첫 번째 샘플 input_ids: {train_dataset[0]['input_ids'][:100]}")
+    print(f"  - 첫 번째 샘플 messages: {train_dataset[0]['messages'][:100]}")
     print(f"  - 첫 번째 샘플 images: {train_dataset[0]['images'].shape}")
     
     trainer = SFTTrainer( 

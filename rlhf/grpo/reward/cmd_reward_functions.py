@@ -30,6 +30,11 @@ class ToothNumberComponent(RewardComponent):
         """
         엄격한 치아 번호 평가
         
+        Args:
+            completion: 생성된 텍스트 (str)
+            ground_truth: 정답 라벨 (str)
+            **kwargs: 추가 인자 (labels 등)
+        
         Examples:
             GT: "number 7, 8, 9"
             
@@ -45,6 +50,19 @@ class ToothNumberComponent(RewardComponent):
             Gen4: "number 1, 2, 3"
                 → Completely wrong: F1=0.0 - wrong_tooth_penalty(0.5) → -0.5 (clipped to 0.0)
         """
+        # 형식 안전 처리
+        if ground_truth is None and 'labels' in kwargs:
+            ground_truth = kwargs.get('labels', [])
+            if isinstance(ground_truth, list) and len(ground_truth) > 0:
+                ground_truth = ground_truth[0]
+        
+        if ground_truth is None:
+            ground_truth = ""
+        
+        # str로 변환
+        completion = str(completion) if not isinstance(completion, str) else completion
+        ground_truth = str(ground_truth) if not isinstance(ground_truth, str) else ground_truth
+        
         gen_teeth = self._extract_teeth_strict(completion)
         gt_teeth = self._extract_teeth_strict(ground_truth)
         
@@ -161,6 +179,33 @@ class CommandKeywordComponent(RewardComponent):
         }
     
     def calculate(self, completion: str, ground_truth: str = None, **kwargs) -> float:
+        """
+        Label의 각 명령어 단위(;로 구분)를 정확히 매칭
+        """
+        # kwargs에서 labels 추출
+        if ground_truth is None and 'labels' in kwargs:
+            ground_truth = kwargs.get('labels', [])
+            if isinstance(ground_truth, list) and len(ground_truth) > 0:
+                ground_truth = ground_truth[0]
+        
+        # ground_truth 형식 변환
+        if isinstance(ground_truth, list):
+            if len(ground_truth) > 0:
+                ground_truth = ground_truth[0] if isinstance(ground_truth[0], str) else str(ground_truth[0])
+            else:
+                ground_truth = ""
+        elif isinstance(ground_truth, dict):
+            ground_truth = ground_truth.get("content", "")
+        elif ground_truth is None:
+            ground_truth = ""
+        
+        # completion 형식 변환
+        if not isinstance(completion, str):
+            if isinstance(completion, list):
+                completion = " ".join(str(item) for item in completion)
+            else:
+                completion = str(completion)
+        
         """
         Label의 각 명령어 단위(;로 구분)를 정확히 매칭
         
@@ -305,6 +350,13 @@ class StructuralComponent(RewardComponent):
     
     def calculate(self, completion: str, ground_truth: str = None, **kwargs) -> float:
         """명령어 개수 및 세미콜론 구조 매칭"""
+        # 형식 안전 처리
+        if ground_truth is None:
+            return 0.0
+        
+        completion = str(completion)
+        ground_truth = str(ground_truth)
+        
         gen_count = completion.count(';') + 1
         gt_count = ground_truth.count(';') + 1
         
@@ -321,9 +373,20 @@ class NumericalValueComponent(RewardComponent):
 
     def calculate(self, completion: str, ground_truth: str = None, **kwargs) -> float:
         """Probing depths, grades 등 숫자 시퀀스 매칭"""
+        # 형식 안전 처리
+        if ground_truth is None:
+            return 0.0
+        
+        completion = str(completion)
+        ground_truth = str(ground_truth)
+        
         # "5 3 2" 같은 연속 숫자 패턴 추출
-        gen_seqs = re.findall(r'\b(\d+(?:\s+\d+){2,})\b', completion)
-        gt_seqs = re.findall(r'\b(\d+(?:\s+\d+){2,})\b', ground_truth)
+        try:
+            gen_seqs = re.findall(r'\b(\d+(?:\s+\d+){2,})\b', completion)
+            gt_seqs = re.findall(r'\b(\d+(?:\s+\d+){2,})\b', ground_truth)
+        except Exception as e:
+            logger.debug(f"Error in numerical value matching: {e}")
+            return 0.0
         
         if not gt_seqs:
             return 1.0
@@ -345,13 +408,26 @@ class ComponentRewardWrapper:
         """Component의 reward 계산"""
         rewards = []
         for completion in completions:
-            # completion이 dict인 경우 content 추출
-            if isinstance(completion, dict):
+            # completion 처리: list, dict, str 모두 처리
+            if isinstance(completion, list):
+                # 리스트인 경우 첫 번째 항목이나 content 추출
+                if len(completion) > 0 and isinstance(completion[0], dict):
+                    completion_text = completion[0].get("content", "")
+                else:
+                    completion_text = " ".join(str(item) for item in completion)
+            elif isinstance(completion, dict):
+                # dict인 경우 content 추출
                 completion_text = completion.get("content", "")
             else:
+                # str인 경우 그대로 사용
                 completion_text = str(completion)
             
-            reward = self.component.calculate(completion_text, **kwargs)
+            try:
+                reward = self.component.calculate(completion_text, **kwargs)
+            except Exception as e:
+                logger.warning(f"Error calculating reward for component {self.component_name}: {e}")
+                reward = 0.0
+            
             rewards.append(reward)
         return rewards
     
