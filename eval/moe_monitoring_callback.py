@@ -6,6 +6,7 @@ from typing import Dict, Any, Optional, Callable
 import json
 import time
 import os
+from transformers.image_utils import load_image
 
 def _is_main_process() -> bool:
     """Best-effort check for rank-0 to gate logging/plotting on distributed runs."""
@@ -45,7 +46,7 @@ class TorchMoECallback:
         enable_generation_logging: bool = True,
         generation_log_dir: str = "./moe_generation_logs",
         max_generation_samples: int = 3,
-        generation_log_every: int = 100
+        generation_log_every: int = 20
     ):
         self.log_every_n_steps = log_every_n_steps
         self.log_heatmap_every = log_heatmap_every
@@ -191,9 +192,30 @@ class TorchMoECallback:
         # Lightweight mode: avoid retaining large tensors by default
         lightweight = True
 
+        # G3MoE 모델의 라우팅 정보 추출 (우선순위 1: 모듈에서 저장된 정보)
+        if hasattr(module, 'last_selected_experts'):
+            selected_experts = module.last_selected_experts
+            # selected_experts: [batch*seq, top_k] 형태
+            if selected_experts.dim() == 2:
+                # top_k experts를 flatten하여 단일 차원으로 변환
+                selected_experts_flat = selected_experts.flatten()
+                routing_info['expert_assignments'] = selected_experts_flat
+                
+                # routing_weights도 함께 저장 (entropy 계산용)
+                if hasattr(module, 'last_routing_weights'):
+                    routing_weights = module.last_routing_weights
+                    if routing_weights.dim() == 2:
+                        routing_info['routing_probs'] = routing_weights.flatten()
+                
+                # num_experts 저장
+                if hasattr(module, 'last_num_experts'):
+                    routing_info['num_experts'] = module.last_num_experts
+            else:
+                routing_info['expert_assignments'] = selected_experts
+        
         # 실제 G3MoE/GRIN 모델 구조에 맞춘 추출
         # output이 (hidden_states, router_logits) 튜플인 경우
-        if isinstance(output, tuple) and len(output) == 2:
+        elif isinstance(output, tuple) and len(output) == 2:
             hidden_states, router_info_tuple = output
             # G3MoEGRINMoE returns a nested tuple: (hidden_states, (router_logits, ...))
             if isinstance(router_info_tuple, tuple) and len(router_info_tuple) > 0:
@@ -213,9 +235,9 @@ class TorchMoECallback:
                     routing_info['gate_logits'] = router_logits
         
         # 다양한 MoE 구현에서 라우팅 정보 추출
-        # 1. 속성으로 저장된 경우
+        # 속성으로 저장된 경우 (fallback)
         for attr in ['last_expert_assignments', 'expert_assignments', 'selected_experts']:
-            if hasattr(module, attr):
+            if hasattr(module, attr) and 'expert_assignments' not in routing_info:
                 routing_info['expert_assignments'] = getattr(module, attr)
                 break
         
@@ -338,13 +360,35 @@ class TorchMoECallback:
         try:
             self.generation_step_count += 1
 
-            # 기본 샘플 프롬프트들
-            sample_prompts = [
-                "What is the capital of France?",
-                "Explain quantum computing in simple terms.",
-                "How does photosynthesis work?",
-                "What are the benefits of exercise?"
+            sample_image_urls = [
+                "https://huggingface.co/spaces/merve/chameleon-7b/resolve/main/bee.jpg",
+                "https://cdn.britannica.com/61/93061-050-99147DCE/Statue-of-Liberty-Island-New-York-Bay.jpg",
+                "https://huggingface.co/spaces/merve/chameleon-7b/resolve/main/bee.jpg",
+                "https://huggingface.co/spaces/merve/chameleon-7b/resolve/main/bee.jpg",
+                "https://huggingface.co/spaces/merve/chameleon-7b/resolve/main/bee.jpg"
             ]
+
+            test_input = self.tokenizer.apply_chat_template(
+                [
+                    {
+                        "role": "system",
+                        "content": [
+                            {"type": "text", "text": "You are a helpful assistant."}
+                        ]
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "Describe this image in Korean."},
+                            {"type": "image"}
+                        ]
+                    }
+                ],
+                # tokenize=True,
+                add_generation_prompt=True,
+                # return_tensors="pt",
+                # return_dict=True,
+            )
 
             generation_logs = []
             sample_count = 0
@@ -353,19 +397,18 @@ class TorchMoECallback:
             original_mode = self.model.training
             self.model.eval()
 
-            for prompt in sample_prompts:
+            for sample_image_url in sample_image_urls:
                 if sample_count >= self.max_generation_samples:
                     break
 
                 try:
                     # 입력 토큰화
+                    image = load_image(sample_image_url)
+
                     inputs = self.tokenizer(
-                        prompt,
-                        return_tensors="pt",
-                        padding=True,
-                        truncation=True,
-                        max_length=512
-                    )
+                        text=test_input.replace("<bos>", "")[:-1],
+                        images=image,
+                        return_tensors="pt")
                     inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
 
                     # 생성 실행
@@ -391,7 +434,7 @@ class TorchMoECallback:
                         "step": current_step,
                         "generation_step": self.generation_step_count,
                         "sample_index": sample_count,
-                        "prompt": prompt,
+                        "prompt": "Describe this image in Korean.",
                         "generated": generated_text.strip(),
                         "full_response": self.tokenizer.decode(outputs[0], skip_special_tokens=True)
                     }
@@ -402,7 +445,7 @@ class TorchMoECallback:
                     # 콘솔 로그
                     if self.log_to_console:
                         self._log_debug(f"Generation sample {sample_count}:")
-                        self._log_debug(f"  Prompt: {prompt}")
+                        self._log_debug(f"  Prompt: {test_input}")
                         self._log_debug(f"  Generated: {generated_text.strip()[:100]}...")
 
                 except Exception as e:
@@ -450,19 +493,24 @@ class TorchMoECallback:
             
             expert_assignments = routing_info.get('expert_assignments')
             routing_probs = routing_info.get('routing_probs')
-            # 일관된 num_experts 사용 (스텝마다 변하지 않도록)
-            num_experts = self.num_experts
+            
+            # ✅ routing_info에서 num_experts 추출 (fallback: self.num_experts)
+            num_experts = routing_info.get('num_experts', self.num_experts)
             
             if expert_assignments is not None:
-                if expert_assignments.is_cuda: # GPU tensor인 경우에만
+                # CPU로 이동 및 clamp
+                if torch.is_tensor(expert_assignments):
+                    if expert_assignments.is_cuda:
+                        expert_assignments = expert_assignments.cpu()
                     expert_assignments = expert_assignments.clamp(0, num_experts - 1)
                 
                 # Expert 사용 분포
                 if expert_assignments.dim() > 1:
                     expert_assignments = expert_assignments.flatten()
                 
-                usage_counts = torch.bincount(expert_assignments, minlength=num_experts)
-                self.expert_usage_history[layer_name].append(usage_counts.cpu())
+                # ✅ 올바른 minlength로 bincount 계산
+                usage_counts = torch.bincount(expert_assignments.long(), minlength=num_experts)
+                self.expert_usage_history[layer_name].append(usage_counts)
                 
                 usage_distribution = usage_counts.float() / (usage_counts.sum() + 1e-8)
                 

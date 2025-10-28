@@ -889,6 +889,14 @@ class G3MoEGRINMoE(nn.Module):
                 # --- End Update Specialization EMA ---
 
         final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+        
+        # 콜백을 위해 라우팅 정보를 모듈에 저장
+        if self.training:
+            with torch.no_grad():
+                self.last_selected_experts = selected_experts.detach()
+                self.last_routing_weights = routing_weights.detach()
+                self.last_num_experts = self.num_experts
+        
         return final_hidden_states, (routing_weights, hn, speciality_loss, cosine_similarities, expression_loss)
 
 

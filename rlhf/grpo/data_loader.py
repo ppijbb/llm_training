@@ -16,10 +16,12 @@ class GRPODataLoader:
     def __init__(
         self,
         model_name: str = "unsloth/Qwen3-0.6B-bnb-4bit",
-        max_length: int = 2048
+        max_length: int = 2048,
+        data_mode: str = "instruction"
     ):
         self.model_name = model_name
         self.max_length = max_length
+        self.data_mode = data_mode
 
         # Load tokenizer only (TRL handles the rest)
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -67,7 +69,11 @@ class GRPODataLoader:
             logger.error(f"❌ Failed to load dataset {dataset_name}: {e}")
             raise
     
-    def load_custom_dataset(self, data_path: str, split: str = "train") -> Dataset:
+    def load_custom_dataset(
+        self,
+        data_path: str,
+        split: str = "train"
+    ) -> Dataset:
         """
         Load custom dataset from local files
 
@@ -108,7 +114,10 @@ class GRPODataLoader:
             logger.error(f"❌ Failed to load custom dataset: {e}")
             raise
     
-    def prepare_grpo_data(self, dataset) -> Dataset:
+    def prepare_grpo_data(
+        self,
+        dataset
+    ) -> Dataset:
         """
         TRL 표준 데이터 형식으로 변환
 
@@ -153,6 +162,9 @@ class GRPODataLoader:
                     example["prompt"] = [{"role": "user", "content": prompt} for prompt in example.get("prompt")]
 
             if "prompt" in example and not ("chosen" in example and "rejected" in example):
+                if self.data_mode == "cmd":
+                    # Fixed system prompt 붙여서 넘기기
+                    example["prompt"] = "Process the flowing utterance into dental commands.\n\n" + example["prompt"]
                 return {"prompt": example["prompt"]}
 
             # UltraFeedback 형식 변환
@@ -184,7 +196,10 @@ class GRPODataLoader:
         logger.info(f"✅ Converted {len(processed_dataset)} samples to TRL format")
         return processed_dataset
     
-    def get_sample_data(self, dataset_name: str = "HuggingFaceH4/ultrafeedback_binarized") -> Dict[str, Any]:
+    def get_sample_data(
+        self,
+        dataset_name: str = "HuggingFaceH4/ultrafeedback_binarized"
+    ) -> Dict[str, Any]:
         """
         샘플 데이터를 가져와서 TRL 형식 확인
 
@@ -243,5 +258,3 @@ def create_grpo_dataloader(
     processed_dataset = data_loader.prepare_grpo_data(dataset)
 
     return data_loader, processed_dataset
-
-

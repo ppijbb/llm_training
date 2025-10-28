@@ -1,14 +1,12 @@
 """
-통합 커스텀 Reward Functions for TRL GRPO
+치과 명령어 GRPO Reward Functions
 
-단일 또는 다중 보상 함수를 지원하는 통합 보상 시스템입니다.
+CommandRewardFunction과 각 component들을 정의합니다.
 """
 import logging
 import re
 from typing import Dict, Any, List, Set
-from reward.reward_functions import RewardComponent, AccuracyComponent, LengthComponent, QualityComponent
-from reward.reward_functions import MultiRewardFunction, SingleCustomRewardFunction
-
+from reward.reward_functions import RewardComponent
 
 logger = logging.getLogger(__name__)
 
@@ -333,50 +331,61 @@ class NumericalValueComponent(RewardComponent):
         matches = sum(1 for g in gt_seqs if g in gen_seqs)
         return matches / len(gt_seqs)
 
-class CommandRewardFunction(MultiRewardFunction):
-    """치과 명령어 GRPO Reward (강화 버전)"""
+class ComponentRewardWrapper:
+    """개별 component를 독립적인 reward function으로 동작하게 만드는 wrapper"""
+    
+    __name__ = "ComponentRewardWrapper"
+    
+    def __init__(self, component, component_name: str, weight: float = 1.0):
+        self.component = component
+        self.component_name = component_name
+        self._name = component_name
+    
+    def __call__(self, completions, **kwargs) -> List[float]:
+        """Component의 reward 계산"""
+        rewards = []
+        for completion in completions:
+            # completion이 dict인 경우 content 추출
+            if isinstance(completion, dict):
+                completion_text = completion.get("content", "")
+            else:
+                completion_text = str(completion)
+            
+            reward = self.component.calculate(completion_text, **kwargs)
+            rewards.append(reward)
+        return rewards
+    
+    def reward_func(self, completions, **kwargs) -> List[float]:
+        """Component의 reward 계산 (별칭)"""
+        return self.__call__(completions, **kwargs)
+    
+    def __repr__(self):
+        return f"ComponentRewardWrapper({self.component_name})"
+    
+    def __str__(self):
+        return self.component_name
+
+
+class CommandRewardFunction:
+    """치과 명령어 GRPO Reward"""
     
     def __init__(self, config: Dict = None):
-        components = [
+        self.components = [
             ToothNumberComponent(weight=0.50),      # 치아 번호 - 최우선
             CommandKeywordComponent(weight=0.25),   # 명령어 키워드
             StructuralComponent(weight=0.15),       # 구조
             NumericalValueComponent(weight=0.10)    # 수치값
         ]
-        
-        super().__init__(components=components, config=config)
+        self.config = config or {}
     
-    def reward_func(
-        self,
-        completions: List[str], 
-        ground_truth: List[str] = None,  # Label 직접 전달!
-        **kwargs) -> List[float]:
-        """
-        GRPO용 reward 계산
-        
-        Args:
-            completions: 생성된 명령어들 (K개)
-            labels: 정답 label들 (K개, 같은 input에 대해 동일)
-        
-        Returns:
-            rewards: 각 completion의 reward (0~1)
-        """
-        if not ground_truth:
-            raise ValueError("Labels must be provided for dental reward function")
-        
-        rewards = []
-        for completion, label in zip(completions, ground_truth):
-            total_reward = 0.0
-            
-            # 각 component의 reward 계산
-            for component in self.components:
-                comp_reward = component.calculate(
-                    completion=completion,
-                    ground_truth=label,
-                    **kwargs
-                )
-                total_reward += comp_reward * component.weight
-            
-            rewards.append(total_reward)
-        
-        return rewards
+    def expand_to_individual_rewards(self) -> List[ComponentRewardWrapper]:
+        """CommandRewardFunction을 개별 component reward function들로 확장"""
+        individual_rewards = []
+        for component in self.components:
+            wrapper = ComponentRewardWrapper(
+                component=component,
+                component_name=f"CommandReward_{component.name}",
+                weight=component.weight
+            )
+            individual_rewards.append(wrapper)
+        return individual_rewards

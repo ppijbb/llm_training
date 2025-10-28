@@ -745,7 +745,8 @@ def main(
     # SFTTrainer에서 사용할 수 있도록 데이터셋 형태를 한번 더 확인
     print("데이터셋 샘플 확인:")
     print(f"  - 첫 번째 훈련 샘플 키: {list(train_dataset[0].keys())}")
-    # print(f"  - 첫 번째 샘플 input_ids 길이: {len(train_dataset[0]['input_ids'])}")
+    print(f"  - 첫 번째 샘플 input_ids: {train_dataset[0]['input_ids'][:100]}")
+    print(f"  - 첫 번째 샘플 images: {train_dataset[0]['images'].shape}")
     
     trainer = SFTTrainer( 
         model=model,
@@ -774,15 +775,17 @@ def main(
     trainer.add_callback(
         create_moe_callback_for_transformers(
             num_experts=model_config["g3moe_params"]["n_routed_experts"],
-            log_every_n_steps=1,           # 50 스텝마다 로그 기록
-            logger=wandb,                  # 사용할 로거 지정 (wandb)
-            log_to_console=True,           # 콘솔에도 주요 메트릭 출력
-                                           # === (선택사항) ===
-            log_heatmap_every=5,           # 500 스텝마다 Expert 사용률 히트맵 로깅
-            alert_threshold_imbalance=4.0, # 특정 Expert 사용률이 평균의 4배를 초과하면 경고
-            unused_expert_threshold=0.25,  # 25% 이상의 Expert가 미사용되면 경고
-            entropy_threshold=0.1,         # 라우팅 엔트로피가 0.1 미만이면 경고
-            save_detailed_logs=False       # 상세 JSON 로그 저장 여부
+            log_every_n_steps=1,             # 매 스텝마다 로그 기록
+            logger=wandb,                    # 사용할 로거 지정 (wandb)
+            log_to_console=True,             # 콘솔에도 주요 메트릭 출력
+            debug_logging=True,              # ✅ 디버그 로깅 활성화
+                         # === (선택사항) === #
+            log_heatmap_every=5,             # 500 스텝마다 Expert 사용률 히트맵 로깅
+            alert_threshold_imbalance=4.0,   # 특정 Expert 사용률이 평균의 4배를 초과하면 경고
+            unused_expert_threshold=0.25,    # 25% 이상의 Expert가 미사용되면 경고
+            entropy_threshold=0.1,           # 라우팅 엔트로피가 0.1 미만이면 경고
+            save_detailed_logs=False  ,      # 상세 JSON 로그 저장 여부
+            enable_generation_logging=True,  # 생성 로깅 활성화
         ))
     
     # Add custom training progress callback

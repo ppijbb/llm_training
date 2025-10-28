@@ -31,7 +31,7 @@ sys.path.append(str(Path(__file__).parent))
 from grpo_trainer import create_grpo_trainer
 from transformers import TrainingArguments
 from trl import GRPOConfig
-from data_loader import GRPODataLoader, create_grpo_dataloader
+from data_loader import GRPODataLoader
 from config import (
     create_grpo_config,
     create_quick_test_config,
@@ -371,7 +371,7 @@ def get_generation_logging_settings(args) -> tuple[bool, str, int]:
     return enable_logging, log_dir, max_samples
 
 
-def load_dataset(args, config: GRPOConfig):
+def load_dataset(args, config: GRPOConfig, reward_type: str):
     """TRL 표준 데이터셋 로딩"""
     logger.info("📦 Loading dataset with TRL standard")
 
@@ -382,7 +382,7 @@ def load_dataset(args, config: GRPOConfig):
     # TRL 표준 데이터 로딩
     if args.custom_data:
         logger.info(f"📁 Loading custom data from {args.custom_data}")
-        data_loader = GRPODataLoader(model_name, max_length)
+        data_loader = GRPODataLoader(model_name, max_length, data_mode=reward_type)
         custom_split = getattr(args, 'split', 'train')  # 기본값 설정
         dataset = data_loader.load_custom_dataset(args.custom_data, split=custom_split)
     else:
@@ -390,7 +390,7 @@ def load_dataset(args, config: GRPOConfig):
         max_samples = getattr(args, 'max_samples', 1000)
         split = getattr(args, 'split', 'train_prefs')  # 기본값 설정
         logger.info(f"📦 Loading dataset: {dataset_name} (split: {split})")
-        data_loader = GRPODataLoader(model_name, max_length)
+        data_loader = GRPODataLoader(model_name, max_length, data_mode=reward_type)
         dataset = data_loader.load_dataset(dataset_name, split=split, max_samples=max_samples)
 
     # TRL 표준 형식으로 변환
@@ -451,8 +451,16 @@ def create_reward_functions(args) -> List:
     reward_functions = []
     for reward_type in args.reward_function:
         reward_func = select_reward_function(reward_type, config)
-        logger.info("✅ Created multi-component reward function")
-        reward_functions.append(reward_func)
+        
+        # CommandRewardFunction인 경우 개별 component로 확장
+        if isinstance(reward_func, CommandRewardFunction):
+            logger.info("🔀 Expanding CommandRewardFunction to individual components")
+            individual_rewards = reward_func.expand_to_individual_rewards()
+            reward_functions.extend(individual_rewards)
+            logger.info(f"✅ Expanded into {len(individual_rewards)} component rewards")
+        else:
+            logger.info("✅ Created reward function")
+            reward_functions.append(reward_func)
 
     logger.info(f"🎯 Total reward functions: {len(reward_functions)}")
     return reward_functions
@@ -479,16 +487,16 @@ def main():
         # Create output directory
         os.makedirs(config.output_dir, exist_ok=True)
         logger.info(f"📁 Output directory: {config.output_dir}")
-        
+
+        # Create reward functions
+        reward_functions = create_reward_functions(args)
+
         # Load dataset
-        train_dataset, eval_dataset = load_dataset(args, config)
+        train_dataset, eval_dataset = load_dataset(args, config, args.reward_function)
 
         if len(train_dataset) == 0:
             logger.error("❌ No training data found")
             return 1
-
-        # Create reward functions
-        reward_functions = create_reward_functions(args)
 
         # Get generation logging settings
         enable_logging, log_dir, max_samples = get_generation_logging_settings(args)
