@@ -746,8 +746,8 @@ def main(
     print("데이터셋 샘플 확인:")
     print(f"  - 첫 번째 훈련 샘플 키: {list(train_dataset[0].keys())}")
     print(f"  - 첫 번째 샘플 messages: {train_dataset[0]['messages'][:100]}")
-    print(f"  - 첫 번째 샘플 images: {train_dataset[0]['images'].shape}")
-    
+    print(f"  - 첫 번째 샘플 images: {train_dataset[0]['images'][0].size}")
+
     trainer = SFTTrainer( 
         model=model,
         args=training_args,

@@ -280,6 +280,13 @@ Examples:
         default=5,
         help="Maximum number of samples to generate for logging (default: 5)"
     )
+
+    parser.add_argument(
+        "--generation-log-every-n-steps",
+        type=int,
+        default=50,
+        help="Log generations every N steps (default: 50)"
+    )
     
     return parser.parse_args()
 
@@ -355,7 +362,7 @@ def create_config_from_args(args) -> GRPOConfig:
     return config
 
 
-def get_generation_logging_settings(args) -> tuple[bool, str, int]:
+def get_generation_logging_settings(args) -> tuple[bool, str, int, int]:
     """Generation logging 설정을 반환"""
     # enable/disable 플래그 처리
     enable_logging = args.enable_generation_logging and not args.disable_generation_logging
@@ -368,7 +375,10 @@ def get_generation_logging_settings(args) -> tuple[bool, str, int]:
     # 최대 샘플 수
     max_samples = args.max_generation_samples
 
-    return enable_logging, log_dir, max_samples
+    # 로깅 주기 (기본값 50 step)
+    log_every = getattr(args, 'generation_log_every_n_steps', 50) if hasattr(args, 'generation_log_every_n_steps') else 50
+
+    return enable_logging, log_dir, max_samples, log_every
 
 
 def load_dataset(args, config: GRPOConfig, reward_type: str):
@@ -499,12 +509,13 @@ def main():
             return 1
 
         # Get generation logging settings
-        enable_logging, log_dir, max_samples = get_generation_logging_settings(args)
+        enable_logging, log_dir, max_samples, log_every = get_generation_logging_settings(args)
 
         logger.info(f"📊 Generation logging: {'enabled' if enable_logging else 'disabled'}")
         if enable_logging:
             logger.info(f"📁 Generation log directory: {log_dir}")
             logger.info(f"🔢 Max generation samples: {max_samples}")
+            logger.info(f"⏱️ Log every {log_every} steps")
 
         # Create trainer with model initialization kwargs, reward functions, and generation logging
         trainer = create_grpo_trainer(
@@ -513,7 +524,8 @@ def main():
             reward_functions=reward_functions,
             enable_generation_logging=enable_logging,
             generation_log_dir=log_dir,
-            max_generation_samples=max_samples)
+            max_generation_samples=max_samples,
+            generation_log_every_n_steps=log_every)
         logger.info("✅ GRPO Trainer created")
         
         if args.eval_only:

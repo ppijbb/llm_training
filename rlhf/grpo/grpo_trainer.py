@@ -27,117 +27,106 @@ logger = logging.getLogger(__name__)
 
 
 class GenerationLoggingCallback(TrainerCallback):
-    """Evaluation 단계에서 생성된 텍스트를 로그로 출력하는 콜백"""
+    """특정 step마다 생성된 텍스트를 로그로 출력하는 콜백"""
 
-    def __init__(self, output_dir: str = "./generation_logs", max_samples: int = 5):
+    def __init__(self, output_dir: str = "./generation_logs", max_samples: int = 5, log_every_n_steps: int = 50):
         self.output_dir = output_dir
         self.max_samples = max_samples
+        self.log_every_n_steps = log_every_n_steps
         self.eval_step_count = 0
 
         # 로그 디렉토리 생성
         os.makedirs(output_dir, exist_ok=True)
 
-        logger.info(f"📊 Generation logging callback initialized. Output dir: {output_dir}")
+        logger.info(f"📊 Generation logging callback initialized. Output dir: {output_dir}, Log every {log_every_n_steps} steps")
 
-    def on_evaluate(self, args: TrainingArguments, state, control, **kwargs):
-        """Evaluation 단계에서 호출됨"""
-        if hasattr(state, 'eval_dataloader') and state.eval_dataloader is not None:
+    def on_log(self, args: TrainingArguments, state, control, **kwargs):
+        """로그 발생 시 호출 (특정 step마다)"""
+        # 로깅 주기에 맞춰 생성 로그 출력
+        if state.global_step % self.log_every_n_steps == 0 and state.global_step > 0:
             self._log_generations(args, state, **kwargs)
 
     def _log_generations(self, args: TrainingArguments, state, **kwargs):
         """실제 생성 로그 작성"""
         model = kwargs.get('model')
         tokenizer = kwargs.get('tokenizer')
-        eval_dataloader = kwargs.get('eval_dataloader')
 
-        if not model or not tokenizer or not eval_dataloader:
+        if not model or not tokenizer:
             return
 
         self.eval_step_count += 1
-        logger.info(f"🔍 Evaluation step {self.eval_step_count} - Logging generations...")
+        current_step = state.global_step
+        
+        logger.info(f"🔍 Step {current_step} - Logging generations...")
 
         # 모델을 evaluation 모드로 전환
         model.eval()
 
         generation_logs = []
-        sample_count = 0
+
+        # 샘플 프롬프트 정의
+        sample_prompts = [
+            "Start with 3, 5 4 6, mesial bleeding, middle of suppuration, mobility 2, 3 3 3, 3 2 3, repeat 8, 3 4 4, 3 5 4 furcation grade 2 ",
+            "3 2 3, 3 2 3, 3 2 3, repeat, repeat, repeat, bleeding 1 on mesial, bleeding 2 mesial and distal three bleeding all",
+            "number 1, 16 impacted, 17 and 32 missing, 5 4 3, 3 3 4, 3 2 3, repeat 9, 4 5 5, bleeding all, mobility class 3",
+            "probing 3 3 3, 3 4 3, 4 3 3, 3 2 3, 2 2 3, repeat on 7, 3 2 3, 4 3 4, 3 3 4, 3 2 3, 3, distal suppuration and bleeding",
+            "Mark number 18, furcation 2, 19, suppuration distal with proximal bleeding, 20, 4 3 3",
+            "3 3 3, 3 4 3, 4 3 3, 3 2 3, 2 2 3, repeat on 7 quadrant 3 bleeding (bleeding all)",
+            "3 3 3, 3 4 3, 4 3 3, 3 2 3, 2 2 3, repeat on 7 3 3 2, 3 3 3, 4 3 4, 4 3 5 quadrant 4 bleeding on proximal",
+            "number 31, 6 5 5, 5 4 5, number 19, 5 5 4 other teeth all 3 3 3",
+            "All probing 3 3 3, except number 21 and 25. 21 is 6 5 5. 25 is 5 5 4.",
+            "13 suppuration and bleeding on the distopalatal, jump to 30 furaction 1",
+            "number 11 crown 3 2 3, implant 3 3 4, bleeding",
+        ]
 
         try:
-            # 첫 번째 배치만 처리 (메모리 절약)
-            for batch in eval_dataloader:
-                if sample_count >= self.max_samples:
-                    break
+            for i, prompt in enumerate(sample_prompts[:self.max_samples]):
+                try:
+                    # 생성 파라미터 설정
+                    inputs = tokenizer(prompt, return_tensors="pt", padding=True, truncation=True)
+                    inputs = {k: v.to(model.device) for k, v in inputs.items()}
 
-                # 배치에서 입력 데이터 추출
-                if hasattr(batch, 'keys'):
-                    # 데이터셋 형식에 따라 처리
-                    if 'prompt' in batch:
-                        prompts = batch['prompt']
-                    elif 'input_ids' in batch:
-                        # 토큰화된 입력을 텍스트로 변환
-                        input_ids = batch['input_ids']
-                        prompts = [tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
-                    else:
-                        logger.warning("⚠️ Unknown batch format for generation logging")
-                        continue
-                else:
-                    logger.warning("⚠️ Invalid batch format for generation logging")
+                    # 생성 실행
+                    with torch.no_grad():
+                        outputs = model.generate(
+                            **inputs,
+                            max_new_tokens=100,
+                            num_return_sequences=1,
+                            do_sample=True,
+                            temperature=0.7,
+                            pad_token_id=tokenizer.eos_token_id,
+                            eos_token_id=tokenizer.eos_token_id,
+                        )
+
+                    # 생성된 텍스트 디코딩
+                    generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+                    # 로그 데이터 구성
+                    log_entry = {
+                        "step": current_step,
+                        "generation_step": self.eval_step_count,
+                        "sample_index": i,
+                        "prompt": prompt,
+                        "generated": generated_text[len(prompt):].strip()[:200],
+                        "full_response": generated_text[:300]
+                    }
+
+                    generation_logs.append(log_entry)
+
+                    logger.info(f"📝 Sample {i+1}:")
+                    logger.info(f"   Prompt: {prompt}")
+                    logger.info(f"   Generated: {log_entry['generated']}")
+
+                except Exception as e:
+                    logger.error(f"❌ Error generating for sample {i}: {e}")
                     continue
-
-                # 각 프롬프트에 대해 생성
-                for i, prompt in enumerate(prompts[:self.max_samples - sample_count]):
-                    if sample_count >= self.max_samples:
-                        break
-
-                    try:
-                        # 생성 파라미터 설정
-                        inputs = tokenizer(prompt, return_tensors="pt", padding=True, truncation=True)
-                        inputs = {k: v.to(model.device) for k, v in inputs.items()}
-
-                        # 생성 실행
-                        with torch.no_grad():
-                            outputs = model.generate(
-                                **inputs,
-                                max_new_tokens=100,
-                                num_return_sequences=1,
-                                do_sample=True,
-                                temperature=0.7,
-                                pad_token_id=tokenizer.eos_token_id,
-                                eos_token_id=tokenizer.eos_token_id,
-                            )
-
-                        # 생성된 텍스트 디코딩
-                        generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-
-                        # 로그 데이터 구성
-                        log_entry = {
-                            "eval_step": self.eval_step_count,
-                            "sample_index": sample_count,
-                            "prompt": prompt[:100] + "..." if len(prompt) > 100 else prompt,
-                            "generated": generated_text[len(prompt):][:200] + "..." if len(generated_text) > len(prompt) + 200 else generated_text[len(prompt):],
-                            "full_response": generated_text[:300] + "..." if len(generated_text) > 300 else generated_text
-                        }
-
-                        generation_logs.append(log_entry)
-                        sample_count += 1
-
-                        logger.info(f"📝 Sample {sample_count}:")
-                        logger.info(f"   Prompt: {log_entry['prompt']}")
-                        logger.info(f"   Generated: {log_entry['generated']}")
-
-                    except Exception as e:
-                        logger.error(f"❌ Error generating for sample {sample_count}: {e}")
-                        sample_count += 1
-                        continue
-
-                break  # 첫 번째 배치만 처리
 
         except Exception as e:
             logger.error(f"❌ Error during generation logging: {e}")
 
         # 로그 파일에 저장
         if generation_logs:
-            log_file = os.path.join(self.output_dir, f"generation_log_step_{self.eval_step_count}.json")
+            log_file = os.path.join(self.output_dir, f"generation_log_step_{current_step}.json")
             try:
                 with open(log_file, 'w', encoding='utf-8') as f:
                     json.dump(generation_logs, f, ensure_ascii=False, indent=2)
@@ -158,6 +147,7 @@ class CustomGRPOTrainer(GRPOTrainer):
         enable_generation_logging: bool = True,
         generation_log_dir: str = "./generation_logs",
         max_generation_samples: int = 5,
+        generation_log_every_n_steps: int = 50,
         *args,
         **kwargs
     ):
@@ -169,7 +159,8 @@ class CustomGRPOTrainer(GRPOTrainer):
         if self.enable_generation_logging:
             self.generation_callback = GenerationLoggingCallback(
                 output_dir=generation_log_dir,
-                max_samples=max_generation_samples
+                max_samples=max_generation_samples,
+                log_every_n_steps=generation_log_every_n_steps
             )
             # 콜백을 args에 추가 (Trainer가 콜백을 인식하도록)
             if 'callbacks' not in kwargs:
@@ -216,7 +207,8 @@ class UnslothGRPOTrainWorkflow:
         reward_functions: List[MultiRewardFunction|SingleCustomRewardFunction] = None,
         enable_generation_logging: bool = True,
         generation_log_dir: str = None,
-        max_generation_samples: int = 5
+        max_generation_samples: int = 5,
+        generation_log_every_n_steps: int = 50
     ):
         self.config = config
         self.model_init_kwargs = model_init_kwargs or {}
@@ -226,6 +218,7 @@ class UnslothGRPOTrainWorkflow:
         self.enable_generation_logging = enable_generation_logging
         self.generation_log_dir = generation_log_dir or os.path.join(config.output_dir, "generation_logs")
         self.max_generation_samples = max_generation_samples
+        self.generation_log_every_n_steps = generation_log_every_n_steps
         self.trainer = None
 
         # Initialize components
@@ -290,6 +283,7 @@ class UnslothGRPOTrainWorkflow:
                 enable_generation_logging=self.enable_generation_logging,
                 generation_log_dir=self.generation_log_dir,
                 max_generation_samples=self.max_generation_samples,
+                generation_log_every_n_steps=self.generation_log_every_n_steps,
                 model=self.model,
                 args=self.config,
                 train_dataset=train_dataset,
@@ -411,7 +405,8 @@ def create_grpo_trainer(
     reward_functions: Optional[List] = None,
     enable_generation_logging: bool = True,
     generation_log_dir: str = None,
-    max_generation_samples: int = 5
+    max_generation_samples: int = 5,
+    generation_log_every_n_steps: int = 50
 ) -> UnslothGRPOTrainWorkflow:
     """Create GRPO trainer with given configuration, reward functions, and generation logging options"""
     return UnslothGRPOTrainWorkflow(
@@ -420,4 +415,5 @@ def create_grpo_trainer(
         reward_functions=reward_functions,
         enable_generation_logging=enable_generation_logging,
         generation_log_dir=generation_log_dir,
-        max_generation_samples=max_generation_samples)
+        max_generation_samples=max_generation_samples,
+        generation_log_every_n_steps=generation_log_every_n_steps)
