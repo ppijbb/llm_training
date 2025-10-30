@@ -177,7 +177,7 @@ class TorchMoECallback:
                         lightweight_entry['aux_loss'] = val
                     self.layer_outputs[layer_name] = lightweight_entry
                     # 디버깅 로그는 항상 출력 (step 정보 제거)
-                    self._log_debug(f"{layer_name}: extracted {list(routing_info.keys())}")
+                    # self._log_debug(f"{layer_name}: extracted {list(routing_info.keys())}")
                 else:
                     self._log_debug(f"{layer_name}: no routing info extracted")
             except Exception as e:
@@ -363,9 +363,9 @@ class TorchMoECallback:
             sample_image_urls = [
                 "https://huggingface.co/spaces/merve/chameleon-7b/resolve/main/bee.jpg",
                 "https://cdn.britannica.com/61/93061-050-99147DCE/Statue-of-Liberty-Island-New-York-Bay.jpg",
-                "https://huggingface.co/spaces/merve/chameleon-7b/resolve/main/bee.jpg",
-                "https://huggingface.co/spaces/merve/chameleon-7b/resolve/main/bee.jpg",
-                "https://huggingface.co/spaces/merve/chameleon-7b/resolve/main/bee.jpg"
+                "https://i.namu.wiki/i/6OBqKb_V51DWQbN4UZ6VpeBgRNnBoyivWjd5DqWHvgnMDTAFaDtYhri0zafTw1mESEkNgx1NiHE9XZlhSUrP-r3_Ahetkd9FtLY01RvEWJisz_7Qyx8832b_HZeK6YghWHtY9sPn7WQlYAz9wJ11ew.webp",
+                "https://ocr.space/Content/Images/table-ocr-original.webp",
+                "https://storage.googleapis.com/kagglesdsdata/datasets/3419046/6067948/images/1058.png?X-Goog-Algorithm=GOOG4-RSA-SHA256&X-Goog-Credential=databundle-worker-v2%40kaggle-161607.iam.gserviceaccount.com%2F20251028%2Fauto%2Fstorage%2Fgoog4_request&X-Goog-Date=20251028T235242Z&X-Goog-Expires=345600&X-Goog-SignedHeaders=host&X-Goog-Signature=8d70ef579e163c8648a49345cd458dc69f2242de2e5f7a52821f9a12856237ea8d042e6a172bbb7c4e31f8b0f982815fa53347aab2ead5b3dae39a21df0297c202ea2f3d6e05d98d61fd2260a22dd98700bb7de3c7b32232b8a7fbd1909462226bc0f5e6fd3af80adffd04b5bb2145ad16656d1a2bfa1ea02b6b8515f3f1881e4ac9a71e97e134f638f3a58db111c55a4f25abd81973edce796e1d531eff09222e86669b46d8bc9c766838062164083ba20d1feb253748313f496f78623d78bf65f30605e5a2f8e38c3fb506b6fcaf74924735639244c4003fd9dff7ec580ff26d792fb693593cb3f0b4a88f68f599f0b8937e77da68e02939a30308fcdcccec"
             ]
 
             test_input = self.tokenizer.apply_chat_template(
