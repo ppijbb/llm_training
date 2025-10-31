@@ -365,7 +365,7 @@ def create_config_from_args(args) -> GRPOConfig:
 def get_generation_logging_settings(args) -> tuple[bool, str, int, int]:
     """Generation logging 설정을 반환"""
     # enable/disable 플래그 처리
-    enable_logging = args.enable_generation_logging and not args.disable_generation_logging
+    enable_logging = args.enable_generation_logging
 
     # 로그 디렉토리 설정
     log_dir = args.generation_log_dir
@@ -522,7 +522,6 @@ def main():
             config=config,
             model_init_kwargs=config.model_init_kwargs,
             reward_functions=reward_functions,
-            enable_generation_logging=enable_logging,
             generation_log_dir=log_dir,
             max_generation_samples=max_samples,
             generation_log_every_n_steps=log_every)

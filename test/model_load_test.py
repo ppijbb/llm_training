@@ -13,7 +13,7 @@ from transformers.image_utils import load_image
 
 from peft.peft_model import PeftModel
 import tensorrt
-import pprint
+import random
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -30,7 +30,7 @@ AutoModel.register(G3MoEConfig, G3MoEModel)
 AutoModel.register(G3MoETextConfig, G3MoETextModel)
 AutoModelForCausalLM.register(G3MoETextConfig, G3MoEForCausalLM)
 VLMS.append("g3moe")
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 os.environ["TORCH_COMPILE_DISABLE"] = "1"
 os.environ["TORCHDYNAMO_DISABLE"] = "1"
 os.environ["TRANSFORMERS_VERBOSITY"] = "warning"
@@ -235,10 +235,15 @@ this is the test text message. now you must instruct the model to generate a res
         # return_tensors="pt",
         # return_dict=True,
     )
-
-    # Load images
-    image = load_image("https://cdn.britannica.com/61/93061-050-99147DCE/Statue-of-Liberty-Island-New-York-Bay.jpg")
-    # image = load_image("https://huggingface.co/spaces/merve/chameleon-7b/resolve/main/bee.jpg")
+    sample_image_urls = [
+        "https://huggingface.co/spaces/merve/chameleon-7b/resolve/main/bee.jpg",
+        "https://cdn.britannica.com/61/93061-050-99147DCE/Statue-of-Liberty-Island-New-York-Bay.jpg",
+        "https://i.namu.wiki/i/6OBqKb_V51DWQbN4UZ6VpeBgRNnBoyivWjd5DqWHvgnMDTAFaDtYhri0zafTw1mESEkNgx1NiHE9XZlhSUrP-r3_Ahetkd9FtLY01RvEWJisz_7Qyx8832b_HZeK6YghWHtY9sPn7WQlYAz9wJ11ew.webp",
+        "https://ocr.space/Content/Images/table-ocr-original.webp",
+        "https://storage.googleapis.com/kagglesdsdata/datasets/3419046/6067948/images/1058.png?X-Goog-Algorithm=GOOG4-RSA-SHA256&X-Goog-Credential=databundle-worker-v2%40kaggle-161607.iam.gserviceaccount.com%2F20251028%2Fauto%2Fstorage%2Fgoog4_request&X-Goog-Date=20251028T235242Z&X-Goog-Expires=345600&X-Goog-SignedHeaders=host&X-Goog-Signature=8d70ef579e163c8648a49345cd458dc69f2242de2e5f7a52821f9a12856237ea8d042e6a172bbb7c4e31f8b0f982815fa53347aab2ead5b3dae39a21df0297c202ea2f3d6e05d98d61fd2260a22dd98700bb7de3c7b32232b8a7fbd1909462226bc0f5e6fd3af80adffd04b5bb2145ad16656d1a2bfa1ea02b6b8515f3f1881e4ac9a71e97e134f638f3a58db111c55a4f25abd81973edce796e1d531eff09222e86669b46d8bc9c766838062164083ba20d1feb253748313f496f78623d78bf65f30605e5a2f8e38c3fb506b6fcaf74924735639244c4003fd9dff7ec580ff26d792fb693593cb3f0b4a88f68f599f0b8937e77da68e02939a30308fcdcccec"
+    ]
+    ran_image = random.choice(sample_image_urls)
+    image = load_image(ran_image)
     
     inputs = tokenizer(
         text=test_input.replace("<bos>", "")[:-1],
