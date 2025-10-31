@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 class GenerationLoggingCallback(TrainerCallback):
     """특정 step마다 생성된 텍스트를 로그로 출력하는 콜백"""
 
-    def __init__(self, output_dir: str = "./generation_logs", max_samples: int = 5, log_every_n_steps: int = 50):
+    def __init__(self, output_dir: str = "./generation_logs", max_samples: int = 5, log_every_n_steps: int = 3):
         self.output_dir = output_dir
         self.max_samples = max_samples
         self.log_every_n_steps = log_every_n_steps
