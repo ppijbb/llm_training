@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 
 class GenerationLoggingCallback(TrainerCallback):
-    """특정 step마다 생성된 텍스트를 로그로 출력하는 콜백"""
+    """특정 step마다 생성된 텍스트를 콘솔과 파일에 출력하는 콜백 (항상 활성화)"""
 
     def __init__(self, output_dir: str = "./generation_logs", max_samples: int = 5, log_every_n_steps: int = 3):
         self.output_dir = output_dir
@@ -39,16 +39,21 @@ class GenerationLoggingCallback(TrainerCallback):
         os.makedirs(output_dir, exist_ok=True)
 
         logger.info(f"📊 Generation logging callback initialized. Output dir: {output_dir}, Log every {log_every_n_steps} steps")
+        print(f"\n{'='*80}")
+        print(f"📊 Generation Logging Callback 초기화됨")
+        print(f"   출력 디렉토리: {output_dir}")
+        print(f"   로깅 주기: 매 {log_every_n_steps} step마다")
+        print(f"   최대 샘플 수: {max_samples}")
+        print(f"{'='*80}\n")
 
     def on_step_end(self, args: TrainingArguments, state, control, **kwargs):
-        """Step 종료 시 호출 (특정 step마다)"""
-        # 로깅 주기에 맞춰 생성 로그 출력
+        """Step 종료 시 호출 (특정 step마다 반드시 실행)"""
+        # 로깅 주기에 맞춰 생성 로그 출력 (무조건 실행)
         if state.global_step % self.log_every_n_steps == 0 and state.global_step > 0:
-            logger.info(f"🔄 Generation logging triggered at step {state.global_step}")
             self._log_generations(args, state, **kwargs)
 
     def _log_generations(self, args: TrainingArguments, state, **kwargs):
-        """실제 생성 로그 작성"""
+        """실제 생성 로그 작성 (콘솔에 강제 출력)"""
         # model과 tokenizer 가져오기 (여러 방법 시도)
         model = kwargs.get('model')
         tokenizer = kwargs.get('tokenizer')
@@ -63,7 +68,9 @@ class GenerationLoggingCallback(TrainerCallback):
                     tokenizer = getattr(trainer, 'tokenizer', None)
         
         if not model or not tokenizer:
-            logger.warning(f"⚠️ Model or tokenizer not available at step {state.global_step}. Skipping generation logging.")
+            error_msg = f"⚠️ Step {state.global_step}: Model or tokenizer not available. Skipping generation logging."
+            logger.warning(error_msg)
+            print(f"\n{error_msg}")
             logger.debug(f"Available kwargs keys: {list(kwargs.keys())}")
             return
 
@@ -71,6 +78,11 @@ class GenerationLoggingCallback(TrainerCallback):
         current_step = state.global_step
         
         logger.info(f"🔍 Step {current_step} - Logging generations...")
+        
+        # 콘솔에 강제 출력
+        print(f"\n{'='*80}")
+        print(f"🔄 STEP {current_step} - Generation 테스트 시작")
+        print(f"{'='*80}")
 
         # 모델을 evaluation 모드로 전환
         model.eval()
@@ -126,16 +138,33 @@ class GenerationLoggingCallback(TrainerCallback):
 
                     generation_logs.append(log_entry)
 
+                    # 콘솔에 강제 출력
+                    print(f"\n{'─'*80}")
+                    print(f"📝 Sample {i+1}/{self.max_samples}")
+                    print(f"{'─'*80}")
+                    print(f"🔵 Prompt:")
+                    print(f"   {prompt}")
+                    print(f"\n🟢 Generated:")
+                    print(f"   {log_entry['generated']}")
+                    print(f"\n📄 Full Response (첫 300자):")
+                    print(f"   {log_entry['full_response']}")
+                    print(f"{'─'*80}")
+                    
+                    # Logger에도 출력
                     logger.info(f"📝 Sample {i+1}:")
                     logger.info(f"   Prompt: {prompt}")
                     logger.info(f"   Generated: {log_entry['generated']}")
 
                 except Exception as e:
-                    logger.error(f"❌ Error generating for sample {i}: {e}")
+                    error_msg = f"❌ Error generating for sample {i}: {e}"
+                    logger.error(error_msg)
+                    print(f"\n{error_msg}")
                     continue
 
         except Exception as e:
-            logger.error(f"❌ Error during generation logging: {e}")
+            error_msg = f"❌ Error during generation logging: {e}"
+            logger.error(error_msg)
+            print(f"\n{error_msg}")
 
         # 로그 파일에 저장
         if generation_logs:
@@ -143,9 +172,20 @@ class GenerationLoggingCallback(TrainerCallback):
             try:
                 with open(log_file, 'w', encoding='utf-8') as f:
                     json.dump(generation_logs, f, ensure_ascii=False, indent=2)
-                logger.info(f"💾 Generation logs saved to {log_file}")
+                save_msg = f"💾 Generation logs saved to {log_file}"
+                logger.info(save_msg)
+                print(f"\n{save_msg}")
             except Exception as e:
-                logger.error(f"❌ Failed to save generation logs: {e}")
+                error_msg = f"❌ Failed to save generation logs: {e}"
+                logger.error(error_msg)
+                print(f"\n{error_msg}")
+        else:
+            print(f"\n⚠️ No generation logs to save")
+
+        # 콘솔에 완료 메시지 출력
+        print(f"\n{'='*80}")
+        print(f"✅ STEP {current_step} - Generation 테스트 완료")
+        print(f"{'='*80}\n")
 
         # 모델을 다시 training 모드로 전환
         model.train()
@@ -157,7 +197,6 @@ class CustomGRPOTrainer(GRPOTrainer):
     def __init__(
         self,
         reward_functions: List[MultiRewardFunction|SingleCustomRewardFunction] = None,
-        enable_generation_logging: bool = True,
         generation_log_dir: str = "./generation_logs",
         max_generation_samples: int = 5,
         generation_log_every_n_steps: int = 50,
@@ -166,22 +205,20 @@ class CustomGRPOTrainer(GRPOTrainer):
     ):
         kwargs['args'].model_init_kwargs = kwargs["model_init_kwargs"] if "model_init_kwargs" in kwargs else {}
         self.custom_reward_functions = reward_functions or []
-        self.enable_generation_logging = enable_generation_logging
 
         # super().__init__() 먼저 호출 (Trainer 초기화)
         super().__init__(reward_funcs=self.custom_reward_functions, *args, **kwargs)
         
-        # 생성 로깅 콜백 설정 (super().__init__() 후에 등록)
-        if self.enable_generation_logging:
-            # Trainer에 콜백 추가
-            self.add_callback(
-                GenerationLoggingCallback(
-                    output_dir=generation_log_dir,
-                    max_samples=max_generation_samples,
-                    log_every_n_steps=generation_log_every_n_steps
-                ))
-            total_callbacks = len(getattr(self.callback_handler, 'callbacks', [])) if hasattr(self, 'callback_handler') else 0
-            logger.info(f"✅ Generation logging callback added to trainer (log_every_n_steps={generation_log_every_n_steps}, total_callbacks={total_callbacks})")
+        # 생성 로깅 콜백 설정 (항상 등록, 무조건 실행)
+        self.add_callback(
+            GenerationLoggingCallback(
+                output_dir=generation_log_dir,
+                max_samples=max_generation_samples,
+                log_every_n_steps=generation_log_every_n_steps
+            ))
+        total_callbacks = len(getattr(self.callback_handler, 'callbacks', [])) if hasattr(self, 'callback_handler') else 0
+        logger.info(f"✅ Generation logging callback added to trainer (log_every_n_steps={generation_log_every_n_steps}, total_callbacks={total_callbacks})")
+        print(f"✅ Generation logging callback 등록됨 (매 {generation_log_every_n_steps} step마다 실행)")
 
     def compute_rewards(
         self,
@@ -218,7 +255,6 @@ class UnslothGRPOTrainWorkflow:
         config: GRPOConfig,
         model_init_kwargs: Optional[Dict[str, Any]] = None,
         reward_functions: List[MultiRewardFunction|SingleCustomRewardFunction] = None,
-        enable_generation_logging: bool = True,
         generation_log_dir: str = None,
         max_generation_samples: int = 5,
         generation_log_every_n_steps: int = 50
@@ -228,7 +264,6 @@ class UnslothGRPOTrainWorkflow:
         self.model = None
         self.tokenizer = None
         self.reward_functions = reward_functions or []
-        self.enable_generation_logging = enable_generation_logging
         self.generation_log_dir = generation_log_dir or os.path.join(config.output_dir, "generation_logs")
         self.max_generation_samples = max_generation_samples
         self.generation_log_every_n_steps = generation_log_every_n_steps
@@ -290,10 +325,9 @@ class UnslothGRPOTrainWorkflow:
         logger.info("🔄 Creating TRL GRPOTrainer")
         
         try:
-            # Create custom trainer with reward functions and generation logging
+            # Create custom trainer with reward functions and generation logging (항상 활성화)
             self.trainer = CustomGRPOTrainer(
                 reward_functions=self.reward_functions,
-                enable_generation_logging=self.enable_generation_logging,
                 generation_log_dir=self.generation_log_dir,
                 max_generation_samples=self.max_generation_samples,
                 generation_log_every_n_steps=self.generation_log_every_n_steps,
@@ -416,17 +450,15 @@ def create_grpo_trainer(
     config: GRPOConfig,
     model_init_kwargs: Optional[Dict[str, Any]] = None,
     reward_functions: Optional[List] = None,
-    enable_generation_logging: bool = True,
     generation_log_dir: str = None,
     max_generation_samples: int = 5,
     generation_log_every_n_steps: int = 50
 ) -> UnslothGRPOTrainWorkflow:
-    """Create GRPO trainer with given configuration, reward functions, and generation logging options"""
+    """Create GRPO trainer with given configuration, reward functions, and generation logging (항상 활성화)"""
     return UnslothGRPOTrainWorkflow(
         config=config,
         model_init_kwargs=model_init_kwargs,
         reward_functions=reward_functions,
-        enable_generation_logging=enable_generation_logging,
         generation_log_dir=generation_log_dir,
         max_generation_samples=max_generation_samples,
         generation_log_every_n_steps=generation_log_every_n_steps)

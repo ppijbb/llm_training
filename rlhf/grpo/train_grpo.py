@@ -253,20 +253,7 @@ Examples:
         help="Resume training from checkpoint"
     )
 
-    # Generation logging options
-    parser.add_argument(
-        "--enable-generation-logging",
-        action="store_true",
-        default=True,
-        help="Enable generation logging during evaluation (default: enabled)"
-    )
-
-    parser.add_argument(
-        "--disable-generation-logging",
-        action="store_true",
-        help="Disable generation logging during evaluation"
-    )
-
+    # Generation logging options (항상 활성화, on/off 옵션 제거)
     parser.add_argument(
         "--generation-log-dir",
         type=str,
@@ -285,7 +272,7 @@ Examples:
         "--generation-log-every-n-steps",
         type=int,
         default=50,
-        help="Log generations every N steps (default: 50)"
+        help="Log generations every N steps (default: 50, 항상 활성화)"
     )
     
     return parser.parse_args()
@@ -362,15 +349,13 @@ def create_config_from_args(args) -> GRPOConfig:
     return config
 
 
-def get_generation_logging_settings(args) -> tuple[bool, str, int, int]:
-    """Generation logging 설정을 반환"""
-    # enable/disable 플래그 처리
-    enable_logging = args.enable_generation_logging
-
+def get_generation_logging_settings(args) -> tuple[str, int, int]:
+    """Generation logging 설정을 반환 (항상 활성화)"""
     # 로그 디렉토리 설정
     log_dir = args.generation_log_dir
-    if not log_dir and hasattr(args, 'output_dir') and args.output_dir:
-        log_dir = os.path.join(args.output_dir, "generation_logs")
+    if not log_dir:
+        # output_dir이 args에 없으면 config에서 가져올 예정
+        log_dir = None  # 나중에 config.output_dir 사용
 
     # 최대 샘플 수
     max_samples = args.max_generation_samples
@@ -378,7 +363,7 @@ def get_generation_logging_settings(args) -> tuple[bool, str, int, int]:
     # 로깅 주기 (기본값 50 step)
     log_every = getattr(args, 'generation_log_every_n_steps', 50) if hasattr(args, 'generation_log_every_n_steps') else 50
 
-    return enable_logging, log_dir, max_samples, log_every
+    return log_dir, max_samples, log_every
 
 
 def load_dataset(args, config: GRPOConfig, reward_type: str):
@@ -508,16 +493,26 @@ def main():
             logger.error("❌ No training data found")
             return 1
 
-        # Get generation logging settings
-        enable_logging, log_dir, max_samples, log_every = get_generation_logging_settings(args)
+        # Get generation logging settings (항상 활성화)
+        log_dir, max_samples, log_every = get_generation_logging_settings(args)
+        
+        # log_dir이 없으면 config.output_dir 사용
+        if not log_dir:
+            log_dir = os.path.join(config.output_dir, "generation_logs")
 
-        logger.info(f"📊 Generation logging: {'enabled' if enable_logging else 'disabled'}")
-        if enable_logging:
-            logger.info(f"📁 Generation log directory: {log_dir}")
-            logger.info(f"🔢 Max generation samples: {max_samples}")
-            logger.info(f"⏱️ Log every {log_every} steps")
+        logger.info(f"📊 Generation logging: 항상 활성화됨")
+        logger.info(f"📁 Generation log directory: {log_dir}")
+        logger.info(f"🔢 Max generation samples: {max_samples}")
+        logger.info(f"⏱️ Log every {log_every} steps")
+        print(f"\n{'='*80}")
+        print(f"📊 Generation Logging 설정")
+        print(f"   상태: 항상 활성화됨 (on/off 옵션 제거됨)")
+        print(f"   출력 디렉토리: {log_dir}")
+        print(f"   최대 샘플 수: {max_samples}")
+        print(f"   로깅 주기: 매 {log_every} step마다")
+        print(f"{'='*80}\n")
 
-        # Create trainer with model initialization kwargs, reward functions, and generation logging
+        # Create trainer with model initialization kwargs, reward functions, and generation logging (항상 활성화)
         trainer = create_grpo_trainer(
             config=config,
             model_init_kwargs=config.model_init_kwargs,
