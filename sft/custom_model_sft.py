@@ -879,38 +879,37 @@ def main(
     # Start training
     print("Starting training...")
     # Guard heavy profiler behind an env flag to avoid OOM from profiler buffers during full training
-    enable_profiler = bool(int(os.getenv("PROFILE_TRAINING", "0")))
-    if enable_profiler:
-        from torch.profiler import profile, record_function, ProfilerActivity
-        with profile(
-            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-            record_shapes=True,
-            profile_memory=True,
-            with_stack=True,
-        ) as prof:
-            try:
-                trainer.train()
-                profiler_table = prof.key_averages().table(sort_by="self_cuda_memory_usage", row_limit=10)
-                wandb.log({"profiler_table": wandb.Table(data=[profiler_table])})
-            except Exception as e:
-                traceback.print_exc()
-                print(f"⚠️ Profiler error: {e}")
-    else:
-        try:
+    try:
+        # Log training start
+        logger.info(f"🚀 Starting training...")
+        logger.info(f"🔧 Training configuration:")
+        logger.info(f"  - Epochs: {training_config['num_train_epochs']}")
+        logger.info(f"  - Batch size per device: {training_config['per_device_train_batch_size']}")
+        logger.info(f"  - Gradient accumulation steps: {training_config['gradient_accumulation_steps']}")
+        logger.info(f"  - Learning rate: {training_config['learning_rate']}")
+        logger.info(f"  - Max sequence length: {data_config['max_seq_length']}")
+        
+        enable_profiler = bool(int(os.getenv("PROFILE_TRAINING", "0")))
+        if enable_profiler:
+            from torch.profiler import profile, record_function, ProfilerActivity
+            with profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                record_shapes=True,
+                profile_memory=True,
+                with_stack=True,
+            ) as prof:
+                try:
+                    trainer.train()
+                    profiler_table = prof.key_averages().table(sort_by="self_cuda_memory_usage", row_limit=10)
+                    wandb.log({"profiler_table": wandb.Table(data=[profiler_table])})
+                except Exception as e:
+                    traceback.print_exc()
+                    print(f"⚠️ Profiler error: {e}")
+        else:
             # eval 최적화를 위한 커스텀 eval 함수 설정
             logger.info("🔧 Setting up memory-optimized evaluation...")
             original_eval_fn = getattr(trainer, 'evaluate', None)
             trainer.evaluate = lambda eval_dataset=None, ignore_keys=None, metric_key_prefix="eval": eval_with_memory_optimization(trainer, original_eval_fn, eval_dataset=eval_dataset, ignore_keys=ignore_keys, metric_key_prefix=metric_key_prefix)
-            
-            # Log training start
-            logger.info("🚀 Starting training...")
-            logger.info(f"🚀 Training configuration:")
-            logger.info(f"  - Epochs: {training_config['num_train_epochs']}")
-            logger.info(f"  - Batch size per device: {training_config['per_device_train_batch_size']}")
-            logger.info(f"  - Gradient accumulation steps: {training_config['gradient_accumulation_steps']}")
-            logger.info(f"  - Learning rate: {training_config['learning_rate']}")
-            logger.info(f"  - Max sequence length: {data_config['max_seq_length']}")
-            
             # Log initial memory state
             log_gpu_memory(logger, "TRAINING_START")
             
@@ -920,73 +919,78 @@ def main(
             training_time = time.time() - start_time
             
             logger.info(f"✅ Training completed successfully in {training_time:.2f} seconds")
-            
-        except RuntimeError as e:
-            error_msg = str(e)
-            logger.error(f"❌ RuntimeError during training: {error_msg}")
-            
-            if "CUDA out of memory" in error_msg:
-                logger.error("❌ CUDA OOM 발생! 상세 정보를 수집합니다...")
-                
-                # Log detailed memory state at OOM
-                log_gpu_memory(logger, "OOM_ERROR")
-                
-                # Log training state at OOM
-                if hasattr(trainer, 'state') and trainer.state is not None:
-                    state = trainer.state
-                    logger.error(f"❌ Training state at OOM:")
-                    logger.error(f"  - Global step: {state.global_step}")
-                    logger.error(f"  - Epoch: {state.epoch:.3f}")
-                    logger.error(f"  - Current loss: {getattr(state, 'log_history', [{}])[-1].get('train_loss', 'N/A')}")
-                
-                # Log model state
-                logger.error(f"❌ Model state at OOM:")
-                logger.error(f"  - Model device: {next(trainer.model.parameters()).device}")
-                logger.error(f"  - Model dtype: {next(trainer.model.parameters()).dtype}")
-                logger.error(f"  - Model requires_grad: {next(trainer.model.parameters()).requires_grad}")
-                
-                # Log batch information
-                if hasattr(trainer, 'train_dataloader'):
-                    try:
-                        batch_size = trainer.per_device_train_batch_size
-                        grad_accum = trainer.gradient_accumulation_steps
-                        effective_batch = batch_size * grad_accum
-                        logger.error(f"❌ Batch configuration at OOM:")
-                        logger.error(f"  - Per device batch size: {batch_size}")
-                        logger.error(f"  - Gradient accumulation: {grad_accum}")
-                        logger.error(f"  - Effective batch size: {effective_batch}")
-                    except Exception as batch_e:
-                        logger.error(f"❌ Could not get batch info: {batch_e}")
-                
-                logger.error("❌ 메모리 정리 후 재시도...")
-                clear_gpu_memory()
-                logger.error("❌ GPU 메모리 정리 완료. 다시 시도해주세요.")
-                
-            else:
-                logger.error(f"❌ Other RuntimeError: {error_msg}")
-                log_error_context(logger, e, "training_runtime_error")
-            
-            raise e
-            
-        except Exception as e:
-            logger.error(f"❌ Unexpected error during training: {str(e)}")
-            log_error_context(logger, e, "training_unexpected_error")
-            raise e
-            
-        finally:
-            # 원래 eval 함수 복원
-            if original_eval_fn:
-                logger.debug("🔧 Restoring original evaluation function...")
-                trainer.evaluate = original_eval_fn
+        
+    except KeyboardInterrupt as e:
+        logger.error(f"❌ KeyboardInterrupt during training: {str(e)}")
+        log_error_context(logger, e, "training_keyboard_interrupt")
+        raise e
 
-    # Save final model
-    print("Saving final model...")
-    trainer.save_model()
-    
-    # Save tokenizer``
-    tokenizer.save_pretrained(training_args.output_dir)
-    
-    print("Training completed!")
+    except RuntimeError as e:
+        error_msg = str(e)
+        logger.error(f"❌ RuntimeError during training: {error_msg}")
+        
+        if "CUDA out of memory" in error_msg:
+            logger.error("❌ CUDA OOM 발생! 상세 정보를 수집합니다...")
+            
+            # Log detailed memory state at OOM
+            log_gpu_memory(logger, "OOM_ERROR")
+            
+            # Log training state at OOM
+            if hasattr(trainer, 'state') and trainer.state is not None:
+                state = trainer.state
+                logger.error(f"❌ Training state at OOM:")
+                logger.error(f"  - Global step: {state.global_step}")
+                logger.error(f"  - Epoch: {state.epoch:.3f}")
+                logger.error(f"  - Current loss: {getattr(state, 'log_history', [{}])[-1].get('train_loss', 'N/A')}")
+            
+            # Log model state
+            logger.error(f"❌ Model state at OOM:")
+            logger.error(f"  - Model device: {next(trainer.model.parameters()).device}")
+            logger.error(f"  - Model dtype: {next(trainer.model.parameters()).dtype}")
+            logger.error(f"  - Model requires_grad: {next(trainer.model.parameters()).requires_grad}")
+            
+            # Log batch information
+            if hasattr(trainer, 'train_dataloader'):
+                try:
+                    batch_size = trainer.per_device_train_batch_size
+                    grad_accum = trainer.gradient_accumulation_steps
+                    effective_batch = batch_size * grad_accum
+                    logger.error(f"❌ Batch configuration at OOM:")
+                    logger.error(f"  - Per device batch size: {batch_size}")
+                    logger.error(f"  - Gradient accumulation: {grad_accum}")
+                    logger.error(f"  - Effective batch size: {effective_batch}")
+                except Exception as batch_e:
+                    logger.error(f"❌ Could not get batch info: {batch_e}")
+            
+            logger.error("❌ 메모리 정리 후 재시도...")
+            clear_gpu_memory()
+            logger.error("❌ GPU 메모리 정리 완료. 다시 시도해주세요.")
+            
+        else:
+            logger.error(f"❌ Other RuntimeError: {error_msg}")
+            log_error_context(logger, e, "training_runtime_error")
+        
+        raise e
+        
+    except Exception as e:
+        logger.error(f"❌ Unexpected error during training: {str(e)}")
+        log_error_context(logger, e, "training_unexpected_error")
+        raise e
+        
+    finally:
+        # 원래 eval 함수 복원
+        # Save final model
+        print("Saving final model...")
+        if config.get("deepspeed_config") is not None:
+            trainer.deepspeed.save_checkpoint(training_args.output_dir)
+        trainer.save_model()
+        
+        # Save tokenizer``
+        tokenizer.save_pretrained(training_args.output_dir)
+        print("Training End")
+        if original_eval_fn:
+            logger.debug("🔧 Restoring original evaluation function...")
+            trainer.evaluate = original_eval_fn
 
 
 if __name__ == "__main__":

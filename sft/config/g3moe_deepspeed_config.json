@@ -50,7 +50,7 @@
     "warmup_ratio": 0.1,
     "logging_steps": 1,
     "eval_steps": 50,
-    "save_steps": 1000,
+    "save_steps": 50,
     "save_total_limit": 2,
     "eval_strategy": "steps",
     "load_best_model_at_end": true,
