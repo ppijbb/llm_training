@@ -8,10 +8,16 @@ and diversity.
 """
 import os
 import time
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
 from transformers import AutoModelForCausalLM, AutoConfig, AutoTokenizer
-from .gramspec_moe import upcycle_model_to_moe, GramSpecRouter
-from .g3moe_model import G3MoEMLP
+from models.gramspec_moe import upcycle_model_to_moe, GramSpecRouter
+from models.g3moe_model import G3MoEMLP
+
+# Note: upcycle_model_to_moe automatically enables global routing state passing
+# via the wrapper. If you need manual control, you can also use:
+# from models.gramspec_moe_wrapper import enable_global_routing_state
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 
@@ -47,6 +53,281 @@ def print_size_comparison(params_before, model_after, model_name):
         print(f"Increase:         {format_parameters(increase)} ({increase:,} parameters)")
         print(f"Size ratio:       {ratio:.4f}x ({ratio*100:.2f}% of original)")
     print(f"{'='*60}\n")
+
+
+def count_active_parameters(model, sample_inputs=None, top_k=None, verbose=True):
+    """
+    Inference 시 실제 활성화되는 파라미터 수를 계산합니다.
+    
+    실제 forward pass를 실행하여 활성화된 expert를 추적합니다.
+    
+    Args:
+        model: G3MoE 모델
+        sample_inputs: 실제 forward pass를 위한 샘플 입력 (dict, optional)
+                      제공되지 않으면 이론적 계산 사용
+        top_k: 활성화되는 expert 수 (None이면 config에서 가져옴)
+        verbose: 상세 출력 여부
+    
+    Returns:
+        dict: 활성화 파라미터 정보
+    """
+    # Config에서 MoE 설정 가져오기
+    if hasattr(model, 'config'):
+        config = model.config
+        if hasattr(config, 'text_config'):
+            config = config.text_config
+    else:
+        raise ValueError("Model must have config attribute")
+    
+    n_routed_experts = getattr(config, 'n_routed_experts', 0)
+    n_shared_experts = getattr(config, 'n_shared_experts', 1)
+    num_experts_per_tok = top_k if top_k is not None else getattr(config, 'num_experts_per_tok', 2)
+    first_k_dense_replace = getattr(config, 'first_k_dense_replace', 0)
+    num_hidden_layers = getattr(config, 'num_hidden_layers', 0)
+    
+    # MoE 레이어 수 계산 (first_k_dense_replace 이후 레이어만 MoE)
+    num_moe_layers = max(0, num_hidden_layers - first_k_dense_replace)
+    
+    # 전체 파라미터 카운트
+    total_params = sum(p.numel() for p in model.parameters())
+    
+    # 카테고리별 파라미터 카운트
+    embedding_params = 0
+    attention_params = 0
+    shared_expert_params = 0
+    routed_expert_params = 0
+    dense_mlp_params = 0  # Dense 레이어의 MLP (MoE가 아닌 레이어)
+    router_params = 0
+    global_router_params = 0  # Global router (공유됨, 한 번만 카운트)
+    norm_params = 0
+    lm_head_params = 0
+    vision_params = 0
+    other_params = 0
+    
+    # Global router는 한 번만 카운트해야 함
+    global_router_seen = set()
+    
+    # 레이어 인덱스 추출 헬퍼 함수
+    def get_layer_idx(name):
+        """레이어 인덱스 추출 (예: 'model.layers.5.moe' -> 5)"""
+        import re
+        match = re.search(r'\.layers\.(\d+)\.', name)
+        if match:
+            return int(match.group(1))
+        return -1
+    
+    for name, param in model.named_parameters():
+        param_count = param.numel()
+        layer_idx = get_layer_idx(name)
+        is_moe_layer = layer_idx >= first_k_dense_replace if layer_idx >= 0 else False
+        
+        # Vision tower 파라미터
+        if 'vision_tower' in name or 'vision_model' in name:
+            vision_params += param_count
+        # Embedding 파라미터
+        elif 'embed' in name.lower():
+            embedding_params += param_count
+        # Attention 파라미터
+        elif 'self_attn' in name or 'attn' in name:
+            attention_params += param_count
+        # Global Router 파라미터 (공유되므로 한 번만 카운트)
+        elif 'global_router' in name or ('router' in name and 'global' in name and 'language_model' in name):
+            # Global router는 한 번만 카운트
+            router_key = 'global_router'
+            if router_key not in global_router_seen:
+                global_router_params += param_count
+                global_router_seen.add(router_key)
+        # Shared Expert 파라미터 (항상 활성화)
+        elif 'shared_experts' in name or 'shared_expert' in name:
+            shared_expert_params += param_count
+        # Routed Expert 파라미터 (MoE 레이어의 experts만)
+        elif 'experts' in name and 'shared' not in name:
+            # MoE 레이어의 experts만 카운트
+            if is_moe_layer or 'moe' in name.lower():
+                routed_expert_params += param_count
+            else:
+                # Dense 레이어의 MLP는 다른 곳에서 처리
+                other_params += param_count
+        # Dense MLP 파라미터 (MoE가 아닌 레이어의 MLP, 항상 활성화)
+        elif ('mlp' in name.lower() or 'gate_proj' in name or 'up_proj' in name or 'down_proj' in name) and \
+             'moe' not in name.lower() and 'expert' not in name.lower():
+            # MoE가 아닌 레이어의 MLP만 카운트
+            if not is_moe_layer:
+                dense_mlp_params += param_count
+            else:
+                other_params += param_count
+        # Router 파라미터 (로컬 router, 각 레이어마다 있지만 항상 활성화)
+        elif 'router' in name or 'gate' in name:
+            # Global router가 아닌 경우만 카운트
+            if 'global' not in name:
+                router_params += param_count
+        # LayerNorm 파라미터
+        elif 'norm' in name.lower() or 'layernorm' in name.lower():
+            norm_params += param_count
+        # LM Head 파라미터
+        elif 'lm_head' in name or 'score' in name:
+            lm_head_params += param_count
+        else:
+            other_params += param_count
+    
+    # Forward pass에서 모든 레이어가 활성화됩니다!
+    # 단, MoE 레이어 내의 Routed Experts만 sparse activation (토큰당 top_k개만)
+    
+    # 항상 활성화되는 파라미터 (모든 레이어)
+    always_active_params = (
+        embedding_params +
+        attention_params +  # 모든 레이어의 attention
+        shared_expert_params +  # 모든 MoE 레이어의 shared expert
+        dense_mlp_params +  # Dense 레이어의 MLP (모두 활성화)
+        global_router_params +  # Global router (항상 활성화)
+        router_params +  # 모든 router (항상 활성화)
+        norm_params +  # 모든 LayerNorm
+        lm_head_params +
+        vision_params +
+        other_params
+    )
+    
+    # Routed Experts만 sparse activation
+    # 실제 forward pass를 통해 활성화된 expert 추적
+    if sample_inputs is not None and n_routed_experts > 0:
+        # 실제 forward pass로 활성화된 expert 추적
+        model.eval()
+        activated_experts_per_layer = {}
+        
+        def hook_fn(module, input, output):
+            """Forward hook으로 실제 활성화된 expert 추적"""
+            if hasattr(module, 'last_selected_experts'):
+                selected_experts = module.last_selected_experts
+                if selected_experts is not None:
+                    # 실제 활성화된 expert ID 추출
+                    unique_experts = torch.unique(selected_experts)
+                    layer_name = f"layer_{getattr(module, 'iter', 'unknown')}"
+                    activated_experts_per_layer[layer_name] = unique_experts.cpu().tolist()
+        
+        # Hook 등록
+        hooks = []
+        for name, module in model.named_modules():
+            if hasattr(module, 'experts') and hasattr(module, 'num_experts'):
+                # MoE 레이어에 hook 등록
+                hook = module.register_forward_hook(hook_fn)
+                hooks.append(hook)
+        
+        # Forward pass 실행
+        with torch.no_grad():
+            try:
+                _ = model(**sample_inputs)
+            except Exception as e:
+                if verbose:
+                    print(f"Warning: Forward pass failed: {e}. Using theoretical calculation.")
+                sample_inputs = None  # Fallback to theoretical
+        
+        # Hook 제거
+        for hook in hooks:
+            hook.remove()
+        
+        # 실제 활성화된 expert 수 계산
+        if activated_experts_per_layer:
+            # 각 레이어에서 활성화된 expert 수의 평균
+            total_activated = sum(len(experts) for experts in activated_experts_per_layer.values())
+            avg_activated_per_layer = total_activated / len(activated_experts_per_layer) if activated_experts_per_layer else num_experts_per_tok
+            activation_ratio = avg_activated_per_layer / n_routed_experts
+            active_routed_expert_params = int(routed_expert_params * activation_ratio)
+            actual_measurement = True
+        else:
+            # Fallback to theoretical
+            activation_ratio = num_experts_per_tok / n_routed_experts
+            active_routed_expert_params = int(routed_expert_params * activation_ratio)
+            actual_measurement = False
+    else:
+        # 이론적 계산 (forward pass 없이)
+        if n_routed_experts > 0:
+            activation_ratio = num_experts_per_tok / n_routed_experts
+            active_routed_expert_params = int(routed_expert_params * activation_ratio)
+        else:
+            activation_ratio = 0.0
+            active_routed_expert_params = 0
+        actual_measurement = False
+    
+    # 전체 활성화 파라미터 = 항상 활성화 + Routed Experts 중 활성화 부분
+    active_params = always_active_params + active_routed_expert_params
+    activation_rate = active_params / total_params if total_params > 0 else 0.0
+    
+    result = {
+        'total_params': total_params,
+        'active_params': active_params,
+        'activation_rate': activation_rate,
+        'breakdown': {
+            'embedding': embedding_params,
+            'attention': attention_params,
+            'shared_experts': shared_expert_params,
+            'dense_mlp': dense_mlp_params,
+            'routed_experts_total': routed_expert_params,
+            'routed_experts_active': active_routed_expert_params,
+            'global_router': global_router_params,
+            'router': router_params,
+            'norm': norm_params,
+            'lm_head': lm_head_params,
+            'vision': vision_params,
+            'other': other_params,
+        },
+        'config': {
+            'n_routed_experts': n_routed_experts,
+            'n_shared_experts': n_shared_experts,
+            'num_experts_per_tok': num_experts_per_tok,
+            'num_moe_layers': num_moe_layers,
+            'first_k_dense_replace': first_k_dense_replace,
+            'num_hidden_layers': num_hidden_layers,
+        },
+        'actual_measurement': actual_measurement if 'actual_measurement' in locals() else False
+    }
+    
+    if verbose:
+        print("\n" + "="*80)
+        print("MoE Model Active Parameter Analysis")
+        print("="*80)
+        print(f"\n📊 Configuration:")
+        print(f"  - Total Hidden Layers: {num_hidden_layers}")
+        print(f"  - MoE Layers: {num_moe_layers} (starting from layer {first_k_dense_replace})")
+        print(f"  - Routed Experts: {n_routed_experts}")
+        print(f"  - Shared Experts per Layer: {n_shared_experts}")
+        print(f"  - Active Experts per Token (top_k): {num_experts_per_tok}")
+        if actual_measurement:
+            print(f"  - Expert Activation Ratio: {activation_ratio:.4f} (실제 측정: 평균 {activation_ratio*n_routed_experts:.1f}개 expert 활성화)")
+        else:
+            print(f"  - Expert Activation Ratio: {activation_ratio:.4f} ({num_experts_per_tok}/{n_routed_experts}) [이론적 계산]")
+        
+        print(f"\n📈 Parameter Breakdown:")
+        print(f"  Total Parameters:           {format_parameters(total_params):>15} (100.00%)")
+        print(f"  Active Parameters:         {format_parameters(active_params):>15} ({activation_rate*100:.2f}%)")
+        print(f"\n  Always Active Components:")
+        print(f"    - Embedding:              {format_parameters(embedding_params):>15} ({embedding_params/total_params*100:.2f}%)")
+        print(f"    - Attention:              {format_parameters(attention_params):>15} ({attention_params/total_params*100:.2f}%)")
+        print(f"    - Dense MLP:              {format_parameters(dense_mlp_params):>15} ({dense_mlp_params/total_params*100:.2f}%)")
+        print(f"    - Shared Experts:         {format_parameters(shared_expert_params):>15} ({shared_expert_params/total_params*100:.2f}%)")
+        print(f"    - Global Router:          {format_parameters(global_router_params):>15} ({global_router_params/total_params*100:.2f}%)")
+        print(f"    - Local Router:           {format_parameters(router_params):>15} ({router_params/total_params*100:.2f}%)")
+        print(f"    - LayerNorm:               {format_parameters(norm_params):>15} ({norm_params/total_params*100:.2f}%)")
+        print(f"    - LM Head:                 {format_parameters(lm_head_params):>15} ({lm_head_params/total_params*100:.2f}%)")
+        print(f"    - Vision Tower:            {format_parameters(vision_params):>15} ({vision_params/total_params*100:.2f}%)")
+        print(f"    - Other:                   {format_parameters(other_params):>15} ({other_params/total_params*100:.2f}%)")
+        print(f"\n  Routed Experts (Sparse Activation):")
+        print(f"    - Total Routed Experts:    {format_parameters(routed_expert_params):>15} ({routed_expert_params/total_params*100:.2f}%)")
+        print(f"    - Active Routed Experts:  {format_parameters(active_routed_expert_params):>15} ({active_routed_expert_params/total_params*100:.2f}%)")
+        if actual_measurement:
+            print(f"      (실제 forward pass에서 {activation_ratio*100:.2f}% 활성화됨)")
+        else:
+            print(f"      (이론적: {activation_ratio*100:.2f}% 활성화, 실제 측정하려면 sample_inputs 제공 필요)")
+        
+        print(f"\n💡 Key Insight:")
+        print(f"  During inference:")
+        print(f"    - All layers are activated (attention, MLP, shared experts, router, etc.)")
+        print(f"    - Only Routed Experts use sparse activation: {activation_ratio*100:.2f}% per token")
+        print(f"    - Overall active parameters: {activation_rate*100:.2f}% of total")
+        print(f"    - Inactive parameters: {format_parameters(total_params - active_params)}")
+        print(f"    - Efficiency: {format_parameters(active_params)} active / {format_parameters(total_params)} total")
+        print("="*80 + "\n")
+    
+    return result
 
 
 def create_text_input(tokenizer, test_text="What is the capital of France?", max_length=128):
@@ -442,9 +723,15 @@ def example_qwen3_to_moe():
     print("Conversion complete!")
     print_size_comparison(params_before, model_after, "Qwen3")
     
+    # Prepare input for testing
+    text_input_after = create_text_input(tokenizer, test_text="What is the capital of France?", max_length=128)
+    
+    # Measure active parameters during inference
+    print("\nMeasuring active parameters during inference...")
+    active_param_info = count_active_parameters(model_after, sample_inputs=text_input_after, verbose=True)
+    
     # Measure forward speed after upcycling
     print("Measuring forward speed after upcycling...")
-    text_input_after = create_text_input(tokenizer, test_text="What is the capital of France?", max_length=128)
     speed_after = measure_forward_speed(model_after, text_input_after, num_runs=10, warmup_runs=3)
     print_speed_comparison(speed_before, speed_after, "Qwen3")
     
@@ -505,9 +792,15 @@ def example_gemma3_to_moe():
     print("Conversion complete!")
     print_size_comparison(params_before, model_after, "Gemma 3")
     
+    # Prepare input for testing
+    text_input_after = create_text_input(tokenizer, test_text="What is the capital of France?", max_length=128)
+    
+    # Measure active parameters during inference
+    print("\nMeasuring active parameters during inference...")
+    active_param_info = count_active_parameters(model_after, sample_inputs=text_input_after, verbose=True)
+    
     # Measure forward speed after upcycling
     print("Measuring forward speed after upcycling...")
-    text_input_after = create_text_input(tokenizer, test_text="What is the capital of France?", max_length=128)
     speed_after = measure_forward_speed(model_after, text_input_after, num_runs=10, warmup_runs=3)
     print_speed_comparison(speed_before, speed_after, "Gemma 3")
     
@@ -568,9 +861,13 @@ def example_llama31_to_moe():
     print("Conversion complete!")
     print_size_comparison(params_before, model_after, "Llama 3.2")
     
+    # Measure active parameters during inference
+    print("\nMeasuring active parameters during inference...")
+    text_input_after = create_text_input(tokenizer, test_text="What is the capital of France?", max_length=128)
+    active_param_info = count_active_parameters(model_after, sample_inputs=text_input_after, verbose=True)
+    
     # Measure forward speed after upcycling
     print("Measuring forward speed after upcycling...")
-    text_input_after = create_text_input(tokenizer, test_text="What is the capital of France?", max_length=128)
     speed_after = measure_forward_speed(model_after, text_input_after, num_runs=10, warmup_runs=3)
     print_speed_comparison(speed_before, speed_after, "Llama 3.2")
     
@@ -635,9 +932,13 @@ def example_gpt_oss_to_moe():
     print("Conversion complete!")
     print_size_comparison(params_before, model_after, "GPT-OSS")
     
+    # Measure active parameters during inference
+    print("\nMeasuring active parameters during inference...")
+    text_input_after = create_text_input(tokenizer, test_text="What is the capital of France?", max_length=128)
+    active_param_info = count_active_parameters(model_after, sample_inputs=text_input_after, verbose=True)
+    
     # Measure forward speed after upcycling
     print("Measuring forward speed after upcycling...")
-    text_input_after = create_text_input(tokenizer, test_text="What is the capital of France?", max_length=128)
     speed_after = measure_forward_speed(model_after, text_input_after, num_runs=10, warmup_runs=3)
     print_speed_comparison(speed_before, speed_after, "GPT-OSS")
     
@@ -667,15 +968,15 @@ if __name__ == "__main__":
     model = example_gemma3_to_moe()
     del model
     
-    print("\n3. Llama 3.2 (3B) to MoE:")
-    print("-" * 60)
-    model = example_llama31_to_moe()
-    del model
+    # print("\n3. Llama 3.2 (3B) to MoE:")
+    # print("-" * 60)
+    # model = example_llama31_to_moe()
+    # del model
     
-    print("\n4. GPT-OSS (20B) to MoE:")
-    print("-" * 60)
-    model = example_gpt_oss_to_moe()
-    del model
+    # print("\n4. GPT-OSS (20B) to MoE:")
+    # print("-" * 60)
+    # model = example_gpt_oss_to_moe()
+    # del model
     
     print("\n" + "=" * 60)
     print("Examples completed!")

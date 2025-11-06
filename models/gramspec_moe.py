@@ -32,6 +32,7 @@ import torch.nn.functional as F
 from typing import Optional, Tuple, List, Union, Dict, Any, Callable
 from tqdm.auto import tqdm
 import warnings
+import functools
 
 # Import necessary components from G3MoE
 from models.g3moe_model import (
@@ -115,7 +116,6 @@ class GramSpecRouter(nn.Module):
 
         # GRU를 통한 전역 라우팅 (hn 활용)
         routing_logits, hn = self.load_balancer(x, hn.to(x.dtype))
-        
         input_shape = routing_logits.shape[:-1]
         hidden_shape = (*input_shape, -1, self.router_dim)
 
@@ -240,6 +240,12 @@ class GramSpecMoEBlock(nn.Module):
         
         # Track whether to return router_scores (for compatibility with models like GPT-OSS)
         self.return_router_scores = False
+        
+        # Context-aware h_0 initialization for World Model connection
+        # Projects context vector (hidden_size) to GRU hidden state size (num_experts * router_dim)
+        # This allows external world information to be injected into the routing process
+        gru_hidden_size = self.num_experts * self.router_dim
+        self.context_projector = nn.Linear(self.hidden_dim, gru_hidden_size)
     
     def _freeze_shared_experts(self):
         """Freeze shared experts parameters"""
@@ -274,11 +280,18 @@ class GramSpecMoEBlock(nn.Module):
         if global_routing_hn is None:
             device = hidden_states.device
             dtype = hidden_states.dtype
-            # GRU expects: [1, batch_size, num_experts * router_dim]
-            global_routing_hn = torch.zeros(
-                1, batch_size, self.num_experts * self.router_dim,
-                device=device, dtype=dtype
-            )
+            
+            # Context-aware h_0 initialization: World Model connection
+            # Extract context vector from input (mean pooling of all tokens)
+            # This represents the "summary of the external world" described in the input
+            v_context = hidden_states.mean(dim=1)  # [batch_size, hidden_dim]
+            
+            # Project context vector to GRU hidden state space using dedicated interpreter
+            # This acts as a bridge between external world observation and internal routing state
+            initial_hn_flat = self.context_projector(v_context)  # [batch_size, num_experts * router_dim]
+            
+            # Reshape for GRU: [1, batch_size, num_experts * router_dim]
+            global_routing_hn = initial_hn_flat.unsqueeze(0)
         
         residual = hidden_states
         final_hidden_states, routing_info = self._sparse_routing(hidden_states, global_routing_hn)
@@ -290,6 +303,11 @@ class GramSpecMoEBlock(nn.Module):
         if self.training:
             final_hidden_states = final_hidden_states.requires_grad_(True)
         
+        # Store routing_info internally for wrapper to access (for global state passing)
+        # routing_info: (routing_weights, hn, speciality_loss, cosine_similarities, expression_loss, router_scores)
+        # This allows the wrapper to extract hn for inter-layer state passing
+        self._last_routing_info = routing_info
+        
         # Return format depends on original MLP's forward signature
         # Some models (like GPT-OSS) expect (hidden_states, router_scores)
         if self.return_router_scores:
@@ -300,6 +318,7 @@ class GramSpecMoEBlock(nn.Module):
         else:
             # Return only hidden_states for compatibility with standard HuggingFace MLP layers
             # Routing information is stored internally and can be accessed via hooks if needed
+            # Wrapper will extract hn from self._last_routing_info
             return final_hidden_states
     
     @torch._dynamo.disable
@@ -321,7 +340,8 @@ class GramSpecMoEBlock(nn.Module):
             jitter_eps=self.router_jitter_noise,
             training=self.training
         )
-        routing_weights, selected_experts, expression_logits, hn, speciality_loss, cosine_similarities, expression_loss = router_output
+        (routing_weights, selected_experts, expression_logits, 
+         hn, speciality_loss, cosine_similarities, expression_loss) = router_output
 
         assert routing_weights.isnan().sum() == 0, f"routing_weights is nan"
 
@@ -1050,6 +1070,199 @@ def upcycle_model_to_moe(
     if verbose:
         if isinstance(processing, tqdm):
             processing.set_description("Upcycling completed")
+    
+    # Automatically enable global routing state passing (Option B: Integrated Computational Trajectory)
+    # This enables inter-layer state passing via the fancy wrapper pattern
+    if verbose:
+        print("\n🔄 Enabling global routing state passing between layers...")
+    model = _enable_global_routing_state(model, verbose=verbose)
+    
+    return model
+
+
+# ==================== Global Routing State Passing (Wrapper Pattern) ====================
+
+class _GlobalRoutingStateContext:
+    """
+    Context manager for global routing state.
+    Uses a mutable container to share state across closures.
+    """
+    def __init__(self):
+        self.hn = None
+    
+    def reset(self):
+        """Reset state"""
+        self.hn = None
+
+
+def _create_layer_interceptor(
+    original_forward: Callable,
+    layer_instance: nn.Module,
+    state_context: _GlobalRoutingStateContext,
+) -> Callable:
+    """
+    Create a wrapper function for a layer that intercepts MoE calls.
+    
+    Uses closure to capture state_context, avoiding variable scope issues.
+    """
+    @functools.wraps(original_forward)
+    def intercepted_forward(*args, **kwargs):
+        # Check if this layer has a GramSpecMoEBlock
+        has_moe = False
+        moe_module = None
+        
+        for attr_name in ['mlp', 'feed_forward', 'ffn', 'ffw', 'moe']:
+            if hasattr(layer_instance, attr_name):
+                candidate = getattr(layer_instance, attr_name)
+                if isinstance(candidate, GramSpecMoEBlock):
+                    has_moe = True
+                    moe_module = candidate
+                    break
+        
+        # Inject global_routing_hn if MoE layer
+        if has_moe:
+            kwargs['global_routing_hn'] = state_context.hn
+        
+        # Call original forward
+        result = original_forward(*args, **kwargs)
+        
+        # Extract and update hn from result if MoE layer
+        if has_moe and moe_module is not None:
+            # Try to get routing_info from the MoE module's internal storage
+            if hasattr(moe_module, '_last_routing_info'):
+                routing_info = moe_module._last_routing_info
+                if isinstance(routing_info, tuple) and len(routing_info) >= 2:
+                    # routing_info: (routing_weights, hn, speciality_loss, cosine_similarities, expression_loss, router_scores)
+                    hn = routing_info[1]  # Second element is hn
+                    if hn is not None:
+                        state_context.hn = hn
+            # Also check result tuple format (for models that return routing_info directly)
+            elif isinstance(result, tuple) and len(result) > 0:
+                last_elem = result[-1]
+                if isinstance(last_elem, tuple) and len(last_elem) >= 2:
+                    # Format: (hidden_states, ..., (router_logits, hn, ...))
+                    routing_info = last_elem
+                    if routing_info[1] is not None:
+                        state_context.hn = routing_info[1]
+                elif isinstance(last_elem, torch.Tensor):
+                    # Format: (hidden_states, hn) - simple case
+                    state_context.hn = last_elem
+        
+        return result
+    
+    return intercepted_forward
+
+
+def _enable_global_routing_state(model: nn.Module, verbose: bool = True) -> nn.Module:
+    """
+    Enable global routing state passing for a model.
+    
+    This wraps the model's forward method to automatically pass global_routing_hn between layers.
+    Uses a fancy, non-invasive approach with higher-order functions and closure.
+    
+    Args:
+        model: The model to enable global state for
+        verbose: Whether to print debug info
+        
+    Returns:
+        Model with global state enabled (modified in-place)
+    """
+    # Find the model's main forward method (usually model.model.forward for HuggingFace models)
+    base_model = None
+    forward_path = None
+    
+    # Try common paths
+    for path in ['model', 'transformer', 'decoder', 'encoder']:
+        if hasattr(model, path):
+            candidate = getattr(model, path)
+            if hasattr(candidate, 'forward'):
+                base_model = candidate
+                forward_path = (model, path, 'forward')
+                break
+    
+    # If not found, try direct forward
+    if forward_path is None and hasattr(model, 'forward'):
+        base_model = model
+        forward_path = (model, 'forward')
+    
+    if forward_path is None:
+        if verbose:
+            print("⚠️  Warning: Could not find model forward method. Global state passing disabled.")
+        return model
+    
+    # Get original forward
+    if len(forward_path) == 3:
+        original_forward = getattr(base_model, 'forward')
+    else:
+        original_forward = model.forward
+    
+    # Check if already wrapped
+    if hasattr(original_forward, '_gramspec_wrapped'):
+        if verbose:
+            print("ℹ️  Model forward already wrapped with global state passing.")
+        return model
+    
+    # Get layers for state passing
+    layers = None
+    for attr_name in ['layers', 'h', 'block', 'decoder_layers']:
+        if hasattr(base_model, attr_name):
+            candidate = getattr(base_model, attr_name)
+            if isinstance(candidate, (nn.ModuleList, list)) and len(candidate) > 0:
+                layers = candidate
+                break
+    
+    if layers is None:
+        if verbose:
+            print("⚠️  Warning: Could not find decoder layers. Global state passing disabled.")
+        return model
+    
+    # Create state context (mutable container for closure)
+    state_context = _GlobalRoutingStateContext()
+    
+    # Store original layer forwards
+    original_layer_forwards = [layer.forward for layer in layers]
+    
+    # Create wrapper
+    @functools.wraps(original_forward)
+    def forward_wrapper(*args, **kwargs):
+        """
+        Wrapped forward that maintains global_routing_hn state across layers.
+        """
+        # Reset state at start of forward
+        state_context.reset()
+        
+        # Create interceptors for each layer
+        layer_interceptors = [
+            _create_layer_interceptor(orig_fn, layer, state_context)
+            for orig_fn, layer in zip(original_layer_forwards, layers)
+        ]
+        
+        # Temporarily replace layer forwards
+        for layer, interceptor in zip(layers, layer_interceptors):
+            layer.forward = interceptor
+        
+        try:
+            # Call original forward (which will now use intercepted layer forwards)
+            result = original_forward(*args, **kwargs)
+        finally:
+            # Restore original layer forwards
+            for layer, orig_fn in zip(layers, original_layer_forwards):
+                layer.forward = orig_fn
+        
+        return result
+    
+    # Mark as wrapped
+    forward_wrapper._gramspec_wrapped = True
+    forward_wrapper._gramspec_state_context = state_context  # Store for debugging
+    
+    # Replace forward
+    if len(forward_path) == 3:
+        setattr(base_model, 'forward', forward_wrapper)
+    else:
+        model.forward = forward_wrapper
+    
+    if verbose:
+        print(f"✅ Wrapped model forward with global routing state passing ({len(layers)} layers)")
     
     return model
 
