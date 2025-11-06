@@ -57,10 +57,10 @@ base_config = AutoConfig.from_pretrained(base_model_name, trust_remote_code=True
 base_config = base_config.to_dict()
 moe_config = {
         "n_shared_experts": 1,
-        "n_routed_experts": 6, # 256, 15, 6
+        "n_routed_experts": 8, # 256, 15, 6
         "n_group": 4,
         "topk_group": 8,
-        "num_experts_per_tok": 2,
+        "num_experts_per_tok": 1,
         "first_k_dense_replace": 18,
         "router_aux_loss_coef": 0.001,
         "router_jitter_noise": 0.01,
@@ -88,12 +88,16 @@ model_config.architectures = [
     # "G3MoEForCausalLM"
     ]
     
-def count_active_parameters(model, top_k=None, verbose=True):
+def count_active_parameters(model, sample_inputs=None, top_k=None, verbose=True):
     """
     Inference 시 실제 활성화되는 파라미터 수를 계산합니다.
     
+    실제 forward pass를 실행하여 활성화된 expert를 추적합니다.
+    
     Args:
         model: G3MoE 모델
+        sample_inputs: 실제 forward pass를 위한 샘플 입력 (dict, optional)
+                      제공되지 않으면 이론적 계산 사용
         top_k: 활성화되는 expert 수 (None이면 config에서 가져옴)
         verbose: 상세 출력 여부
     
@@ -217,13 +221,65 @@ def count_active_parameters(model, top_k=None, verbose=True):
     )
     
     # Routed Experts만 sparse activation
-    # 각 토큰마다 top_k개만 선택되므로, 전체 routed experts의 일부만 활성화
-    if n_routed_experts > 0:
-        activation_ratio = num_experts_per_tok / n_routed_experts
-        active_routed_expert_params = int(routed_expert_params * activation_ratio)
+    # 실제 forward pass를 통해 활성화된 expert 추적
+    if sample_inputs is not None and n_routed_experts > 0:
+        # 실제 forward pass로 활성화된 expert 추적
+        model.eval()
+        activated_experts_per_layer = {}
+        
+        def hook_fn(module, input, output):
+            """Forward hook으로 실제 활성화된 expert 추적"""
+            if hasattr(module, 'last_selected_experts'):
+                selected_experts = module.last_selected_experts
+                if selected_experts is not None:
+                    # 실제 활성화된 expert ID 추출
+                    unique_experts = torch.unique(selected_experts)
+                    layer_name = f"layer_{getattr(module, 'iter', 'unknown')}"
+                    activated_experts_per_layer[layer_name] = unique_experts.cpu().tolist()
+        
+        # Hook 등록
+        hooks = []
+        for name, module in model.named_modules():
+            if hasattr(module, 'experts') and hasattr(module, 'num_experts'):
+                # MoE 레이어에 hook 등록
+                hook = module.register_forward_hook(hook_fn)
+                hooks.append(hook)
+        
+        # Forward pass 실행
+        with torch.no_grad():
+            try:
+                _ = model(**sample_inputs)
+            except Exception as e:
+                if verbose:
+                    print(f"Warning: Forward pass failed: {e}. Using theoretical calculation.")
+                sample_inputs = None  # Fallback to theoretical
+        
+        # Hook 제거
+        for hook in hooks:
+            hook.remove()
+        
+        # 실제 활성화된 expert 수 계산
+        if activated_experts_per_layer:
+            # 각 레이어에서 활성화된 expert 수의 평균
+            total_activated = sum(len(experts) for experts in activated_experts_per_layer.values())
+            avg_activated_per_layer = total_activated / len(activated_experts_per_layer) if activated_experts_per_layer else num_experts_per_tok
+            activation_ratio = avg_activated_per_layer / n_routed_experts
+            active_routed_expert_params = int(routed_expert_params * activation_ratio)
+            actual_measurement = True
+        else:
+            # Fallback to theoretical
+            activation_ratio = num_experts_per_tok / n_routed_experts
+            active_routed_expert_params = int(routed_expert_params * activation_ratio)
+            actual_measurement = False
     else:
-        activation_ratio = 0.0
-        active_routed_expert_params = 0
+        # 이론적 계산 (forward pass 없이)
+        if n_routed_experts > 0:
+            activation_ratio = num_experts_per_tok / n_routed_experts
+            active_routed_expert_params = int(routed_expert_params * activation_ratio)
+        else:
+            activation_ratio = 0.0
+            active_routed_expert_params = 0
+        actual_measurement = False
     
     # 전체 활성화 파라미터 = 항상 활성화 + Routed Experts 중 활성화 부분
     active_params = always_active_params + active_routed_expert_params
@@ -254,7 +310,8 @@ def count_active_parameters(model, top_k=None, verbose=True):
             'num_moe_layers': num_moe_layers,
             'first_k_dense_replace': first_k_dense_replace,
             'num_hidden_layers': num_hidden_layers,
-        }
+        },
+        'actual_measurement': actual_measurement if 'actual_measurement' in locals() else False
     }
     
     if verbose:
@@ -267,7 +324,10 @@ def count_active_parameters(model, top_k=None, verbose=True):
         print(f"  - Routed Experts: {n_routed_experts}")
         print(f"  - Shared Experts per Layer: {n_shared_experts}")
         print(f"  - Active Experts per Token (top_k): {num_experts_per_tok}")
-        print(f"  - Expert Activation Ratio: {activation_ratio:.4f} ({num_experts_per_tok}/{n_routed_experts})")
+        if actual_measurement:
+            print(f"  - Expert Activation Ratio: {activation_ratio:.4f} (실제 측정: 평균 {activation_ratio*n_routed_experts:.1f}개 expert 활성화)")
+        else:
+            print(f"  - Expert Activation Ratio: {activation_ratio:.4f} ({num_experts_per_tok}/{n_routed_experts}) [이론적 계산]")
         
         print(f"\n📈 Parameter Breakdown:")
         print(f"  Total Parameters:           {format_parameters(total_params):>15} (100.00%)")
@@ -286,7 +346,10 @@ def count_active_parameters(model, top_k=None, verbose=True):
         print(f"\n  Routed Experts (Sparse Activation):")
         print(f"    - Total Routed Experts:    {format_parameters(routed_expert_params):>15} ({routed_expert_params/total_params*100:.2f}%)")
         print(f"    - Active Routed Experts:  {format_parameters(active_routed_expert_params):>15} ({active_routed_expert_params/total_params*100:.2f}%)")
-        print(f"      (Only {activation_ratio*100:.2f}% of routed experts are active)")
+        if actual_measurement:
+            print(f"      (실제 forward pass에서 {activation_ratio*100:.2f}% 활성화됨)")
+        else:
+            print(f"      (이론적: {activation_ratio*100:.2f}% 활성화, 실제 측정하려면 sample_inputs 제공 필요)")
         
         print(f"\n💡 Key Insight:")
         print(f"  During inference:")
@@ -469,11 +532,12 @@ this is the test text message. now you must instruct the model to generate a res
     print(format_parameters(test_model.num_parameters()))
     print("Test Sequence Length:", inputs.input_ids.shape[1])
     
-    # 활성화 파라미터 측정
+    # 활성화 파라미터 측정 (실제 forward pass로 측정)
     print("\n" + "="*80)
     print("Measuring Active Parameters During Inference")
     print("="*80)
-    active_param_info = count_active_parameters(test_model, verbose=True)
+    # 실제 forward pass를 위해 sample inputs 사용
+    active_param_info = count_active_parameters(test_model, sample_inputs=inputs, verbose=True)
 
     with torch.inference_mode():
         # torch._dynamo.config.capture_dynamic_output_shape_ops = True

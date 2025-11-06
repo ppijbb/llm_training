@@ -97,7 +97,7 @@
         "stage3_max_live_parameters": 5e8,
         "stage3_max_reuse_distance": 5e8,
         "stage3_prefetch_bucket_size": 1e7,
-        "stage3_gather_16bit_weights_on_model_save": false
+        "stage3_gather_16bit_weights_on_model_save": true
     },
     "aio": {
         "block_size": 1048576,

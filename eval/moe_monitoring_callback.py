@@ -8,6 +8,20 @@ import time
 import os
 from transformers.image_utils import load_image
 
+# GramSpec 분석 도구 import
+try:
+    from eval.gramspec_moe_analysis import GramSpecAnalyzer
+    GRAMSPEC_ANALYSIS_AVAILABLE = True
+except ImportError:
+    GRAMSPEC_ANALYSIS_AVAILABLE = False
+
+# GramSpec 실제 검증 도구 import
+try:
+    from eval.gramspec_semantic_validation import GramSpecSemanticValidator
+    GRAMSPEC_VALIDATION_AVAILABLE = True
+except ImportError:
+    GRAMSPEC_VALIDATION_AVAILABLE = False
+
 def _is_main_process() -> bool:
     """Best-effort check for rank-0 to gate logging/plotting on distributed runs."""
     try:
@@ -82,6 +96,28 @@ class TorchMoECallback:
         # hooks 저장소
         self.hooks = []
         self.layer_outputs = {}
+        
+        # Layer별 expert usage tracking (실제 검증용)
+        self.layer_expert_usage_counts = {}  # layer_name -> torch.Tensor [num_experts]
+        
+        # GramSpec 분석기 (옵션)
+        self.gramspec_analyzer = None
+        if GRAMSPEC_ANALYSIS_AVAILABLE:
+            try:
+                self.gramspec_analyzer = GramSpecAnalyzer(num_experts=num_experts, router_dim=128)
+            except Exception as e:
+                if log_to_console:
+                    print(f"Warning: Could not initialize GramSpecAnalyzer: {e}")
+        
+        # GramSpec 실제 검증기 (옵션)
+        self.gramspec_validator = None
+        if GRAMSPEC_VALIDATION_AVAILABLE:
+            try:
+                # num_layers는 register_model에서 설정
+                self.gramspec_validator = None  # 나중에 초기화
+            except Exception as e:
+                if log_to_console:
+                    print(f"Warning: Could not initialize GramSpecSemanticValidator: {e}")
 
         if save_detailed_logs:
             import os
@@ -101,11 +137,34 @@ class TorchMoECallback:
         self.model = model
         self.tokenizer = tokenizer
         self._register_hooks()
+        
+        # Layer 개수 추출 및 validator 초기화
+        if GRAMSPEC_VALIDATION_AVAILABLE:
+            try:
+                num_layers = self._count_moe_layers(model)
+                if num_layers > 0:
+                    self.gramspec_validator = GramSpecSemanticValidator(
+                        num_layers=num_layers,
+                        num_experts=self.num_experts
+                    )
+                    if self.log_to_console:
+                        self._log_debug(f"GramSpecSemanticValidator initialized with {num_layers} layers")
+            except Exception as e:
+                if self.log_to_console:
+                    self._log_debug(f"Warning: Could not initialize validator: {e}")
 
         if self.enable_generation_logging and tokenizer is None:
             self._log_debug("Warning: Generation logging enabled but no tokenizer provided")
 
         return self
+    
+    def _count_moe_layers(self, model: torch.nn.Module) -> int:
+        """모델에서 MoE layer 개수 세기"""
+        count = 0
+        for name, module in model.named_modules():
+            if self._is_moe_layer(module):
+                count += 1
+        return count
 
     def set_tokenizer(self, tokenizer):
         """토크나이저 설정"""
@@ -213,6 +272,19 @@ class TorchMoECallback:
             else:
                 routing_info['expert_assignments'] = selected_experts
         
+        # GramSpec 관련 추가 정보 추출
+        if hasattr(module, 'router') and hasattr(module.router, 'expression_projector'):
+            # Expression projection 정보 (lightweight mode에서는 제외)
+            if not lightweight:
+                # Expression logits는 너무 클 수 있으므로 평균만 저장
+                pass
+        
+        # Router에서 직접 추출 가능한 정보
+        if hasattr(module, 'router'):
+            router = module.router
+            # Speciality penalty, expression loss 등은 forward 중에 계산되므로
+            # 별도로 저장하지 않음 (모니터링 콜백에서는 hook으로 추출 불가)
+        
         # 실제 G3MoE/GRIN 모델 구조에 맞춘 추출
         # output이 (hidden_states, router_logits) 튜플인 경우
         elif isinstance(output, tuple) and len(output) == 2:
@@ -309,6 +381,16 @@ class TorchMoECallback:
             routing_info['ortho_loss'] = output.ortho_loss
         if hasattr(output, 'aux_loss'):
             routing_info['aux_loss'] = output.aux_loss
+        
+        # GramSpec 관련 메트릭 (router에서 추출 가능한 경우)
+        if hasattr(module, 'router'):
+            router = module.router
+            # Expression loss는 계산 시점에만 존재하므로 직접 추출 불가
+            # 대신 router의 expression_projector 상태를 확인
+            if hasattr(router, 'expression_projector'):
+                # Orthogonal loss는 forward 중에 계산되므로 별도 저장 필요
+                # 여기서는 기본 정보만 저장
+                pass
 
         return routing_info if routing_info else None
     
@@ -497,6 +579,12 @@ class TorchMoECallback:
             # ✅ routing_info에서 num_experts 추출 (fallback: self.num_experts)
             num_experts = routing_info.get('num_experts', self.num_experts)
             
+            # GramSpec 분석 (가능한 경우)
+            if self.gramspec_analyzer is not None and hasattr(routing_info, 'gram_matrix'):
+                # GramSpec 분석기는 forward hook에서 직접 호출해야 함
+                # 여기서는 기본 메트릭만 계산
+                pass
+            
             if expert_assignments is not None:
                 # CPU로 이동 및 clamp
                 if torch.is_tensor(expert_assignments):
@@ -511,6 +599,11 @@ class TorchMoECallback:
                 # ✅ 올바른 minlength로 bincount 계산
                 usage_counts = torch.bincount(expert_assignments.long(), minlength=num_experts)
                 self.expert_usage_history[layer_name].append(usage_counts)
+                
+                # Layer별 expert usage tracking (실제 검증용)
+                if layer_name not in self.layer_expert_usage_counts:
+                    self.layer_expert_usage_counts[layer_name] = torch.zeros(num_experts, dtype=torch.long)
+                self.layer_expert_usage_counts[layer_name] += usage_counts
                 
                 usage_distribution = usage_counts.float() / (usage_counts.sum() + 1e-8)
                 
@@ -541,6 +634,22 @@ class TorchMoECallback:
             
             metrics[layer_name] = layer_metrics
         
+        # Layer-wise balance 분석 (실제 검증 지표)
+        if self.gramspec_validator is not None and self.layer_expert_usage_counts:
+            # Layer index 추출 (layer_name에서)
+            layer_idx_map = {}
+            for layer_name in self.layer_expert_usage_counts.keys():
+                # layer_name에서 숫자 추출 (예: "model.layers.5.moe" -> 5)
+                import re
+                match = re.search(r'\.(\d+)\.', layer_name)
+                if match:
+                    layer_idx = int(match.group(1))
+                    layer_idx_map[layer_idx] = self.layer_expert_usage_counts[layer_name]
+            
+            if layer_idx_map:
+                layer_balance_metrics = self.gramspec_validator.analyze_layer_wise_balance(layer_idx_map)
+                metrics['_layer_wise_balance'] = layer_balance_metrics
+        
         return metrics
     
     def _log_metrics(self, metrics, current_step: int):
@@ -561,9 +670,9 @@ class TorchMoECallback:
         
         # 전체 평균 메트릭
         if metrics:
-            avg_cv = np.mean([m.get('expert_cv', torch.tensor(0.0)).item() for m in metrics.values() if 'expert_cv' in m])
-            avg_entropy = np.mean([m.get('routing_entropy', torch.tensor(0.0)).item() for m in metrics.values() if 'routing_entropy' in m])
-            total_unused = sum([m.get('unused_experts', 0) for m in metrics.values()])
+            avg_cv = np.mean([m.get('expert_cv', torch.tensor(0.0)).item() for m in metrics.values() if 'expert_cv' in m and isinstance(m, dict)])
+            avg_entropy = np.mean([m.get('routing_entropy', torch.tensor(0.0)).item() for m in metrics.values() if 'routing_entropy' in m and isinstance(m, dict)])
+            total_unused = sum([m.get('unused_experts', 0) for m in metrics.values() if isinstance(m, dict)])
             
             log_data.update({
                 'moe/avg_expert_cv': avg_cv,
@@ -571,6 +680,16 @@ class TorchMoECallback:
                 'moe/total_unused_experts': total_unused,
                 'moe/step': current_step
             })
+            
+            # Layer-wise balance 메트릭 (실제 검증 지표)
+            if '_layer_wise_balance' in metrics:
+                balance_metrics = metrics['_layer_wise_balance']
+                log_data.update({
+                    'validation/layer_utilization_cv': balance_metrics.get('layer_utilization_cv', 0.0),
+                    'validation/layer_utilization_mean': balance_metrics.get('layer_utilization_mean', 0.0),
+                    'validation/layer_entropy_mean': balance_metrics.get('layer_entropy_mean', 0.0),
+                    'validation/early_late_ratio': balance_metrics.get('early_late_utilization_ratio', 1.0),
+                })
         
         # 로거에 전송 (rank 0에서만)
         if self.logger:
