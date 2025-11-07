@@ -436,8 +436,8 @@ class TorchMoECallback:
     @torch.no_grad()
     def _log_generations(self, current_step: int):
         """모델 생성 결과 로깅"""
-        if not self.is_main_process:
-            return
+        # if not self.is_main_process:
+        #     return
 
         try:
             self.generation_step_count += 1
@@ -655,8 +655,8 @@ class TorchMoECallback:
     def _log_metrics(self, metrics, current_step: int):
         """메트릭 로깅"""
         # rank 0에서만 로깅 수행
-        if not self.is_main_process:
-            return
+        # if not self.is_main_process:
+        #     return
             
         log_data = {}
         
@@ -710,8 +710,8 @@ class TorchMoECallback:
     def _log_heatmaps(self, current_step: int):
         """Expert 사용률 히트맵 로깅"""
         # rank 0에서만 실행
-        if not self.is_main_process:
-            return
+        # if not self.is_main_process:
+        #     return
         try:
             import matplotlib.pyplot as plt
             import seaborn as sns

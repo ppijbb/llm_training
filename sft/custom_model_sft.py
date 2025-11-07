@@ -493,7 +493,7 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
         
         total_params = model.num_parameters()
         logger.info(f"  - Total parameters: {format_parameters(total_params)}")
-        
+        logger.info(f"  - Model Memory consumption: {memory_before['allocated']:.2f}GB → {memory_after['allocated']:.2f}GB")
         # Log model device placement
         if hasattr(model, 'device'):
             logger.info(f"  - Model device: {model.device}")
@@ -515,6 +515,7 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
                 # "q_proj", "k_proj", "v_proj", "o_proj",
                 "gate_proj", "up_proj", "down_proj",
                 "router", "routing_temperature",
+                "global_router",
                 "rnn.weight_ih_l0", "rnn.weight_hh_l0"
             ],
             modules_to_save=["router", "routing_temperature"],
@@ -784,7 +785,7 @@ def main(
             alert_threshold_imbalance=4.0,   # 특정 Expert 사용률이 평균의 4배를 초과하면 경고
             unused_expert_threshold=0.25,    # 25% 이상의 Expert가 미사용되면 경고
             entropy_threshold=0.1,           # 라우팅 엔트로피가 0.1 미만이면 경고
-            save_detailed_logs=False  ,      # 상세 JSON 로그 저장 여부
+            save_detailed_logs=False,      # 상세 JSON 로그 저장 여부
             enable_generation_logging=True,  # 생성 로깅 활성화
         ))
     

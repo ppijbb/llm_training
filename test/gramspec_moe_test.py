@@ -674,10 +674,10 @@ def print_speed_comparison(speed_before, speed_after, model_name, is_generation=
             print(f"{'─'*90}\n")
 
 
-def example_qwen3_to_moe():
-    """Example: Convert Qwen3 to MoE"""
-    print("Loading Qwen3 model...")
-    model_name = "Qwen/Qwen3-0.6B"
+def example_llama_to_moe():
+    """Example: Convert Llama 3.2 to MoE"""
+    print("Loading Llama 3.2 model...")
+    model_name = "meta-llama/Llama-3.2-1B-Instruct"
     model_before = AutoModelForCausalLM.from_pretrained(model_name)
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
@@ -812,10 +812,10 @@ def example_gemma3_to_moe():
     return model_after
 
 
-def example_llama31_to_moe():
-    """Example: Convert Llama 3.2 to MoE"""
-    print("Loading Llama 3.2 model...")
-    model_name = "meta-llama/Llama-3.2-3B-Instruct"
+def example_qwen3_to_moe():
+    """Example: Convert Qwen 3 VL to MoE"""
+    print("Loading Qwen 3 VL model...")
+    model_name = "Qwen/Qwen3-VL-4B-Instruct"
     model_before = AutoModelForCausalLM.from_pretrained(model_name)
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     
@@ -958,9 +958,9 @@ if __name__ == "__main__":
     print("=" * 60)
     
     # Run examples with latest models (all <= 7B)
-    print("\n1. Qwen 3 (0.6B) to MoE:")
+    print("\n1. Llama 3.2 (3B) to MoE:")
     print("-" * 60)
-    model = example_qwen3_to_moe()
+    model = example_llama_to_moe()
     del model
     
     print("\n2. Gemma 3 (1B) to MoE:")
@@ -968,10 +968,10 @@ if __name__ == "__main__":
     model = example_gemma3_to_moe()
     del model
     
-    # print("\n3. Llama 3.2 (3B) to MoE:")
-    # print("-" * 60)
-    # model = example_llama31_to_moe()
-    # del model
+    print("\n3. Qwen 3 (4B) to MoE:")
+    print("-" * 60)
+    model = example_qwen3_to_moe()
+    del model
     
     # print("\n4. GPT-OSS (20B) to MoE:")
     # print("-" * 60)

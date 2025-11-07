@@ -51,7 +51,7 @@ def format_parameters(number):
         return str(number)
 
 
-base_model_name = "google/gemma-3-4b-it"
+base_model_name = "Gunulhona/Gemma-3-4B"
 model_architecture = G3MoEForConditionalGeneration
 base_config = AutoConfig.from_pretrained(base_model_name, trust_remote_code=True)
 base_config = base_config.to_dict()
@@ -87,7 +87,7 @@ model_config.architectures = [
     # "G3MoEModel", 
     # "G3MoEForCausalLM"
     ]
-    
+
 def count_active_parameters(model, sample_inputs=None, top_k=None, verbose=True):
     """
     Inference 시 실제 활성화되는 파라미터 수를 계산합니다.
@@ -380,7 +380,8 @@ def test_train_forward():
     # 2. Create dummy inputs
     print("Creating dummy inputs...")
     tokenizer = AutoProcessor.from_pretrained(base_model_name, use_fast=True)
-    
+    with open("/home/conan/workspace/llm_training/sft/config/chat_template.txt", "r") as f:
+        tokenizer.chat_template = f.read()
     try:
         image_size = train_test_model.config.vision_config.image_size
     except AttributeError:
@@ -512,9 +513,7 @@ this is the test text message. now you must instruct the model to generate a res
     sample_image_urls = [
         "https://huggingface.co/spaces/merve/chameleon-7b/resolve/main/bee.jpg",
         "https://cdn.britannica.com/61/93061-050-99147DCE/Statue-of-Liberty-Island-New-York-Bay.jpg",
-        "https://i.namu.wiki/i/6OBqKb_V51DWQbN4UZ6VpeBgRNnBoyivWjd5DqWHvgnMDTAFaDtYhri0zafTw1mESEkNgx1NiHE9XZlhSUrP-r3_Ahetkd9FtLY01RvEWJisz_7Qyx8832b_HZeK6YghWHtY9sPn7WQlYAz9wJ11ew.webp",
         "https://ocr.space/Content/Images/table-ocr-original.webp",
-        "https://storage.googleapis.com/kagglesdsdata/datasets/3419046/6067948/images/1058.png?X-Goog-Algorithm=GOOG4-RSA-SHA256&X-Goog-Credential=databundle-worker-v2%40kaggle-161607.iam.gserviceaccount.com%2F20251028%2Fauto%2Fstorage%2Fgoog4_request&X-Goog-Date=20251028T235242Z&X-Goog-Expires=345600&X-Goog-SignedHeaders=host&X-Goog-Signature=8d70ef579e163c8648a49345cd458dc69f2242de2e5f7a52821f9a12856237ea8d042e6a172bbb7c4e31f8b0f982815fa53347aab2ead5b3dae39a21df0297c202ea2f3d6e05d98d61fd2260a22dd98700bb7de3c7b32232b8a7fbd1909462226bc0f5e6fd3af80adffd04b5bb2145ad16656d1a2bfa1ea02b6b8515f3f1881e4ac9a71e97e134f638f3a58db111c55a4f25abd81973edce796e1d531eff09222e86669b46d8bc9c766838062164083ba20d1feb253748313f496f78623d78bf65f30605e5a2f8e38c3fb506b6fcaf74924735639244c4003fd9dff7ec580ff26d792fb693593cb3f0b4a88f68f599f0b8937e77da68e02939a30308fcdcccec"
     ]
     ran_image = random.choice(sample_image_urls)
     image = load_image(ran_image)
@@ -603,6 +602,7 @@ def check_params_diff():
             tensor_a = state_dict_a[key]
             tensor_b = state_dict_b[key]
             if not torch.allclose(tensor_a, tensor_b, atol=1e-6, rtol=1e-5):
+
                 different_layers.append(key)
 
         if different_layers:
