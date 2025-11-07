@@ -1348,16 +1348,16 @@ class G3MoEPreTrainedModel(PreTrainedModel):
             config = AutoConfig.from_pretrained(pretrained_model_name_or_path, **kwargs.get("config_kwargs", {}))
         if not isinstance(config, G3MoEConfig):
             config = G3MoEConfig(**config.to_dict())
-            if config.attn_implementation == None:
+            if config.text_config.attn_implementation == None:
                 if is_flash_attn_2_available():
-                    config.attn_implementation = "flash_attention_2"
+                    config.text_config.attn_implementation = "flash_attention_2"
                 elif is_torch_flex_attn_available():
-                    config.attn_implementation = "flex_attention"
+                    config.text_config.attn_implementation = "flex_attention"
                 elif cls.training:
-                    config.attn_implementation = "eager"
+                    config.text_config.attn_implementation = "eager"
                 else:
-                    config.attn_implementation = "sdpa"
-            print(f"Forced attn implementation: {config.attn_implementation}")
+                    config.text_config.attn_implementation = "sdpa"
+            print(f"Forced attn implementation: {config.text_config.attn_implementation}")
 
         logging.get_logger('transformers').debug("Loading G3MoE model skeleton using super().from_pretrained...")
         logging.set_verbosity_error()
@@ -1748,12 +1748,12 @@ class G3MoEForCausalLM(G3MoEPreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
-    config: G3MoETextConfig
+    config: G3MoEConfig
     base_model_prefix = "language_model"
 
-    def __init__(self, config: G3MoETextConfig, **kwargs):
+    def __init__(self, config: G3MoEConfig, **kwargs):
         super().__init__(config)
-        self.model = G3MoETextModel(config, **kwargs)
+        self.model = G3MoETextModel(config.text_config, **kwargs)
         # Ensure config refers to resolved text config from the submodule
         self.config = self.model.config
         self.vocab_size = self.config.vocab_size
@@ -2013,18 +2013,17 @@ def token_type_ids_mask_function(
     """
 )
 class G3MoEModel(G3MoEPreTrainedModel):
+    config: G3MoEConfig
     _checkpoint_conversion_mapping = {"language_model.model": "language_model"}
     # we are filtering the logits/labels so we shouldn't divide the loss based on num_items_in_batch
     accepts_loss_kwargs = False
 
     def __init__(self, config: G3MoEConfig):
         super().__init__(config)
-        self.vision_tower = AutoModel.from_config(config=config.vision_config)
+        self.vision_tower = AutoModel.from_config(config=config.vision_config, trust_remote_code=True)
+        self.language_model = G3MoETextModel.from_config(config=config.text_config, trust_remote_code=True)
         self.multi_modal_projector = G3MoEMultiModalProjector(config=config)
         self.vocab_size = config.text_config.vocab_size
-
-        language_model = AutoModel.from_config(config=config.text_config)
-        self.language_model = language_model
         self.pad_token_id = self.config.pad_token_id if self.config.pad_token_id is not None else -1
         self.post_init()
 

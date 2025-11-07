@@ -43,6 +43,12 @@ class GramSpecAnalyzer:
         self.cosine_similarity_history = []
         self.speciality_penalty_history = []
         
+        # Load balancing metrics
+        self.expert_token_counts_history = []  # List of [num_experts] tensors
+        self.expert_activation_counts_history = []  # List of [num_experts] tensors
+        self.load_balancing_coefficient_history = []
+        self.expert_utilization_history = []
+        
     def analyze_routing_step(
         self,
         routing_logits: torch.Tensor,  # [batch*seq, num_experts, router_dim]
@@ -99,10 +105,22 @@ class GramSpecAnalyzer:
             context_metrics = self._compute_context_utilization(hidden_states, selected_experts)
             metrics.update(context_metrics)
         
+        # 8. Load Balancing Metrics (필수 - 논문에 포함)
+        load_balancing_metrics = self._compute_load_balancing_metrics(
+            selected_experts, routing_weights
+        )
+        metrics.update(load_balancing_metrics)
+        
         # 히스토리 저장
         self.gram_matrix_history.append(gram_metrics.get('gram_matrix_orthogonality', 0.0))
         self.speciality_penalty_history.append(speciality_penalty)
         self.cosine_similarity_history.append(cosine_similarities.mean().item())
+        
+        # Load balancing 히스토리 저장
+        if 'expert_token_counts' in load_balancing_metrics:
+            self.expert_token_counts_history.append(load_balancing_metrics['expert_token_counts'])
+        if 'load_balancing_coefficient' in load_balancing_metrics:
+            self.load_balancing_coefficient_history.append(load_balancing_metrics['load_balancing_coefficient'])
         
         return metrics
     
@@ -167,9 +185,15 @@ class GramSpecAnalyzer:
         routing_weights: torch.Tensor,
     ) -> Dict[str, float]:
         """
-        Expert specialization 지표 계산
+        Expert specialization 지표 계산 (논문 필수 지표)
         
         검증 포인트: 각 expert가 서로 다른 input pattern에 반응하는가?
+        
+        논문에서 사용하는 specialization 지표:
+        1. Expert similarity matrix (낮을수록 specialized)
+        2. Expert activation entropy (균형도 측정)
+        3. Expression-routing alignment (specialization quality)
+        4. Expert diversity score
         """
         # Expert별 activation pattern 분석
         # selected_experts: [batch*seq, top_k]
@@ -210,16 +234,34 @@ class GramSpecAnalyzer:
         expert_similarity_matrix = torch.matmul(routing_normalized, routing_normalized.T)
         off_diagonal_mask = ~torch.eye(self.num_experts, dtype=bool, device=expert_similarity_matrix.device)
         expert_similarity_mean = expert_similarity_matrix[off_diagonal_mask].mean()
+        expert_similarity_std = expert_similarity_matrix[off_diagonal_mask].std()
+        
+        # Expert diversity score: 1 - mean_similarity (높을수록 더 diverse/specialized)
+        expert_diversity_score = 1.0 - expert_similarity_mean
         
         # Expression-routing alignment: 각 expert의 expression과 routing이 얼마나 일치하는가?
         expression_normalized = F.normalize(expression_mean, dim=-1)
         alignment_scores = F.cosine_similarity(expression_normalized, routing_normalized, dim=-1)
         alignment_mean = alignment_scores.mean()
+        alignment_std = alignment_scores.std()
+        
+        # Expert specialization strength: 각 expert가 얼마나 명확하게 구분되는가?
+        # Similarity matrix의 off-diagonal 요소들의 분산 (높을수록 expert들이 더 구분됨)
+        specialization_strength = expert_similarity_matrix[off_diagonal_mask].var().item()
+        
+        # Expert concentration: 특정 expert에 집중되는 정도 (낮을수록 균형)
+        max_activation_prob = activation_probs.max().item()
+        expert_concentration = max_activation_prob * self.num_experts  # Normalized
         
         return {
             'expert_activation_entropy': normalized_entropy.item(),
             'expert_similarity_mean': expert_similarity_mean.item(),
+            'expert_similarity_std': expert_similarity_std.item(),
+            'expert_diversity_score': expert_diversity_score.item(),
             'expert_routing_expression_alignment': alignment_mean.item(),
+            'expert_routing_expression_alignment_std': alignment_std.item(),
+            'expert_specialization_strength': specialization_strength,
+            'expert_concentration': expert_concentration,
             'expert_utilization_rate': (expert_activation_counts > 0).float().mean().item(),
         }
     
@@ -367,27 +409,202 @@ class GramSpecAnalyzer:
             'sequential_routing_consistency': sequential_consistency.item(),
         }
     
+    def _compute_load_balancing_metrics(
+        self,
+        selected_experts: torch.Tensor,  # [batch*seq, top_k]
+        routing_weights: torch.Tensor,  # [batch*seq, top_k]
+    ) -> Dict[str, Any]:
+        """
+        Load balancing 지표 계산 (논문 필수 지표)
+        
+        MoE 논문에서 표준적으로 사용하는 지표들:
+        1. Expert별 처리 토큰 수 (per-expert token count)
+        2. Load balancing coefficient (CV - coefficient of variation)
+        3. Expert utilization rate
+        4. Load imbalance ratio
+        
+        Returns:
+            Load balancing 관련 지표 딕셔너리
+        """
+        # selected_experts: [batch*seq, top_k]
+        # routing_weights: [batch*seq, top_k]
+        
+        batch_seq_len = selected_experts.size(0)
+        top_k = selected_experts.size(1)
+        
+        # Expert별 토큰 수 계산 (각 토큰이 top_k개 expert에 할당되므로 가중치 고려)
+        expert_token_counts = torch.zeros(self.num_experts, device=selected_experts.device, dtype=torch.float32)
+        expert_weighted_counts = torch.zeros(self.num_experts, device=selected_experts.device, dtype=torch.float32)
+        
+        # 각 expert가 처리한 토큰 수 (가중치 포함)
+        for i in range(batch_seq_len):
+            for j in range(top_k):
+                expert_idx = selected_experts[i, j].item()
+                weight = routing_weights[i, j].item()
+                expert_token_counts[expert_idx] += 1.0
+                expert_weighted_counts[expert_idx] += weight
+        
+        # Expert별 활성화 횟수 (가중치 없이)
+        expert_activation_counts = torch.zeros(self.num_experts, device=selected_experts.device, dtype=torch.long)
+        selected_flat = selected_experts.flatten()
+        for expert_idx in range(self.num_experts):
+            expert_activation_counts[expert_idx] = (selected_flat == expert_idx).sum().long()
+        
+        # Load Balancing Coefficient (CV - Coefficient of Variation)
+        # Switch Transformer, GShard 등에서 사용하는 표준 지표
+        # CV = std / mean (낮을수록 균형이 좋음)
+        token_counts_mean = expert_token_counts.mean().item()
+        token_counts_std = expert_token_counts.std().item()
+        load_balancing_coefficient = token_counts_std / (token_counts_mean + 1e-8)
+        
+        # Weighted load balancing coefficient
+        weighted_counts_mean = expert_weighted_counts.mean().item()
+        weighted_counts_std = expert_weighted_counts.std().item()
+        weighted_load_balancing_coefficient = weighted_counts_std / (weighted_counts_mean + 1e-8)
+        
+        # Load Imbalance Ratio: max / mean (1에 가까울수록 균형이 좋음)
+        load_imbalance_ratio = expert_token_counts.max().item() / (token_counts_mean + 1e-8)
+        weighted_load_imbalance_ratio = expert_weighted_counts.max().item() / (weighted_counts_mean + 1e-8)
+        
+        # Expert Utilization Rate: 실제로 사용된 expert 비율
+        expert_utilization_rate = (expert_token_counts > 0).float().mean().item()
+        
+        # Expert별 처리 비율 (정규화)
+        total_tokens = expert_token_counts.sum().item()
+        expert_token_proportions = (expert_token_counts / (total_tokens + 1e-8)).cpu().numpy().tolist()
+        
+        # Ideal distribution: 모든 expert가 균등하게 처리한다면 1/num_experts
+        ideal_proportion = 1.0 / self.num_experts
+        expert_proportion_entropy = -(torch.tensor(expert_token_proportions) * 
+                                     torch.log(torch.tensor(expert_token_proportions) + 1e-8)).sum().item()
+        max_entropy = np.log(self.num_experts)
+        normalized_proportion_entropy = expert_proportion_entropy / max_entropy
+        
+        # Expert별 평균 routing weight
+        expert_avg_weights = torch.zeros(self.num_experts, device=selected_experts.device, dtype=torch.float32)
+        expert_weight_counts = torch.zeros(self.num_experts, device=selected_experts.device, dtype=torch.float32)
+        
+        for i in range(batch_seq_len):
+            for j in range(top_k):
+                expert_idx = selected_experts[i, j].item()
+                weight = routing_weights[i, j].item()
+                expert_avg_weights[expert_idx] += weight
+                expert_weight_counts[expert_idx] += 1.0
+        
+        expert_avg_weights = expert_avg_weights / (expert_weight_counts + 1e-8)
+        expert_avg_weight_mean = expert_avg_weights.mean().item()
+        expert_avg_weight_std = expert_avg_weights.std().item()
+        
+        return {
+            'expert_token_counts': expert_token_counts.cpu().numpy().tolist(),
+            'expert_weighted_counts': expert_weighted_counts.cpu().numpy().tolist(),
+            'expert_activation_counts': expert_activation_counts.cpu().numpy().tolist(),
+            'load_balancing_coefficient': load_balancing_coefficient,
+            'weighted_load_balancing_coefficient': weighted_load_balancing_coefficient,
+            'load_imbalance_ratio': load_imbalance_ratio,
+            'weighted_load_imbalance_ratio': weighted_load_imbalance_ratio,
+            'expert_utilization_rate': expert_utilization_rate,
+            'expert_token_proportions': expert_token_proportions,
+            'expert_proportion_entropy': normalized_proportion_entropy,
+            'expert_avg_routing_weight_mean': expert_avg_weight_mean,
+            'expert_avg_routing_weight_std': expert_avg_weight_std,
+            'total_tokens_processed': int(total_tokens),
+        }
+    
     def get_aggregated_metrics(self) -> Dict[str, float]:
-        """전체 학습 과정에 대한 집계 지표"""
+        """전체 학습 과정에 대한 집계 지표 (논문용)"""
         if not self.gram_matrix_history:
             return {}
         
-        return {
+        metrics = {
             'avg_gram_orthogonality': np.mean(self.gram_matrix_history),
             'std_gram_orthogonality': np.std(self.gram_matrix_history),
             'avg_speciality_penalty': np.mean(self.speciality_penalty_history),
             'avg_cosine_similarity': np.mean(self.cosine_similarity_history),
         }
+        
+        # Load balancing 집계 지표
+        if self.load_balancing_coefficient_history:
+            metrics['avg_load_balancing_coefficient'] = np.mean(self.load_balancing_coefficient_history)
+            metrics['std_load_balancing_coefficient'] = np.std(self.load_balancing_coefficient_history)
+            metrics['final_load_balancing_coefficient'] = self.load_balancing_coefficient_history[-1]
+        
+        # Expert token counts 집계
+        if self.expert_token_counts_history:
+            # 모든 스텝의 expert token counts를 평균
+            all_counts = np.array(self.expert_token_counts_history)  # [num_steps, num_experts]
+            avg_expert_token_counts = all_counts.mean(axis=0).tolist()
+            std_expert_token_counts = all_counts.std(axis=0).tolist()
+            final_expert_token_counts = all_counts[-1].tolist()
+            
+            metrics['avg_expert_token_counts'] = avg_expert_token_counts
+            metrics['std_expert_token_counts'] = std_expert_token_counts
+            metrics['final_expert_token_counts'] = final_expert_token_counts
+            
+            # 최종 스텝의 load balancing 지표
+            final_counts = torch.tensor(final_expert_token_counts)
+            final_mean = final_counts.mean().item()
+            final_std = final_counts.std().item()
+            metrics['final_load_balancing_cv'] = final_std / (final_mean + 1e-8)
+            metrics['final_load_imbalance_ratio'] = final_counts.max().item() / (final_mean + 1e-8)
+        
+        return metrics
     
     def save_analysis(self, filepath: str):
-        """분석 결과 저장"""
+        """분석 결과 저장 (논문용 데이터 포함)"""
         analysis_data = {
             'aggregated_metrics': self.get_aggregated_metrics(),
             'gram_matrix_history': self.gram_matrix_history,
             'speciality_penalty_history': self.speciality_penalty_history,
             'cosine_similarity_history': self.cosine_similarity_history,
+            'load_balancing_coefficient_history': self.load_balancing_coefficient_history,
+            'expert_token_counts_history': self.expert_token_counts_history,
         }
         
         with open(filepath, 'w') as f:
             json.dump(analysis_data, f, indent=2)
+    
+    def get_paper_metrics_summary(self) -> Dict[str, Any]:
+        """
+        논문에 포함할 주요 지표 요약
+        
+        Returns:
+            논문에 포함할 핵심 지표들
+        """
+        aggregated = self.get_aggregated_metrics()
+        
+        if not aggregated:
+            return {}
+        
+        # 논문에 포함할 핵심 지표들
+        summary = {
+            # Load Balancing Metrics (필수)
+            'load_balancing': {
+                'coefficient_of_variation': aggregated.get('final_load_balancing_cv', 0.0),
+                'load_imbalance_ratio': aggregated.get('final_load_imbalance_ratio', 0.0),
+                'expert_utilization_rate': aggregated.get('expert_utilization_rate', 0.0),
+                'expert_token_distribution': aggregated.get('final_expert_token_counts', []),
+            },
+            
+            # Expert Specialization Metrics (필수)
+            'expert_specialization': {
+                'expert_diversity_score': aggregated.get('expert_diversity_score', 0.0),
+                'expert_similarity_mean': aggregated.get('expert_similarity_mean', 0.0),
+                'expert_specialization_strength': aggregated.get('expert_specialization_strength', 0.0),
+            },
+            
+            # Gram Matrix Quality
+            'gram_matrix_quality': {
+                'orthogonality': aggregated.get('avg_gram_orthogonality', 0.0),
+                'orthogonality_std': aggregated.get('std_gram_orthogonality', 0.0),
+            },
+            
+            # Routing Quality
+            'routing_quality': {
+                'routing_confidence': aggregated.get('routing_confidence', 0.0),
+                'cosine_similarity_mean': aggregated.get('avg_cosine_similarity', 0.0),
+            },
+        }
+        
+        return summary
 
