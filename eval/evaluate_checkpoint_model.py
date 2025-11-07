@@ -29,12 +29,13 @@ from models import G3MoEModel, G3MoETextModel, G3MoEConfig, G3MoEForCausalLM, G3
 from transformers.modeling_utils import VLMS
 from eval.gramspec_moe_analysis import GramSpecAnalyzer
 
+os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 # Register models
 AutoConfig.register("g3moe", G3MoEConfig)
 AutoConfig.register("g3moe_text", G3MoETextConfig)
 AutoModel.register(G3MoEConfig, G3MoEModel)
 AutoModel.register(G3MoETextConfig, G3MoETextModel)
-AutoModelForCausalLM.register(G3MoETextConfig, G3MoEForCausalLM)
+AutoModelForCausalLM.register(G3MoEConfig, G3MoEForConditionalGeneration)
 VLMS.append("g3moe")
 
 
@@ -273,329 +274,259 @@ def prepare_evaluation_data(
     use_training_eval_set: bool = True,
 ) -> List[Dict[str, torch.Tensor]]:
     """
-    평가용 데이터 준비
+    평가용 데이터 준비 (streaming 모드)
     
-    Options:
-    1. 학습에 사용한 test split 사용 (use_training_eval_set=True)
-    2. HuggingFace 데이터셋 사용 (dataset_name 지정)
-    3. VLM 평가 데이터셋 사용 (MME, VQAv2 등)
+    HuggingFace Hub에서 streaming 모드로 데이터를 로드합니다.
     """
+    from datasets import load_dataset
+    from datasets.iterable_dataset import IterableDataset
+    from itertools import islice
+    
     inputs_list = []
     
+    if not dataset_name:
+        raise ValueError("dataset_name must be provided")
+    
     # Option 1: 학습에 사용한 test split 사용
-    if use_training_eval_set and dataset_name:
-        try:
-            from data.simple_sft_dataset import get_simple_sft_dataset
-            print(f"Loading training eval set from: {dataset_name}")
-            dataset = get_simple_sft_dataset(
-                dataset_name=dataset_name,
-                tokenizer=tokenizer,
-                max_length=max_length,
-                max_samples=num_samples,
-                test_size=0.1,
-                use_streaming=False
-            )
-            
-            eval_dataset = dataset.get("test", None)
-            if eval_dataset is not None:
-                print(f"✅ Loaded {len(eval_dataset)} eval samples from training dataset")
-                eval_dataset = eval_dataset.select(range(min(num_samples, len(eval_dataset))))
-                
-                for sample in tqdm(eval_dataset, desc="Preparing eval data"):
-                    # VLM 데이터셋인 경우 이미지 포함
-                    if 'images' in sample and sample['images']:
-                        # 이미지가 있는 경우
-                        messages = sample.get('messages', [])
-                        if messages:
-                            # Chat template 적용
-                            if hasattr(tokenizer, 'apply_chat_template'):
-                                text = tokenizer.apply_chat_template(
-                                    messages,
-                                    add_generation_prompt=True,
-                                    tokenize=False
-                                )
-                            else:
-                                text = str(messages)
-                            
-                            # 이미지와 텍스트 함께 처리
-                            images = sample['images']
-                            if isinstance(images, list) and len(images) > 0:
-                                inputs = tokenizer(
-                                    text=text,
-                                    images=images[0] if len(images) == 1 else images,
-                                    return_tensors="pt",
-                                    truncation=True,
-                                    max_length=max_length,
-                                    padding="max_length",
-                                )
-                            else:
-                                inputs = tokenizer(
-                                    text=text,
-                                    return_tensors="pt",
-                                    truncation=True,
-                                    max_length=max_length,
-                                    padding="max_length",
-                                )
-                        else:
-                            continue
-                    else:
-                        # 텍스트만 있는 경우
-                        messages = sample.get('messages', [])
-                        if messages:
-                            if hasattr(tokenizer, 'apply_chat_template'):
-                                text = tokenizer.apply_chat_template(
-                                    messages,
-                                    add_generation_prompt=True,
-                                    tokenize=False
-                                )
-                            else:
-                                text = str(messages)
-                            
-                            inputs = tokenizer(
-                                text=text,
-                                return_tensors="pt",
-                                truncation=True,
-                                max_length=max_length,
-                                padding="max_length",
-                            )
-                        else:
-                            continue
-                    
-                    if "token_type_ids" in inputs:
-                        del inputs["token_type_ids"]
-                    inputs_list.append(inputs)
-                
-                return inputs_list
-        except Exception as e:
-            print(f"⚠️ Failed to load training eval set: {e}")
-            print("Falling back to default samples...")
-    
-    # Option 2: VLM 평가 데이터셋 사용
-    if dataset_name and dataset_name.lower() in ['mme', 'vqav2', 'textvqa', 'imagenet1k', 'imagenet-1k']:
-        try:
-            from datasets import load_dataset
-            from PIL import Image
-            import requests
-            from io import BytesIO
-            
-            print(f"Loading VLM evaluation dataset: {dataset_name}")
-            
-            if dataset_name.lower() == 'mme':
-                dataset = load_dataset("MMMU/MME")
-                # MME는 여러 task로 구성
-                tasks = ['color', 'count', 'position', 'posters', 'ocr']
-                for task in tasks[:2]:  # 처음 2개 task만 사용
-                    if task in dataset:
-                        task_data = dataset[task].select(range(min(num_samples // 2, len(dataset[task]))))
-                        for sample in tqdm(task_data, desc=f"Loading {task}"):
-                            image = sample['image']
-                            question = sample['question']
-                            prompt = f"<image>\n{question}\nAnswer:"
-                            
-                            inputs = tokenizer(
-                                text=[prompt],
-                                images=[image],
-                                return_tensors="pt",
-                                truncation=True,
-                                max_length=max_length,
-                            )
-                            if "token_type_ids" in inputs:
-                                del inputs["token_type_ids"]
-                            inputs_list.append(inputs)
-            
-            elif dataset_name.lower() == 'vqav2':
-                print("Loading VQAv2 dataset from HuggingFace...")
-                try:
-                    # VQAv2 데이터셋 로드
-                    dataset = load_dataset("lmms-lab/VQAv2", split="validation")
-                except:
-                    # 대체 경로 시도
-                    try:
-                        dataset = load_dataset("datalab/vqa_v2", split="validation")
-                    except:
-                        dataset = load_dataset("Antonio/vqa_v2", split="validation")
-                
-                dataset = dataset.select(range(min(num_samples, len(dataset))))
-                
-                for sample in tqdm(dataset, desc="Loading VQAv2"):
-                    try:
-                        # 이미지 로드
-                        if 'image' in sample:
-                            image = sample['image']
-                        elif 'image_url' in sample:
-                            # URL에서 이미지 다운로드
-                            img_url = sample['image_url']
-                            response = requests.get(img_url, timeout=10)
-                            image = Image.open(BytesIO(response.content)).convert('RGB')
-                        elif 'image_path' in sample:
-                            image = Image.open(sample['image_path']).convert('RGB')
-                        else:
-                            continue
-                        
-                        # 질문 추출
-                        question = sample.get('question', sample.get('text', ''))
-                        if not question:
-                            continue
-                        
-                        # 프롬프트 생성
-                        prompt = f"<image>\nQuestion: {question}\nAnswer:"
-                        
-                        inputs = tokenizer(
-                            text=[prompt],
-                            images=[image],
-                            return_tensors="pt",
-                            truncation=True,
-                            max_length=max_length,
-                        )
-                        if "token_type_ids" in inputs:
-                            del inputs["token_type_ids"]
-                        inputs_list.append(inputs)
-                    except Exception as e:
-                        print(f"⚠️ Error loading VQAv2 sample: {e}")
-                        continue
-            
-            elif dataset_name.lower() == 'textvqa':
-                print("Loading TextVQA dataset from HuggingFace...")
-                try:
-                    dataset = load_dataset("lmms-lab/TextVQA", split="validation")
-                except:
-                    try:
-                        dataset = load_dataset("textvqa", split="validation")
-                    except:
-                        dataset = load_dataset("HuggingFaceM4/TextVQA", split="validation")
-                
-                dataset = dataset.select(range(min(num_samples, len(dataset))))
-                
-                for sample in tqdm(dataset, desc="Loading TextVQA"):
-                    try:
-                        # 이미지 로드
-                        if 'image' in sample:
-                            image = sample['image']
-                        elif 'image_url' in sample:
-                            img_url = sample['image_url']
-                            response = requests.get(img_url, timeout=10)
-                            image = Image.open(BytesIO(response.content)).convert('RGB')
-                        elif 'image_path' in sample:
-                            image = Image.open(sample['image_path']).convert('RGB')
-                        else:
-                            continue
-                        
-                        # 질문 추출
-                        question = sample.get('question', sample.get('text', ''))
-                        if not question:
-                            continue
-                        
-                        # 프롬프트 생성 (TextVQA는 텍스트가 포함된 이미지에 대한 질문)
-                        prompt = f"<image>\nQuestion: {question}\nAnswer the question based on the text visible in the image:"
-                        
-                        inputs = tokenizer(
-                            text=[prompt],
-                            images=[image],
-                            return_tensors="pt",
-                            truncation=True,
-                            max_length=max_length,
-                        )
-                        if "token_type_ids" in inputs:
-                            del inputs["token_type_ids"]
-                        inputs_list.append(inputs)
-                    except Exception as e:
-                        print(f"⚠️ Error loading TextVQA sample: {e}")
-                        continue
-            
-            elif dataset_name.lower() in ['imagenet1k', 'imagenet-1k']:
-                print("Loading ImageNet-1k dataset from HuggingFace...")
-                try:
-                    # ImageNet-1k 데이터셋 로드
-                    dataset = load_dataset("imagenet-1k", split="validation")
-                except:
-                    try:
-                        dataset = load_dataset("Maysee/tiny-imagenet", split="validation")
-                        print("⚠️ Using tiny-imagenet as fallback")
-                    except:
-                        # ImageNet 직접 경로 시도
-                        try:
-                            dataset = load_dataset("laion/laion400m", split="train", streaming=True)
-                            print("⚠️ Using LAION-400M as fallback (will sample first N)")
-                            dataset = list(dataset.take(num_samples))
-                        except Exception as e:
-                            raise Exception(f"Could not load ImageNet-1k: {e}")
-                
-                # ImageNet은 이미지 분류이므로 클래스 이름을 질문으로 사용
-                if not isinstance(dataset, list):
-                    dataset = dataset.select(range(min(num_samples, len(dataset))))
-                
-                for sample in tqdm(dataset, desc="Loading ImageNet-1k"):
-                    try:
-                        # 이미지 로드
-                        if 'image' in sample:
-                            image = sample['image']
-                        elif 'img' in sample:
-                            image = sample['img']
-                        else:
-                            continue
-                        
-                        # 레이블 추출
-                        label = sample.get('label', sample.get('labels', None))
-                        label_text = sample.get('label_text', sample.get('class_name', ''))
-                        
-                        # 프롬프트 생성 (이미지 분류)
-                        if label_text:
-                            prompt = f"<image>\nWhat is the main object or class in this image? Answer with a single word or short phrase:"
-                        else:
-                            prompt = f"<image>\nWhat is the main object or class in this image? Answer with a single word or short phrase:"
-                        
-                        inputs = tokenizer(
-                            text=[prompt],
-                            images=[image],
-                            return_tensors="pt",
-                            truncation=True,
-                            max_length=max_length,
-                        )
-                        if "token_type_ids" in inputs:
-                            del inputs["token_type_ids"]
-                        
-                        # 레이블 정보도 함께 저장 (정확도 계산용)
-                        inputs['label'] = label
-                        inputs['label_text'] = label_text
-                        inputs_list.append(inputs)
-                    except Exception as e:
-                        print(f"⚠️ Error loading ImageNet-1k sample: {e}")
-                        continue
-            
-            if inputs_list:
-                print(f"✅ Successfully loaded {len(inputs_list)} samples from {dataset_name}")
-                return inputs_list
-        except Exception as e:
-            import traceback
-            print(f"⚠️ Failed to load VLM dataset {dataset_name}: {e}")
-            traceback.print_exc()
-            print("Falling back to default samples...")
-    
-    # Option 3: 기본 샘플 (fallback)
-    print("Using default text samples...")
-    sample_texts = [
-        "The capital of France is Paris.",
-        "Machine learning is a subset of artificial intelligence.",
-        "Python is a popular programming language.",
-        "The Earth orbits around the Sun.",
-        "Water boils at 100 degrees Celsius at sea level.",
-    ] * (num_samples // 5 + 1)
-    
-    sample_texts = sample_texts[:num_samples]
-    
-    for text in tqdm(sample_texts, desc="Preparing evaluation data"):
-        inputs = tokenizer(
-            text,
-            return_tensors="pt",
-            truncation=True,
+    if use_training_eval_set:
+        from data.simple_sft_dataset import get_simple_sft_dataset
+        print(f"Loading training eval set from: {dataset_name} (streaming mode)")
+        
+        dataset = get_simple_sft_dataset(
+            dataset_name=dataset_name,
+            tokenizer=tokenizer,
             max_length=max_length,
-            padding="max_length",
+            max_samples=num_samples,
+            test_size=0.1,
+            use_streaming=True
         )
-        if "token_type_ids" in inputs:
-            del inputs["token_type_ids"]
-        inputs_list.append(inputs)
+        
+        eval_dataset = dataset.get("test", None)
+        if eval_dataset is None:
+            raise ValueError(f"No test split found in dataset: {dataset_name}")
+        
+        print(f"✅ Loaded eval dataset (streaming mode)")
+        
+        # Streaming 데이터셋 처리
+        sample_count = 0
+        for sample in tqdm(eval_dataset, desc="Preparing eval data", total=num_samples):
+            if sample_count >= num_samples:
+                break
+            
+            # VLM 데이터셋인 경우 이미지 포함
+            if 'images' in sample and sample['images']:
+                messages = sample.get('messages', [])
+                if not messages:
+                    continue
+                
+                # Chat template 적용
+                if hasattr(tokenizer, 'apply_chat_template'):
+                    text = tokenizer.apply_chat_template(
+                        messages,
+                        add_generation_prompt=True,
+                        tokenize=False
+                    )
+                else:
+                    text = str(messages)
+                
+                # 이미지와 텍스트 함께 처리
+                images = sample['images']
+                if isinstance(images, list) and len(images) > 0:
+                    inputs = tokenizer(
+                        text=text,
+                        images=images[0] if len(images) == 1 else images,
+                        return_tensors="pt",
+                        truncation=True,
+                        max_length=max_length,
+                        padding="max_length",
+                    )
+                else:
+                    inputs = tokenizer(
+                        text=text,
+                        return_tensors="pt",
+                        truncation=True,
+                        max_length=max_length,
+                        padding="max_length",
+                    )
+            else:
+                # 텍스트만 있는 경우
+                messages = sample.get('messages', [])
+                if not messages:
+                    continue
+                
+                if hasattr(tokenizer, 'apply_chat_template'):
+                    text = tokenizer.apply_chat_template(
+                        messages,
+                        add_generation_prompt=True,
+                        tokenize=False
+                    )
+                else:
+                    text = str(messages)
+                
+                inputs = tokenizer(
+                    text=text,
+                    return_tensors="pt",
+                    truncation=True,
+                    max_length=max_length,
+                    padding="max_length",
+                )
+            
+            if "token_type_ids" in inputs:
+                del inputs["token_type_ids"]
+            inputs_list.append(inputs)
+            sample_count += 1
+        
+        print(f"✅ Successfully loaded {len(inputs_list)} samples from {dataset_name}")
+        return inputs_list
     
-    return inputs_list
+    # Option 2: HuggingFace Hub에서 직접 로드 (streaming 모드)
+    print(f"Loading dataset from HuggingFace Hub: {dataset_name} (streaming mode)")
+    
+    # 데이터셋 이름에서 split 추출 (형식: "dataset_name:split" 필수)
+    if ':' not in dataset_name:
+        raise ValueError(
+            f"Dataset name must include split in format 'dataset_name:split'. "
+            f"Got: {dataset_name}. Example: 'lmms-lab/VQAv2:validation'"
+        )
+    
+    dataset_path, split_name = dataset_name.split(':', 1)
+    
+    try:
+        # Streaming 모드로 데이터셋 로드
+        dataset = load_dataset(
+            dataset_path,
+            split=split_name,
+            streaming=True
+        )
+        
+        if not isinstance(dataset, IterableDataset):
+            raise ValueError(f"Expected IterableDataset, got {type(dataset)}")
+        
+        print(f"✅ Loaded dataset in streaming mode")
+        
+        # Streaming 데이터셋에서 샘플 추출
+        sample_count = 0
+        for sample in tqdm(islice(dataset, num_samples), desc="Preparing eval data", total=num_samples):
+            try:
+                # 이미지 처리
+                image = None
+                if 'image' in sample:
+                    image = sample['image']
+                elif 'images' in sample:
+                    images = sample['images']
+                    if isinstance(images, list) and len(images) > 0:
+                        image = images[0]
+                    elif images:
+                        image = images
+                
+                # 텍스트/질문 처리
+                question = None
+                if 'question' in sample:
+                    question = sample['question']
+                elif 'text' in sample:
+                    question = sample['text']
+                elif 'prompt' in sample:
+                    question = sample['prompt']
+                elif 'messages' in sample:
+                    messages = sample['messages']
+                    if hasattr(tokenizer, 'apply_chat_template'):
+                        question = tokenizer.apply_chat_template(
+                            messages,
+                            add_generation_prompt=True,
+                            tokenize=False
+                        )
+                    else:
+                        question = str(messages)
+                
+                if not question:
+                    continue
+                
+                # 프롬프트 생성
+                if image is not None:
+                    prompt =  tokenizer.apply_chat_template(
+                            [
+                                {
+                                    "role": "system",
+                                    "content": [
+                                        {"type": "text", "text": "You are a helpful assistant."}
+                                    ]
+                                },
+                                {
+                                    "role": "user",
+                                    "content": [
+                                        {"type": "text", "text": question},
+                                        {"type": "image"}
+                                    ]
+                                }
+                            ],
+                            # tokenize=True,
+                            add_generation_prompt=True,
+                            # return_tensors="pt",
+                            # return_dict=True,
+                        )
+                    inputs = tokenizer(
+                        text=prompt,
+                        images=[image],
+                        return_tensors="pt",
+                        truncation=True,
+                        max_length=max_length,
+                        padding="max_length",
+                    )
+                else:
+                    prompt =  tokenizer.apply_chat_template(
+                            [
+                                {
+                                    "role": "system",
+                                    "content": [
+                                        {"type": "text", "text": "You are a helpful assistant."}
+                                    ]
+                                },
+                                {
+                                    "role": "user",
+                                    "content": [
+                                        {"type": "text", "text": question}
+                                    ]
+                                }
+                            ],
+                            # tokenize=True,
+                            add_generation_prompt=True,
+                            # return_tensors="pt",
+                            # return_dict=True,
+                        )
+                    inputs = tokenizer(
+                        text=prompt,
+                        return_tensors="pt",
+                        truncation=True,
+                        max_length=max_length,
+                        padding="max_length",
+                    )
+                
+                if "token_type_ids" in inputs:
+                    del inputs["token_type_ids"]
+                
+                # 레이블 정보가 있으면 함께 저장
+                if 'label' in sample:
+                    inputs['label'] = sample['label']
+                if 'label_text' in sample:
+                    inputs['label_text'] = sample['label_text']
+                if 'answer' in sample:
+                    inputs['answer'] = sample['answer']
+                
+                inputs_list.append(inputs)
+                sample_count += 1
+                
+            except Exception as e:
+                print(f"⚠️ Error processing sample: {e}")
+                continue
+        
+        print(f"✅ Successfully loaded {len(inputs_list)} samples from {dataset_name}")
+        return inputs_list
+        
+    except Exception as e:
+        import traceback
+        print(f"❌ Failed to load dataset {dataset_name}: {e}")
+        traceback.print_exc()
+        raise
 
 
 def evaluate_model(
@@ -615,13 +546,18 @@ def evaluate_model(
     collector.register_hooks(model)
     
     model.eval()
-    eval_data = eval_data[:max_samples] if max_samples else eval_data
     
-    print(f"Evaluating on {len(eval_data)} samples...")
+    # max_samples가 지정된 경우 제한
+    if max_samples:
+        eval_data = eval_data[:max_samples]
+    
+    num_samples = len(eval_data)
+    print(f"Evaluating on {num_samples} samples...")
+    
     with torch.no_grad():
-        for i, inputs in enumerate(tqdm(eval_data, desc="Evaluating")):
+        for i, inputs in enumerate(tqdm(eval_data, desc="Evaluating", total=num_samples)):
             # Move to device
-            inputs = {k: v.to(device) for k, v in inputs.items()}
+            inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
             
             # Forward pass
             try:
@@ -643,34 +579,54 @@ def evaluate_model(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate checkpoint model with GramSpec analysis")
-    parser.add_argument("--checkpoint_path", type=str, required=True,
-                       help="Path to checkpoint directory")
-    parser.add_argument("--base_model", type=str, default="Gunulhona/Gemma-3-4B",
-                       help="Base model name")
-    parser.add_argument("--num_samples", type=int, default=100,
-                       help="Number of evaluation samples")
-    parser.add_argument("--max_length", type=int, default=512,
-                       help="Maximum sequence length")
-    parser.add_argument("--output_dir", type=str, default="./evaluation_results",
-                       help="Output directory for results")
-    parser.add_argument("--device", type=str, default="cuda",
-                       help="Device to use")
-    parser.add_argument("--num_experts", type=int, default=8,
-                       help="Number of experts (from config)")
-    parser.add_argument("--router_dim", type=int, default=128,
-                       help="Router dimension")
-    parser.add_argument("--eval_dataset", type=str, default=None,
-                       help="Evaluation dataset name (e.g., 'HuggingFaceTB/smoltalk' for training eval set, or 'mme', 'vqav2', 'textvqa', 'imagenet1k' for VLM benchmarks)")
-    parser.add_argument("--use_training_eval_set", action="store_true",
-                       help="Use test split from training dataset")
+    parser = argparse.ArgumentParser(
+        description="Evaluate checkpoint model with GramSpec analysis")
+    parser.add_argument(
+        "--checkpoint_path",
+        type=str,
+        required=True,
+        help="Path to checkpoint directory")
+    parser.add_argument(
+        "--base_model",
+        type=str,
+        default="Gunulhona/Gemma-3-4B",
+        help="Base model name")
+    parser.add_argument(
+        "--num_samples",
+        type=int,
+        default=100,
+        help="Number of evaluation samples")
+    parser.add_argument(
+        "--max_length",
+        type=int,
+        default=512,
+        help="Maximum sequence length")
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="./evaluation_results",
+        help="Output directory for results")
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cuda",
+        help="Device to use")
+    parser.add_argument(
+        "--eval_dataset",
+        type=str,
+        required=True,
+        help="Evaluation dataset name from HuggingFace Hub. Format: 'dataset_name:split' (e.g., 'lmms-lab/VQAv2:validation'). All datasets are loaded in streaming mode.")
+    parser.add_argument(
+        "--use_training_eval_set",
+        action="store_true",
+        help="Use test split from training dataset (streaming mode)")
     
     args = parser.parse_args()
     
     # MoE config (checkpoint에서 가져와야 하지만, 여기서는 기본값 사용)
     moe_config = {
         "n_shared_experts": 1,
-        "n_routed_experts": args.num_experts,
+        "n_routed_experts": 8,
         "n_group": 2,
         "topk_group": 2,
         "num_experts_per_tok": 2,
@@ -701,8 +657,8 @@ def main():
     
     # Analyzer 초기화
     analyzer = GramSpecAnalyzer(
-        num_experts=args.num_experts,
-        router_dim=args.router_dim,
+        num_experts=moe_config.get('n_routed_experts', 8),
+        router_dim=moe_config.get('router_dim', 128),
     )
     
     # 평가 데이터 준비
