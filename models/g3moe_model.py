@@ -70,7 +70,6 @@ from transformers.configuration_utils import PretrainedConfig
 from transformers import logging
 from transformers.utils.deprecation import deprecate_kwarg
 from transformers import AutoModel, AutoConfig, AutoModelForCausalLM
-from transformers.modeling_utils import set_initialized_submodules
 from .g3moe_config import G3MoEConfig, G3MoETextConfig
 
 if is_torch_flex_attn_available():

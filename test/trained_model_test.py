@@ -23,7 +23,7 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 
 
 # 학습된 체크포인트 경로 (예시)
-checkpoint_path = "/mls/conan/training_logs/outputs/checkpoint-150"
+checkpoint_path = "/mls/conan/training_logs/outputs/checkpoint-200"
 
 
 
@@ -74,6 +74,8 @@ model = PeftModel.from_pretrained(
             pretrained_model_name_or_path=base_model_name,
             config=model_config,
             torch_dtype=torch.bfloat16,
+            low_cpu_mem_usage=True,
+            offload_state_dict=True,
             use_cache=False,
             attn_implementation="flash_attention_3",
         ).to("cuda"),
@@ -95,12 +97,12 @@ Always answer in shortest possible sentence.<end_of_turn>
 
 test_input = tokenizer.apply_chat_template(
     [
-        {
-            "role": "system",
-            "content": [
-                {"type": "text", "text": test_text.strip()}
-            ]
-        },
+        # {
+        #     "role": "system",
+        #     "content": [
+        #         {"type": "text", "text": test_text.strip()}
+        #     ]
+        # },
         {
             "role": "user",
             "content": [
@@ -135,7 +137,7 @@ if "token_type_ids" in inputs:
 # 실제 forward pass를 위해 sample inputs 사용
 with torch.inference_mode():
     # torch._dynamo.config.capture_dynamic_output_shape_ops = True
-    fast_inputs =tokenizer(text="Jack Hallow's What's poppin?", return_tensors="pt")
+    fast_inputs = tokenizer(text="<start_of_turn>user\nJack Hallow's What's poppin?<end_of_turn>\n\n<start_of_turn>model\nJack Hallow's What's poppin? is the song", return_tensors="pt")
     del fast_inputs["token_type_ids"]
     response =tokenizer.batch_decode(
         model.generate(

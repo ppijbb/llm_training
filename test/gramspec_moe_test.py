@@ -11,7 +11,7 @@ import time
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
-from transformers import AutoModelForCausalLM, AutoConfig, AutoTokenizer
+from transformers import AutoModelForCausalLM, Gemma3ForConditionalGeneration, Qwen3VLForConditionalGeneration, AutoTokenizer
 from models.gramspec_moe import upcycle_model_to_moe, GramSpecRouter
 from models.g3moe_model import G3MoEMLP
 
@@ -711,7 +711,7 @@ def example_llama_to_moe():
         "hidden_activation": "silu",
     }
     
-    print("Upcycling Qwen3 to MoE...")
+    print("Upcycling Llama 3.2 to MoE...")
     model_after = upcycle_model_to_moe(
         model_before, 
         moe_config,
@@ -721,7 +721,7 @@ def example_llama_to_moe():
     )
     
     print("Conversion complete!")
-    print_size_comparison(params_before, model_after, "Qwen3")
+    print_size_comparison(params_before, model_after, "Llama 3.2")
     
     # Prepare input for testing
     text_input_after = create_text_input(tokenizer, test_text="What is the capital of France?", max_length=128)
@@ -733,12 +733,12 @@ def example_llama_to_moe():
     # Measure forward speed after upcycling
     print("Measuring forward speed after upcycling...")
     speed_after = measure_forward_speed(model_after, text_input_after, num_runs=10, warmup_runs=3)
-    print_speed_comparison(speed_before, speed_after, "Qwen3")
+    print_speed_comparison(speed_before, speed_after, "Llama 3.2")
     
     # Measure generation speed AFTER upcycling
     print("Measuring generation speed after upcycling (max_new_tokens=32)...")
     gen_speed_after = measure_generation_speed(model_after, tokenizer, text_input_after, max_new_tokens=32, num_runs=5, warmup_runs=2)
-    print_speed_comparison(gen_speed_before, gen_speed_after, "Qwen3", is_generation=True)
+    print_speed_comparison(gen_speed_before, gen_speed_after, "Llama 3.2", is_generation=True)
     
     return model_after
 
@@ -746,8 +746,8 @@ def example_llama_to_moe():
 def example_gemma3_to_moe():
     """Example: Convert Gemma 3 to MoE"""
     print("Loading Gemma 3 model...")
-    model_name = "google/gemma-3-1b-it"
-    model_before = AutoModelForCausalLM.from_pretrained(model_name)
+    model_name = "google/gemma-3-4b-it"
+    model_before = Gemma3ForConditionalGeneration.from_pretrained(model_name)
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     
     # Count parameters before upcycling
@@ -765,8 +765,8 @@ def example_gemma3_to_moe():
     
     # Define MoE configuration
     moe_config = {
-        "hidden_size": model_before.config.hidden_size,
-        "intermediate_size": model_before.config.intermediate_size,
+        "hidden_size": model_before.config.text_config.hidden_size,
+        "intermediate_size": model_before.config.text_config.intermediate_size,
         "num_experts": 3,
         "num_experts_per_tok": 1,  # Must be <= num_experts
         "router_dim": 128,
@@ -816,7 +816,7 @@ def example_qwen3_to_moe():
     """Example: Convert Qwen 3 VL to MoE"""
     print("Loading Qwen 3 VL model...")
     model_name = "Qwen/Qwen3-VL-4B-Instruct"
-    model_before = AutoModelForCausalLM.from_pretrained(model_name)
+    model_before = Qwen3VLForConditionalGeneration.from_pretrained(model_name, trust_remote_code=True)
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     
     # Count parameters before upcycling
@@ -834,8 +834,8 @@ def example_qwen3_to_moe():
     
     # Define MoE configuration
     moe_config = {
-        "hidden_size": model_before.config.hidden_size,
-        "intermediate_size": model_before.config.intermediate_size,
+        "hidden_size": model_before.config.text_config.hidden_size,
+        "intermediate_size": model_before.config.text_config.intermediate_size,
         "num_experts": 3,
         "num_experts_per_tok": 1,  # Must be <= num_experts
         "router_dim": 128,
@@ -849,7 +849,7 @@ def example_qwen3_to_moe():
         "hidden_activation": "silu",
     }
     
-    print("Upcycling Llama 3.2 to MoE...")
+    print("Upcycling Qwen3 VL to MoE...")
     model_after = upcycle_model_to_moe(
         model_before,
         moe_config,
@@ -859,7 +859,7 @@ def example_qwen3_to_moe():
     )
     
     print("Conversion complete!")
-    print_size_comparison(params_before, model_after, "Llama 3.2")
+    print_size_comparison(params_before, model_after, "Qwen3 VL")
     
     # Measure active parameters during inference
     print("\nMeasuring active parameters during inference...")
@@ -869,12 +869,12 @@ def example_qwen3_to_moe():
     # Measure forward speed after upcycling
     print("Measuring forward speed after upcycling...")
     speed_after = measure_forward_speed(model_after, text_input_after, num_runs=10, warmup_runs=3)
-    print_speed_comparison(speed_before, speed_after, "Llama 3.2")
+    print_speed_comparison(speed_before, speed_after, "Qwen3 VL")
     
     # Measure generation speed AFTER upcycling
     print("Measuring generation speed after upcycling (max_new_tokens=32)...")
     gen_speed_after = measure_generation_speed(model_after, tokenizer, text_input_after, max_new_tokens=32, num_runs=5, warmup_runs=2)
-    print_speed_comparison(gen_speed_before, gen_speed_after, "Llama 3.2", is_generation=True)
+    print_speed_comparison(gen_speed_before, gen_speed_after, "Qwen3 VL", is_generation=True)
     
     return model_after
 
@@ -958,17 +958,17 @@ if __name__ == "__main__":
     print("=" * 60)
     
     # Run examples with latest models (all <= 7B)
-    print("\n1. Llama 3.2 (3B) to MoE:")
+    print("\n1. Llama 3.2 (1B) to MoE:")
     print("-" * 60)
     model = example_llama_to_moe()
     del model
     
-    print("\n2. Gemma 3 (1B) to MoE:")
+    print("\n2. Gemma 3 (4B) to MoE:")
     print("-" * 60)
     model = example_gemma3_to_moe()
     del model
     
-    print("\n3. Qwen 3 (4B) to MoE:")
+    print("\n3. Qwen 3 VL (4B) to MoE:")
     print("-" * 60)
     model = example_qwen3_to_moe()
     del model

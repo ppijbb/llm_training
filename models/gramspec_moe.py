@@ -501,7 +501,7 @@ def find_layers_in_model(model: nn.Module) -> Optional[List[nn.Module]]:
                 return layers
     
     # Try nested access (model.model.layers, model.decoder.layers, etc.)
-    for attr_name in ['model', 'decoder', 'transformer', 'encoder']:
+    for attr_name in ['model', "language_model", 'decoder', 'transformer', 'encoder']:
         if hasattr(model, attr_name):
             submodel = getattr(model, attr_name)
             for name in layer_names:
