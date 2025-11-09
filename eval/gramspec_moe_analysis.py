@@ -49,6 +49,18 @@ class GramSpecAnalyzer:
         self.load_balancing_coefficient_history = []
         self.expert_utilization_history = []
         
+        # Additional metrics from recent papers
+        self.maxvio_history = []  # Maximum violation (Loss-free balancing)
+        self.aux_loss_history = []  # Auxiliary loss (Switch Transformer, DeepSpeed MoE)
+        self.lpr_history = []  # Layer-wise Performance Ratio
+        self.deepspeed_metrics_history = []  # DeepSpeed MoE metrics
+        
+        # Specialization metrics history
+        self.expert_utilization_rate_history = []
+        self.expert_diversity_score_history = []
+        self.expert_similarity_mean_history = []
+        self.expert_specialization_strength_history = []
+        
     def analyze_routing_step(
         self,
         routing_logits: torch.Tensor,  # [batch*seq, num_experts, router_dim]
@@ -121,6 +133,31 @@ class GramSpecAnalyzer:
             self.expert_token_counts_history.append(load_balancing_metrics['expert_token_counts'])
         if 'load_balancing_coefficient' in load_balancing_metrics:
             self.load_balancing_coefficient_history.append(load_balancing_metrics['load_balancing_coefficient'])
+        if 'expert_utilization_rate' in load_balancing_metrics:
+            self.expert_utilization_rate_history.append(load_balancing_metrics['expert_utilization_rate'])
+        if 'maxvio' in load_balancing_metrics:
+            self.maxvio_history.append(load_balancing_metrics['maxvio'])
+        if 'aux_loss' in load_balancing_metrics:
+            self.aux_loss_history.append(load_balancing_metrics['aux_loss'])
+        if 'lpr' in load_balancing_metrics:
+            self.lpr_history.append(load_balancing_metrics['lpr'])
+        if 'expert_efficiency' in load_balancing_metrics:
+            self.deepspeed_metrics_history.append({
+                'expert_efficiency': load_balancing_metrics['expert_efficiency'],
+                'expert_capacity_utilization': load_balancing_metrics.get('expert_capacity_utilization', 0.0),
+                'load_variance': load_balancing_metrics.get('load_variance', 0.0),
+            })
+        
+        # Specialization 히스토리 저장
+        if 'expert_utilization_rate' in specialization_metrics:
+            # 이미 load_balancing에서 저장했으므로 중복 방지
+            pass
+        if 'expert_diversity_score' in specialization_metrics:
+            self.expert_diversity_score_history.append(specialization_metrics['expert_diversity_score'])
+        if 'expert_similarity_mean' in specialization_metrics:
+            self.expert_similarity_mean_history.append(specialization_metrics['expert_similarity_mean'])
+        if 'expert_specialization_strength' in specialization_metrics:
+            self.expert_specialization_strength_history.append(specialization_metrics['expert_specialization_strength'])
         
         return metrics
     
@@ -495,6 +532,36 @@ class GramSpecAnalyzer:
         expert_avg_weight_mean = expert_avg_weights.mean().item()
         expert_avg_weight_std = expert_avg_weights.std().item()
         
+        # MaxVio (Maximum Violation) - Loss-free balancing paper
+        # Measures the maximum deviation of expert load from the mean load
+        mean_load = token_counts_mean
+        maxvio = (expert_token_counts - mean_load).abs().max().item()
+        normalized_maxvio = maxvio / (mean_load + 1e-8)
+        
+        # Aux Loss (Auxiliary Loss) - Switch Transformer, DeepSpeed MoE
+        # Computes the auxiliary loss for load balancing
+        # Formula: num_experts * sum(f_i * P_i) where f_i is fraction of tokens, P_i is average routing probability
+        # For simplicity, we use expert_token_counts as proxy for routing probabilities
+        expert_fractions = expert_token_counts / (total_tokens + 1e-8)
+        # Average routing weight per expert (proxy for routing probability)
+        expert_routing_probs = expert_avg_weights / (expert_avg_weights.sum() + 1e-8)
+        aux_loss = self.num_experts * (expert_fractions * expert_routing_probs).sum().item()
+        
+        # LPR (Layer-wise Performance Ratio) - simplified version
+        # Measures the ratio of expert performance contribution
+        # For now, we use routing weight variance as a proxy
+        lpr = expert_avg_weight_std / (expert_avg_weight_mean + 1e-8)
+        
+        # DeepSpeed MoE metrics
+        # 1. Expert capacity utilization (how well experts are utilized)
+        expert_capacity_utilization = expert_utilization_rate
+        
+        # 2. Load variance (normalized)
+        load_variance = token_counts_std ** 2 / ((mean_load + 1e-8) ** 2)
+        
+        # 3. Expert efficiency (inverse of imbalance)
+        expert_efficiency = 1.0 / (load_imbalance_ratio + 1e-8)
+        
         return {
             'expert_token_counts': expert_token_counts.cpu().numpy().tolist(),
             'expert_weighted_counts': expert_weighted_counts.cpu().numpy().tolist(),
@@ -509,6 +576,14 @@ class GramSpecAnalyzer:
             'expert_avg_routing_weight_mean': expert_avg_weight_mean,
             'expert_avg_routing_weight_std': expert_avg_weight_std,
             'total_tokens_processed': int(total_tokens),
+            # Additional metrics from recent papers
+            'maxvio': maxvio,
+            'normalized_maxvio': normalized_maxvio,
+            'aux_loss': aux_loss,
+            'lpr': lpr,
+            'expert_capacity_utilization': expert_capacity_utilization,
+            'load_variance': load_variance,
+            'expert_efficiency': expert_efficiency,
         }
     
     def get_aggregated_metrics(self) -> Dict[str, float]:
@@ -547,6 +622,51 @@ class GramSpecAnalyzer:
             final_std = final_counts.std().item()
             metrics['final_load_balancing_cv'] = final_std / (final_mean + 1e-8)
             metrics['final_load_imbalance_ratio'] = final_counts.max().item() / (final_mean + 1e-8)
+        
+        # MaxVio 집계
+        if self.maxvio_history:
+            metrics['avg_maxvio'] = np.mean(self.maxvio_history)
+            metrics['max_maxvio'] = np.max(self.maxvio_history)
+            metrics['final_maxvio'] = self.maxvio_history[-1]
+        
+        # Aux Loss 집계
+        if self.aux_loss_history:
+            metrics['avg_aux_loss'] = np.mean(self.aux_loss_history)
+            metrics['final_aux_loss'] = self.aux_loss_history[-1]
+        
+        # LPR 집계
+        if self.lpr_history:
+            metrics['avg_lpr'] = np.mean(self.lpr_history)
+            metrics['final_lpr'] = self.lpr_history[-1]
+        
+        # DeepSpeed MoE metrics 집계
+        if self.deepspeed_metrics_history:
+            metrics['avg_expert_efficiency'] = np.mean([m['expert_efficiency'] for m in self.deepspeed_metrics_history])
+            metrics['avg_expert_capacity_utilization'] = np.mean([m['expert_capacity_utilization'] for m in self.deepspeed_metrics_history])
+            metrics['avg_load_variance'] = np.mean([m['load_variance'] for m in self.deepspeed_metrics_history])
+            metrics['final_expert_efficiency'] = self.deepspeed_metrics_history[-1]['expert_efficiency']
+        
+        # Expert Utilization Rate 집계
+        if self.expert_utilization_rate_history:
+            metrics['avg_expert_utilization_rate'] = np.mean(self.expert_utilization_rate_history)
+            metrics['final_expert_utilization_rate'] = self.expert_utilization_rate_history[-1]
+        elif self.expert_token_counts_history:
+            # Fallback: 최종 expert token counts에서 계산
+            final_counts = np.array(self.expert_token_counts_history[-1])
+            metrics['expert_utilization_rate'] = (final_counts > 0).sum() / len(final_counts)
+        
+        # Expert Specialization 지표 집계
+        if self.expert_diversity_score_history:
+            metrics['avg_expert_diversity_score'] = np.mean(self.expert_diversity_score_history)
+            metrics['final_expert_diversity_score'] = self.expert_diversity_score_history[-1]
+        
+        if self.expert_similarity_mean_history:
+            metrics['avg_expert_similarity_mean'] = np.mean(self.expert_similarity_mean_history)
+            metrics['final_expert_similarity_mean'] = self.expert_similarity_mean_history[-1]
+        
+        if self.expert_specialization_strength_history:
+            metrics['avg_expert_specialization_strength'] = np.mean(self.expert_specialization_strength_history)
+            metrics['final_expert_specialization_strength'] = self.expert_specialization_strength_history[-1]
         
         return metrics
     

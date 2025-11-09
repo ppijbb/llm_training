@@ -55,7 +55,7 @@ try:
     AutoConfig.register("g3moe_text", G3MoETextConfig)
     AutoModel.register(G3MoEConfig, G3MoEModel)
     AutoModel.register(G3MoETextConfig, G3MoETextModel)
-    AutoModelForCausalLM.register(G3MoETextConfig, G3MoEForCausalLM)
+    AutoModelForCausalLM.register(G3MoEConfig, G3MoEForConditionalGeneration)
 
     from transformers.modeling_utils import VLMS
     VLMS.append("g3moe")
@@ -507,6 +507,8 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
 
     # Setup LoRA if requested
     if model_config["use_lora"]:
+        # G3MoERouter는 PEFT에서 지원하지 않으므로 target_modules에서 제외
+        # Router는 PEFT 적용 후 수동으로 trainable로 설정
         lora_config = LoraConfig(
             r=model_config["lora_r"],
             lora_alpha=model_config["lora_alpha"],
@@ -514,11 +516,10 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
             target_modules=[
                 # "q_proj", "k_proj", "v_proj", "o_proj",
                 "gate_proj", "up_proj", "down_proj",
-                "router", "routing_temperature",
-                "global_router",
+                # "router", "routing_temperature", "global_router" 제외 - PEFT 미지원
                 "rnn.weight_ih_l0", "rnn.weight_hh_l0"
             ],
-            modules_to_save=["router", "routing_temperature"],
+            # modules_to_save에서도 router 제외 (PEFT가 처리할 수 없음)
             bias="none",
             task_type=TaskType.CAUSAL_LM,
             inference_mode=False,  # 훈련 모드 명시
@@ -533,10 +534,21 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
             if hasattr(module, 'lora_A') and hasattr(module, 'lora_B'):
                 module.lora_A.requires_grad_(True)
                 module.lora_B.requires_grad_(True)
-            # Ensure router modules remain fully trainable (not LoRA-wrapped)
-            if name.endswith('router') or name.split('.')[-1] == 'router':
+        
+        # G3MoERouter를 찾아서 trainable로 설정 (PEFT 적용 후)
+        from models.g3moe_model import G3MoERouter
+        router_count = 0
+        for name, module in model.named_modules():
+            if isinstance(module, G3MoERouter):
                 for p in module.parameters(recurse=True):
                     p.requires_grad_(True)
+                router_count += 1
+                logger.info(f"✓ Router module '{name}' set to trainable (not LoRA-wrapped)")
+        
+        if router_count > 0:
+            logger.info(f"✓ {router_count} router module(s) set to fully trainable")
+        else:
+            logger.warning("⚠️ No G3MoERouter modules found - router may not be trainable")
         # DDP 정적 그래프 비활성화: MoE 라우팅/LoRA로 스텝마다 활성 파라미터가 달라질 수 있으므로 동적 그래프 허용
         if hasattr(model, '_set_static_graph'):
             model._set_static_graph(True)

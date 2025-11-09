@@ -100,6 +100,9 @@ class TorchMoECallback:
         # Layer별 expert usage tracking (실제 검증용)
         self.layer_expert_usage_counts = {}  # layer_name -> torch.Tensor [num_experts]
         
+        # Wandb step 추적 (monotonically increasing 보장)
+        self.last_logged_step = -1
+        
         # GramSpec 분석기 (옵션)
         self.gramspec_analyzer = None
         if GRAMSPEC_ANALYSIS_AVAILABLE:
@@ -549,11 +552,14 @@ class TorchMoECallback:
 
                 # 로거에 생성 결과 로깅 (Wandb 등)
                 if self.logger and hasattr(self.logger, 'log'):
-                    for i, log_entry in enumerate(generation_logs):
-                        self.logger.log({
-                            f'generation/step_{current_step}/sample_{i}/prompt': log_entry['prompt'],
-                            f'generation/step_{current_step}/sample_{i}/generated': log_entry['generated'][:200] + "..."
-                        }, step=current_step)
+                    # Step이 감소하지 않도록 보장
+                    if current_step > self.last_logged_step:
+                        gen_log_data = {}
+                        for i, log_entry in enumerate(generation_logs):
+                            gen_log_data[f'generation/step_{current_step}/sample_{i}/prompt'] = log_entry['prompt']
+                            gen_log_data[f'generation/step_{current_step}/sample_{i}/generated'] = log_entry['generated'][:200] + "..."
+                        self.logger.log(gen_log_data, step=current_step)
+                        self.last_logged_step = current_step
 
             # 모델을 원래 모드로 복원
             self.model.train(original_mode)
@@ -654,14 +660,17 @@ class TorchMoECallback:
     
     def _log_metrics(self, metrics, current_step: int):
         """메트릭 로깅"""
-        # rank 0에서만 로깅 수행
-        # if not self.is_main_process:
-        #     return
-            
+        # Step이 감소하지 않도록 보장
+        if current_step <= self.last_logged_step:
+            self._log_debug(f"Warning: Skipping log at step {current_step} (last logged: {self.last_logged_step})")
+            return
+        
         log_data = {}
         
         # 레이어별 메트릭
         for layer_name, layer_metrics in metrics.items():
+            if layer_name.startswith('_'):
+                continue  # 내부 메트릭은 건너뛰기
             for metric_name, value in layer_metrics.items():
                 if torch.is_tensor(value) and value.numel() == 1:
                     log_data[f'moe/{layer_name}/{metric_name}'] = value.item()
@@ -670,15 +679,14 @@ class TorchMoECallback:
         
         # 전체 평균 메트릭
         if metrics:
-            avg_cv = np.mean([m.get('expert_cv', torch.tensor(0.0)).item() for m in metrics.values() if 'expert_cv' in m and isinstance(m, dict)])
-            avg_entropy = np.mean([m.get('routing_entropy', torch.tensor(0.0)).item() for m in metrics.values() if 'routing_entropy' in m and isinstance(m, dict)])
-            total_unused = sum([m.get('unused_experts', 0) for m in metrics.values() if isinstance(m, dict)])
+            avg_cv = np.mean([m.get('expert_cv', torch.tensor(0.0)).item() for m in metrics.values() if 'expert_cv' in m and isinstance(m, dict) and not isinstance(m, str)])
+            avg_entropy = np.mean([m.get('routing_entropy', torch.tensor(0.0)).item() for m in metrics.values() if 'routing_entropy' in m and isinstance(m, dict) and not isinstance(m, str)])
+            total_unused = sum([m.get('unused_experts', 0) for m in metrics.values() if isinstance(m, dict) and not isinstance(m, str)])
             
             log_data.update({
                 'moe/avg_expert_cv': avg_cv,
                 'moe/avg_routing_entropy': avg_entropy,
                 'moe/total_unused_experts': total_unused,
-                'moe/step': current_step
             })
             
             # Layer-wise balance 메트릭 (실제 검증 지표)
@@ -691,46 +699,119 @@ class TorchMoECallback:
                     'validation/early_late_ratio': balance_metrics.get('early_late_utilization_ratio', 1.0),
                 })
         
-        # 로거에 전송 (rank 0에서만)
+        # Paper 벤치마크 메트릭 추가 (GramSpecAnalyzer가 있는 경우)
+        if self.gramspec_analyzer is not None:
+            try:
+                paper_metrics = self.gramspec_analyzer.get_paper_metrics_summary()
+                if paper_metrics:
+                    # Load balancing metrics
+                    if 'load_balancing' in paper_metrics:
+                        lb = paper_metrics['load_balancing']
+                        log_data.update({
+                            'paper/load_balancing/cv': lb.get('coefficient_of_variation', 0.0),
+                            'paper/load_balancing/imbalance_ratio': lb.get('load_imbalance_ratio', 0.0),
+                            'paper/load_balancing/utilization_rate': lb.get('expert_utilization_rate', 0.0),
+                        })
+                    
+                    # Expert specialization metrics
+                    if 'expert_specialization' in paper_metrics:
+                        es = paper_metrics['expert_specialization']
+                        log_data.update({
+                            'paper/expert_specialization/diversity_score': es.get('expert_diversity_score', 0.0),
+                            'paper/expert_specialization/similarity_mean': es.get('expert_similarity_mean', 0.0),
+                            'paper/expert_specialization/specialization_strength': es.get('expert_specialization_strength', 0.0),
+                        })
+                    
+                    # Gram matrix quality
+                    if 'gram_matrix_quality' in paper_metrics:
+                        gm = paper_metrics['gram_matrix_quality']
+                        log_data.update({
+                            'paper/gram_matrix/orthogonality': gm.get('orthogonality', 0.0),
+                            'paper/gram_matrix/orthogonality_std': gm.get('orthogonality_std', 0.0),
+                        })
+                    
+                    # Routing quality
+                    if 'routing_quality' in paper_metrics:
+                        rq = paper_metrics['routing_quality']
+                        log_data.update({
+                            'paper/routing/confidence': rq.get('routing_confidence', 0.0),
+                            'paper/routing/cosine_similarity_mean': rq.get('cosine_similarity_mean', 0.0),
+                        })
+            except Exception as e:
+                self._log_debug(f"Warning: Failed to get paper metrics: {e}")
+        
+        # 로거에 전송 (step 명시적으로 전달하여 monotonically increasing 보장)
         if self.logger:
             if hasattr(self.logger, 'log'):
-                # Let the logger infer step from the training loop to avoid mismatches
-                self.logger.log(log_data)
+                # Wandb의 경우 step을 명시적으로 전달
+                self.logger.log(log_data, step=current_step)
+                self.last_logged_step = current_step
             elif hasattr(self.logger, 'add_scalars'):  # TensorBoard
                 for key, value in log_data.items():
                     self.logger.add_scalar(key, value, current_step)
+                self.last_logged_step = current_step
         
         # 콘솔 출력
         if self.log_to_console:
             self._log_debug(f"Step {current_step} MoE Metrics:")
             for key, value in log_data.items():
-                if 'avg_' in key or 'total_' in key:
+                if 'avg_' in key or 'total_' in key or 'paper/' in key:
                     self._log_debug(f"  {key}: {value:.4f}")
     
     def _log_heatmaps(self, current_step: int):
         """Expert 사용률 히트맵 로깅"""
-        # rank 0에서만 실행
-        # if not self.is_main_process:
-        #     return
+        # Step이 감소하지 않도록 보장
+        if current_step <= self.last_logged_step:
+            return
+        
+        if not self.expert_usage_history:
+            if self.debug_logging:
+                self._log_debug(f"No expert usage history available for heatmap at step {current_step}")
+            return
+        
         try:
+            import matplotlib
+            matplotlib.use('Agg')  # Non-interactive backend
             import matplotlib.pyplot as plt
             import seaborn as sns
             
+            heatmap_created = False
+            
             for layer_name in self.expert_usage_history:
-                if len(self.expert_usage_history[layer_name]) > 10:
+                history = self.expert_usage_history[layer_name]
+                # 최소 2개 이상의 데이터 필요 (10개에서 완화)
+                if len(history) < 2:
+                    if self.debug_logging:
+                        self._log_debug(f"Insufficient data for {layer_name} heatmap (need at least 2 steps, got {len(history)})")
+                    continue
+                
+                try:
                     # 모든 텐서를 동일한 크기로 맞추기 위해 최대 크기로 패딩
-                    usage_tensors = list(self.expert_usage_history[layer_name])
-                    max_size = max(tensor.size(0) for tensor in usage_tensors)
+                    usage_tensors = list(history)
+                    if not usage_tensors:
+                        continue
+                    
+                    # 빈 텐서 필터링
+                    valid_tensors = [t for t in usage_tensors if t.numel() > 0]
+                    if not valid_tensors:
+                        continue
+                    
+                    max_size = max(tensor.size(0) for tensor in valid_tensors)
+                    if max_size == 0:
+                        continue
                     
                     # 각 텐서를 최대 크기로 패딩
                     padded_tensors = []
-                    for tensor in usage_tensors:
+                    for tensor in valid_tensors:
                         if tensor.size(0) < max_size:
                             padding = torch.zeros(max_size - tensor.size(0), dtype=tensor.dtype)
                             padded_tensor = torch.cat([tensor, padding])
                         else:
                             padded_tensor = tensor
                         padded_tensors.append(padded_tensor)
+                    
+                    if not padded_tensors:
+                        continue
                     
                     usage_matrix = torch.stack(padded_tensors)
                     usage_matrix = usage_matrix.float()
@@ -739,27 +820,56 @@ class TorchMoECallback:
                     row_sums = usage_matrix.sum(dim=1, keepdim=True)
                     usage_matrix = usage_matrix / (row_sums + 1e-8)
                     
+                    # 히트맵 생성
                     plt.figure(figsize=(12, 6))
                     sns.heatmap(usage_matrix.T.numpy(), 
                                 cmap='YlOrRd', 
                                 xticklabels=False,
-                                yticklabels=True)
-                    plt.title(f'{layer_name} Expert Usage Distribution')
+                                yticklabels=True,
+                                cbar_kws={'label': 'Usage Ratio'})
+                    plt.title(f'{layer_name} Expert Usage Distribution (Step {current_step})')
                     plt.xlabel('Time Steps')
                     plt.ylabel('Expert Index')
+                    plt.tight_layout()
                     
+                    # 로거에 전송 (step 명시적으로 전달)
                     if self.logger and hasattr(self.logger, 'log'):
-                        import wandb
-                        self.logger.log({
-                            f'moe/{layer_name}/usage_heatmap': wandb.Image(plt)
-                        }, step=current_step)
+                        try:
+                            import wandb
+                            self.logger.log({
+                                f'moe/{layer_name}/usage_heatmap': wandb.Image(plt)
+                            }, step=current_step)
+                            self.last_logged_step = current_step
+                        except Exception as e:
+                            self._log_debug(f"Warning: Failed to log heatmap to logger: {e}")
                     
+                    # 파일로 저장
                     if self.save_detailed_logs:
-                        plt.savefig(f'{self.log_dir}/{layer_name}_heatmap_step_{current_step}.png')
+                        try:
+                            safe_layer_name = layer_name.replace(".", "_").replace("/", "_")
+                            heatmap_path = os.path.join(self.log_dir, f'{safe_layer_name}_heatmap_step_{current_step}.png')
+                            plt.savefig(heatmap_path, dpi=150, bbox_inches='tight')
+                            if self.debug_logging:
+                                self._log_debug(f"Heatmap saved to {heatmap_path}")
+                        except Exception as e:
+                            self._log_debug(f"Warning: Failed to save heatmap: {e}")
                     
                     plt.close()
-        except ImportError:
-            self._log_debug("matplotlib/seaborn not available for heatmap logging")
+                    heatmap_created = True
+                    
+                except Exception as e:
+                    import traceback
+                    self._log_debug(f"Error creating heatmap for {layer_name}: {e}\n{traceback.format_exc()}")
+                    continue
+            
+            if not heatmap_created and self.debug_logging:
+                self._log_debug(f"No heatmaps were created at step {current_step}")
+                
+        except ImportError as e:
+            self._log_debug(f"Warning: matplotlib/seaborn not available for heatmap logging: {e}")
+        except Exception as e:
+            import traceback
+            self._log_debug(f"Error during heatmap logging: {e}\n{traceback.format_exc()}")
     
     def _check_alerts(self, metrics):
         """경고 상황 체크"""
@@ -824,10 +934,13 @@ class TorchMoECallback:
                 self._log_debug(f"⚠️  MoE Alert at step {current_step}: {alert['message']}")
             
             if self.logger and hasattr(self.logger, 'log'):
-                self.logger.log({
-                    f'alerts/{alert["type"]}': 1,
-                    f'alerts/{alert["layer"]}_severity': alert.get('severity', 1)
-                }, step=current_step)
+                # Step이 감소하지 않도록 보장
+                if current_step > self.last_logged_step:
+                    self.logger.log({
+                        f'alerts/{alert["type"]}': 1,
+                        f'alerts/{alert["layer"]}_severity': alert.get('severity', 1)
+                    }, step=current_step)
+                    self.last_logged_step = current_step
     
     def _save_detailed_log(self, metrics, current_step: int):
         """상세 로그 저장"""

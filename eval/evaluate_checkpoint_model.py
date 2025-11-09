@@ -29,7 +29,7 @@ from models import G3MoEModel, G3MoETextModel, G3MoEConfig, G3MoEForCausalLM, G3
 from transformers.modeling_utils import VLMS
 from eval.gramspec_moe_analysis import GramSpecAnalyzer
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+
 # Register models
 AutoConfig.register("g3moe", G3MoEConfig)
 AutoConfig.register("g3moe_text", G3MoETextConfig)
@@ -51,6 +51,9 @@ class RoutingInfoCollector:
         
     def register_hooks(self, model: nn.Module):
         """모델의 MoE 레이어와 Router에 hook 등록"""
+        from models.g3moe_model import G3MoERouter, G3MoEGRINMoE
+        from models.gramspec_moe import GramSpecRouter, GramSpecMoEBlock
+        
         # Router의 forward hook (routing_logits, expression_logits 추출)
         def create_router_hook(layer_name):
             def router_hook_fn(module, input, output):
@@ -80,9 +83,40 @@ class RoutingInfoCollector:
                                 router_dim = module.router_dim
                                 routing_logits = routing_logits.view(batch_size, seq_len, num_experts, router_dim)
                     
+                    # expression_logits의 shape 확인 및 수정
+                    # Router forward에서 expression_logits는 view(hidden_shape)를 거쳐 [batch, seq, num_experts, router_dim] 형태가 되어야 함
+                    # 하지만 실제로는 [batch, seq, 1, router_dim] 또는 [batch*seq, 1, router_dim] 형태일 수 있음
+                    expression_logits_fixed = expression_logits
+                    if isinstance(expression_logits, torch.Tensor):
+                        # expression_logits의 shape 확인
+                        if expression_logits.dim() == 4:
+                            exp_batch, exp_seq, exp_num_exp, exp_router_dim = expression_logits.shape
+                            if exp_num_exp == 1 and routing_logits is not None:
+                                # [batch, seq, 1, router_dim] -> [batch, seq, num_experts, router_dim]로 expand
+                                if routing_logits.dim() == 4:
+                                    _, _, num_experts, router_dim = routing_logits.shape
+                                    expression_logits_fixed = expression_logits.expand(exp_batch, exp_seq, num_experts, router_dim)
+                        elif expression_logits.dim() == 3:
+                            exp_batch_seq, exp_dim1, exp_dim2 = expression_logits.shape
+                            if routing_logits is not None:
+                                if routing_logits.dim() == 4:
+                                    batch_size, seq_len, num_experts, router_dim = routing_logits.shape
+                                    if exp_dim1 == 1 and exp_dim2 == router_dim:
+                                        # [batch*seq, 1, router_dim] -> [batch*seq, num_experts, router_dim]로 expand
+                                        expression_logits_fixed = expression_logits.expand(exp_batch_seq, num_experts, router_dim)
+                                    elif exp_dim1 * exp_dim2 == num_experts * router_dim:
+                                        # [batch*seq, num_experts*router_dim] -> [batch*seq, num_experts, router_dim]로 reshape
+                                        expression_logits_fixed = expression_logits.view(exp_batch_seq, num_experts, router_dim)
+                                elif routing_logits.dim() == 3:
+                                    batch_seq_len, num_experts, router_dim = routing_logits.shape
+                                    if exp_dim1 == 1 and exp_dim2 == router_dim:
+                                        expression_logits_fixed = expression_logits.expand(batch_seq_len, num_experts, router_dim)
+                                    elif exp_dim1 * exp_dim2 == num_experts * router_dim:
+                                        expression_logits_fixed = expression_logits.view(batch_seq_len, num_experts, router_dim)
+                    
                     self.router_internal_data[layer_name].append({
                         'routing_logits': routing_logits.detach().cpu() if routing_logits is not None else None,
-                        'expression_logits': expression_logits.detach().cpu() if isinstance(expression_logits, torch.Tensor) else None,
+                        'expression_logits': expression_logits_fixed.detach().cpu() if isinstance(expression_logits_fixed, torch.Tensor) else None,
                         'selected_experts': selected_experts.detach().cpu(),
                         'routing_weights': multiplier.detach().cpu(),
                         'cosine_similarities': cosine_similarities.detach().cpu() if isinstance(cosine_similarities, torch.Tensor) else None,
@@ -91,20 +125,86 @@ class RoutingInfoCollector:
                     })
             return router_hook_fn
         
-        # MoE Block의 forward hook
+        # MoE Block의 forward hook (G3MoEGRINMoE와 GramSpecMoEBlock 모두 지원)
         def create_moe_hook(layer_name):
             def moe_hook_fn(module, input, output):
-                # GramSpecMoEBlock에서 routing 정보 추출
+                # G3MoEGRINMoE: output = (final_hidden_states, (routing_weights, hn, speciality_loss, cosine_similarities, expression_loss))
+                # 주의: forward에서 router_logits로 이름을 바꾸지만 실제로는 routing_weights입니다
+                if isinstance(output, tuple) and len(output) == 2:
+                    final_hidden_states, routing_info_tuple = output
+                    if isinstance(routing_info_tuple, tuple) and len(routing_info_tuple) >= 5:
+                        routing_weights_from_moe, hn, speciality_loss, cosine_similarities, expression_loss = routing_info_tuple[:5]
+                        
+                        # Router에서 수집한 데이터와 매칭
+                        # Router hook이 먼저 실행되어 router_internal_data에 데이터가 저장되어야 함
+                        # Global router를 사용하므로 모든 router 데이터 중 가장 최근 것을 사용
+                        latest_router_data = None
+                        if self.router_internal_data:
+                            # 모든 router 데이터 중 가장 최근 것 찾기
+                            all_router_data = []
+                            for router_name, router_data_list in self.router_internal_data.items():
+                                if router_data_list:
+                                    all_router_data.extend([(router_name, data) for data in router_data_list])
+                            
+                            if all_router_data:
+                                # 가장 최근 데이터 사용 (마지막 항목)
+                                _, latest_router_data = all_router_data[-1]
+                        
+                        if latest_router_data:
+                            
+                            # routing_weights는 top-k에 대한 가중치이므로, router_scores를 재구성
+                            # Router hook에서 수집한 selected_experts와 routing_weights를 사용
+                            router_scores = None
+                            selected_experts = latest_router_data.get('selected_experts')
+                            routing_weights = latest_router_data.get('routing_weights')
+                            
+                            if selected_experts is not None and routing_weights is not None:
+                                # selected_experts: [batch*seq, top_k]
+                                # routing_weights: [batch*seq, top_k]
+                                batch_size, seq_len = input[0].shape[:2] if len(input) > 0 and isinstance(input[0], torch.Tensor) else (1, 1)
+                                num_experts = module.num_experts if hasattr(module, 'num_experts') else selected_experts.max().item() + 1
+                                
+                                # 모든 expert에 대한 점수를 0으로 초기화
+                                router_scores = torch.zeros(batch_size * seq_len, num_experts, dtype=routing_weights.dtype)
+                                
+                                # selected_experts에 해당하는 위치에 routing_weights 할당
+                                batch_seq_indices = torch.arange(batch_size * seq_len, device=selected_experts.device).unsqueeze(1).expand(-1, selected_experts.shape[-1])
+                                router_scores[batch_seq_indices, selected_experts] = routing_weights
+                                
+                                router_scores = router_scores.view(batch_size, seq_len, num_experts)
+                            
+                            self.routing_data.append({
+                                'layer': layer_name,
+                                'routing_logits': latest_router_data.get('routing_logits'),
+                                'expression_logits': latest_router_data.get('expression_logits'),
+                                'routing_weights': latest_router_data.get('routing_weights'),
+                                'selected_experts': latest_router_data.get('selected_experts'),
+                                'cosine_similarities': latest_router_data.get('cosine_similarities'),
+                                'speciality_penalty': latest_router_data.get('speciality_penalty', float(speciality_loss) if isinstance(speciality_loss, torch.Tensor) else speciality_loss),
+                                'expression_loss': latest_router_data.get('expression_loss', float(expression_loss) if isinstance(expression_loss, torch.Tensor) else expression_loss),
+                                'router_scores': router_scores.detach().cpu() if router_scores is not None else None,
+                            })
+                            return
+                
+                # GramSpecMoEBlock: _last_routing_info 사용
                 if hasattr(module, '_last_routing_info'):
                     routing_info = module._last_routing_info
                     if routing_info is not None and len(routing_info) >= 6:
                         routing_weights, hn, speciality_loss, cosine_similarities, expression_loss, router_scores = routing_info
                         
                         # Router에서 수집한 데이터와 매칭
-                        router_data = self.router_internal_data.get(layer_name, [])
-                        if router_data:
-                            latest_router_data = router_data[-1]  # 가장 최근 데이터 사용
+                        # Global router를 사용하므로 모든 router 데이터 중 가장 최근 것을 사용
+                        latest_router_data = None
+                        if self.router_internal_data:
+                            all_router_data = []
+                            for router_name, router_data_list in self.router_internal_data.items():
+                                if router_data_list:
+                                    all_router_data.extend([(router_name, data) for data in router_data_list])
                             
+                            if all_router_data:
+                                _, latest_router_data = all_router_data[-1]
+                        
+                        if latest_router_data:
                             self.routing_data.append({
                                 'layer': layer_name,
                                 'routing_logits': latest_router_data.get('routing_logits'),
@@ -119,19 +219,25 @@ class RoutingInfoCollector:
             return moe_hook_fn
         
         # Router와 MoE Block에 hook 등록
+        router_count = 0
+        moe_count = 0
+        
         for name, module in model.named_modules():
-            # Router hook
-            if hasattr(module, 'load_balancer') and hasattr(module, 'expression_projector'):
-                # GramSpecRouter
+            # Router hook (G3MoERouter 또는 GramSpecRouter)
+            if isinstance(module, (G3MoERouter, GramSpecRouter)) or (hasattr(module, 'load_balancer') and hasattr(module, 'expression_projector')):
                 hook = module.register_forward_hook(create_router_hook(name))
                 self.router_hooks.append(hook)
+                router_count += 1
                 print(f"Registered router hook: {name}")
             
-            # MoE Block hook
-            if isinstance(module, nn.Module) and hasattr(module, '_last_routing_info'):
+            # MoE Block hook (G3MoEGRINMoE 또는 GramSpecMoEBlock)
+            if isinstance(module, (G3MoEGRINMoE, GramSpecMoEBlock)) or hasattr(module, '_last_routing_info'):
                 hook = module.register_forward_hook(create_moe_hook(name))
                 self.hooks.append(hook)
+                moe_count += 1
                 print(f"Registered MoE block hook: {name}")
+        
+        print(f"\n✅ Hook registration complete: {router_count} routers, {moe_count} MoE blocks")
     
     def remove_hooks(self):
         """Hook 제거"""
@@ -179,10 +285,78 @@ class RoutingInfoCollector:
                     continue
             
             # Shape 확인 및 변환
-            if routing_logits.dim() == 4:
-                batch_size, seq_len, num_experts_actual, router_dim_actual = routing_logits.shape
-                routing_logits = routing_logits.view(batch_size * seq_len, num_experts_actual, router_dim_actual)
-                expression_logits = expression_logits.view(batch_size * seq_len, num_experts_actual, router_dim_actual)
+            # routing_logits와 expression_logits의 shape을 일치시킴
+            if routing_logits is not None and expression_logits is not None:
+                # routing_logits shape 확인
+                batch_seq_len = None
+                num_experts_actual = None
+                router_dim_actual = None
+                
+                if routing_logits.dim() == 4:
+                    batch_size, seq_len, num_experts_actual, router_dim_actual = routing_logits.shape
+                    batch_seq_len = batch_size * seq_len
+                    routing_logits = routing_logits.view(batch_seq_len, num_experts_actual, router_dim_actual)
+                elif routing_logits.dim() == 3:
+                    # [batch*seq, num_experts, router_dim] 형태
+                    batch_seq_len, num_experts_actual, router_dim_actual = routing_logits.shape
+                else:
+                    print(f"⚠️ Unexpected routing_logits shape: {routing_logits.shape}")
+                    continue
+                
+                # expression_logits shape 확인 및 변환
+                if expression_logits.dim() == 4:
+                    # [batch, seq, num_experts, router_dim]
+                    exp_batch_size, exp_seq_len, exp_num_experts, exp_router_dim = expression_logits.shape
+                    exp_batch_seq_len = exp_batch_size * exp_seq_len
+                    if exp_batch_seq_len == batch_seq_len:
+                        expression_logits = expression_logits.view(exp_batch_seq_len, exp_num_experts, exp_router_dim)
+                    else:
+                        # Shape이 다르면 재구성 시도
+                        expression_logits = expression_logits.view(-1, exp_num_experts, exp_router_dim)
+                elif expression_logits.dim() == 3:
+                    # [batch*seq, num_experts, router_dim] 또는 [batch*seq, num_experts*router_dim]
+                    exp_batch_seq_len, dim1, dim2 = expression_logits.shape
+                    
+                    if dim1 == num_experts_actual and dim2 == router_dim_actual:
+                        # 이미 올바른 shape
+                        pass
+                    elif dim1 * dim2 == num_experts_actual * router_dim_actual:
+                        # [batch*seq, num_experts*router_dim] 형태를 [batch*seq, num_experts, router_dim]로 변환
+                        expression_logits = expression_logits.view(exp_batch_seq_len, num_experts_actual, router_dim_actual)
+                    else:
+                        # Shape이 맞지 않으면 재구성 시도
+                        total_elements = expression_logits.numel()
+                        expected_elements = batch_seq_len * num_experts_actual * router_dim_actual
+                        
+                        if total_elements == expected_elements:
+                            expression_logits = expression_logits.view(batch_seq_len, num_experts_actual, router_dim_actual)
+                        else:
+                            print(f"⚠️ Cannot reshape expression_logits: shape={expression_logits.shape}, expected elements={expected_elements}, actual={total_elements}")
+                            # 최선의 노력으로 재구성
+                            if total_elements % (num_experts_actual * router_dim_actual) == 0:
+                                new_batch_seq = total_elements // (num_experts_actual * router_dim_actual)
+                                expression_logits = expression_logits.view(new_batch_seq, num_experts_actual, router_dim_actual)
+                            else:
+                                continue
+                elif expression_logits.dim() == 2:
+                    # [batch*seq, num_experts*router_dim] 형태
+                    exp_batch_seq_len, exp_total_dim = expression_logits.shape
+                    if exp_total_dim == num_experts_actual * router_dim_actual:
+                        expression_logits = expression_logits.view(exp_batch_seq_len, num_experts_actual, router_dim_actual)
+                    else:
+                        print(f"⚠️ Cannot reshape expression_logits from 2D: shape={expression_logits.shape}, expected dim={num_experts_actual * router_dim_actual}")
+                        continue
+                else:
+                    print(f"⚠️ Unexpected expression_logits shape: {expression_logits.shape}")
+                    continue
+                
+                # 최종 shape 확인
+                if routing_logits.shape != expression_logits.shape:
+                    print(f"⚠️ Shape mismatch after conversion: routing_logits={routing_logits.shape}, expression_logits={expression_logits.shape}")
+                    # 최소한의 shape으로 맞춤
+                    min_batch_seq = min(routing_logits.shape[0], expression_logits.shape[0])
+                    routing_logits = routing_logits[:min_batch_seq]
+                    expression_logits = expression_logits[:min_batch_seq]
             
             if cosine_similarities is None:
                 batch_size, seq_len = routing_logits.shape[0] // num_experts, 1
@@ -269,7 +443,7 @@ def load_checkpoint_model(
 def prepare_evaluation_data(
     tokenizer: Any,
     dataset_name: Optional[str] = None,
-    num_samples: int = 100,
+    num_samples: int = 500,
     max_length: int = 512,
     use_training_eval_set: bool = True,
 ) -> List[Dict[str, torch.Tensor]]:
@@ -700,10 +874,30 @@ def main():
     if 'aggregated_metrics' in results:
         print("\n📈 Aggregated Metrics:")
         agg = results['aggregated_metrics']
-        print(f"  Load Balancing CV: {agg.get('final_load_balancing_cv', 'N/A'):.4f}")
-        print(f"  Load Imbalance Ratio: {agg.get('final_load_imbalance_ratio', 'N/A'):.4f}")
-        print(f"  Expert Utilization Rate: {agg.get('expert_utilization_rate', 'N/A'):.4f}")
-        print(f"  Gram Orthogonality: {agg.get('avg_gram_orthogonality', 'N/A'):.4f}")
+        
+        def format_metric(value, default='N/A'):
+            if value == default or value is None:
+                return default
+            try:
+                return f"{float(value):.4f}"
+            except (ValueError, TypeError):
+                return str(value)
+        
+        print("\n📊 주요 Load Balancing 지표:")
+        print(f"  Load Balancing CV: {format_metric(agg.get('final_load_balancing_cv', 'N/A'))}")
+        print(f"  Load Imbalance Ratio: {format_metric(agg.get('final_load_imbalance_ratio', 'N/A'))}")
+        print(f"  MaxVio (Maximum Violation): {format_metric(agg.get('final_maxvio', 'N/A'))}")
+        print(f"  Aux Loss: {format_metric(agg.get('final_aux_loss', 'N/A'))}")
+        print(f"  Expert Utilization Rate: {format_metric(agg.get('expert_utilization_rate', 'N/A'))}")
+        
+        print("\n📈 최근 논문 지표:")
+        print(f"  LPR (Layer-wise Performance Ratio): {format_metric(agg.get('final_lpr', 'N/A'))}")
+        print(f"  Expert Efficiency (DeepSpeed MoE): {format_metric(agg.get('final_expert_efficiency', 'N/A'))}")
+        print(f"  Expert Capacity Utilization: {format_metric(agg.get('avg_expert_capacity_utilization', 'N/A'))}")
+        print(f"  Load Variance: {format_metric(agg.get('avg_load_variance', 'N/A'))}")
+        
+        print("\n🔬 Gram Matrix & Specialization 지표:")
+        print(f"  Gram Orthogonality: {format_metric(agg.get('avg_gram_orthogonality', 'N/A'))}")
 
 
 if __name__ == "__main__":

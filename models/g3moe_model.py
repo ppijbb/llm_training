@@ -156,7 +156,7 @@ def load_balancing_loss_func(
     Returns:
         The auxiliary loss.
     """
-    if gate_logits is None or not isinstance(gate_logits, tuple):
+    if gate_logits is None:
         return torch.tensor(0.0)
 
     if isinstance(gate_logits, tuple):
@@ -166,8 +166,9 @@ def load_balancing_loss_func(
         compute_device = gate_logits[0].device
         concatenated_gate_logits = torch.cat([layer_gate.to(compute_device) for layer_gate in gate_logits], dim=0)
     else:
-        # handle tensor input
+        # handle tensor input (single tensor from global router)
         concatenated_gate_logits = gate_logits
+        compute_device = concatenated_gate_logits.device
 
     routing_weights = torch.nn.functional.softmax(concatenated_gate_logits, dim=-1)
 
@@ -194,8 +195,9 @@ def load_balancing_loss_func(
         )
 
         # Compute the percentage of tokens routed to each experts
-        tokens_per_expert = torch.sum(expert_mask.float() * expert_attention_mask, dim=0) / torch.sum(
-            expert_attention_mask, dim=0
+        # Sum over batch*seq and top_k dimensions to get [num_experts]
+        tokens_per_expert = torch.sum(expert_mask.float() * expert_attention_mask, dim=(0, 1)) / torch.sum(
+            expert_attention_mask, dim=(0, 1)
         )
 
         # Compute the mask that masks all padding tokens as 0 with the same shape of tokens_per_expert
@@ -719,6 +721,9 @@ class G3MoERouter(nn.Module):
         batch_size, seq_len = input_shape
         domain_scores_flat = domain_scores.view(batch_size * seq_len, self.num_experts)
         
+        # Full per-expert routing probabilities (for monitoring/loss)
+        routing_probs_full = F.softmax(domain_scores_flat, dim=-1)
+        
         # Simplified top-k routing to reduce computation
         top_k_logits, selected_experts = torch.topk(domain_scores_flat, top_k, dim=-1)
         multiplier = F.softmax(top_k_logits, dim=-1, dtype=torch.float32).type_as(domain_scores_flat)
@@ -747,7 +752,8 @@ class G3MoERouter(nn.Module):
                 # Update EMA of expert loads
                 self.expert_load_ema.mul_(self.ema_alpha).add_(current_load, alpha=1.0 - self.ema_alpha)
 
-        return multiplier, selected_experts, expression_logits, hn, speciality_penalty, cosine_similarities, expression_loss
+        # Return both top-k routing weights (for execution) and full probabilities (for loss/monitoring)
+        return multiplier, selected_experts, expression_logits, hn, speciality_penalty, cosine_similarities, expression_loss, routing_probs_full
 
 iterations = 0
 class G3MoEGRINMoE(nn.Module):
@@ -842,7 +848,8 @@ class G3MoEGRINMoE(nn.Module):
             jitter_eps=self.router_jitter_noise,
             training=self.training
         )
-        routing_weights, selected_experts, expression_logits, hn, speciality_loss, cosine_similarities, expression_loss = router_output
+        # Unpack including full probabilities
+        routing_weights, selected_experts, expression_logits, hn, speciality_loss, cosine_similarities, expression_loss, routing_probs_full = router_output
 
         # multiplier와 selected_experts는 이미 global router에서 sparsemixer를 통해 계산됨
         assert routing_weights.isnan().sum() == 0, f"{self.iter} layer routing_weights is nan Line: 826"
@@ -896,7 +903,7 @@ class G3MoEGRINMoE(nn.Module):
                 self.last_routing_weights = routing_weights.detach()
                 self.last_num_experts = self.num_experts
         
-        return final_hidden_states, (routing_weights, hn, speciality_loss, cosine_similarities, expression_loss)
+        return final_hidden_states, (routing_probs_full, hn, speciality_loss, cosine_similarities, expression_loss)
 
 
 class G3MoERMSNorm(nn.Module):
@@ -2410,7 +2417,7 @@ class G3MoEForConditionalGeneration(G3MoEPreTrainedModel, GenerationMixin):
                     ortho_loss = ortho_loss / num_moe_layers  # Average over layers
                     loss += self.config.text_config.ortho_loss_coef * ortho_loss
                     ortho_loss += _orthogonal_constraint_loss(
-                        self.config.text_config.num_experts_per_tok,
+                        self.config.text_config.n_routed_experts,
                         outputs.router_logits
                     )
 
