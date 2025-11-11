@@ -792,12 +792,12 @@ def main(
             logger=wandb,                    # 사용할 로거 지정 (wandb)
             log_to_console=True,             # 콘솔에도 주요 메트릭 출력
             debug_logging=True,              # ✅ 디버그 로깅 활성화
-                         # === (선택사항) === #
+                       #  === (선택사항) ===  #
             log_heatmap_every=5,             # 500 스텝마다 Expert 사용률 히트맵 로깅
             alert_threshold_imbalance=4.0,   # 특정 Expert 사용률이 평균의 4배를 초과하면 경고
             unused_expert_threshold=0.25,    # 25% 이상의 Expert가 미사용되면 경고
             entropy_threshold=0.1,           # 라우팅 엔트로피가 0.1 미만이면 경고
-            save_detailed_logs=False,      # 상세 JSON 로그 저장 여부
+            save_detailed_logs=False,        # 상세 JSON 로그 저장 여부
             enable_generation_logging=True,  # 생성 로깅 활성화
         ))
     

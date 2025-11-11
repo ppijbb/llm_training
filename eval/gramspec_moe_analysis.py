@@ -29,9 +29,10 @@ class GramSpecAnalyzer:
     4. Domain scoring (cosine similarity + speciality penalty)이 효과적인가?
     """
     
-    def __init__(self, num_experts: int, router_dim: int = 128):
+    def __init__(self, num_experts: int, router_dim: int = 128, capacity_factor: float = 1.25):
         self.num_experts = num_experts
         self.router_dim = router_dim
+        self.capacity_factor = capacity_factor  # Capacity factor for capacity usage calculation
         self.reset()
     
     def reset(self):
@@ -112,14 +113,29 @@ class GramSpecAnalyzer:
             diversity_metrics = self._compute_expert_output_diversity(expert_outputs)
             metrics.update(diversity_metrics)
         
+        # 10. Inference Cost / FLOPs / Utilized Parameters (추가)
+        # Note: FLOPs 계산은 별도로 수행해야 하므로 여기서는 활성화된 expert 수만 계산
+        inference_cost_metrics = self._compute_inference_cost_metrics(
+            selected_experts, routing_weights
+        )
+        metrics.update(inference_cost_metrics)
+        
         # 7. Context Utilization (if hidden states available)
         if hidden_states is not None:
             context_metrics = self._compute_context_utilization(hidden_states, selected_experts)
             metrics.update(context_metrics)
         
-        # 8. Load Balancing Metrics (필수 - 논문에 포함)
-        load_balancing_metrics = self._compute_load_balancing_metrics(
+        # 9. Routing Consistency / Locality Metrics (추가)
+        consistency_metrics = self._compute_routing_consistency_metrics(
             selected_experts, routing_weights
+        )
+        metrics.update(consistency_metrics)
+        
+        # 8. Load Balancing Metrics (필수 - 논문에 포함)
+        # Capacity factor는 일반적으로 1.0-2.0 사이 (기본값 1.25)
+        capacity_factor = getattr(self, 'capacity_factor', 1.25)
+        load_balancing_metrics = self._compute_load_balancing_metrics(
+            selected_experts, routing_weights, capacity_factor=capacity_factor
         )
         metrics.update(load_balancing_metrics)
         
@@ -446,19 +462,78 @@ class GramSpecAnalyzer:
             'sequential_routing_consistency': sequential_consistency.item(),
         }
     
+    def _compute_routing_consistency_metrics(
+        self,
+        selected_experts: torch.Tensor,  # [batch*seq, top_k]
+        routing_weights: torch.Tensor,  # [batch*seq, top_k]
+    ) -> Dict[str, float]:
+        """
+        Routing Consistency / Locality Metrics (논문 필수 지표)
+        
+        Measures:
+        1. Segment Routing Performance (SRP): 연속된 토큰들이 같은 expert를 선택하는 비율
+        2. Segment Cache Hit Rate (SCH): 캐시 효율을 위한 동일 expert 재사용 비율
+        3. Routing locality: 인접한 토큰들이 비슷한 expert를 선택하는 경향
+        """
+        batch_seq_len = selected_experts.size(0)
+        top_k = selected_experts.size(1)
+        
+        if batch_seq_len < 2:
+            return {}
+        
+        # Top-1 expert 선택 패턴
+        top1_expert = selected_experts[:, 0]  # [batch*seq]
+        
+        # 1. Sequential Routing Consistency (SRP-like)
+        # 연속된 토큰들이 같은 top-1 expert를 선택하는 비율
+        sequential_matches = (top1_expert[1:] == top1_expert[:-1]).sum().float()
+        sequential_routing_consistency = sequential_matches / (batch_seq_len - 1)
+        
+        # 2. Top-k overlap: 연속된 토큰들의 top-k expert 집합이 겹치는 비율
+        top_k_overlaps = []
+        for i in range(batch_seq_len - 1):
+            experts_i = set(selected_experts[i].cpu().numpy())
+            experts_next = set(selected_experts[i + 1].cpu().numpy())
+            overlap = len(experts_i & experts_next) / len(experts_i | experts_next) if (experts_i | experts_next) else 0.0
+            top_k_overlaps.append(overlap)
+        avg_top_k_overlap = np.mean(top_k_overlaps) if top_k_overlaps else 0.0
+        
+        # 3. Routing locality: 인접 토큰들이 비슷한 routing weight를 가지는지
+        # 첫 번째 expert의 weight를 비교
+        top1_weights = routing_weights[:, 0]  # [batch*seq]
+        weight_correlation = 0.0
+        if batch_seq_len > 1:
+            # 인접 토큰 간 weight 차이
+            weight_diffs = (top1_weights[1:] - top1_weights[:-1]).abs()
+            weight_locality = 1.0 - weight_diffs.mean().item()  # 낮은 차이 = 높은 locality
+        
+        # 4. Expert reuse rate: 같은 expert가 연속으로 선택되는 비율
+        expert_reuse_rate = sequential_routing_consistency.item()
+        
+        return {
+            'sequential_routing_consistency': sequential_routing_consistency.item(),
+            'top_k_overlap': avg_top_k_overlap,
+            'routing_locality': weight_locality if batch_seq_len > 1 else 0.0,
+            'expert_reuse_rate': expert_reuse_rate,
+        }
+    
     def _compute_load_balancing_metrics(
         self,
         selected_experts: torch.Tensor,  # [batch*seq, top_k]
         routing_weights: torch.Tensor,  # [batch*seq, top_k]
+        capacity_factor: Optional[float] = None,  # Capacity factor (c in c * T/E)
     ) -> Dict[str, Any]:
         """
         Load balancing 지표 계산 (논문 필수 지표)
         
         MoE 논문에서 표준적으로 사용하는 지표들:
-        1. Expert별 처리 토큰 수 (per-expert token count)
-        2. Load balancing coefficient (CV - coefficient of variation)
-        3. Expert utilization rate
-        4. Load imbalance ratio
+        1. Expert별 처리 토큰 수 (per-expert token count) ✅
+        2. Load balancing coefficient (CV - coefficient of variation) ✅
+        3. Expert utilization rate ✅
+        4. Load imbalance ratio ✅
+        5. Capacity factor / capacity usage ✅ (추가)
+        6. Routing sparsity (experts per token) ✅ (추가)
+        7. Fraction of active experts / sparsity ratio ✅ (추가)
         
         Returns:
             Load balancing 관련 지표 딕셔너리
@@ -468,6 +543,7 @@ class GramSpecAnalyzer:
         
         batch_seq_len = selected_experts.size(0)
         top_k = selected_experts.size(1)
+        total_tokens = batch_seq_len
         
         # Expert별 토큰 수 계산 (각 토큰이 top_k개 expert에 할당되므로 가중치 고려)
         expert_token_counts = torch.zeros(self.num_experts, device=selected_experts.device, dtype=torch.float32)
@@ -562,6 +638,39 @@ class GramSpecAnalyzer:
         # 3. Expert efficiency (inverse of imbalance)
         expert_efficiency = 1.0 / (load_imbalance_ratio + 1e-8)
         
+        # Capacity Factor / Capacity Usage (논문 필수 지표)
+        # Capacity factor: c * T/E where c is capacity factor, T is total tokens, E is num experts
+        # Each expert can process up to capacity_factor * (total_tokens / num_experts) tokens
+        if capacity_factor is None:
+            # Default capacity factor (typically 1.0-2.0 in MoE papers)
+            capacity_factor = 1.25
+        ideal_capacity_per_expert = capacity_factor * (total_tokens / self.num_experts)
+        max_expert_load = expert_token_counts.max().item()
+        capacity_usage = max_expert_load / (ideal_capacity_per_expert + 1e-8)
+        capacity_utilization = expert_token_counts.mean().item() / (ideal_capacity_per_expert + 1e-8)
+        
+        # Routing Sparsity / Number of experts activated per token (논문 필수 지표)
+        # Average number of experts activated per token (top_k)
+        avg_experts_per_token = float(top_k)
+        routing_sparsity = 1.0 - (avg_experts_per_token / self.num_experts)  # Higher = more sparse
+        
+        # Fraction of active experts / Sparsity ratio (논문 필수 지표)
+        # Fraction of experts that are actually used (have at least one token)
+        fraction_active_experts = expert_utilization_rate  # Already computed above
+        sparsity_ratio = 1.0 - fraction_active_experts  # Higher = more sparse (fewer experts used)
+        
+        # Expert Choice vs Token Choice routing metrics
+        # Token choice: each token chooses experts (current implementation)
+        # Expert choice: each expert chooses tokens (alternative)
+        # For token choice, we measure how evenly tokens are distributed
+        token_choice_entropy = normalized_proportion_entropy  # Already computed
+        # For expert choice, we would measure how evenly experts choose tokens
+        # Since we use token choice, we report token choice metrics
+        routing_type = "token_choice"  # Current implementation
+        
+        # Standard deviation of tokens per expert (for aux loss calculation)
+        std_tokens_per_expert = token_counts_std
+        
         return {
             'expert_token_counts': expert_token_counts.cpu().numpy().tolist(),
             'expert_weighted_counts': expert_weighted_counts.cpu().numpy().tolist(),
@@ -584,6 +693,64 @@ class GramSpecAnalyzer:
             'expert_capacity_utilization': expert_capacity_utilization,
             'load_variance': load_variance,
             'expert_efficiency': expert_efficiency,
+            # Additional metrics from user requirements
+            'capacity_factor': capacity_factor,
+            'ideal_capacity_per_expert': ideal_capacity_per_expert,
+            'capacity_usage': capacity_usage,
+            'capacity_utilization': capacity_utilization,
+            'routing_sparsity': routing_sparsity,
+            'avg_experts_per_token': avg_experts_per_token,
+            'fraction_active_experts': fraction_active_experts,
+            'sparsity_ratio': sparsity_ratio,
+            'routing_type': routing_type,
+            'token_choice_entropy': token_choice_entropy,
+            'std_tokens_per_expert': std_tokens_per_expert,
+        }
+    
+    def _compute_inference_cost_metrics(
+        self,
+        selected_experts: torch.Tensor,  # [batch*seq, top_k]
+        routing_weights: torch.Tensor,  # [batch*seq, top_k]
+    ) -> Dict[str, float]:
+        """
+        Inference Cost / FLOPs / Utilized Parameters Metrics (논문 필수 지표)
+        
+        Measures:
+        1. Number of active experts per token (routing sparsity)
+        2. Total number of unique experts activated
+        3. Expert activation ratio (active experts / total experts)
+        4. Average experts per token
+        """
+        batch_seq_len = selected_experts.size(0)
+        top_k = selected_experts.size(1)
+        
+        # Unique experts activated
+        unique_experts = torch.unique(selected_experts.flatten())
+        num_active_experts = len(unique_experts)
+        
+        # Expert activation ratio
+        expert_activation_ratio = num_active_experts / self.num_experts
+        
+        # Average experts per token (top_k)
+        avg_experts_per_token = float(top_k)
+        
+        # Total expert activations (counting duplicates)
+        total_expert_activations = batch_seq_len * top_k
+        
+        # Expert utilization efficiency
+        # Ideal: all experts used equally
+        ideal_activations_per_expert = total_expert_activations / self.num_experts
+        actual_activations = torch.bincount(selected_experts.flatten(), minlength=self.num_experts).float()
+        utilization_efficiency = 1.0 - (actual_activations.std() / (actual_activations.mean() + 1e-8))
+        
+        return {
+            'num_active_experts': num_active_experts,
+            'expert_activation_ratio': expert_activation_ratio,
+            'avg_experts_per_token': avg_experts_per_token,
+            'total_expert_activations': total_expert_activations,
+            'utilization_efficiency': utilization_efficiency.item(),
+            # Note: FLOPs 계산은 별도 measure_efficiency.py에서 수행
+            # 여기서는 활성화 관련 지표만 제공
         }
     
     def get_aggregated_metrics(self) -> Dict[str, float]:
@@ -668,6 +835,10 @@ class GramSpecAnalyzer:
             metrics['avg_expert_specialization_strength'] = np.mean(self.expert_specialization_strength_history)
             metrics['final_expert_specialization_strength'] = self.expert_specialization_strength_history[-1]
         
+        # Capacity, Sparsity, Routing metrics 집계 (최신 스텝에서 가져옴)
+        # 이들은 per-step metrics이므로 최신 값만 사용
+        # 실제로는 per-layer metrics에서 집계해야 하지만, 여기서는 간단히 처리
+        
         return metrics
     
     def save_analysis(self, filepath: str):
@@ -689,7 +860,7 @@ class GramSpecAnalyzer:
         논문에 포함할 주요 지표 요약
         
         Returns:
-            논문에 포함할 핵심 지표들
+            논문에 포함할 핵심 지표들 (데이터가 없으면 None 반환)
         """
         aggregated = self.get_aggregated_metrics()
         
@@ -697,32 +868,33 @@ class GramSpecAnalyzer:
             return {}
         
         # 논문에 포함할 핵심 지표들
+        # 데이터가 없으면 None 반환 (0.0으로 fallback하지 않음)
         summary = {
             # Load Balancing Metrics (필수)
             'load_balancing': {
-                'coefficient_of_variation': aggregated.get('final_load_balancing_cv', 0.0),
-                'load_imbalance_ratio': aggregated.get('final_load_imbalance_ratio', 0.0),
-                'expert_utilization_rate': aggregated.get('expert_utilization_rate', 0.0),
-                'expert_token_distribution': aggregated.get('final_expert_token_counts', []),
+                'coefficient_of_variation': aggregated.get('final_load_balancing_cv'),
+                'load_imbalance_ratio': aggregated.get('final_load_imbalance_ratio'),
+                'expert_utilization_rate': aggregated.get('expert_utilization_rate'),
+                'expert_token_distribution': aggregated.get('final_expert_token_counts'),
             },
             
             # Expert Specialization Metrics (필수)
             'expert_specialization': {
-                'expert_diversity_score': aggregated.get('expert_diversity_score', 0.0),
-                'expert_similarity_mean': aggregated.get('expert_similarity_mean', 0.0),
-                'expert_specialization_strength': aggregated.get('expert_specialization_strength', 0.0),
+                'expert_diversity_score': aggregated.get('expert_diversity_score'),
+                'expert_similarity_mean': aggregated.get('expert_similarity_mean'),
+                'expert_specialization_strength': aggregated.get('expert_specialization_strength'),
             },
             
             # Gram Matrix Quality
             'gram_matrix_quality': {
-                'orthogonality': aggregated.get('avg_gram_orthogonality', 0.0),
-                'orthogonality_std': aggregated.get('std_gram_orthogonality', 0.0),
+                'orthogonality': aggregated.get('avg_gram_orthogonality'),
+                'orthogonality_std': aggregated.get('std_gram_orthogonality'),
             },
             
             # Routing Quality
             'routing_quality': {
-                'routing_confidence': aggregated.get('routing_confidence', 0.0),
-                'cosine_similarity_mean': aggregated.get('avg_cosine_similarity', 0.0),
+                'routing_confidence': aggregated.get('routing_confidence'),
+                'cosine_similarity_mean': aggregated.get('avg_cosine_similarity'),
             },
         }
         

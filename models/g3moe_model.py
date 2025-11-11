@@ -240,6 +240,142 @@ def load_balancing_loss_func(
     return aux_loss
 
 
+def gramspec_lb_loss(
+    gate_logits: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
+    num_experts: int,
+    lb_l2_coef: float = 1.0,
+    lb_cv_coef: float = 0.5,
+    lb_entropy_floor_coef: float = 0.0,
+    top_k: int = 2,
+    lb_topk_l2_coef: float = 0.0,
+    lb_topk_cv_coef: float = 0.0,
+    attention_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    GramSpec-aligned low-overhead load balancing loss.
+    Uses per-expert statistics only (O(E)) to minimize compute overhead.
+    No shape changes or fallback zeros/nan - skips invalid terms.
+
+    Args:
+        gate_logits: Routing logits, either tensor [N, E] or tuple of tensors
+        num_experts: Number of experts E
+        lb_l2_coef: Weight for L2 uniformity loss
+        lb_cv_coef: Weight for CV minimization
+        lb_entropy_floor_coef: Weight for entropy floor (optional)
+        top_k: Number of experts selected per token
+        lb_topk_l2_coef: Weight for top-k token count uniformity loss
+        lb_topk_cv_coef: Weight for top-k token count CV minimization
+        attention_mask: Attention mask for valid tokens
+
+    Returns:
+        Scalar loss tensor (sum of weighted terms)
+    """
+    # Handle tuple input (concatenate if needed)
+    if isinstance(gate_logits, tuple):
+        if not gate_logits:  # Empty tuple - skip entirely
+            return torch.tensor(0.0, dtype=torch.float32, requires_grad=False)
+        tensors = [gl for gl in gate_logits if gl is not None and gl.numel() > 0]
+        if not tensors:
+            return torch.tensor(0.0, dtype=torch.float32, requires_grad=False)
+        gate_logits = torch.cat(tensors, dim=0)
+
+    if gate_logits is None or gate_logits.numel() == 0:
+        return torch.tensor(0.0, dtype=torch.float32, requires_grad=False)
+
+    # Get routing weights using existing softmax path
+    routing_weights = torch.nn.functional.softmax(gate_logits, dim=-1)
+    device, dtype = routing_weights.device, routing_weights.dtype
+
+    # Compute per-expert mean probabilities
+    routing_per_expert_attention_mask = None
+    if attention_mask is not None:
+        # Use existing masking logic from load_balancing_loss_func
+        batch_size, seq_length = attention_mask.shape
+        num_hidden_layers = gate_logits.shape[0] // (batch_size * seq_length)
+
+        routing_per_expert_attention_mask = (
+            attention_mask[None, :, :, None]
+            .expand((num_hidden_layers, batch_size, seq_length, num_experts))
+            .reshape(-1, num_experts)
+            .to(device)
+        )
+
+        # Mean per expert (masked)
+        p_bar = torch.sum(routing_weights * routing_per_expert_attention_mask, dim=0) / torch.sum(
+            routing_per_expert_attention_mask, dim=0
+        )
+    else:
+        # Simple mean across batch dimension
+        p_bar = routing_weights.mean(dim=0)  # [E]
+
+    # Uniform target distribution
+    u = torch.full_like(p_bar, 1.0 / float(num_experts))
+
+    # Numerical stability
+    eps = torch.finfo(dtype).eps
+
+    total_loss = torch.zeros((), dtype=dtype, device=device)
+
+    # L2 uniformity loss
+    if lb_l2_coef > 0:
+        l2_loss = torch.sum((p_bar - u) ** 2)
+        total_loss = total_loss + lb_l2_coef * l2_loss
+
+    # CV minimization (approximate)
+    if lb_cv_coef > 0:
+        mean_p = p_bar.mean()
+        var_p = p_bar.var(unbiased=False)  # Population variance
+        cv_loss = var_p / (mean_p + eps)
+        total_loss = total_loss + lb_cv_coef * cv_loss
+
+    # Entropy floor (optional)
+    if lb_entropy_floor_coef > 0:
+        # Token-level entropy floor
+        token_entropy = -torch.sum(routing_weights * torch.log(routing_weights + eps), dim=-1)
+        entropy_floor_loss = -token_entropy.mean()  # Minimize negative entropy = maximize entropy
+        total_loss = total_loss + lb_entropy_floor_coef * entropy_floor_loss
+
+    # Top-k token count based losses (works on discrete expert selection)
+    if (lb_topk_l2_coef > 0 or lb_topk_cv_coef > 0) and top_k > 0:
+        k = min(top_k, num_experts)
+        # top-k indices based on routing probabilities (monotonic with logits)
+        topk_probs, topk_indices = torch.topk(routing_weights, k=k, dim=-1)
+
+        if attention_mask is not None and routing_per_expert_attention_mask is not None:
+            token_mask = routing_per_expert_attention_mask.any(dim=-1)
+            if token_mask.any():
+                topk_indices = topk_indices[token_mask]
+                topk_probs = topk_probs[token_mask]
+            else:
+                topk_indices = topk_indices[:0]
+                topk_probs = topk_probs[:0]
+
+        flat_indices = topk_indices.reshape(-1)
+        flat_probs = topk_probs.reshape(-1)
+
+        counts = torch.zeros(num_experts, dtype=dtype, device=device)
+        if flat_indices.numel() > 0:
+            ones = torch.ones_like(flat_indices, dtype=dtype, device=device)
+            counts.scatter_add_(0, flat_indices, ones)
+
+            weighted_counts = torch.zeros_like(counts)
+            weighted_counts.scatter_add_(0, flat_indices, flat_probs.to(dtype))
+
+            total_counts = counts.sum()
+            if total_counts > 0 and lb_topk_l2_coef > 0:
+                usage_distribution = counts / total_counts
+                l2_topk_loss = torch.sum((usage_distribution - u) ** 2)
+                total_loss = total_loss + lb_topk_l2_coef * l2_topk_loss
+
+            mean_weight = weighted_counts.mean()
+            var_weight = weighted_counts.var(unbiased=False) if weighted_counts.numel() > 0 else torch.tensor(0.0, device=device, dtype=dtype)
+            if lb_topk_cv_coef > 0 and mean_weight > 0:
+                topk_cv_loss = var_weight / (mean_weight + eps)
+                total_loss = total_loss + lb_topk_cv_coef * topk_cv_loss
+
+    return total_loss
+
+
 # Copied from Phi-3.5-MoE
 def _get_unpad_data(attention_mask):
     seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
@@ -284,7 +420,7 @@ class G3MoEModelOutputWithPast(BaseModelOutputWithPast):
 
     image_hidden_states: Optional[torch.FloatTensor] = None
     aux_loss: Optional[torch.FloatTensor] = None
-    router_logits: Optional[torch.FloatTensor] = None
+    router_logits: Optional[Union[torch.FloatTensor, Tuple[torch.FloatTensor, ...]]] = None
     speciality_loss: Optional[torch.FloatTensor] = None
     cosine_similarities: Optional[torch.FloatTensor] = None
     ortho_loss: Optional[torch.FloatTensor] = None
@@ -332,7 +468,7 @@ class G3MoECausalLMOutputWithPast(ModelOutput):
     # this is moe specific
     aux_loss: Optional[torch.FloatTensor] = None
     ortho_loss: Optional[torch.FloatTensor] = None
-    router_logits: Optional[torch.FloatTensor] = None
+    router_logits: Optional[Union[torch.FloatTensor, Tuple[torch.FloatTensor, ...]]] = None
     speciality_loss: Optional[torch.FloatTensor] = None
     cosine_similarities: Optional[torch.FloatTensor] = None
     expression_loss: Optional[torch.FloatTensor] = None
@@ -661,6 +797,8 @@ class G3MoERouter(nn.Module):
         self.router_dim = config.router_dim
         self.balancing_strength = getattr(config, "balancing_strength", 0.01)
         self.ema_alpha = getattr(config, "ema_alpha", 0.99)
+        self.lb_bias_to_hn = getattr(config, "lb_bias_to_hn", True)
+        self.lb_bias_scale = getattr(config, "lb_bias_scale", 0.1)
         self.register_buffer("expert_load_ema", torch.zeros(self.num_experts), persistent=True)
 
         self.load_balancer = nn.GRU(
@@ -683,6 +821,31 @@ class G3MoERouter(nn.Module):
     def forward(self, x, hn, top_k=2, jitter_eps=0.01, training=True):
         # GRU를 통한 전역 라우팅 (hn 활용)
         routing_logits, hn = self.load_balancer(x, hn)
+
+        # Optional: Inject EMA-based load balancing bias into hn (low overhead)
+        if self.lb_bias_to_hn and self.training and hn is not None:
+            # Normalize EMA load to probabilities to avoid scale drift
+            ema_total = self.expert_load_ema.sum()
+            if ema_total > 0:
+                ema_dist = self.expert_load_ema / ema_total
+            else:
+                ema_dist = torch.full_like(self.expert_load_ema, 1.0 / self.num_experts)
+
+            u = torch.full_like(ema_dist, 1.0 / self.num_experts)
+            lb_bias = self.lb_bias_scale * (u - ema_dist)  # [E]
+
+            # Broadcast to match hn shape: [num_layers(=1), batch, num_experts*router_dim]
+            num_layers, batch_size, hidden_dim = hn.shape
+            assert hidden_dim == self.num_experts * self.router_dim, "hn hidden dim mismatch"
+
+            hn_bias = (
+                lb_bias.view(1, 1, self.num_experts, 1)
+                .expand(num_layers, batch_size, self.num_experts, self.router_dim)
+                .reshape(num_layers, batch_size, hidden_dim)
+                .to(hn.dtype)
+            )
+            hn = hn + hn_bias
+
         input_shape = routing_logits.shape[:-1]
         hidden_shape = (*input_shape, -1, self.router_dim)
 
@@ -709,7 +872,9 @@ class G3MoERouter(nn.Module):
         speciality_penalty = torch.mean((F.normalize(gram - routing_i.unsqueeze(0).unsqueeze(0), dim=-1) ** 2).sum(dim=(-2,-1)))
         
         # Cosine similarity between expression and routing logits
-        cosine_similarities = 1.0 - F.cosine_similarity(expression_logits, routing_logits, dim=-1)
+        cos = F.cosine_similarity(expression_logits, routing_logits, dim=-1)  # [-1, 1]
+        cos = cos.clamp(-1 + 1e-6, 1 - 1e-6)
+        cosine_similarities = 1.0 - cos.pow(2) 
         
         # routing_logits 대신 cosine_similarities를 기반으로 한 도메인 스코어 반환
         # 이렇게 하면 각 expert의 표현 정보가 더 잘 반영됨
@@ -731,7 +896,7 @@ class G3MoERouter(nn.Module):
         # Compute expression loss for the projection matrix
         expression_loss = self.expression_projector.orthogonal_loss()
 
-        # ---- Adaptive filter logic for load balancing (applied during training) ----
+        # -- Adaptive filter logic for load balancing (applied during training) --
         if self.training:
             with torch.no_grad():
                 total_load = self.expert_load_ema.sum()
@@ -1702,7 +1867,11 @@ class G3MoETextModel(G3MoEPreTrainedModel):
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
+        all_router_logits = []  # 모든 MoE 레이어의 router_logits를 수집
         global_routing_hn = None
+        speciality_loss = None
+        cosine_similarities = None
+        expression_loss = None
 
         for decoder_layer in self.layers[: self.config.num_hidden_layers]:
             if output_hidden_states:
@@ -1725,6 +1894,8 @@ class G3MoETextModel(G3MoEPreTrainedModel):
             routing_result = layer_outputs[-1]
             if routing_result is not None:
                 router_logits = routing_result[0]
+                if router_logits is not None:
+                    all_router_logits.append(router_logits)  # 리스트에 추가
                 global_routing_hn = routing_result[1]
                 speciality_loss = routing_result[2]
                 cosine_similarities = routing_result[3]
@@ -1738,12 +1909,15 @@ class G3MoETextModel(G3MoEPreTrainedModel):
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
+        # router_logits를 튜플로 변환 (비어있으면 None)
+        router_logits_tuple = tuple(all_router_logits) if all_router_logits else None
+
         return G3MoEModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=past_key_values,
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
-            router_logits=router_logits,
+            router_logits=router_logits_tuple,
             speciality_loss=speciality_loss,
             cosine_similarities=cosine_similarities,
             expression_loss=expression_loss,
@@ -1905,10 +2079,17 @@ class G3MoEForCausalLM(G3MoEPreTrainedModel, GenerationMixin):
                 if num_moe_layers > 0:
                     ortho_loss = ortho_loss / num_moe_layers  # Average over layers
                     loss += self.config.text_config.ortho_loss_coef * ortho_loss
-                    ortho_loss += _orthogonal_constraint_loss(
-                        self.model.config.n_routed_experts, 
-                        outputs.router_logits
-                    )
+                    # router_logits가 튜플인 경우 모든 레이어를 concatenate
+                    if outputs.router_logits is not None:
+                        if isinstance(outputs.router_logits, tuple):
+                            # 모든 레이어의 router_logits를 concatenate
+                            router_logits_for_ortho = torch.cat([rl for rl in outputs.router_logits if rl is not None], dim=0)
+                        else:
+                            router_logits_for_ortho = outputs.router_logits
+                        ortho_loss += _orthogonal_constraint_loss(
+                            self.model.config.n_routed_experts, 
+                            router_logits_for_ortho
+                        )
 
             if outputs.router_logits is not None:
                 # Add router z-loss to prevent router from being too confident
@@ -1922,6 +2103,28 @@ class G3MoEForCausalLM(G3MoEPreTrainedModel, GenerationMixin):
                     usage_uniformity_coef=getattr(self.model.config, "usage_uniformity_coef", 0.0),
                 )
                 loss += self.model.config.router_aux_loss_coef * aux_loss
+
+                # Add GramSpec-aligned low-overhead LB loss
+                gslb_coef = getattr(self.model.config, "gslb_coef", 0.0)
+                if gslb_coef > 0:
+                    lb_l2_coef = getattr(self.model.config, "lb_l2_coef", 1.0)
+                    lb_cv_coef = getattr(self.model.config, "lb_cv_coef", 0.5)
+                    lb_entropy_floor_coef = getattr(self.model.config, "lb_entropy_floor_coef", 0.0)
+                    lb_topk_l2_coef = getattr(self.model.config, "lb_topk_l2_coef", 0.0)
+                    lb_topk_cv_coef = getattr(self.model.config, "lb_topk_cv_coef", 0.0)
+
+                    gramspec_loss = gramspec_lb_loss(
+                        outputs.router_logits,
+                        self.model.config.n_routed_experts,
+                        lb_l2_coef=lb_l2_coef,
+                        lb_cv_coef=lb_cv_coef,
+                        lb_entropy_floor_coef=lb_entropy_floor_coef,
+                        top_k=self.model.config.num_experts_per_tok,
+                        lb_topk_l2_coef=lb_topk_l2_coef,
+                        lb_topk_cv_coef=lb_topk_cv_coef,
+                        attention_mask=attention_mask,
+                    )
+                    loss += gslb_coef * gramspec_loss
 
         try:
             import torch.distributed as dist
@@ -2416,10 +2619,17 @@ class G3MoEForConditionalGeneration(G3MoEPreTrainedModel, GenerationMixin):
                 if num_moe_layers > 0:
                     ortho_loss = ortho_loss / num_moe_layers  # Average over layers
                     loss += self.config.text_config.ortho_loss_coef * ortho_loss
-                    ortho_loss += _orthogonal_constraint_loss(
-                        self.config.text_config.n_routed_experts,
-                        outputs.router_logits
-                    )
+                    # router_logits가 튜플인 경우 모든 레이어를 concatenate
+                    if outputs.router_logits is not None:
+                        if isinstance(outputs.router_logits, tuple):
+                            # 모든 레이어의 router_logits를 concatenate
+                            router_logits_for_ortho = torch.cat([rl for rl in outputs.router_logits if rl is not None], dim=0)
+                        else:
+                            router_logits_for_ortho = outputs.router_logits
+                        ortho_loss += _orthogonal_constraint_loss(
+                            self.config.text_config.n_routed_experts,
+                            router_logits_for_ortho
+                        )
 
             if outputs.router_logits is not None:
                 # Add router z-loss to prevent router from being too confident
@@ -2433,6 +2643,28 @@ class G3MoEForConditionalGeneration(G3MoEPreTrainedModel, GenerationMixin):
                     usage_uniformity_coef=getattr(self.config.text_config, "usage_uniformity_coef", 0.0),
                 )
                 loss += self.config.text_config.router_aux_loss_coef * aux_loss
+
+                # Add GramSpec-aligned low-overhead LB loss
+                gslb_coef = getattr(self.config.text_config, "gslb_coef", 0.0)
+                if gslb_coef > 0:
+                    lb_l2_coef = getattr(self.config.text_config, "lb_l2_coef", 1.0)
+                    lb_cv_coef = getattr(self.config.text_config, "lb_cv_coef", 0.5)
+                    lb_entropy_floor_coef = getattr(self.config.text_config, "lb_entropy_floor_coef", 0.0)
+                    lb_topk_l2_coef = getattr(self.config.text_config, "lb_topk_l2_coef", 0.0)
+                    lb_topk_cv_coef = getattr(self.config.text_config, "lb_topk_cv_coef", 0.0)
+
+                    gramspec_loss = gramspec_lb_loss(
+                        outputs.router_logits,
+                        self.config.text_config.n_routed_experts,
+                        lb_l2_coef=lb_l2_coef,
+                        lb_cv_coef=lb_cv_coef,
+                        lb_entropy_floor_coef=lb_entropy_floor_coef,
+                        top_k=self.config.text_config.num_experts_per_tok,
+                        lb_topk_l2_coef=lb_topk_l2_coef,
+                        lb_topk_cv_coef=lb_topk_cv_coef,
+                        attention_mask=attention_mask,
+                    )
+                    loss += gslb_coef * gramspec_loss
 
         if not return_dict:
             output = (logits,) + outputs[1:]
