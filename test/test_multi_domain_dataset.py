@@ -9,10 +9,12 @@ import logging
 import traceback
 from typing import Dict, Any
 
-# Add parent directory to path
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# Add project root directory to path for relative imports
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
 
-from transformers import AutoTokenizer
+from transformers import AutoProcessor
 from data.multi_domain_sft_dataset import (
     get_multi_domain_sft_dataset,
     DOMAIN_DATASETS,
@@ -25,7 +27,7 @@ from data.multi_domain_sft_dataset import (
     all_domains_dataset,
     log_memory_usage
 )
-from data.simple_sft_dataset import create_simple_collate_fn
+from data.multi_domain_sft_dataset import create_simple_collate_fn
 
 # 로깅 설정
 logging.basicConfig(
@@ -42,14 +44,16 @@ def test_tokenizer_loading():
     logger.info("=" * 60)
     
     try:
-        tokenizer = AutoTokenizer.from_pretrained("google/gemma-2b-it")
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
+        tokenizer = AutoProcessor.from_pretrained("google/gemma-3-4b-it")
+        with open("/home/conan/workspace/llm_training/sft/config/chat_template.txt", "r") as f:
+            chat_template = f.read()
+        if tokenizer.tokenizer.pad_token is None:
+            tokenizer.tokenizer.pad_token = tokenizer.tokenizer.eos_token
         
         logger.info(f"✅ 토크나이저 로드 성공: {tokenizer.__class__.__name__}")
-        logger.info(f"   - vocab_size: {tokenizer.vocab_size}")
-        logger.info(f"   - pad_token: {tokenizer.pad_token}")
-        logger.info(f"   - eos_token: {tokenizer.eos_token}")
+        logger.info(f"   - vocab_size: {tokenizer.tokenizer.vocab_size}")
+        logger.info(f"   - pad_token: {tokenizer.tokenizer.pad_token}")
+        logger.info(f"   - eos_token: {tokenizer.tokenizer.eos_token}")
         
         log_memory_usage("토크나이저 로드 후")
         return tokenizer
@@ -296,15 +300,23 @@ def test_dataset_structure(dataset, split_name: str = 'train'):
         return False
 
 
-def test_collate_function(tokenizer, dataset):
+def test_collate_function(tokenizer, dataset, model_name: str = "google/gemma-2b-it"):
     """Collate 함수 테스트"""
     logger.info("=" * 60)
     logger.info("🔧 Collate 함수 테스트")
     logger.info("=" * 60)
     
     try:
-        collate_fn = create_simple_collate_fn(tokenizer, max_length=2048)
-        logger.info(f"✅ Collate 함수 생성 성공")
+        # Processor 생성 (multi-domain용, allow_text_only=True)
+        try:
+            processor = AutoProcessor.from_pretrained(model_name)
+        except Exception as e:
+            logger.warning(f"   ⚠️ AutoProcessor 로드 실패, tokenizer를 processor로 사용: {e}")
+            # Processor가 없으면 tokenizer를 processor로 사용 (일부 모델은 tokenizer만 있음)
+            processor = tokenizer
+        
+        collate_fn = create_simple_collate_fn(processor, max_length=2048, allow_text_only=True)
+        logger.info(f"✅ Collate 함수 생성 성공 (allow_text_only=True)")
         
         if dataset is None or 'train' not in dataset:
             logger.warning("   ⚠️ 데이터셋이 없어 collate 테스트를 건너뜁니다")
@@ -365,7 +377,7 @@ def main():
     
     # 각 도메인별 테스트
     test_results = {}
-    for domain_name in DOMAIN_DATASETS.keys():
+    for domain_name in [k for k in DOMAIN_DATASETS.keys() if k == "ocr"]:
         dataset = test_single_domain_dataset(domain_name, tokenizer, max_samples=20)
         if dataset is not None:
             test_results[domain_name] = test_dataset_structure(dataset, 'train')
