@@ -67,7 +67,7 @@ export PYTHONPATH="$PROJECT_ROOT:$PYTHONPATH"
 if [ -z "$CUDA_VISIBLE_DEVICES" ]; then
     export CUDA_VISIBLE_DEVICES=$(seq 0 $((NUM_GPUS-1)) | paste -sd, -)
 fi
-export CUDA_VISIBLE_DEVICES=1,2
+export CUDA_VISIBLE_DEVICES=0,1
 export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false
 # CUDA allocator tuning to reduce fragmentation and OOM risk

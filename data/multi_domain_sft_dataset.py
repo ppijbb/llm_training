@@ -1186,31 +1186,41 @@ def convert_sample_to_messages(sample: Dict[str, Any], dataset_name: str, log_fa
         ]
         return {"messages": messages, "images": []}
     
-    # OCR-VQA 계열 (일반 VQA 스키마 재사용)
+    # OCR-VQA 계열 (하위 호환성용 - 실제로는 process_ocr_vqa 사용)
     if "ocr-vqa" in dataset_name.lower() or "ocrvqa" in dataset_name.lower():
-        question = sample.get("question", "")
+        # OCR-VQA는 questions (복수, 리스트)와 answers (복수, 리스트)를 사용
+        # 하나의 이미지에 여러 질문-답변 쌍이 있으므로 첫 번째 쌍만 사용 (하위 호환성)
+        questions = sample.get("questions", [])
         answers = sample.get("answers", [])
-        answer = ""
-        if isinstance(answers, list) and answers:
-            if isinstance(answers[0], dict):
-                answer = answers[0].get("answer", "")
-            else:
-                answer = str(answers[0])
-        else:
-            answer = sample.get("answer", "")
-        if not question:
+        
+        # questions/answers가 리스트인지 확인
+        if not isinstance(questions, (list, tuple)) or not isinstance(answers, (list, tuple)):
             return None
+        
+        if len(questions) == 0 or len(answers) == 0:
+            return None
+        
+        # 첫 번째 질문-답변 쌍 사용
+        question = str(questions[0]).strip()
+        answer = str(answers[0]).strip()
+        
+        if not question or not answer:
+            return None
+        
         messages = [
             {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": question}]},
             {"role": "assistant", "content": [{"type": "text", "text": answer}]}
         ]
-        img = sample.get("image", [])
-        if not isinstance(img, list):
-            img = [img] if img is not None else []
-        img = validate_image_data(img)
-        if not img:
+        
+        img = sample.get("image", None)
+        if img is None:
             return None
-        return {"messages": messages, "images": img}
+        
+        img_list = validate_image_data([img])
+        if not img_list:
+            return None
+        
+        return {"messages": messages, "images": img_list}
     
     # MetaMathQA 형식 처리 (학습용 수학 instruction)
     if "metamathqa" in dataset_name.lower() or "meta-math" in dataset_name.lower():
@@ -1646,9 +1656,8 @@ def _process_dataset_config_split(
     config: str,
     train_split: str,
     test_split: Optional[str],
-    train_f,
-    test_f,
-    file_lock: threading.Lock,
+    train_path: str,
+    test_path: str,
     image_counter_lock: threading.Lock,
     shared_counters: Dict[str, Any],
     images_dir: str,
@@ -1760,12 +1769,11 @@ def _process_dataset_config_split(
                     converted["images"] = image_paths
                     converted["domain"] = domain
                     
-                    # 파일 쓰기 (thread-safe)
+                    # 파일 쓰기 (도메인별 파일에 append)
                     try:
                         json_str = json.dumps(converted, ensure_ascii=False)
-                        with file_lock:
-                            train_f.write(json_str + "\n")
-                            train_f.flush()
+                        with open(train_path, "a", encoding="utf-8") as f:
+                            f.write(json_str + "\n")
                         
                         # 카운터 업데이트 (thread-safe)
                         with domain_processed_lock:
@@ -1853,15 +1861,14 @@ def _process_dataset_config_split(
                         converted["images"] = image_paths
                         converted["domain"] = domain
                         
-                        # 파일 쓰기 (thread-safe)
+                        # 파일 쓰기 (도메인별 파일에 append)
                         try:
                             json_str = json.dumps(converted, ensure_ascii=False)
-                            with file_lock:
-                                test_f.write(json_str + "\n")
-                                test_f.flush()
+                            with open(test_path, "a", encoding="utf-8") as f:
+                                f.write(json_str + "\n")
                             
                             # 카운터 업데이트 (thread-safe)
-                            with file_lock:
+                            with domain_processed_lock:
                                 shared_counters["domain_counts"][domain]["test"] += 1
                                 shared_counters["total_processed"] += 1
                             
@@ -1913,9 +1920,7 @@ def _process_dataset_config_split(
 def _process_domain_datasets(
     domain: str,
     dataset_names: List[str],
-    train_f,
-    test_f,
-    file_lock: threading.Lock,
+    temp_dir: str,
     image_counter_lock: threading.Lock,
     shared_counters: Dict[str, Any],
     images_dir: str,
@@ -1926,8 +1931,12 @@ def _process_domain_datasets(
 ) -> Dict[str, Any]:
     """
     단일 도메인의 데이터셋들을 처리하는 함수 (병렬 처리용)
-    각 데이터셋, config, split을 병렬로 처리
+    각 데이터셋, config, split을 순차 처리 (도메인별 병렬은 상위 레벨에서)
     """
+    # 도메인별 임시 파일 생성
+    domain_train_path = os.path.join(temp_dir, f"{domain}_train.jsonl")
+    domain_test_path = os.path.join(temp_dir, f"{domain}_test.jsonl")
+    
     # 도메인별 처리 통계
     domain_stats = {
         "total_processed": 0,  # train_count + test_count 합계
@@ -2065,29 +2074,25 @@ def _process_domain_datasets(
             traceback.print_exc()
             raise RuntimeError(error_msg) from e
     
-    # 모든 작업을 병렬로 실행
+    # 모든 작업을 순차로 실행 (도메인별 병렬 처리는 상위 레벨에서 수행)
     if not tasks:
         error_msg = f"❌ [{domain}] 도메인에 처리할 작업이 없습니다."
         logger.error(error_msg)
         raise RuntimeError(error_msg)
     
-    logger.info(f"   🚀 {domain} 도메인: {len(tasks)}개 작업을 병렬로 처리합니다.")
+    logger.debug(f"   📋 {domain} 도메인: {len(tasks)}개 작업을 순차 처리합니다.")
     
-    executor = ThreadPoolExecutor(max_workers=max_workers)
-    future_to_task = {}
-    
-    try:
-        for task in tasks:
-            future = executor.submit(
-                _process_dataset_config_split,
+    # 도메인 내부는 순차 처리 (도메인별 병렬은 상위 레벨에서 처리)
+    for task in tasks:
+        try:
+            result = _process_dataset_config_split(
                 domain=task["domain"],
                 dataset_name=task["dataset_name"],
                 config=task["config"],
                 train_split=task["train_split"],
                 test_split=task["test_split"],
-                train_f=train_f,
-                test_f=test_f,
-                file_lock=file_lock,
+                train_path=domain_train_path,
+                test_path=domain_test_path,
                 image_counter_lock=image_counter_lock,
                 shared_counters=shared_counters,
                 images_dir=images_dir,
@@ -2098,39 +2103,15 @@ def _process_domain_datasets(
                 domain_processed_dict=domain_processed_dict,
                 max_samples_per_domain=max_samples_per_domain
             )
-            future_to_task[future] = task
-        
-        # 완료된 작업 처리
-        for future in as_completed(future_to_task):
-            task = future_to_task[future]
-            try:
-                result = future.result()
-                # train_count + test_count 합계
-                total_count = result.get("train_count", 0) + result.get("test_count", 0)
-                domain_stats["total_processed"] += total_count
-            except Exception as e:
-                error_msg = f"❌ [{domain}] 데이터셋 {task['dataset_name']} Config {task['config']} 처리 실패: {e}"
-                logger.error(error_msg)
-                logger.error("🛑 오류 발생으로 인해 모든 작업을 취소하고 프로세스를 중단합니다.")
-                traceback.print_exc()
-                
-                # 모든 미완료 작업 취소
-                for f in future_to_task:
-                    if not f.done():
-                        f.cancel()
-                
-                # Executor 종료 (기다리지 않고 즉시 취소)
-                executor.shutdown(wait=False, cancel_futures=True)
-                
-                # 프로세스 강제 종료
-                logger.error("💀 프로세스를 강제 종료합니다.")
-                os._exit(1)
-    finally:
-        # 정상 완료 시에만 정상 종료
-        try:
-            executor.shutdown(wait=True)
-        except:
-            pass  # 이미 종료된 경우 무시
+            # train_count + test_count 합계
+            total_count = result.get("train_count", 0) + result.get("test_count", 0)
+            domain_stats["total_processed"] += total_count
+        except Exception as e:
+            error_msg = f"❌ [{domain}] 데이터셋 {task['dataset_name']} Config {task['config']} 처리 실패: {e}"
+            logger.error(error_msg)
+            logger.error("🛑 오류 발생으로 인해 모든 작업을 취소하고 프로세스를 중단합니다.")
+            traceback.print_exc()
+            raise RuntimeError(error_msg) from e
     
     # 도메인별 처리 통계 로깅 및 검증
     if domain_stats["total_processed"] == 0:
@@ -2143,7 +2124,9 @@ def _process_domain_datasets(
     return {
         "domain": domain,
         "domain_stats": domain_stats,
-        "domain_processed": domain_processed_dict.get(domain, 0)
+        "domain_processed": domain_processed_dict.get(domain, 0),
+        "train_path": domain_train_path,
+        "test_path": domain_test_path
     }
 
 def get_multi_domain_sft_dataset(
@@ -2198,8 +2181,7 @@ def get_multi_domain_sft_dataset(
         train_jsonl_path = os.path.join(temp_dir, "train.jsonl")
         test_jsonl_path = os.path.join(temp_dir, "test.jsonl")
         
-        # 파일 쓰기 lock (병렬 처리 시 thread-safe)
-        file_lock = threading.Lock()
+        # 이미지 카운터 lock (병렬 처리 시 thread-safe)
         image_counter_lock = threading.Lock()
         
         # 공유 카운터 (thread-safe)
@@ -2209,80 +2191,105 @@ def get_multi_domain_sft_dataset(
             "domain_counts": defaultdict(lambda: {"train": 0, "test": 0})
         }
 
+        # 각 도메인별로 처리 (병렬화)
+        domain_pbar = tqdm(domain_configs.items(), desc="도메인 처리", unit="domain")
+        
+        # 도메인별 병렬 처리
+        executor = ThreadPoolExecutor(max_workers=max_workers)
+        future_to_domain = {}
+        domain_file_paths = {}  # 도메인별 파일 경로 저장
+        
+        try:
+            for domain, dataset_names in domain_configs.items():
+                if not dataset_names:
+                    error_msg = f"❌ {domain} 도메인에 데이터셋이 지정되지 않았습니다."
+                    logger.error(error_msg)
+                    raise ValueError(error_msg)
+                
+                # 각 도메인을 병렬로 처리
+                future = executor.submit(
+                    _process_domain_datasets,
+                    domain=domain,
+                    dataset_names=dataset_names,
+                    temp_dir=temp_dir,
+                    image_counter_lock=image_counter_lock,
+                    shared_counters=shared_counters,
+                    images_dir=images_dir,
+                    max_samples_per_domain=max_samples_per_domain,
+                    test_size=test_size,
+                    use_streaming=use_streaming,
+                    max_workers=max_workers
+                )
+                future_to_domain[future] = domain
+            
+            # 완료된 작업 처리
+            for future in as_completed(future_to_domain):
+                domain = future_to_domain[future]
+                try:
+                    result = future.result()
+                    domain_file_paths[domain] = {
+                        "train": result["train_path"],
+                        "test": result["test_path"]
+                    }
+                    domain_pbar.update(1)
+                    domain_pbar.set_description(f"도메인: {domain} 완료")
+                except Exception as e:
+                    error_msg = f"❌ {domain} 도메인 처리 실패: {e}"
+                    logger.error(error_msg)
+                    logger.error("🛑 오류 발생으로 인해 모든 작업을 취소하고 프로세스를 중단합니다.")
+                    traceback.print_exc()
+                    domain_pbar.update(1)
+                    
+                    # 모든 미완료 작업 취소
+                    for f in future_to_domain:
+                        if not f.done():
+                            f.cancel()
+                    
+                    # Executor 종료 (기다리지 않고 즉시 취소)
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    
+                    # 프로세스 강제 종료
+                    logger.error("💀 프로세스를 강제 종료합니다.")
+                    os._exit(1)
+        finally:
+            # 정상 완료 시에만 정상 종료
+            try:
+                executor.shutdown(wait=True)
+            except:
+                pass  # 이미 종료된 경우 무시
+        
+        # 최종 카운터 업데이트
+        domain_counts = shared_counters["domain_counts"]
+        total_processed = shared_counters["total_processed"]
+        image_counter = shared_counters["image_counter"]
+        
+        # 병렬 처리 완료
+        domain_pbar.close()
+        
+        # 도메인별 파일을 최종 파일로 합치기
+        logger.info("🔄 도메인별 파일을 최종 파일로 합치는 중...")
         with open(train_jsonl_path, "w", encoding="utf-8") as train_f, \
              open(test_jsonl_path, "w", encoding="utf-8") as test_f:
             
-            # 각 도메인별로 처리 (병렬화)
-            domain_pbar = tqdm(domain_configs.items(), desc="도메인 처리", unit="domain")
-            
-            # 도메인별 병렬 처리
-            executor = ThreadPoolExecutor(max_workers=max_workers)
-            future_to_domain = {}
-            
-            try:
-                for domain, dataset_names in domain_configs.items():
-                    if not dataset_names:
-                        error_msg = f"❌ {domain} 도메인에 데이터셋이 지정되지 않았습니다."
-                        logger.error(error_msg)
-                        raise ValueError(error_msg)
-                    
-                    # 각 도메인을 병렬로 처리
-                    future = executor.submit(
-                        _process_domain_datasets,
-                        domain=domain,
-                        dataset_names=dataset_names,
-                        train_f=train_f,
-                        test_f=test_f,
-                        file_lock=file_lock,
-                        image_counter_lock=image_counter_lock,
-                        shared_counters=shared_counters,
-                        images_dir=images_dir,
-                        max_samples_per_domain=max_samples_per_domain,
-                        test_size=test_size,
-                        use_streaming=use_streaming,
-                        max_workers=max_workers
-                    )
-                    future_to_domain[future] = domain
+            for domain in domain_configs.keys():
+                if domain not in domain_file_paths:
+                    continue
                 
-                # 완료된 작업 처리
-                for future in as_completed(future_to_domain):
-                    domain = future_to_domain[future]
-                    try:
-                        result = future.result()
-                        domain_pbar.update(1)
-                        domain_pbar.set_description(f"도메인: {domain} 완료")
-                    except Exception as e:
-                        error_msg = f"❌ {domain} 도메인 처리 실패: {e}"
-                        logger.error(error_msg)
-                        logger.error("🛑 오류 발생으로 인해 모든 작업을 취소하고 프로세스를 중단합니다.")
-                        traceback.print_exc()
-                        domain_pbar.update(1)
-                        
-                        # 모든 미완료 작업 취소
-                        for f in future_to_domain:
-                            if not f.done():
-                                f.cancel()
-                        
-                        # Executor 종료 (기다리지 않고 즉시 취소)
-                        executor.shutdown(wait=False, cancel_futures=True)
-                        
-                        # 프로세스 강제 종료
-                        logger.error("💀 프로세스를 강제 종료합니다.")
-                        os._exit(1)
-            finally:
-                # 정상 완료 시에만 정상 종료
-                try:
-                    executor.shutdown(wait=True)
-                except:
-                    pass  # 이미 종료된 경우 무시
-            
-            # 최종 카운터 업데이트
-            domain_counts = shared_counters["domain_counts"]
-            total_processed = shared_counters["total_processed"]
-            image_counter = shared_counters["image_counter"]
-            
-            # 병렬 처리 완료
-            domain_pbar.close()
+                # Train 파일 합치기
+                domain_train_path = domain_file_paths[domain]["train"]
+                if os.path.exists(domain_train_path):
+                    with open(domain_train_path, "r", encoding="utf-8") as f:
+                        for line in f:
+                            if line.strip():
+                                train_f.write(line)
+                
+                # Test 파일 합치기
+                domain_test_path = domain_file_paths[domain]["test"]
+                if os.path.exists(domain_test_path):
+                    with open(domain_test_path, "r", encoding="utf-8") as f:
+                        for line in f:
+                            if line.strip():
+                                test_f.write(line)
 
         # 도메인별 통계 출력 및 검증
         if not domain_counts:
@@ -2551,7 +2558,99 @@ def create_simple_collate_fn(processor, max_length: int = 2048, allow_text_only:
             self.processor = processor
             self.max_length = max_length
             self.allow_text_only = allow_text_only
+        
+        def _collate_language_modeling(self, examples):
+            """messages를 텍스트로 변환하여 processor에 전달"""
+            texts = []
+            images_list = []
             
+            for example in examples:
+                # messages를 텍스트로 변환
+                if "messages" in example:
+                    messages = validate_messages(example["messages"])
+                    try:
+                        # processor의 tokenizer를 사용하여 chat template 적용
+                        if hasattr(self.processor, 'tokenizer'):
+                            tokenizer = self.processor.tokenizer
+                        else:
+                            tokenizer = self.processor
+                        
+                        text = tokenizer.apply_chat_template(
+                            messages,
+                            tokenize=False,
+                            add_generation_prompt=False
+                        )
+                        texts.append(text)
+                    except Exception as e:
+                        logger.warning(f"⚠️ Chat template 적용 실패, messages를 직접 사용: {e}")
+                        # 실패 시 messages를 그대로 전달 (processor가 처리할 수 있으면)
+                        texts.append(messages)
+                else:
+                    # messages가 없으면 빈 문자열
+                    texts.append("")
+                
+                # 이미지 처리
+                if 'images' in example and example['images']:
+                    images = validate_image_data(example['images'])
+                    images_list.append(images if images else [])
+                else:
+                    images_list.append([])
+            
+            # processor 호출
+            try:
+                # 이미지가 있는 샘플과 없는 샘플 분리
+                has_images = any(imgs for imgs in images_list)
+                
+                if has_images:
+                    # 이미지가 있는 경우
+                    output = self.processor(
+                        text=texts,
+                        images=images_list if has_images else None,
+                        return_tensors="pt",
+                        padding=True,
+                        truncation=True,
+                        max_length=self.max_length
+                    )
+                else:
+                    # 이미지가 없는 경우 (텍스트 전용)
+                    if not self.allow_text_only:
+                        raise ValueError("이미지가 없는 샘플이 있지만 allow_text_only=False입니다.")
+                    
+                    # 텍스트만 처리
+                    if hasattr(self.processor, 'tokenizer'):
+                        tokenizer = self.processor.tokenizer
+                    else:
+                        tokenizer = self.processor
+                    
+                    output = tokenizer(
+                        text=texts,
+                        return_tensors="pt",
+                        padding=True,
+                        truncation=True,
+                        max_length=self.max_length
+                    )
+                
+                # labels 생성 (input_ids와 동일)
+                labels = output["input_ids"].clone()
+                
+                # padding 토큰 마스킹
+                pad_token_id = self.processor.tokenizer.pad_token_id if hasattr(self.processor, 'tokenizer') else self.processor.pad_token_id
+                if pad_token_id is not None:
+                    labels[labels == pad_token_id] = -100
+                
+                output["labels"] = labels
+                return output
+                
+            except Exception as e:
+                logger.error(f"⚠️ Processor 처리 중 오류: {e}")
+                import traceback
+                traceback.print_exc()
+                raise
+            
+        def torch_call(self, examples):
+            """torch_call 오버라이드 - _collate_language_modeling 직접 호출"""
+            return self._collate_language_modeling(examples)
+        
         def __call__(self, features):
             assert features is not None, "features is None"
 
@@ -2577,7 +2676,7 @@ def create_simple_collate_fn(processor, max_length: int = 2048, allow_text_only:
                     feature['images'] = []
             
             try:
-                return self.torch_call(examples=features)
+                return self._collate_language_modeling(features)
             except Exception as e:
                 import traceback
                 traceback.print_exc()

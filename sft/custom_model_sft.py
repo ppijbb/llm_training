@@ -39,6 +39,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from models import G3MoEForCausalLM, G3MoEConfig, G3MoEForConditionalGeneration, G3MoETextConfig, G3MoETextModel, G3MoEModel
 from data.base_model_sft_dataset import get_dataset, create_multimodal_collate_fn
 from data.simple_sft_dataset import get_simple_sft_dataset, create_simple_collate_fn, smoltalk_dataset, orca_mini_dataset, validate_image_data
+from data.multi_domain_sft_dataset import get_multi_domain_sft_dataset, create_simple_collate_fn as create_multi_domain_collate_fn, all_domains_dataset
 
 from training_utils.utils import format_parameters, load_config, setup_deepspeed_environment
 from optimizers.custom_optimizers import get_custom_optimizer
@@ -568,15 +569,23 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
 
 def setup_dataset(data_config: Dict[str, Any], tokenizer):
     """Setup training dataset"""    
+    use_multi_domain = data_config.get("use_multi_domain", False)
     dataset_name = data_config.get("dataset_name", "HuggingFaceTB/smoltalk")
     max_samples = data_config.get("max_samples", 100000)
+    max_samples_per_domain = data_config.get("max_samples_per_domain", None)  # multi-domain용
     max_seq_length = data_config.get("max_seq_length", 131072) or 131072
     test_size = data_config.get("test_size", 0.1)
+    use_streaming = data_config.get("streaming", False)
+    max_workers = data_config.get("max_workers", 4)  # multi-domain 병렬 처리용
     
-    print(f"Loading simple SFT dataset: {dataset_name}")
+    print(f"Loading dataset: {dataset_name}")
+    print(f"  - Use multi-domain: {use_multi_domain}")
     print(f"  - Max samples: {max_samples}")
+    if max_samples_per_domain:
+        print(f"  - Max samples per domain: {max_samples_per_domain}")
     print(f"  - Max sequence length: {max_seq_length}")
     print(f"  - Test size: {test_size}")
+    print(f"  - Streaming: {use_streaming}")
     print(f"  - 토크나이저 타입: {type(tokenizer)}")
     print(f"  - 토크나이저에 chat_template 있음: {hasattr(tokenizer, 'chat_template')}")
     if hasattr(tokenizer, 'chat_template') and tokenizer.chat_template:
@@ -594,10 +603,47 @@ def setup_dataset(data_config: Dict[str, Any], tokenizer):
         tokenizer.chat_template = chat_template
         print("  ✅ 채팅 템플릿을 tokenizer에 설정")
     
-    # print(f"Loading dataset: {data_config['dataset_name']}")
     try:
+        # Multi-domain 데이터셋 사용
+        if use_multi_domain:
+            print(f"🔄 Multi-domain 데이터셋 로더 사용")
+            # domain_configs가 지정되어 있으면 사용, 없으면 모든 도메인 사용
+            domain_configs = data_config.get("domain_configs", None)
+            
+            if max_samples_per_domain is None:
+                # max_samples_per_domain이 없으면 max_samples를 도메인 수로 나눔
+                if domain_configs:
+                    num_domains = len(domain_configs)
+                else:
+                    from data.multi_domain_sft_dataset import DOMAIN_DATASETS
+                    num_domains = len(DOMAIN_DATASETS)
+                max_samples_per_domain = max(1, max_samples // num_domains)
+                print(f"  - 자동 계산된 도메인당 샘플 수: {max_samples_per_domain}")
+            
+            dataset = get_multi_domain_sft_dataset(
+                domain_configs=domain_configs,
+                tokenizer=tokenizer,
+                max_length=max_seq_length,
+                max_samples_per_domain=max_samples_per_domain,
+                test_size=test_size,
+                use_streaming=use_streaming,
+                max_workers=max_workers
+            )
+            # Multi-domain용 collate 함수 사용 (allow_text_only=True)
+            # processor 생성 (AutoProcessor 또는 tokenizer)
+            # tokenizer가 이미 AutoProcessor인 경우 그대로 사용
+            if hasattr(tokenizer, 'tokenizer'):
+                # AutoProcessor인 경우
+                processor = tokenizer
+            else:
+                # AutoTokenizer인 경우, tokenizer를 processor로 사용
+                # (multi_domain_collate_fn이 tokenizer도 처리할 수 있음)
+                processor = tokenizer
+            
+            collate_fn = create_multi_domain_collate_fn(processor, max_length=max_seq_length, allow_text_only=True)
+        
         # 간단한 데이터셋 로더 사용
-        if "smoltalk" in dataset_name.lower() or "orca" in dataset_name.lower() or "llava" in dataset_name.lower():
+        elif "smoltalk" in dataset_name.lower() or "orca" in dataset_name.lower() or "llava" in dataset_name.lower():
             print(f"일반 데이터셋 로더 시도: {dataset_name}")
             dataset = get_simple_sft_dataset(
                 dataset_name=dataset_name,
@@ -605,7 +651,7 @@ def setup_dataset(data_config: Dict[str, Any], tokenizer):
                 max_length=max_seq_length,
                 max_samples=max_samples,
                 test_size=test_size,
-                use_streaming=True
+                use_streaming=use_streaming
             )
             # 이미지 중첩 리스트 문제 해결을 위한 커스텀 data collator 사용
             collate_fn = create_simple_collate_fn(tokenizer, max_length=max_seq_length)
@@ -616,18 +662,33 @@ def setup_dataset(data_config: Dict[str, Any], tokenizer):
                 dataset_name=data_config["dataset_name"],
                 max_length=data_config["max_seq_length"],
                 test_size=data_config["test_size"],
-                text_only=data_config["text_only"],
+                text_only=data_config.get("text_only", False),
                 streaming=data_config["streaming"]
             )
             collate_fn = create_multimodal_collate_fn(tokenizer)
         
         print(f"Dataset loaded:")
         for split, data in dataset.items():
-            print(f"  {split}: {data.info.dataset_size if bool(data_config['streaming']) else len(data)} examples")
+            try:
+                if use_streaming and hasattr(data, 'info') and hasattr(data.info, 'dataset_size'):
+                    size = data.info.dataset_size
+                else:
+                    size = len(data) if hasattr(data, '__len__') else "unknown"
+                print(f"  {split}: {size} examples")
+            except Exception as e:
+                print(f"  {split}: size unknown ({e})")
         
         # 빈 데이터셋 체크
-        if data_config.get("streaming", False):
-            if dataset.get("train", []).info.dataset_size == 0:
+        train_dataset = dataset.get("train", None)
+        if train_dataset is None:
+            raise ValueError("훈련 데이터셋이 없습니다!")
+        
+        if use_streaming:
+            if hasattr(train_dataset, 'info') and hasattr(train_dataset.info, 'dataset_size'):
+                if train_dataset.info.dataset_size == 0:
+                    raise ValueError("훈련 데이터셋이 비어있습니다!")
+        else:
+            if hasattr(train_dataset, '__len__') and len(train_dataset) == 0:
                 raise ValueError("훈련 데이터셋이 비어있습니다!")
 
         return dataset, collate_fn

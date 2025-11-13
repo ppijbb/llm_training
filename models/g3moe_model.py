@@ -2755,10 +2755,187 @@ class G3MoEForConditionalGeneration(G3MoEPreTrainedModel, GenerationMixin):
         return create_masks_for_generate(**mask_kwargs)
 
 
+class G3MoERouterTrainingMonitor:
+    """
+    PyTorch 학습 루프에서 라우터가 '실제로' 학습되는지 지속 모니터링하는 콜백.
+    - on_batch_start: step 스냅샷(파라미터 값) 저장
+    - on_after_backward: grad norm/분포/엔트로피/EMA/보조 로스 로깅
+    - on_step_end: 파라미터 업데이트량(delta) 확인
+    사용자는 학습 루프에서 각 타이밍에 해당 메서드를 호출하면 됩니다.
+    """
+    def __init__(
+        self,
+        model: nn.Module,
+        optimizer: Optional[torch.optim.Optimizer] = None,
+        log_every: int = 100,
+        log_fn: Optional[Callable[[str], None]] = None,
+    ):
+        self.model = model
+        self.optimizer = optimizer
+        self.log_every = max(int(log_every), 1)
+        self.log_fn = log_fn if log_fn is not None else (lambda msg: logger.info(msg))
+        self._step = 0
+        self._pre_step_snapshots: dict[str, dict[str, torch.Tensor]] = {}
+
+    def _iter_router_modules(self):
+        for name, module in self.model.named_modules():
+            if getattr(module, "_is_g3moe_router", False) or isinstance(module, G3MoERouter):
+                yield name, module
+
+    @staticmethod
+    def _check_requires_grad(module: nn.Module) -> bool:
+        params = list(module.parameters(recurse=True))
+        return len(params) > 0 and all(p.requires_grad for p in params)
+
+    def _check_in_optimizer(self, module: nn.Module) -> bool:
+        if self.optimizer is None:
+            return False
+        target_ids = {id(p) for p in module.parameters(recurse=True)}
+        if not target_ids:
+            return False
+        opt_ids = set()
+        for group in self.optimizer.param_groups:
+            for p in group.get("params", []):
+                opt_ids.add(id(p))
+        return target_ids.issubset(opt_ids)
+
+    @staticmethod
+    def _grad_norms(module: nn.Module) -> dict[str, float]:
+        norms: dict[str, float] = {}
+        for n, p in module.named_parameters(recurse=True):
+            if p.grad is not None:
+                # 작은 수치 노이즈는 0으로 취급하지 않음
+                norms[n] = float(p.grad.detach().norm().item())
+        return norms
+
+    @staticmethod
+    def _snapshot_params(module: nn.Module) -> dict[str, torch.Tensor]:
+        return {n: p.detach().clone() for n, p in module.named_parameters(recurse=True)}
+
+    @staticmethod
+    def _param_deltas(before: dict[str, torch.Tensor], module: nn.Module) -> dict[str, float]:
+        deltas: dict[str, float] = {}
+        for n, p in module.named_parameters(recurse=True):
+            if n in before:
+                deltas[n] = float((before[n] - p.detach()).abs().sum().item())
+        return deltas
+
+    @staticmethod
+    def _router_usage_and_entropy(router_logits: Optional[Union[torch.Tensor, Tuple[torch.Tensor, ...]]]) -> tuple[Optional[List[float]], Optional[float]]:
+        if router_logits is None:
+            return None, None
+        if isinstance(router_logits, tuple):
+            if not router_logits:
+                return None, None
+            probs = torch.cat([t for t in router_logits if t is not None and t.numel() > 0], dim=0)
+        else:
+            probs = router_logits
+        if probs.numel() == 0:
+            return None, None
+        # 본 코드 경로에서는 router_logits가 '확률'로 전달되는 경우가 많음
+        p = probs.clamp_min(1e-12)
+        num_experts = p.size(-1)
+        top1 = p.argmax(dim=-1)
+        usage = torch.bincount(top1, minlength=num_experts).float()
+        usage = usage / usage.sum().clamp_min(1.0)
+        entropy = float((-(p * p.log()).sum(dim=-1)).mean().item())
+        return usage.tolist(), entropy
+
+    def on_batch_start(self):
+        self._step += 1
+        self._pre_step_snapshots.clear()
+        for name, module in self._iter_router_modules():
+            self._pre_step_snapshots[name] = self._snapshot_params(module)
+
+    def on_after_backward(
+        self,
+        outputs: Optional[Union[G3MoECausalLMOutputWithPast, G3MoEModelOutputWithPast]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+    ):
+        if self._step % self.log_every != 0:
+            return
+
+        # 라우터 모듈별 상태/grad
+        lines = []
+        for name, module in self._iter_router_modules():
+            req = self._check_requires_grad(module)
+            inopt = self._check_in_optimizer(module)
+            norms = self._grad_norms(module)
+            any_grad = any(v > 0.0 for v in norms.values())
+            gsum = sum(norms.values()) if norms else 0.0
+            gmax = max(norms.values()) if norms else 0.0
+            lines.append(f"[router:{name}] requires_grad={req} in_optimizer={inopt} any_grad={any_grad} grad_sum={gsum:.6f} grad_max={gmax:.6f}")
+
+        # 사용 분포/엔트로피
+        usage, entropy = (None, None)
+        if outputs is not None and hasattr(outputs, "router_logits"):
+            usage, entropy = self._router_usage_and_entropy(outputs.router_logits)
+            if usage is not None:
+                lines.append(f"[routing] usage(top1_ratio)={','.join(f'{u:.3f}' for u in usage)}")
+            if entropy is not None:
+                lines.append(f"[routing] entropy={entropy:.6f}")
+
+        # EMA (가능한 경우)
+        try:
+            # ForCausalLM -> .model.global_router, TextModel -> .global_router
+            global_router = None
+            if hasattr(self.model, "model") and hasattr(self.model.model, "global_router"):
+                global_router = self.model.model.global_router
+            elif hasattr(self.model, "global_router"):
+                global_router = self.model.global_router
+            if global_router is not None and hasattr(global_router, "expert_load_ema"):
+                ema = global_router.expert_load_ema.detach().float()
+                s = float(ema.sum().item())
+                ema_norm = (ema / s) if s > 0 else ema
+                lines.append(f"[ema] expert_load_ema_norm={','.join(f'{float(x):.3f}' for x in ema_norm.tolist())}")
+        except Exception:
+            pass
+
+        if lines:
+            self.log_fn(f"[step {self._step}] " + " | ".join(lines))
+
+        # 선택적으로 보조 로스도 로깅(계산 비용 낮음)
+        try:
+            if outputs is not None and hasattr(outputs, "router_logits") and outputs.router_logits is not None:
+                if hasattr(self.model, "model") and hasattr(self.model.model, "config"):
+                    cfg = self.model.model.config
+                elif hasattr(self.model, "config"):
+                    cfg = self.model.config
+                else:
+                    cfg = None
+                if cfg is not None:
+                    aux = load_balancing_loss_func(
+                        outputs.router_logits,
+                        cfg.n_routed_experts,
+                        getattr(cfg, "num_experts_per_tok", 2),
+                        attention_mask,
+                        router_z_loss_coef=getattr(cfg, "router_z_loss_coef", None),
+                        router_entropy_coef=getattr(cfg, "router_entropy_coef", None),
+                        usage_uniformity_coef=getattr(cfg, "usage_uniformity_coef", None),
+                    ).detach().float().item()
+                    self.log_fn(f"[step {self._step}] aux_lb_loss={aux:.6f}")
+        except Exception:
+            pass
+
+    def on_step_end(self):
+        if self._step % self.log_every != 0:
+            return
+        lines = []
+        for name, module in self._iter_router_modules():
+            before = self._pre_step_snapshots.get(name, {})
+            deltas = self._param_deltas(before, module)
+            delta_sum = sum(deltas.values()) if deltas else 0.0
+            lines.append(f"[router:{name}] param_delta_sum={delta_sum:.6f}")
+        if lines:
+            self.log_fn(f"[step {self._step}] " + " | ".join(lines))
+        self._pre_step_snapshots.clear()
+
+
 __all__ = [
     "G3MoEPreTrainedModel",
     "G3MoETextModel",
     "G3MoEForCausalLM",
     "G3MoEForConditionalGeneration",
     "G3MoEModel",
+    "G3MoERouterTrainingMonitor",
 ]
