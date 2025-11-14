@@ -1003,7 +1003,9 @@ class G3MoEGRINMoE(nn.Module):
     def _sparse_routing(self, hidden_states: torch.Tensor, global_routing_logits: torch.Tensor) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         if self.training and self.input_jitter_noise > 0:
-            hidden_states *= torch.empty_like(hidden_states).uniform_(1.0 - self.input_jitter_noise, 1.0 + self.input_jitter_noise)
+            # Inplace 연산 대신 새로운 텐서 생성 (gradient checkpointing 호환)
+            jitter = torch.empty_like(hidden_states).uniform_(1.0 - self.input_jitter_noise, 1.0 + self.input_jitter_noise)
+            hidden_states = hidden_states * jitter
         
         # Global router에서 전체 라우팅 처리 (GRU + expression projection + sparsemixer)
         router_output = self.router(
@@ -1869,9 +1871,11 @@ class G3MoETextModel(G3MoEPreTrainedModel):
         all_self_attns = () if output_attentions else None
         all_router_logits = []  # 모든 MoE 레이어의 router_logits를 수집
         global_routing_hn = None
-        speciality_loss = None
-        cosine_similarities = None
-        expression_loss = None
+        
+        # 각 layer의 loss를 누적하기 위한 리스트
+        all_speciality_losses = []
+        all_cosine_similarities = []
+        all_expression_losses = []
 
         for decoder_layer in self.layers[: self.config.num_hidden_layers]:
             if output_hidden_states:
@@ -1897,9 +1901,18 @@ class G3MoETextModel(G3MoEPreTrainedModel):
                 if router_logits is not None:
                     all_router_logits.append(router_logits)  # 리스트에 추가
                 global_routing_hn = routing_result[1]
-                speciality_loss = routing_result[2]
-                cosine_similarities = routing_result[3]
-                expression_loss = routing_result[4]
+                
+                # 각 layer의 값을 리스트에 저장 (덮어쓰지 않음)
+                layer_speciality_loss = routing_result[2]
+                layer_cosine_similarities = routing_result[3]
+                layer_expression_loss = routing_result[4]
+                
+                if layer_speciality_loss is not None:
+                    all_speciality_losses.append(layer_speciality_loss)
+                if layer_cosine_similarities is not None:
+                    all_cosine_similarities.append(layer_cosine_similarities)
+                if layer_expression_loss is not None:
+                    all_expression_losses.append(layer_expression_loss)
 
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
@@ -1911,6 +1924,21 @@ class G3MoETextModel(G3MoEPreTrainedModel):
 
         # router_logits를 튜플로 변환 (비어있으면 None)
         router_logits_tuple = tuple(all_router_logits) if all_router_logits else None
+        
+        # 모든 layer의 loss를 집계
+        speciality_loss = None
+        cosine_similarities = None
+        expression_loss = None
+        
+        if all_speciality_losses:
+            # speciality_loss는 평균 (스칼라 값들의 평균)
+            speciality_loss = torch.stack(all_speciality_losses).mean() if len(all_speciality_losses) > 0 else None
+        if all_cosine_similarities:
+            # cosine_similarities는 평균 (텐서들의 평균)
+            cosine_similarities = torch.stack(all_cosine_similarities).mean() if len(all_cosine_similarities) > 0 else None
+        if all_expression_losses:
+            # expression_loss는 평균 (스칼라 값들의 평균)
+            expression_loss = torch.stack(all_expression_losses).mean() if len(all_expression_losses) > 0 else None
 
         return G3MoEModelOutputWithPast(
             last_hidden_state=hidden_states,
