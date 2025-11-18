@@ -767,6 +767,10 @@ def main(
     print("Setting up dataset...")
     dataset, collate_fn = setup_dataset(data_config, tokenizer)
     
+    # 모델 및 데이터셋 로드 후 메모리 정리
+    logger.info("🧹 모델 및 데이터셋 로드 후 GPU 메모리 정리...")
+    clear_gpu_memory()
+    
     # Create training arguments
     training_args = create_training_args(
         training_config, 
@@ -805,6 +809,10 @@ def main(
     # 데이터셋 검증
     train_dataset = dataset.get("train", None)
     eval_dataset = dataset.get("test", None)
+    if eval_dataset is None:
+        splited = train_dataset.train_test_split(test_size=0.1)
+        train_dataset = splited["train"]
+        eval_dataset = splited["test"]
     
     if train_dataset is None or len(train_dataset) == 0:
         raise ValueError(f"훈련 데이터셋이 비어있습니다! 데이터셋 로딩을 확인하세요.")
@@ -820,8 +828,17 @@ def main(
     print("데이터셋 샘플 확인:")
     print(f"  - 첫 번째 훈련 샘플 키: {list(train_dataset[0].keys())}")
     print(f"  - 첫 번째 샘플 messages: {train_dataset[0]['messages'][:100]}")
-    print(f"  - 첫 번째 샘플 images: {train_dataset[0]['images'][0].size}")
-
+    
+    # 이미지가 있는 경우에만 출력 (multi-domain에서는 텍스트 전용 샘플이 있을 수 있음)
+    first_sample_images = train_dataset[0].get('images', [])
+    if first_sample_images and len(first_sample_images) > 0:
+        if hasattr(first_sample_images[0], 'size'):
+            print(f"  - 첫 번째 샘플 images: {first_sample_images[0].size}")
+        else:
+            print(f"  - 첫 번째 샘플 images: {type(first_sample_images[0])} (이미지 객체)")
+    else:
+        print(f"  - 첫 번째 샘플 images: 없음 (텍스트 전용 샘플)")
+    
     trainer = SFTTrainer( 
         model=model,
         args=training_args,
@@ -831,19 +848,27 @@ def main(
         data_collator=collate_fn,
         optimizers=(custom_optimizer, None) if custom_optimizer is not None else (None, None)
     )
-    # Enforce: Disable gradient checkpointing with ZeRO-3 at runtime as an additional safeguard
+    # ZeRO-3에서도 gradient checkpointing 사용 가능 (DeepSpeed activation checkpointing과 함께 사용)
+    # 단, DeepSpeed config에 activation_checkpointing이 활성화되어 있으면 그것을 우선 사용
     try:
         ds_cfg_path = getattr(trainer.args, "deepspeed", None)
         if ds_cfg_path:
             import json
             with open(ds_cfg_path, "r") as f:
-                _zero_stage = int((json.load(f).get("zero_optimization", {}) or {}).get("stage", 0) or 0)
-            if _zero_stage == 3:
-                if hasattr(trainer.model, "gradient_checkpointing_disable"):
-                    trainer.model.gradient_checkpointing_disable()
-                trainer.args.gradient_checkpointing = False
-                print("✓ Disabled gradient checkpointing for DeepSpeed ZeRO-3 compatibility")
-    except Exception as _:
+                ds_cfg = json.load(f)
+            _zero_stage = int((ds_cfg.get("zero_optimization", {}) or {}).get("stage", 0) or 0)
+            # DeepSpeed activation checkpointing이 활성화되어 있으면 그대로 사용
+            ds_activation_checkpointing = ds_cfg.get("activation_checkpointing", {})
+            if ds_activation_checkpointing and ds_activation_checkpointing.get("partition_activations", False):
+                print("✓ DeepSpeed activation checkpointing 활성화됨 - PyTorch gradient checkpointing과 함께 사용")
+                # PyTorch gradient checkpointing도 활성화 (DeepSpeed와 함께 사용 가능)
+                trainer.args.gradient_checkpointing = True
+            elif _zero_stage == 3:
+                # ZeRO-3이고 DeepSpeed activation checkpointing이 없으면 PyTorch gradient checkpointing 사용
+                print("✓ ZeRO-3에서 PyTorch gradient checkpointing 활성화 (메모리 절약)")
+                trainer.args.gradient_checkpointing = True
+    except Exception as e:
+        print(f"⚠️ Gradient checkpointing 설정 확인 실패: {e}, 기본값 사용")
         pass
     # Add MoE monitoring callback
     trainer.add_callback(
@@ -984,6 +1009,17 @@ def main(
             logger.info("🔧 Setting up memory-optimized evaluation...")
             original_eval_fn = getattr(trainer, 'evaluate', None)
             trainer.evaluate = lambda eval_dataset=None, ignore_keys=None, metric_key_prefix="eval": eval_with_memory_optimization(trainer, original_eval_fn, eval_dataset=eval_dataset, ignore_keys=ignore_keys, metric_key_prefix=metric_key_prefix)
+            
+            # 학습 시작 전 메모리 정리
+            logger.info("🧹 학습 시작 전 GPU 메모리 정리...")
+            clear_gpu_memory()
+            
+            # DataLoader 최적화 (메모리 절약)
+            if hasattr(trainer.args, 'dataloader_num_workers'):
+                if trainer.args.dataloader_num_workers is None or trainer.args.dataloader_num_workers > 0:
+                    logger.info(f"🔧 DataLoader num_workers를 0으로 설정 (메모리 절약)")
+                    trainer.args.dataloader_num_workers = 1
+            
             # Log initial memory state
             log_gpu_memory(logger, "TRAINING_START")
             
@@ -1003,8 +1039,16 @@ def main(
         error_msg = str(e)
         logger.error(f"❌ RuntimeError during training: {error_msg}")
         
-        if "CUDA out of memory" in error_msg:
-            logger.error("❌ CUDA OOM 발생! 상세 정보를 수집합니다...")
+        # CUBLAS 메모리 할당 실패도 메모리 부족으로 처리
+        is_memory_error = (
+            "CUDA out of memory" in error_msg or
+            "CUBLAS_STATUS_ALLOC_FAILED" in error_msg or
+            "cublasCreate" in error_msg
+        )
+        
+        if is_memory_error:
+            logger.error("❌ GPU 메모리 부족 오류 발생! (CUDA OOM 또는 CUBLAS 할당 실패)")
+            logger.error("   상세 정보를 수집합니다...")
             
             # Log detailed memory state at OOM
             log_gpu_memory(logger, "OOM_ERROR")
@@ -1038,7 +1082,20 @@ def main(
             
             logger.error("❌ 메모리 정리 후 재시도...")
             clear_gpu_memory()
-            logger.error("❌ GPU 메모리 정리 완료. 다시 시도해주세요.")
+            logger.error("❌ GPU 메모리 정리 완료.")
+            logger.error("💡 해결 방법 제안:")
+            logger.error("   1. per_device_train_batch_size를 더 줄이기 (현재: {})".format(
+                trainer.per_device_train_batch_size if hasattr(trainer, 'per_device_train_batch_size') else 'N/A'
+            ))
+            logger.error("   2. gradient_accumulation_steps를 더 늘리기 (현재: {})".format(
+                trainer.gradient_accumulation_steps if hasattr(trainer, 'gradient_accumulation_steps') else 'N/A'
+            ))
+            logger.error("   3. max_length를 줄이기 (현재: {})".format(
+                trainer.args.max_length if hasattr(trainer.args, 'max_length') else 'N/A'
+            ))
+            logger.error("   4. 다른 프로세스가 GPU를 사용 중인지 확인 (nvidia-smi)")
+            logger.error("   5. DeepSpeed ZeRO-3 CPU offload가 제대로 작동하는지 확인")
+            logger.error("   6. 이미지가 포함된 샘플이 많으면 이미지 전용 데이터셋으로 분리 고려")
             
         else:
             logger.error(f"❌ Other RuntimeError: {error_msg}")

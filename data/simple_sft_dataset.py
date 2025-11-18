@@ -12,8 +12,10 @@ import tempfile
 import pathlib
 import shutil
 import json
+import hashlib
+from datetime import datetime
 from PIL import Image
-from datasets import Dataset, DatasetDict, load_dataset, Image as DatasetImage, Sequence, Features
+from datasets import Dataset, DatasetDict, load_dataset, Image as DatasetImage, Sequence, Features, Value
 
 # Configure logger
 logger = logging.getLogger(__name__)
@@ -23,6 +25,18 @@ formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(messag
 handler.setFormatter(formatter)
 logger.addHandler(handler)
 
+def _generate_simple_cache_key(dataset_name: str, max_samples: int, test_size: float, use_streaming: bool) -> str:
+    """캐시 키 생성"""
+    cache_data = {
+        "dataset_name": dataset_name,
+        "max_samples": max_samples,
+        "test_size": test_size,
+        "use_streaming": use_streaming
+    }
+    cache_str = json.dumps(cache_data, sort_keys=True, ensure_ascii=False)
+    cache_hash = hashlib.md5(cache_str.encode('utf-8')).hexdigest()
+    return f"simple_{cache_hash}"
+
 def get_simple_sft_dataset(
     dataset_name: str = "HuggingFaceTB/smoltalk", 
     tokenizer=None,
@@ -30,7 +44,8 @@ def get_simple_sft_dataset(
     max_samples: int = 1000,
     test_size: float = 0.1,
     use_streaming: bool = True,
-    chunk_size: int = 1000
+    chunk_size: int = 1000,
+    use_cache: bool = True
 ):
     """
     메모리 효율적인 SFT 데이터셋을 로드합니다.
@@ -40,17 +55,154 @@ def get_simple_sft_dataset(
     if tokenizer is None:
         raise ValueError("Tokenizer must be provided")
     
+    # 캐시 키 생성
+    cache_key = _generate_simple_cache_key(dataset_name, max_samples, test_size, use_streaming)
+    base_temp_dir = "/mls/conan/tmp"
+    cache_dir = os.path.join(base_temp_dir, "cache", cache_key)
+    cache_train_path = os.path.join(cache_dir, "train.jsonl")
+    cache_test_path = os.path.join(cache_dir, "test.jsonl")
+    cache_images_dir = os.path.join(cache_dir, "images")
+    cache_meta_path = os.path.join(cache_dir, "cache_meta.json")
+    
+    # 캐시 확인
+    if use_cache and os.path.exists(cache_train_path) and os.path.exists(cache_test_path):
+        # 파일 크기 확인 (빈 파일이 아닌지)
+        if os.path.getsize(cache_train_path) > 0:
+            logger.info(f"💾 캐시된 데이터셋 발견: {cache_key}")
+            logger.info(f"   - 캐시 디렉토리: {cache_dir}")
+            
+            # 메타데이터 확인
+            if os.path.exists(cache_meta_path):
+                try:
+                    with open(cache_meta_path, "r", encoding="utf-8") as f:
+                        cache_meta = json.load(f)
+                        logger.info(f"   - 캐시 생성 시간: {cache_meta.get('created_at', 'N/A')}")
+                        logger.info(f"   - Train 샘플 수: {cache_meta.get('train_count', 'N/A')}")
+                        logger.info(f"   - Test 샘플 수: {cache_meta.get('test_count', 'N/A')}")
+                except Exception as e:
+                    logger.warning(f"   ⚠️ 캐시 메타데이터 읽기 실패: {e}")
+            
+            # 캐시된 파일로부터 데이터셋 로드
+            try:
+                data_files = {}
+                if os.path.exists(cache_train_path) and os.path.getsize(cache_train_path) > 0:
+                    data_files["train"] = cache_train_path
+                if os.path.exists(cache_test_path) and os.path.getsize(cache_test_path) > 0:
+                    data_files["test"] = cache_test_path
+                
+                if not data_files:
+                    logger.warning("   ⚠️ 캐시 파일이 비어있습니다. 재처리합니다.")
+                    raise FileNotFoundError("Cache files are empty")
+                
+                logger.info("🧠 캐시된 JSONL 파일로부터 데이터셋 로딩...")
+                
+                # JSONL 파일을 읽어서 리스트로 만든 후 Dataset.from_list 사용
+                dataset_dict = DatasetDict()
+                for split_name, file_path in data_files.items():
+                    logger.info(f"   📂 {split_name} split 로딩 중...")
+                    
+                    # JSONL 파일 읽기 및 정제
+                    records = []
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        for line_num, line in enumerate(f, 1):
+                            if not line.strip():
+                                continue
+                            try:
+                                record = json.loads(line.strip())
+                                
+                                # messages 정규화
+                                if 'messages' in record and isinstance(record['messages'], list):
+                                    for message in record['messages']:
+                                        if not isinstance(message, dict):
+                                            continue
+                                        if 'content' in message and isinstance(message['content'], list):
+                                            for content_item in message['content']:
+                                                if not isinstance(content_item, dict):
+                                                    continue
+                                                # text 필드가 없거나 None이면 빈 문자열로
+                                                if 'text' not in content_item or content_item.get('text') is None:
+                                                    content_item['text'] = ""
+                                                # type 필드가 없으면 "text"로
+                                                if 'type' not in content_item:
+                                                    content_item['type'] = "text"
+                                
+                                # images 필드 정규화 (없으면 빈 리스트, 문자열 리스트로 보장)
+                                if 'images' not in record:
+                                    record['images'] = []
+                                elif record['images'] is None:
+                                    record['images'] = []
+                                elif not isinstance(record['images'], list):
+                                    record['images'] = []
+                                else:
+                                    # 이미지 경로가 문자열인지 확인
+                                    record['images'] = [str(img) if img is not None else "" for img in record['images'] if img is not None]
+                                
+                                records.append(record)
+                            except (json.JSONDecodeError, TypeError) as e:
+                                logger.debug(f"   ⚠️ {split_name} 파일 {line_num}번째 줄 JSON 파싱 실패, 건너뜀: {e}")
+                                continue
+                    
+                    # Dataset.from_list로 생성
+                    if records:
+                        dataset_dict[split_name] = Dataset.from_list(records)
+                        logger.info(f"   ✅ {split_name} split 로드 완료: {len(dataset_dict[split_name])}개 샘플")
+                    else:
+                        logger.warning(f"   ⚠️ {split_name} split에 유효한 샘플이 없습니다.")
+                        # 빈 데이터셋 생성
+                        dataset_dict[split_name] = Dataset.from_list([])
+                
+                # 이미지 경로 처리
+                logger.info("🖼️ 이미지 경로를 이미지 객체로 캐스팅 (lazy loading)...")
+                for split in dataset_dict:
+                    def preprocess_images(example):
+                        """이미지 데이터 전처리 - 중첩 리스트 평면화"""
+                        if 'images' in example and example['images']:
+                            # 이미지 경로를 절대 경로로 변환
+                            image_paths = example['images']
+                            if isinstance(image_paths, list):
+                                fixed_paths = []
+                                for img_path in image_paths:
+                                    if isinstance(img_path, str) and img_path.strip():
+                                        if not os.path.isabs(img_path):
+                                            img_path = os.path.join(cache_images_dir, os.path.basename(img_path))
+                                        # 파일 존재 확인
+                                        if os.path.exists(img_path):
+                                            fixed_paths.append(img_path)
+                                example['images'] = validate_image_data(fixed_paths)
+                            else:
+                                example['images'] = validate_image_data(example['images']) if example['images'] else []
+                        elif 'images' not in example:
+                            example['images'] = []
+                        return example
+                    
+                    # 이미지 전처리 적용
+                    dataset_dict[split] = dataset_dict[split].map(preprocess_images)
+                    
+                    # 이미지 필드를 DatasetImage로 캐스팅
+                    current_features = dataset_dict[split].features
+                    new_features = current_features.copy()
+                    if 'images' in new_features:
+                        new_features['images'] = Sequence(DatasetImage(decode=True))
+                        dataset_dict[split] = dataset_dict[split].cast(new_features)
+                
+                logger.info("✅ 캐시된 데이터셋 로드 완료")
+                return dataset_dict
+                
+            except Exception as e:
+                logger.warning(f"   ⚠️ 캐시 로드 실패, 재처리합니다: {e}")
+                traceback.print_exc()
+                # 캐시 로드 실패 시 기존 로직으로 진행
+    
+    # 캐시가 없거나 사용하지 않는 경우 기존 처리 로직
     logger.info(f"📦 메모리 효율적 로딩 (V2 - JSONL): {dataset_name}")
     logger.info(f"   - max_samples: {max_samples}")
     logger.info(f"   - streaming: {use_streaming}")
     
     log_memory_usage("데이터셋 로딩 시작")
     
-    base_temp_dir = "/mls/conan/tmp"
-    os.makedirs(base_temp_dir, exist_ok=True)
-    temp_dir = tempfile.mkdtemp(dir=base_temp_dir)
-    logger.info(f"📂 임시 디렉토리 생성: {temp_dir}")
-    images_dir = os.path.join(temp_dir, "images")
+    # 캐시 디렉토리 사용
+    os.makedirs(cache_dir, exist_ok=True)
+    images_dir = cache_images_dir
     os.makedirs(images_dir, exist_ok=True)
 
     try:
@@ -70,8 +222,8 @@ def get_simple_sft_dataset(
         image_counter = 0
         train_count, test_count = 0, 0
         
-        train_jsonl_path = os.path.join(temp_dir, "train.jsonl")
-        test_jsonl_path = os.path.join(temp_dir, "test.jsonl")
+        train_jsonl_path = cache_train_path
+        test_jsonl_path = cache_test_path
 
         with open(train_jsonl_path, "w", encoding="utf-8") as train_f, \
              open(test_jsonl_path, "w", encoding="utf-8") as test_f:
@@ -204,13 +356,31 @@ def get_simple_sft_dataset(
 
         logger.info("✅ 메모리 효율적 데이터셋 생성 완료")
         
+        # 처리 완료 후 메타데이터 저장
+        try:
+            cache_meta = {
+                "created_at": datetime.now().isoformat(),
+                "train_count": train_count,
+                "test_count": test_count,
+                "dataset_name": dataset_name,
+                "max_samples": max_samples,
+                "test_size": test_size,
+                "use_streaming": use_streaming,
+                "cache_key": cache_key
+            }
+            with open(cache_meta_path, "w", encoding="utf-8") as f:
+                json.dump(cache_meta, f, indent=2, ensure_ascii=False)
+            logger.info(f"💾 데이터셋 캐시 저장 완료: {cache_dir}")
+        except Exception as e:
+            logger.warning(f"⚠️ 캐시 메타데이터 저장 실패: {e}")
+        
         return dataset_dict
 
     except Exception as e:
         logger.error(f"❌ 데이터셋 로딩 실패: {e}")
         traceback.print_exc()
-        # On failure, clean up immediately
-        shutil.rmtree(temp_dir, ignore_errors=True)
+        # 실패 시에도 캐시 디렉토리는 유지 (부분적으로 처리된 데이터가 있을 수 있음)
+        # shutil.rmtree(cache_dir, ignore_errors=True)
         raise Exception(f"😢 데이터셋 로딩 시도가 실패했습니다.") from e
 
 

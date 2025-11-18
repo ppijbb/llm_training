@@ -13,8 +13,10 @@ import tempfile
 import pathlib
 import shutil
 import json
+import hashlib
+from datetime import datetime
 from PIL import Image
-from datasets import Dataset, DatasetDict, load_dataset, Image as DatasetImage, Sequence, Features
+from datasets import Dataset, DatasetDict, load_dataset, Image as DatasetImage, Sequence, Features, Value
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed, CancelledError
 import threading
@@ -1599,6 +1601,22 @@ DOMAIN_DATASETS = {
     ]
 }
 
+def _generate_cache_key(domain_configs: Dict[str, List[str]], max_samples_per_domain: int, 
+                       test_size: float, use_streaming: bool, max_workers: int) -> str:
+    """캐시 키 생성"""
+    # 도메인 설정을 정렬하여 일관성 보장
+    sorted_domains = sorted(domain_configs.items())
+    cache_data = {
+        "domain_configs": sorted_domains,
+        "max_samples_per_domain": max_samples_per_domain,
+        "test_size": test_size,
+        "use_streaming": use_streaming,
+        "max_workers": max_workers
+    }
+    cache_str = json.dumps(cache_data, sort_keys=True, ensure_ascii=False)
+    cache_hash = hashlib.md5(cache_str.encode('utf-8')).hexdigest()
+    return f"multi_domain_{cache_hash}"
+
 def get_domain_from_config(config_name: str, dataset_name: str) -> Optional[str]:
     """
     Config 이름과 데이터셋 이름을 기반으로 도메인을 추론합니다.
@@ -2137,7 +2155,8 @@ def get_multi_domain_sft_dataset(
     test_size: float = 0.1,
     use_streaming: bool = True,
     chunk_size: int = 1000,
-    max_workers: int = 4
+    max_workers: int = 4,
+    use_cache: bool = True
 ):
     """
     멀티 도메인 SFT 데이터셋을 로드합니다.
@@ -2151,6 +2170,8 @@ def get_multi_domain_sft_dataset(
         test_size: 테스트 세트 비율
         use_streaming: 스트리밍 모드 사용 여부
         chunk_size: 청크 크기
+        max_workers: 병렬 처리 워커 수
+        use_cache: 캐시 사용 여부 (기본값: True)
     
     Returns:
         DatasetDict with train/test splits, 각 샘플에 'domain' 필드 포함
@@ -2161,7 +2182,153 @@ def get_multi_domain_sft_dataset(
     if domain_configs is None:
         domain_configs = DOMAIN_DATASETS
     
-    logger.info(f"📦 멀티 도메인 데이터셋 로딩 시작")
+    # 캐시 키 생성
+    cache_key = _generate_cache_key(domain_configs, max_samples_per_domain, test_size, use_streaming, max_workers)
+    base_temp_dir = "/mls/conan/tmp"
+    cache_dir = os.path.join(base_temp_dir, "cache", cache_key)
+    cache_train_path = os.path.join(cache_dir, "train.jsonl")
+    cache_test_path = os.path.join(cache_dir, "test.jsonl")
+    cache_images_dir = os.path.join(cache_dir, "images")
+    cache_meta_path = os.path.join(cache_dir, "cache_meta.json")
+    
+    # 캐시 확인
+    if use_cache and os.path.exists(cache_train_path) and os.path.exists(cache_test_path):
+        # 파일 크기 확인 (빈 파일이 아닌지)
+        if os.path.getsize(cache_train_path) > 0:
+            logger.info(f"💾 캐시된 데이터셋 발견: {cache_key}")
+            logger.info(f"   - 캐시 디렉토리: {cache_dir}")
+            
+            # 메타데이터 확인
+            if os.path.exists(cache_meta_path):
+                try:
+                    with open(cache_meta_path, "r", encoding="utf-8") as f:
+                        cache_meta = json.load(f)
+                        logger.info(f"   - 캐시 생성 시간: {cache_meta.get('created_at', 'N/A')}")
+                        logger.info(f"   - Train 샘플 수: {cache_meta.get('train_count', 'N/A')}")
+                        logger.info(f"   - Test 샘플 수: {cache_meta.get('test_count', 'N/A')}")
+                except Exception as e:
+                    logger.warning(f"   ⚠️ 캐시 메타데이터 읽기 실패: {e}")
+            
+            # 캐시된 파일로부터 데이터셋 로드
+            try:
+                data_files = {}
+                if os.path.exists(cache_train_path) and os.path.getsize(cache_train_path) > 0:
+                    data_files["train"] = cache_train_path
+                if os.path.exists(cache_test_path) and os.path.getsize(cache_test_path) > 0:
+                    data_files["test"] = cache_test_path
+                
+                if not data_files:
+                    logger.warning("   ⚠️ 캐시 파일이 비어있습니다. 재처리합니다.")
+                    raise FileNotFoundError("Cache files are empty")
+                
+                logger.info("🧠 캐시된 JSONL 파일로부터 데이터셋 로딩...")
+                
+                # JSONL 파일을 읽어서 리스트로 만든 후 Dataset.from_list 사용
+                dataset_dict = DatasetDict()
+                for split_name, file_path in data_files.items():
+                    logger.info(f"   📂 {split_name} split 로딩 중...")
+                    
+                    # JSONL 파일 읽기 및 정제
+                    records = []
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        for line_num, line in enumerate(f, 1):
+                            if not line.strip():
+                                continue
+                            try:
+                                record = json.loads(line.strip())
+                                
+                                # messages 정규화
+                                if 'messages' in record and isinstance(record['messages'], list):
+                                    for message in record['messages']:
+                                        if not isinstance(message, dict):
+                                            continue
+                                        if 'content' in message and isinstance(message['content'], list):
+                                            for content_item in message['content']:
+                                                if not isinstance(content_item, dict):
+                                                    continue
+                                                # text 필드가 없거나 None이면 빈 문자열로
+                                                if 'text' not in content_item or content_item.get('text') is None:
+                                                    content_item['text'] = ""
+                                                # type 필드가 없으면 "text"로
+                                                if 'type' not in content_item:
+                                                    content_item['type'] = "text"
+                                
+                                # images 필드 정규화 (없으면 빈 리스트, 문자열 리스트로 보장)
+                                if 'images' not in record:
+                                    record['images'] = []
+                                elif record['images'] is None:
+                                    record['images'] = []
+                                elif not isinstance(record['images'], list):
+                                    record['images'] = []
+                                else:
+                                    # 이미지 경로가 문자열인지 확인
+                                    record['images'] = [str(img) if img is not None else "" for img in record['images'] if img is not None]
+                                
+                                # domain 필드 정규화 (없으면 "unknown")
+                                if 'domain' not in record or record.get('domain') is None:
+                                    record['domain'] = "unknown"
+                                else:
+                                    record['domain'] = str(record['domain'])
+                                
+                                records.append(record)
+                            except (json.JSONDecodeError, TypeError) as e:
+                                logger.debug(f"   ⚠️ {split_name} 파일 {line_num}번째 줄 JSON 파싱 실패, 건너뜀: {e}")
+                                continue
+                    
+                    # Dataset.from_list로 생성
+                    if records:
+                        dataset_dict[split_name] = Dataset.from_list(records)
+                        logger.info(f"   ✅ {split_name} split 로드 완료: {len(dataset_dict[split_name])}개 샘플")
+                    else:
+                        logger.warning(f"   ⚠️ {split_name} split에 유효한 샘플이 없습니다.")
+                        # 빈 데이터셋 생성
+                        dataset_dict[split_name] = Dataset.from_list([])
+                
+                # 이미지 경로 처리
+                logger.info("🖼️ 이미지 경로를 이미지 객체로 캐스팅 (lazy loading)...")
+                for split in dataset_dict:
+                    def preprocess_images(example):
+                        """이미지 데이터 전처리 - 중첩 리스트 평면화"""
+                        if 'images' in example and example['images']:
+                            # 이미지 경로를 절대 경로로 변환 (캐시 디렉토리 기준)
+                            image_paths = example['images']
+                            if isinstance(image_paths, list):
+                                # 상대 경로인 경우 절대 경로로 변환
+                                fixed_paths = []
+                                for img_path in image_paths:
+                                    if isinstance(img_path, str) and img_path.strip():
+                                        if not os.path.isabs(img_path):
+                                            img_path = os.path.join(cache_images_dir, os.path.basename(img_path))
+                                        # 파일 존재 확인
+                                        if os.path.exists(img_path):
+                                            fixed_paths.append(img_path)
+                                example['images'] = validate_image_data(fixed_paths)
+                            else:
+                                example['images'] = validate_image_data(example['images']) if example['images'] else []
+                        elif 'images' not in example:
+                            example['images'] = []
+                        return example
+                    
+                    # 이미지 전처리 적용
+                    dataset_dict[split] = dataset_dict[split].map(preprocess_images)
+                    
+                    # 이미지 필드를 DatasetImage로 캐스팅
+                    current_features = dataset_dict[split].features
+                    new_features = current_features.copy()
+                    if 'images' in new_features:
+                        new_features['images'] = Sequence(DatasetImage(decode=True))
+                        dataset_dict[split] = dataset_dict[split].cast(new_features)
+                
+                logger.info("✅ 캐시된 데이터셋 로드 완료")
+                return dataset_dict
+                
+            except Exception as e:
+                logger.warning(f"   ⚠️ 캐시 로드 실패, 재처리합니다: {e}")
+                traceback.print_exc()
+                # 캐시 로드 실패 시 기존 로직으로 진행
+    
+    # 캐시가 없거나 사용하지 않는 경우 기존 처리 로직
+    logger.info(f"📦 멀티 도메인 데이터셋 로딩 시작 (캐시 없음)")
     logger.info(f"   - 도메인 수: {len(domain_configs)}개")
     logger.info(f"   - 도메인당 최대 샘플: {max_samples_per_domain}개")
     logger.info(f"   - 총 최대 샘플: {max_samples_per_domain * len(domain_configs)}개")
@@ -2170,16 +2337,14 @@ def get_multi_domain_sft_dataset(
     
     log_memory_usage("멀티 도메인 데이터셋 로딩 시작")
     
-    base_temp_dir = "/mls/conan/tmp"
-    os.makedirs(base_temp_dir, exist_ok=True)
-    temp_dir = tempfile.mkdtemp(dir=base_temp_dir)
-    logger.info(f"📂 임시 디렉토리 생성: {temp_dir}")
-    images_dir = os.path.join(temp_dir, "images")
+    # 캐시 디렉토리 사용 (기존 temp_dir 대신)
+    os.makedirs(cache_dir, exist_ok=True)
+    images_dir = cache_images_dir
     os.makedirs(images_dir, exist_ok=True)
 
     try:
-        train_jsonl_path = os.path.join(temp_dir, "train.jsonl")
-        test_jsonl_path = os.path.join(temp_dir, "test.jsonl")
+        train_jsonl_path = cache_train_path
+        test_jsonl_path = cache_test_path
         
         # 이미지 카운터 lock (병렬 처리 시 thread-safe)
         image_counter_lock = threading.Lock()
@@ -2211,7 +2376,7 @@ def get_multi_domain_sft_dataset(
                     _process_domain_datasets,
                     domain=domain,
                     dataset_names=dataset_names,
-                    temp_dir=temp_dir,
+                    temp_dir=cache_dir,
                     image_counter_lock=image_counter_lock,
                     shared_counters=shared_counters,
                     images_dir=images_dir,
@@ -2327,8 +2492,8 @@ def get_multi_domain_sft_dataset(
                 logger.info("🔄 샘플 수 균등화를 위해 JSONL 파일 재처리...")
                 
                 # 임시 파일로 재작성
-                balanced_train_path = os.path.join(temp_dir, "train_balanced.jsonl")
-                balanced_test_path = os.path.join(temp_dir, "test_balanced.jsonl")
+                balanced_train_path = os.path.join(cache_dir, "train_balanced.jsonl")
+                balanced_test_path = os.path.join(cache_dir, "test_balanced.jsonl")
             
                 domain_train_samples = defaultdict(list)
                 domain_test_samples = defaultdict(list)
@@ -2532,12 +2697,32 @@ def get_multi_domain_sft_dataset(
 
         logger.info("✅ 멀티 도메인 데이터셋 생성 완료")
         
+        # 처리 완료 후 메타데이터 저장
+        try:
+            cache_meta = {
+                "created_at": datetime.now().isoformat(),
+                "train_count": balanced_train_count,
+                "test_count": balanced_test_count,
+                "domain_configs": domain_configs,
+                "max_samples_per_domain": max_samples_per_domain,
+                "test_size": test_size,
+                "use_streaming": use_streaming,
+                "max_workers": max_workers,
+                "cache_key": cache_key
+            }
+            with open(cache_meta_path, "w", encoding="utf-8") as f:
+                json.dump(cache_meta, f, indent=2, ensure_ascii=False)
+            logger.info(f"💾 데이터셋 캐시 저장 완료: {cache_dir}")
+        except Exception as e:
+            logger.warning(f"⚠️ 캐시 메타데이터 저장 실패: {e}")
+        
         return dataset_dict
 
     except Exception as e:
         logger.error(f"❌ 멀티 도메인 데이터셋 로딩 실패: {e}")
         traceback.print_exc()
-        shutil.rmtree(temp_dir, ignore_errors=True)
+        # 실패 시에도 캐시 디렉토리는 유지 (부분적으로 처리된 데이터가 있을 수 있음)
+        # shutil.rmtree(cache_dir, ignore_errors=True)
         raise Exception(f"😢 멀티 도메인 데이터셋 로딩 시도가 실패했습니다.") from e
 
 
@@ -2560,67 +2745,66 @@ def create_simple_collate_fn(processor, max_length: int = 2048, allow_text_only:
             self.allow_text_only = allow_text_only
         
         def _collate_language_modeling(self, examples):
-            """messages를 텍스트로 변환하여 processor에 전달"""
-            texts = []
-            images_list = []
+            """이미지가 없는 샘플도 처리할 수 있도록 오버라이드"""
+            # messages 추출
+            messages = [example["messages"] for example in examples]
             
+            # images 추출 (없을 수 있음)
+            images = []
+            has_images = False
             for example in examples:
-                # messages를 텍스트로 변환
-                if "messages" in example:
-                    messages = validate_messages(example["messages"])
-                    try:
-                        # processor의 tokenizer를 사용하여 chat template 적용
-                        if hasattr(self.processor, 'tokenizer'):
-                            tokenizer = self.processor.tokenizer
-                        else:
-                            tokenizer = self.processor
-                        
-                        text = tokenizer.apply_chat_template(
-                            messages,
-                            tokenize=False,
-                            add_generation_prompt=False
-                        )
-                        texts.append(text)
-                    except Exception as e:
-                        logger.warning(f"⚠️ Chat template 적용 실패, messages를 직접 사용: {e}")
-                        # 실패 시 messages를 그대로 전달 (processor가 처리할 수 있으면)
-                        texts.append(messages)
+                if "images" in example and example["images"]:
+                    img = example["images"]
+                    # 이미지가 리스트인 경우
+                    if isinstance(img, list) and len(img) > 0:
+                        images.append(img)
+                        has_images = True
+                    elif img:  # 리스트가 아닌 단일 이미지
+                        images.append(img)
+                        has_images = True
+                    else:
+                        images.append(None)
                 else:
-                    # messages가 없으면 빈 문자열
-                    texts.append("")
-                
-                # 이미지 처리
-                if 'images' in example and example['images']:
-                    images = validate_image_data(example['images'])
-                    images_list.append(images if images else [])
-                else:
-                    images_list.append([])
+                    images.append(None)
             
             # processor 호출
-            try:
-                # 이미지가 있는 샘플과 없는 샘플 분리
-                has_images = any(imgs for imgs in images_list)
-                
-                if has_images:
-                    # 이미지가 있는 경우
+            if has_images:
+                # 이미지가 있는 경우 (일부 샘플만 이미지가 있어도 processor가 처리)
+                # None이 포함된 images 리스트를 전달하면 processor가 처리할 수 있는지 확인 필요
+                # 일단 processor에 전달하고, 에러가 나면 텍스트만 처리
+                try:
                     output = self.processor(
-                        text=texts,
-                        images=images_list if has_images else None,
+                        text=messages,
+                        images=images,
                         return_tensors="pt",
                         padding=True,
                         truncation=True,
                         max_length=self.max_length
                     )
-                else:
-                    # 이미지가 없는 경우 (텍스트 전용)
+                except (IndexError, TypeError, ValueError) as e:
+                    # processor가 None을 처리하지 못하는 경우, 텍스트만 처리
                     if not self.allow_text_only:
-                        raise ValueError("이미지가 없는 샘플이 있지만 allow_text_only=False입니다.")
+                        raise ValueError(f"이미지 처리 실패: {e}")
                     
                     # 텍스트만 처리
                     if hasattr(self.processor, 'tokenizer'):
                         tokenizer = self.processor.tokenizer
                     else:
                         tokenizer = self.processor
+                    
+                    # messages를 텍스트로 변환
+                    texts = []
+                    for msg in messages:
+                        try:
+                            text = tokenizer.apply_chat_template(
+                                msg,
+                                tokenize=False,
+                                add_generation_prompt=False
+                            )
+                            texts.append(text)
+                        except Exception as e2:
+                            logger.warning(f"⚠️ Chat template 적용 실패: {e2}")
+                            texts.append(str(msg))
                     
                     output = tokenizer(
                         text=texts,
@@ -2629,29 +2813,50 @@ def create_simple_collate_fn(processor, max_length: int = 2048, allow_text_only:
                         truncation=True,
                         max_length=self.max_length
                     )
+            else:
+                # 이미지가 없는 경우 (텍스트 전용)
+                if not self.allow_text_only:
+                    raise ValueError("이미지가 없는 샘플이 있지만 allow_text_only=False입니다.")
                 
-                # labels 생성 (input_ids와 동일)
-                labels = output["input_ids"].clone()
+                # 텍스트만 처리
+                if hasattr(self.processor, 'tokenizer'):
+                    tokenizer = self.processor.tokenizer
+                else:
+                    tokenizer = self.processor
                 
-                # padding 토큰 마스킹
-                pad_token_id = self.processor.tokenizer.pad_token_id if hasattr(self.processor, 'tokenizer') else self.processor.pad_token_id
-                if pad_token_id is not None:
-                    labels[labels == pad_token_id] = -100
+                # messages를 텍스트로 변환
+                texts = []
+                for msg in messages:
+                    try:
+                        text = tokenizer.apply_chat_template(
+                            msg,
+                            tokenize=False,
+                            add_generation_prompt=False
+                        )
+                        texts.append(text)
+                    except Exception as e:
+                        logger.warning(f"⚠️ Chat template 적용 실패: {e}")
+                        texts.append(str(msg))
                 
-                output["labels"] = labels
-                return output
-                
-            except Exception as e:
-                logger.error(f"⚠️ Processor 처리 중 오류: {e}")
-                import traceback
-                traceback.print_exc()
-                raise
+                output = tokenizer(
+                    text=texts,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=self.max_length
+                )
             
-        def torch_call(self, examples):
-            """torch_call 오버라이드 - _collate_language_modeling 직접 호출"""
-            return self._collate_language_modeling(examples)
+            # labels 생성
+            labels = output["input_ids"].clone()
+            pad_token_id = self.processor.tokenizer.pad_token_id if hasattr(self.processor, 'tokenizer') else self.processor.pad_token_id
+            if pad_token_id is not None:
+                labels[labels == pad_token_id] = -100
+            
+            output["labels"] = labels
+            return output
         
         def __call__(self, features):
+            """features를 검증/전처리한 후 torch_call 사용"""
             assert features is not None, "features is None"
 
             for i, feature in enumerate(features):
@@ -2666,17 +2871,17 @@ def create_simple_collate_fn(processor, max_length: int = 2048, allow_text_only:
                         # 이미지가 있지만 유효하지 않은 경우
                         if not self.allow_text_only:
                             raise ValueError(f"샘플 {i}의 이미지가 유효하지 않습니다!")
-                        # 텍스트 전용 허용 모드면 이미지를 빈 리스트로 설정
-                        feature['images'] = []
+                        # 텍스트 전용 허용 모드면 images 필드를 제거
+                        del feature['images']
                 else:
                     # 이미지가 없는 경우
                     if not self.allow_text_only:
                         raise ValueError(f"샘플 {i}에 이미지가 없습니다! 모든 샘플은 이미지를 포함해야 합니다.")
-                    # 텍스트 전용 허용 모드면 빈 리스트로 설정
-                    feature['images'] = []
+                    # 텍스트 전용 허용 모드면 images 필드가 없으면 그대로 유지
             
             try:
-                return self._collate_language_modeling(features)
+                # torch_call 사용 (내부적으로 _collate_language_modeling 호출)
+                return self.torch_call(examples=features)
             except Exception as e:
                 import traceback
                 traceback.print_exc()

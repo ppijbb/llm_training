@@ -872,14 +872,15 @@ class G3MoERouter(nn.Module):
         speciality_penalty = torch.mean((F.normalize(gram - routing_i.unsqueeze(0).unsqueeze(0), dim=-1) ** 2).sum(dim=(-2,-1)))
         
         # Cosine similarity between expression and routing logits
-        cos = F.cosine_similarity(expression_logits, routing_logits, dim=-1)  # [-1, 1]
-        cos = cos.clamp(-1 + 1e-6, 1 - 1e-6)
-        cosine_similarities = 1.0 - cos.pow(2) 
+        # cos = F.cosine_similarity(expression_logits, routing_logits, dim=-1)  # [-1, 1]
+        # cos = cos.clamp(-1 + 1e-6, 1 - 1e-6)
+        # domain_orthogonality = 1.0 - cos.pow(2)
+        domain_orthogonality = (expression_logits * routing_logits).sum(dim=-1)
         
         # routing_logits 대신 cosine_similarities를 기반으로 한 도메인 스코어 반환
         # 이렇게 하면 각 expert의 표현 정보가 더 잘 반영됨
         # speciality_penalty: [batch, seq] -> [batch, seq, 1, 1] for broadcasting
-        domain_scores = cosine_similarities * (1.0 + speciality_penalty.unsqueeze(-1).unsqueeze(-1))
+        domain_scores = domain_orthogonality * (1.0 + speciality_penalty.unsqueeze(-1).unsqueeze(-1))
         
         # Sparsemixer를 통한 최종 expert 선택 및 가중치 계산
         # domain_scores를 [batch*seq, num_experts] 형태로 변환
@@ -918,7 +919,7 @@ class G3MoERouter(nn.Module):
                 self.expert_load_ema.mul_(self.ema_alpha).add_(current_load, alpha=1.0 - self.ema_alpha)
 
         # Return both top-k routing weights (for execution) and full probabilities (for loss/monitoring)
-        return multiplier, selected_experts, expression_logits, hn, speciality_penalty, cosine_similarities, expression_loss, routing_probs_full
+        return multiplier, selected_experts, expression_logits, hn, speciality_penalty, domain_orthogonality, expression_loss, routing_probs_full
 
 iterations = 0
 class G3MoEGRINMoE(nn.Module):
@@ -997,6 +998,13 @@ class G3MoEGRINMoE(nn.Module):
             final_hidden_states = final_hidden_states.requires_grad_(True)
             if router_logits is not None:
                 router_logits = router_logits.requires_grad_(True)
+            # Loss의 gradient도 명시적으로 유지
+            if speciality_loss is not None and torch.is_tensor(speciality_loss):
+                speciality_loss = speciality_loss.requires_grad_(True)
+            if cosine_similarities is not None and torch.is_tensor(cosine_similarities):
+                cosine_similarities = cosine_similarities.requires_grad_(True)
+            if expression_loss is not None and torch.is_tensor(expression_loss):
+                expression_loss = expression_loss.requires_grad_(True)
         return final_hidden_states, (router_logits, hn, speciality_loss, cosine_similarities, expression_loss)    
     
     @torch._dynamo.disable  # Disable torch.compile for this method due to data-dependent branching
@@ -1382,6 +1390,13 @@ class G3MoEDecoderLayer(GradientCheckpointingLayer):
             hidden_states = hidden_states.requires_grad_(True)
             if router_logits is not None:
                 router_logits = router_logits.requires_grad_(True)
+            # Loss의 gradient도 명시적으로 유지
+            if speciality_loss is not None and torch.is_tensor(speciality_loss):
+                speciality_loss = speciality_loss.requires_grad_(True)
+            if cosine_similarities is not None and torch.is_tensor(cosine_similarities):
+                cosine_similarities = cosine_similarities.requires_grad_(True)
+            if expression_loss is not None and torch.is_tensor(expression_loss):
+                expression_loss = expression_loss.requires_grad_(True)
         hidden_states = residual + hidden_states
         outputs = (hidden_states,)
         if output_attentions:
@@ -1925,20 +1940,48 @@ class G3MoETextModel(G3MoEPreTrainedModel):
         # router_logits를 튜플로 변환 (비어있으면 None)
         router_logits_tuple = tuple(all_router_logits) if all_router_logits else None
         
-        # 모든 layer의 loss를 집계
+        # 모든 layer의 loss를 집계 (gradient 유지)
         speciality_loss = None
         cosine_similarities = None
         expression_loss = None
         
         if all_speciality_losses:
-            # speciality_loss는 평균 (스칼라 값들의 평균)
-            speciality_loss = torch.stack(all_speciality_losses).mean() if len(all_speciality_losses) > 0 else None
+            # speciality_loss는 평균 (스칼라 값들의 평균) - gradient 유지
+            stacked = torch.stack(all_speciality_losses)
+            speciality_loss = stacked.mean()
+            # gradient 명시적으로 유지
+            if self.training:
+                speciality_loss = speciality_loss.requires_grad_(True)
+        
         if all_cosine_similarities:
-            # cosine_similarities는 평균 (텐서들의 평균)
-            cosine_similarities = torch.stack(all_cosine_similarities).mean() if len(all_cosine_similarities) > 0 else None
+            # cosine_similarities는 평균 (텐서들의 평균) - gradient 유지
+            # 모든 텐서가 동일한 shape인지 확인
+            try:
+                stacked = torch.stack(all_cosine_similarities)
+                cosine_similarities = stacked.mean(dim=0)
+                # gradient 명시적으로 유지
+                if self.training:
+                    cosine_similarities = cosine_similarities.requires_grad_(True)
+            except RuntimeError as e:
+                # Shape이 다른 경우 각각 평균을 내고 다시 평균
+                if "size" in str(e).lower() or "shape" in str(e).lower():
+                    # 각 텐서의 평균을 구한 후 스칼라로 변환
+                    means = [cs.mean() if torch.is_tensor(cs) and cs.numel() > 0 else torch.tensor(0.0, device=all_cosine_similarities[0].device, requires_grad=True) 
+                            for cs in all_cosine_similarities if cs is not None]
+                    if means:
+                        cosine_similarities = torch.stack(means).mean()
+                        if self.training:
+                            cosine_similarities = cosine_similarities.requires_grad_(True)
+                else:
+                    raise
+        
         if all_expression_losses:
-            # expression_loss는 평균 (스칼라 값들의 평균)
-            expression_loss = torch.stack(all_expression_losses).mean() if len(all_expression_losses) > 0 else None
+            # expression_loss는 평균 (스칼라 값들의 평균) - gradient 유지
+            stacked = torch.stack(all_expression_losses)
+            expression_loss = stacked.mean()
+            # gradient 명시적으로 유지
+            if self.training:
+                expression_loss = expression_loss.requires_grad_(True)
 
         return G3MoEModelOutputWithPast(
             last_hidden_state=hidden_states,

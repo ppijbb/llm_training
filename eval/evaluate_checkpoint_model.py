@@ -57,72 +57,80 @@ class RoutingInfoCollector:
         # Router의 forward hook (routing_logits, expression_logits 추출)
         def create_router_hook(layer_name):
             def router_hook_fn(module, input, output):
-                # Router forward의 반환값: (multiplier, selected_experts, expression_logits, hn, speciality_penalty, cosine_similarities, expression_loss)
-                if len(output) >= 7:
+                # Router forward의 반환값: (multiplier, selected_experts, expression_logits, hn, speciality_penalty, cosine_similarities, expression_loss, routing_probs_full)
+                # 8개 값을 반환 (routing_probs_full 추가됨)
+                if len(output) >= 8:
+                    multiplier, selected_experts, expression_logits, hn, speciality_penalty, cosine_similarities, expression_loss, routing_probs_full = output
+                elif len(output) >= 7:
+                    # 이전 버전 호환성 (7개만 반환하는 경우)
                     multiplier, selected_experts, expression_logits, hn, speciality_penalty, cosine_similarities, expression_loss = output
-                    
-                    # Router 내부에서 routing_logits 추출 시도
-                    routing_logits = None
-                    if hasattr(module, 'load_balancer'):
-                        # GRU의 출력을 routing_logits로 사용
-                        # input[0]은 hidden_states, input[1]은 hn
-                        if len(input) >= 1:
-                            hidden_states = input[0]
-                            hn_input = input[1] if len(input) > 1 else None
+                    routing_probs_full = None
+                else:
+                    # output이 튜플이 아니거나 길이가 부족한 경우
+                    return
+                
+                # Router 내부에서 routing_logits 추출 시도
+                routing_logits = None
+                if hasattr(module, 'load_balancer'):
+                    # GRU의 출력을 routing_logits로 사용
+                    # input[0]은 hidden_states, input[1]은 hn
+                    if len(input) >= 1:
+                        hidden_states = input[0]
+                        hn_input = input[1] if len(input) > 1 else None
+                        
+                        # GRU forward를 직접 호출하여 routing_logits 얻기
+                        with torch.no_grad():
+                            if hn_input is not None:
+                                routing_logits, _ = module.load_balancer(hidden_states, hn_input.to(hidden_states.dtype))
+                            else:
+                                routing_logits, _ = module.load_balancer(hidden_states, None)
                             
-                            # GRU forward를 직접 호출하여 routing_logits 얻기
-                            with torch.no_grad():
-                                if hn_input is not None:
-                                    routing_logits, _ = module.load_balancer(hidden_states, hn_input.to(hidden_states.dtype))
-                                else:
-                                    routing_logits, _ = module.load_balancer(hidden_states, None)
-                                
-                                # Reshape to [batch, seq, num_experts, router_dim]
-                                batch_size, seq_len = hidden_states.shape[:2]
-                                num_experts = module.num_experts
-                                router_dim = module.router_dim
-                                routing_logits = routing_logits.view(batch_size, seq_len, num_experts, router_dim)
-                    
-                    # expression_logits의 shape 확인 및 수정
-                    # Router forward에서 expression_logits는 view(hidden_shape)를 거쳐 [batch, seq, num_experts, router_dim] 형태가 되어야 함
-                    # 하지만 실제로는 [batch, seq, 1, router_dim] 또는 [batch*seq, 1, router_dim] 형태일 수 있음
-                    expression_logits_fixed = expression_logits
-                    if isinstance(expression_logits, torch.Tensor):
-                        # expression_logits의 shape 확인
-                        if expression_logits.dim() == 4:
-                            exp_batch, exp_seq, exp_num_exp, exp_router_dim = expression_logits.shape
-                            if exp_num_exp == 1 and routing_logits is not None:
-                                # [batch, seq, 1, router_dim] -> [batch, seq, num_experts, router_dim]로 expand
-                                if routing_logits.dim() == 4:
-                                    _, _, num_experts, router_dim = routing_logits.shape
-                                    expression_logits_fixed = expression_logits.expand(exp_batch, exp_seq, num_experts, router_dim)
-                        elif expression_logits.dim() == 3:
-                            exp_batch_seq, exp_dim1, exp_dim2 = expression_logits.shape
-                            if routing_logits is not None:
-                                if routing_logits.dim() == 4:
-                                    batch_size, seq_len, num_experts, router_dim = routing_logits.shape
-                                    if exp_dim1 == 1 and exp_dim2 == router_dim:
-                                        # [batch*seq, 1, router_dim] -> [batch*seq, num_experts, router_dim]로 expand
-                                        expression_logits_fixed = expression_logits.expand(exp_batch_seq, num_experts, router_dim)
-                                    elif exp_dim1 * exp_dim2 == num_experts * router_dim:
-                                        # [batch*seq, num_experts*router_dim] -> [batch*seq, num_experts, router_dim]로 reshape
-                                        expression_logits_fixed = expression_logits.view(exp_batch_seq, num_experts, router_dim)
-                                elif routing_logits.dim() == 3:
-                                    batch_seq_len, num_experts, router_dim = routing_logits.shape
-                                    if exp_dim1 == 1 and exp_dim2 == router_dim:
-                                        expression_logits_fixed = expression_logits.expand(batch_seq_len, num_experts, router_dim)
-                                    elif exp_dim1 * exp_dim2 == num_experts * router_dim:
-                                        expression_logits_fixed = expression_logits.view(batch_seq_len, num_experts, router_dim)
-                    
-                    self.router_internal_data[layer_name].append({
-                        'routing_logits': routing_logits.detach().cpu() if routing_logits is not None else None,
-                        'expression_logits': expression_logits_fixed.detach().cpu() if isinstance(expression_logits_fixed, torch.Tensor) else None,
-                        'selected_experts': selected_experts.detach().cpu(),
-                        'routing_weights': multiplier.detach().cpu(),
-                        'cosine_similarities': cosine_similarities.detach().cpu() if isinstance(cosine_similarities, torch.Tensor) else None,
-                        'speciality_penalty': float(speciality_penalty) if isinstance(speciality_penalty, torch.Tensor) else speciality_penalty,
-                        'expression_loss': float(expression_loss) if isinstance(expression_loss, torch.Tensor) else expression_loss,
-                    })
+                            # Reshape to [batch, seq, num_experts, router_dim]
+                            batch_size, seq_len = hidden_states.shape[:2]
+                            num_experts = module.num_experts
+                            router_dim = module.router_dim
+                            routing_logits = routing_logits.view(batch_size, seq_len, num_experts, router_dim)
+                
+                # expression_logits의 shape 확인 및 수정
+                # Router forward에서 expression_logits는 view(hidden_shape)를 거쳐 [batch, seq, num_experts, router_dim] 형태가 되어야 함
+                # 하지만 실제로는 [batch, seq, 1, router_dim] 또는 [batch*seq, 1, router_dim] 형태일 수 있음
+                expression_logits_fixed = expression_logits
+                if isinstance(expression_logits, torch.Tensor):
+                    # expression_logits의 shape 확인
+                    if expression_logits.dim() == 4:
+                        exp_batch, exp_seq, exp_num_exp, exp_router_dim = expression_logits.shape
+                        if exp_num_exp == 1 and routing_logits is not None:
+                            # [batch, seq, 1, router_dim] -> [batch, seq, num_experts, router_dim]로 expand
+                            if routing_logits.dim() == 4:
+                                _, _, num_experts, router_dim = routing_logits.shape
+                                expression_logits_fixed = expression_logits.expand(exp_batch, exp_seq, num_experts, router_dim)
+                    elif expression_logits.dim() == 3:
+                        exp_batch_seq, exp_dim1, exp_dim2 = expression_logits.shape
+                        if routing_logits is not None:
+                            if routing_logits.dim() == 4:
+                                batch_size, seq_len, num_experts, router_dim = routing_logits.shape
+                                if exp_dim1 == 1 and exp_dim2 == router_dim:
+                                    # [batch*seq, 1, router_dim] -> [batch*seq, num_experts, router_dim]로 expand
+                                    expression_logits_fixed = expression_logits.expand(exp_batch_seq, num_experts, router_dim)
+                                elif exp_dim1 * exp_dim2 == num_experts * router_dim:
+                                    # [batch*seq, num_experts*router_dim] -> [batch*seq, num_experts, router_dim]로 reshape
+                                    expression_logits_fixed = expression_logits.view(exp_batch_seq, num_experts, router_dim)
+                            elif routing_logits.dim() == 3:
+                                batch_seq_len, num_experts, router_dim = routing_logits.shape
+                                if exp_dim1 == 1 and exp_dim2 == router_dim:
+                                    expression_logits_fixed = expression_logits.expand(batch_seq_len, num_experts, router_dim)
+                                elif exp_dim1 * exp_dim2 == num_experts * router_dim:
+                                    expression_logits_fixed = expression_logits.view(batch_seq_len, num_experts, router_dim)
+                
+                self.router_internal_data[layer_name].append({
+                    'routing_logits': routing_logits.detach().cpu() if routing_logits is not None else None,
+                    'expression_logits': expression_logits_fixed.detach().cpu() if isinstance(expression_logits_fixed, torch.Tensor) else None,
+                    'selected_experts': selected_experts.detach().cpu(),
+                    'routing_weights': multiplier.detach().cpu(),
+                    'cosine_similarities': cosine_similarities.detach().cpu() if isinstance(cosine_similarities, torch.Tensor) else None,
+                    'speciality_penalty': float(speciality_penalty) if isinstance(speciality_penalty, torch.Tensor) else speciality_penalty,
+                    'expression_loss': float(expression_loss) if isinstance(expression_loss, torch.Tensor) else expression_loss,
+                })
             return router_hook_fn
         
         # MoE Block의 forward hook (G3MoEGRINMoE와 GramSpecMoEBlock 모두 지원)
@@ -897,7 +905,9 @@ def main():
         print(f"  Load Variance: {format_metric(agg.get('avg_load_variance', 'N/A'))}")
         
         print("\n🔬 Gram Matrix & Specialization 지표:")
-        print(f"  Gram Orthogonality: {format_metric(agg.get('avg_gram_orthogonality', 'N/A'))}")
+        print(f"  Gram Orthogonality (평균): {format_metric(agg.get('avg_gram_orthogonality', 'N/A'))}")
+        if 'std_gram_orthogonality' in agg:
+            print(f"  Gram Orthogonality (표준편차): {format_metric(agg.get('std_gram_orthogonality', 'N/A'))}")
 
 
 if __name__ == "__main__":
