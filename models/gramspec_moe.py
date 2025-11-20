@@ -115,7 +115,15 @@ class GramSpecRouter(nn.Module):
         top_k = min(top_k, self.num_experts)
 
         # GRU를 통한 전역 라우팅 (hn 활용)
-        routing_logits, hn = self.load_balancer(x, hn.to(x.dtype))
+        # Handle None hn case (for compatibility with models that don't provide initial state)
+        if hn is not None:
+            hn_input = hn.to(x.dtype)
+        else:
+            # Initialize to zeros if not provided
+            batch_size = x.shape[0]
+            hn_input = torch.zeros(1, batch_size, self.num_experts * self.router_dim, device=x.device, dtype=x.dtype)
+        
+        routing_logits, hn = self.load_balancer(x, hn_input)
         input_shape = routing_logits.shape[:-1]
         hidden_shape = (*input_shape, -1, self.router_dim)
 
@@ -517,8 +525,11 @@ def extract_config_info(config: Any) -> Dict[str, Any]:
     """
     Extract necessary configuration information from any config object.
     
+    Supports both G3MoEConfig (with text_config) and direct config objects.
+    Following G3MoE's latest pattern: handle text_config if present.
+    
     Args:
-        config: Configuration object (can be dict, PretrainedConfig, or custom config)
+        config: Configuration object (can be dict, PretrainedConfig, G3MoEConfig, or custom config)
         
     Returns:
         Dictionary with extracted configuration values
@@ -534,21 +545,45 @@ def extract_config_info(config: Any) -> Dict[str, Any]:
         else:
             cfg_dict = {}
     
-    # Extract with defaults
+    # Handle G3MoEConfig pattern: check for text_config (multimodal models)
+    # Following latest G3MoE pattern from custom_model_sft.py
+    text_config_dict = None
+    if hasattr(config, 'text_config') and config.text_config is not None:
+        # Multi-modal model with text_config
+        if hasattr(config.text_config, 'to_dict'):
+            text_config_dict = config.text_config.to_dict()
+        elif hasattr(config.text_config, '__dict__'):
+            text_config_dict = config.text_config.__dict__.copy()
+        elif isinstance(config.text_config, dict):
+            text_config_dict = config.text_config
+    elif 'text_config' in cfg_dict and cfg_dict['text_config'] is not None:
+        # text_config in dict format
+        text_config_dict = cfg_dict['text_config']
+        if not isinstance(text_config_dict, dict):
+            # Try to convert to dict
+            if hasattr(text_config_dict, 'to_dict'):
+                text_config_dict = text_config_dict.to_dict()
+            elif hasattr(text_config_dict, '__dict__'):
+                text_config_dict = text_config_dict.__dict__.copy()
+    
+    # Use text_config if available, otherwise use main config
+    source_dict = text_config_dict if text_config_dict is not None else cfg_dict
+    
+    # Extract with defaults (prioritize text_config if available)
     extracted = {
-        'hidden_size': cfg_dict.get('hidden_size', cfg_dict.get('d_model', cfg_dict.get('n_embd', 768))),
-        'intermediate_size': cfg_dict.get('intermediate_size', cfg_dict.get('ffn_dim', cfg_dict.get('d_ff', 3072))),
-        'num_experts': cfg_dict.get('n_routed_experts', cfg_dict.get('num_experts', 8)),
-        'num_experts_per_tok': cfg_dict.get('num_experts_per_tok', cfg_dict.get('top_k', 2)),
-        'router_dim': cfg_dict.get('router_dim', 128),
-        'n_shared_experts': cfg_dict.get('n_shared_experts', 1),
-        'first_k_dense_replace': cfg_dict.get('first_k_dense_replace', 0),
-        'router_jitter_noise': cfg_dict.get('router_jitter_noise', 0.01),
-        'input_jitter_noise': cfg_dict.get('input_jitter_noise', 0.0),
-        'freeze_shared_experts': cfg_dict.get('freeze_shared_experts', True),
-        'balancing_strength': cfg_dict.get('balancing_strength', 0.01),
-        'ema_alpha': cfg_dict.get('ema_alpha', 0.99),
-        'hidden_activation': cfg_dict.get('hidden_activation', cfg_dict.get('activation_function', 'gelu')),
+        'hidden_size': source_dict.get('hidden_size', cfg_dict.get('hidden_size', cfg_dict.get('d_model', cfg_dict.get('n_embd', 768)))),
+        'intermediate_size': source_dict.get('intermediate_size', cfg_dict.get('intermediate_size', cfg_dict.get('ffn_dim', cfg_dict.get('d_ff', 3072)))),
+        'num_experts': source_dict.get('n_routed_experts', cfg_dict.get('n_routed_experts', source_dict.get('num_experts', cfg_dict.get('num_experts', 8)))),
+        'num_experts_per_tok': source_dict.get('num_experts_per_tok', cfg_dict.get('num_experts_per_tok', source_dict.get('top_k', cfg_dict.get('top_k', 2)))),
+        'router_dim': source_dict.get('router_dim', cfg_dict.get('router_dim', 128)),
+        'n_shared_experts': source_dict.get('n_shared_experts', cfg_dict.get('n_shared_experts', 1)),
+        'first_k_dense_replace': source_dict.get('first_k_dense_replace', cfg_dict.get('first_k_dense_replace', 0)),
+        'router_jitter_noise': source_dict.get('router_jitter_noise', cfg_dict.get('router_jitter_noise', 0.01)),
+        'input_jitter_noise': source_dict.get('input_jitter_noise', cfg_dict.get('input_jitter_noise', 0.0)),
+        'freeze_shared_experts': source_dict.get('freeze_shared_experts', cfg_dict.get('freeze_shared_experts', True)),
+        'balancing_strength': source_dict.get('balancing_strength', cfg_dict.get('balancing_strength', 0.01)),
+        'ema_alpha': source_dict.get('ema_alpha', cfg_dict.get('ema_alpha', 0.99)),
+        'hidden_activation': source_dict.get('hidden_activation', source_dict.get('hidden_act', cfg_dict.get('hidden_activation', cfg_dict.get('hidden_act', cfg_dict.get('activation_function', 'gelu'))))),
     }
     
     return extracted
@@ -876,11 +911,15 @@ def upcycle_model_to_moe(
             num_experts_to_use = existing_num_experts if existing_num_experts else cfg['num_experts']
             
             # Create a dummy config object for expert_module_class
+            # G3MoEMLP expects G3MoETextConfig-like interface
             class DummyConfig:
                 def __init__(self):
                     self.hidden_size = cfg['hidden_size']
                     self.intermediate_size = cfg['intermediate_size']
                     self.hidden_activation = cfg['hidden_activation']
+                    # Additional attributes that G3MoEMLP might access
+                    self.model_type = "g3moe_text"
+                    # Ensure compatibility with G3MoETextConfig interface
             
             expert_config = DummyConfig()
             
@@ -1009,11 +1048,15 @@ def upcycle_model_to_moe(
             processing.set_description(f"Layer {layer_idx}: Creating MoE block from dense MLP")
         
         # Create a dummy config object for expert_module_class
+        # G3MoEMLP expects G3MoETextConfig-like interface
         class DummyConfig:
             def __init__(self):
                 self.hidden_size = cfg['hidden_size']
                 self.intermediate_size = cfg['intermediate_size']
                 self.hidden_activation = cfg['hidden_activation']
+                # Additional attributes that G3MoEMLP might access
+                self.model_type = "g3moe_text"
+                # Ensure compatibility with G3MoETextConfig interface
         
         expert_config = DummyConfig()
         
