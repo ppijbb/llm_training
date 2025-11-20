@@ -848,6 +848,32 @@ def main(
         data_collator=collate_fn,
         optimizers=(custom_optimizer, None) if custom_optimizer is not None else (None, None)
     )
+    
+    # Trainer 생성 후 wandb가 초기화되었는지 확인하고, 필요시 초기화
+    # DeepSpeed가 Trainer를 초기화할 때 wandb를 자동으로 초기화하지만,
+    # callback이 wandb를 사용하기 전에 확실히 초기화되어 있는지 보장
+    if training_config.get("report_to", None) and "wandb" in training_config["report_to"]:
+        import wandb
+        rank = int(os.getenv("RANK", "0"))
+        if rank == 0 and (wandb.run is None or not wandb.run):
+            # Trainer가 아직 wandb를 초기화하지 않았다면 여기서 초기화
+            run = wandb.init(
+                project="g3moe-sft",
+                name=training_config["run_name"],
+                config=config,
+                mode="online"  # 항상 online으로 wandb에 기록
+            )
+            run.define_metric("train/*", step_metric="train/step")
+            run.define_metric("validation/*", step_metric="validation/step")
+            run.define_metric("eval/*", step_metric="eval/step")
+            run.define_metric("moe/*", step_metric="train/step")
+            run.define_metric("multi_modality/*", step_metric="train/step")
+            run.define_metric("router/*", step_metric="train/step")
+            run.define_metric("other/*", step_metric="train/step")
+
+            logger.info("✅ wandb initialized after Trainer creation")
+        elif wandb.run is not None:
+            logger.info("✅ wandb already initialized by Trainer")
     # ZeRO-3에서도 gradient checkpointing 사용 가능 (DeepSpeed activation checkpointing과 함께 사용)
     # 단, DeepSpeed config에 activation_checkpointing이 활성화되어 있으면 그것을 우선 사용
     try:
@@ -877,7 +903,7 @@ def main(
             log_every_n_steps=1,             # 매 스텝마다 로그 기록
             logger=wandb,                    # 사용할 로거 지정 (wandb)
             log_to_console=False,            # 콘솔에도 주요 메트릭 출력
-            debug_logging=True,              # ✅ 디버그 로깅 활성화
+            debug_logging=True,              # 디버그 로깅 활성화
                        #  === (선택사항) ===  #
             log_heatmap_every=5,             # 500 스텝마다 Expert 사용률 히트맵 로깅
             alert_threshold_imbalance=4.0,   # 특정 Expert 사용률이 평균의 4배를 초과하면 경고
@@ -937,7 +963,7 @@ def main(
                 if 'grad_norm' in logs:
                     self.logger.debug(f"📊 Gradient Norm: {logs['grad_norm']:.6f}")
     
-    trainer.add_callback(DetailedTrainingCallback(logger))
+    # trainer.add_callback(DetailedTrainingCallback(logger))
     # trainer.add_callback(
     #     ModelEvalCallback(
     #         trainer=trainer,  # Will be set by Trainer
@@ -1146,16 +1172,10 @@ if __name__ == "__main__":
         
         # Set seed
         set_seed(training_config["seed"])
-        # Initialize wandb if needed
-        if training_config.get("report_to") and "wandb" in training_config["report_to"]:
-            rank = int(os.getenv("RANK", "0"))
-            if rank == 0:
-                wandb.init(
-                    project="g3moe-sft",
-                    name=training_config["run_name"],
-                    config=config
-                )
-
+        # wandb.init()은 Trainer가 자동으로 초기화하도록 함
+        # DeepSpeed가 Trainer를 초기화할 때 wandb를 재초기화할 수 있으므로
+        # 여기서 수동으로 초기화하지 않고 Trainer의 자동 초기화를 사용
+        
         main(model_config, data_config, training_config)
 
     except Exception as e:

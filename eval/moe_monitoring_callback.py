@@ -178,8 +178,8 @@ class TorchMoECallback:
         if not self.is_main_process:
             return
         
-        # debug_logging 또는 log_to_console 중 하나라도 True면 출력
-        if self.debug_logging or self.log_to_console:
+        # log_to_console이 True일 때만 출력 (debug_logging은 wandb에만 기록)
+        if self.log_to_console:
             prefix = "[MoE Debug]" if self.debug_logging else "[MoE]"
             print(f"{prefix} {message}")
     
@@ -415,6 +415,22 @@ class TorchMoECallback:
                         if torch.is_tensor(val):
                             val = val.detach().to('cpu')
                         lightweight_entry['aux_loss'] = val
+                    # G3MoE specific metrics
+                    if 'speciality_loss' in routing_info and routing_info['speciality_loss'] is not None:
+                        val = routing_info['speciality_loss']
+                        if torch.is_tensor(val):
+                            val = val.detach().to('cpu')
+                        lightweight_entry['speciality_loss'] = val
+                    if 'cosine_similarities' in routing_info and routing_info['cosine_similarities'] is not None:
+                        val = routing_info['cosine_similarities']
+                        if torch.is_tensor(val):
+                            val = val.detach().to('cpu')
+                        lightweight_entry['cosine_similarities'] = val
+                    if 'expression_loss' in routing_info and routing_info['expression_loss'] is not None:
+                        val = routing_info['expression_loss']
+                        if torch.is_tensor(val):
+                            val = val.detach().to('cpu')
+                        lightweight_entry['expression_loss'] = val
                     self.layer_outputs[layer_name] = lightweight_entry
                     # 디버깅 로그는 항상 출력 (step 정보 제거)
                     # self._log_debug(f"{layer_name}: extracted {list(routing_info.keys())}")
@@ -466,25 +482,73 @@ class TorchMoECallback:
             # 별도로 저장하지 않음 (모니터링 콜백에서는 hook으로 추출 불가)
         
         # 실제 G3MoE/GRIN 모델 구조에 맞춘 추출
-        # output이 (hidden_states, router_logits) 튜플인 경우
-        elif isinstance(output, tuple) and len(output) == 2:
-            hidden_states, router_info_tuple = output
-            # G3MoEGRINMoE returns a nested tuple: (hidden_states, (router_logits, ...))
-            if isinstance(router_info_tuple, tuple) and len(router_info_tuple) > 0:
+        # G3MoEGRINMoE output: (hidden_states, (routing_probs_full, hn, speciality_loss, cosine_similarities, expression_loss))
+        # G3MoEDecoderLayer output: (hidden_states, (self_attn_weights?), (router_logits, hn, speciality_loss, cosine_similarities, expression_loss))
+        if isinstance(output, tuple) and len(output) >= 2:
+            hidden_states = output[0]
+            router_info_tuple = output[-1]  # 마지막 요소가 routing info 튜플
+            
+            # G3MoE nested tuple 구조 파싱
+            if isinstance(router_info_tuple, tuple) and len(router_info_tuple) >= 5:
+                routing_probs_full = router_info_tuple[0]  # 실제로는 routing_probs_full (softmax된 확률)
+                # hn = router_info_tuple[1]  # 사용 안 함
+                speciality_loss = router_info_tuple[2]
+                cosine_similarities = router_info_tuple[3]
+                expression_loss = router_info_tuple[4]
+                
+                # routing_probs_full에서 expert assignments 추출 (이미 softmax된 확률)
+                # 하지만 last_selected_experts가 있으면 그것을 우선 사용
+                if routing_probs_full is not None and torch.is_tensor(routing_probs_full):
+                    # expert_assignments가 아직 없으면 routing_probs_full에서 추출
+                    if 'expert_assignments' not in routing_info:
+                        # top-k를 고려하여 argmax로 추출 (하지만 실제로는 last_selected_experts 사용 권장)
+                        if routing_probs_full.dim() >= 2:
+                            expert_assignments = routing_probs_full.argmax(dim=-1)
+                            routing_info['expert_assignments'] = expert_assignments.flatten()
+                        else:
+                            expert_assignments = routing_probs_full.argmax(dim=-1)
+                            routing_info['expert_assignments'] = expert_assignments
+                    
+                    # routing_probs가 없으면 routing_probs_full 사용
+                    if 'routing_probs' not in routing_info:
+                        if routing_probs_full.dim() >= 2:
+                            routing_info['routing_probs'] = routing_probs_full.flatten()
+                        else:
+                            routing_info['routing_probs'] = routing_probs_full
+                
+                # Loss 메트릭 저장 (CPU로 이동)
+                if speciality_loss is not None:
+                    val = speciality_loss.detach().to('cpu') if torch.is_tensor(speciality_loss) else speciality_loss
+                    routing_info['speciality_loss'] = val
+                if cosine_similarities is not None:
+                    val = cosine_similarities.detach().to('cpu') if torch.is_tensor(cosine_similarities) else cosine_similarities
+                    routing_info['cosine_similarities'] = val
+                if expression_loss is not None:
+                    val = expression_loss.detach().to('cpu') if torch.is_tensor(expression_loss) else expression_loss
+                    routing_info['expression_loss'] = val
+            elif isinstance(router_info_tuple, tuple) and len(router_info_tuple) > 0:
+                # 다른 형태의 튜플 (기존 호환성 유지)
                 router_logits = router_info_tuple[0]
+                if router_logits is not None and torch.is_tensor(router_logits):
+                    # Compute expert assignments cheaply; skip storing full probs/logits
+                    if 'expert_assignments' not in routing_info:
+                        expert_assignments = router_logits.argmax(dim=-1)
+                        routing_info['expert_assignments'] = expert_assignments.flatten() if expert_assignments.dim() > 1 else expert_assignments
+                    if not lightweight:
+                        routing_probs = torch.nn.functional.softmax(router_logits, dim=-1)
+                        routing_info['routing_probs'] = routing_probs.flatten() if routing_probs.dim() > 1 else routing_probs
+                        routing_info['gate_logits'] = router_logits
             else:
+                # 단일 텐서인 경우
                 router_logits = router_info_tuple
-
-            if router_logits is not None and torch.is_tensor(router_logits):
-                # Compute expert assignments cheaply; skip storing full probs/logits
-                expert_assignments = router_logits.argmax(dim=-1)
-                routing_info.update({
-                    'expert_assignments': expert_assignments,
-                })
-                if not lightweight:
-                    routing_probs = torch.nn.functional.softmax(router_logits, dim=-1)
-                    routing_info['routing_probs'] = routing_probs
-                    routing_info['gate_logits'] = router_logits
+                if router_logits is not None and torch.is_tensor(router_logits):
+                    if 'expert_assignments' not in routing_info:
+                        expert_assignments = router_logits.argmax(dim=-1)
+                        routing_info['expert_assignments'] = expert_assignments.flatten() if expert_assignments.dim() > 1 else expert_assignments
+                    if not lightweight:
+                        routing_probs = torch.nn.functional.softmax(router_logits, dim=-1)
+                        routing_info['routing_probs'] = routing_probs.flatten() if routing_probs.dim() > 1 else routing_probs
+                        routing_info['gate_logits'] = router_logits
         
         # 다양한 MoE 구현에서 라우팅 정보 추출
         # 속성으로 저장된 경우 (fallback)
@@ -599,10 +663,12 @@ class TorchMoECallback:
         if not self.layer_outputs:
             collected = self._collect_from_model_state()
             if not collected:
-                self._log_debug(f"Step {current_step}: no routing info captured via hooks or model state.")
+                if self.log_to_console:
+                    self._log_debug(f"Step {current_step}: no routing info captured via hooks or model state.")
             else:
                 self.layer_outputs.update(collected)
-                self._log_debug(f"Step {current_step}: collected {len(collected)} routing info from model state")
+                if self.log_to_console:
+                    self._log_debug(f"Step {current_step}: collected {len(collected)} routing info from model state")
 
         # 메트릭 계산
         step_metrics = self._calculate_step_metrics()
@@ -611,18 +677,21 @@ class TorchMoECallback:
 
         # 디버그: 메트릭이 비어있는지 확인
         if not step_metrics:
-            self._log_debug(f"Step {current_step}: step_metrics is empty! layer_outputs: {len(self.layer_outputs)}")
+            if self.log_to_console:
+                self._log_debug(f"Step {current_step}: step_metrics is empty! layer_outputs: {len(self.layer_outputs)}")
 
         # _log_metrics를 매 step마다 호출하여 log_data 생성
         # (실제 wandb 로깅은 on_log에서 하므로, 여기서는 pending에 저장)
         self._log_metrics(step_metrics, current_step)
 
-        # pending_metrics에 step별로 저장 (on_log에서 사용)
+        # pending_metrics에 step별로 저장 (on_log에서만 wandb 로깅)
         if hasattr(self, 'last_log_data') and self.last_log_data:
             self.pending_metrics[current_step] = self.last_log_data.copy()
-            self._log_debug(f"Step {current_step}: stored {len(self.last_log_data)} metrics in pending")
+            if self.log_to_console:
+                self._log_debug(f"Step {current_step}: stored {len(self.last_log_data)} metrics in pending")
         else:
-            self._log_debug(f"Step {current_step}: no metrics to store in pending")
+            if self.log_to_console:
+                self._log_debug(f"Step {current_step}: no metrics to store in pending")
 
         # 히트맵 생성
         if current_step % self.log_heatmap_every == 0:
@@ -643,7 +712,7 @@ class TorchMoECallback:
             self.model is not None and
             self.tokenizer is not None):
             if self.is_main_process:
-                print(f"[MoE Generation] Logging generations at step {current_step}")
+                self._log_debug(f"[MoE Generation] Logging generations at step {current_step}")
             self._log_generations(current_step)
 
     @torch.no_grad()
@@ -768,14 +837,14 @@ class TorchMoECallback:
                             gen_log_data[f'generation/step_{current_step}/sample_{i}/generated'] = log_entry['generated'][:200] + "..."
                         self.logger.log(gen_log_data, step=current_step, commit=True)
                     except Exception as e:
-                        print(f"[MoE Generation] Warning: Failed to log generation to wandb at step {current_step}: {e}")
+                        self._log_debug(f"Warning: Failed to log generation to wandb at step {current_step}: {e}")
 
             # 모델을 원래 모드로 복원
             self.model.train(original_mode)
-            print(f"[MoE Generation] ✅ Completed generation logging at step {current_step} ({sample_count} samples)")
+            self._log_debug(f"✅ Completed generation logging at step {current_step} ({sample_count} samples)")
 
         except Exception as e:
-            print(f"[MoE Generation] Error during generation logging: {e}")
+            self._log_debug(f"Error during generation logging: {e}")
             # 모델을 다시 training 모드로 전환
             if self.model is not None:
                 self.model.train(original_mode)
@@ -877,6 +946,28 @@ class TorchMoECallback:
                     'max_entropy': token_entropy.max(),
                 })
             
+            # G3MoE specific metrics
+            if 'speciality_loss' in routing_info and routing_info['speciality_loss'] is not None:
+                val = routing_info['speciality_loss']
+                if torch.is_tensor(val):
+                    layer_metrics['speciality_loss'] = val.item() if val.numel() == 1 else val.mean().item()
+                else:
+                    layer_metrics['speciality_loss'] = float(val)
+            
+            if 'cosine_similarities' in routing_info and routing_info['cosine_similarities'] is not None:
+                val = routing_info['cosine_similarities']
+                if torch.is_tensor(val):
+                    layer_metrics['cosine_similarities'] = val.item() if val.numel() == 1 else val.mean().item()
+                else:
+                    layer_metrics['cosine_similarities'] = float(val)
+            
+            if 'expression_loss' in routing_info and routing_info['expression_loss'] is not None:
+                val = routing_info['expression_loss']
+                if torch.is_tensor(val):
+                    layer_metrics['expression_loss'] = val.item() if val.numel() == 1 else val.mean().item()
+                else:
+                    layer_metrics['expression_loss'] = float(val)
+            
             metrics[layer_name] = layer_metrics
         
         # Layer-wise balance 분석 (실제 검증 지표)
@@ -933,7 +1024,8 @@ class TorchMoECallback:
                 if entry:
                     collected[name] = entry
         except Exception as e:
-            self._log_debug(f"_collect_from_model_state error: {e}")
+            if self.log_to_console:
+                self._log_debug(f"_collect_from_model_state error: {e}")
         return collected
     
     def _log_metrics(self, metrics, current_step: int):
@@ -942,27 +1034,21 @@ class TorchMoECallback:
         if not self.is_main_process:
             return
         
-        # 디버깅: 메트릭 계산 시작
-        try:
-            process_info = _get_process_info()
-            if self.debug_logging:
-                self._log_debug(f"[_log_metrics] Step {current_step}, Process: rank={process_info['rank']}, RANK={process_info['RANK']}")
-        except Exception:
-            pass
+        # 디버깅: 메트릭 계산 시작 (wandb에만 기록, console 출력 안 함)
         
         log_data = {}
         
-        # 레이어별 메트릭 (train prefix 추가)
+        # 레이어별 메트릭 (moe 카테고리로 분리)
         for layer_name, layer_metrics in metrics.items():
             if layer_name.startswith('_'):
                 continue  # 내부 메트릭은 건너뛰기
             for metric_name, value in layer_metrics.items():
                 if torch.is_tensor(value) and value.numel() == 1:
-                    log_data[f'train_moe/moe/{layer_name}/{metric_name}'] = value.item()
+                    log_data[f'moe/{layer_name}/{metric_name}'] = value.item()
                 elif isinstance(value, (int, float)):
-                    log_data[f'train_moe/moe/{layer_name}/{metric_name}'] = value
+                    log_data[f'moe/{layer_name}/{metric_name}'] = value
         
-        # 전체 평균 메트릭 (train prefix 추가)
+        # 전체 평균 메트릭 (moe 카테고리로 분리)
         if metrics:
             # 실제로 값이 있는 경우만 계산 (0으로 fallback하지 않음)
             cv_values = [m['expert_cv'].item() if torch.is_tensor(m['expert_cv']) else m['expert_cv'] 
@@ -976,26 +1062,44 @@ class TorchMoECallback:
                             if isinstance(m, dict) and not isinstance(m, str) and 'unused_experts' in m]
             
             if cv_values:
-                log_data['train_moe/moe/avg_expert_cv'] = np.mean(cv_values)
+                log_data['moe/avg_expert_cv'] = np.mean(cv_values)
             if entropy_values:
-                log_data['train_moe/moe/avg_routing_entropy'] = np.mean(entropy_values)
+                log_data['moe/avg_routing_entropy'] = np.mean(entropy_values)
             if unused_values:
-                log_data['train_moe/moe/total_unused_experts'] = sum(unused_values)
+                log_data['moe/total_unused_experts'] = sum(unused_values)
             
-            # Layer-wise balance 메트릭 (실제 검증 지표) - train prefix 추가
+            # G3MoE specific metrics (평균 계산)
+            speciality_loss_values = [m['speciality_loss'] 
+                                     for m in metrics.values() 
+                                     if isinstance(m, dict) and not isinstance(m, str) and 'speciality_loss' in m]
+            cosine_similarities_values = [m['cosine_similarities'] 
+                                         for m in metrics.values() 
+                                         if isinstance(m, dict) and not isinstance(m, str) and 'cosine_similarities' in m]
+            expression_loss_values = [m['expression_loss'] 
+                                     for m in metrics.values() 
+                                     if isinstance(m, dict) and not isinstance(m, str) and 'expression_loss' in m]
+            
+            if speciality_loss_values:
+                log_data['moe/avg_speciality_loss'] = np.mean(speciality_loss_values)
+            if cosine_similarities_values:
+                log_data['moe/avg_cosine_similarities'] = np.mean(cosine_similarities_values)
+            if expression_loss_values:
+                log_data['moe/avg_expression_loss'] = np.mean(expression_loss_values)
+            
+            # Layer-wise balance 메트릭 (실제 검증 지표) - moe 카테고리로 분리
             if '_layer_wise_balance' in metrics:
                 balance_metrics = metrics['_layer_wise_balance']
                 # 실제로 값이 있는 경우만 로깅 (0으로 fallback하지 않음)
                 if 'layer_utilization_cv' in balance_metrics:
-                    log_data['train_moe/validation/layer_utilization_cv'] = balance_metrics['layer_utilization_cv']
+                    log_data['moe/validation/layer_utilization_cv'] = balance_metrics['layer_utilization_cv']
                 if 'layer_utilization_mean' in balance_metrics:
-                    log_data['train_moe/validation/layer_utilization_mean'] = balance_metrics['layer_utilization_mean']
+                    log_data['moe/validation/layer_utilization_mean'] = balance_metrics['layer_utilization_mean']
                 if 'layer_entropy_mean' in balance_metrics:
-                    log_data['train_moe/validation/layer_entropy_mean'] = balance_metrics['layer_entropy_mean']
+                    log_data['moe/validation/layer_entropy_mean'] = balance_metrics['layer_entropy_mean']
                 if 'early_late_utilization_ratio' in balance_metrics:
-                    log_data['train_moe/validation/early_late_ratio'] = balance_metrics['early_late_utilization_ratio']
+                    log_data['moe/validation/early_late_ratio'] = balance_metrics['early_late_utilization_ratio']
         
-        # Paper 벤치마크 메트릭 추가 (GramSpecAnalyzer가 있는 경우) - train prefix 추가
+        # Paper 벤치마크 메트릭 추가 (GramSpecAnalyzer가 있는 경우) - moe 카테고리로 분리
         if self.gramspec_analyzer is not None:
             try:
                 paper_metrics = self.gramspec_analyzer.get_paper_metrics_summary()
@@ -1004,79 +1108,79 @@ class TorchMoECallback:
                     if 'load_balancing' in paper_metrics:
                         lb = paper_metrics['load_balancing']
                         if 'coefficient_of_variation' in lb and lb['coefficient_of_variation'] is not None:
-                            log_data['train_moe/paper/load_balancing/cv'] = lb['coefficient_of_variation']
+                            log_data['moe/paper/load_balancing/cv'] = lb['coefficient_of_variation']
                         if 'load_imbalance_ratio' in lb and lb['load_imbalance_ratio'] is not None:
-                            log_data['train_moe/paper/load_balancing/imbalance_ratio'] = lb['load_imbalance_ratio']
+                            log_data['moe/paper/load_balancing/imbalance_ratio'] = lb['load_imbalance_ratio']
                         if 'expert_utilization_rate' in lb and lb['expert_utilization_rate'] is not None:
-                            log_data['train_moe/paper/load_balancing/utilization_rate'] = lb['expert_utilization_rate']
+                            log_data['moe/paper/load_balancing/utilization_rate'] = lb['expert_utilization_rate']
                     
                     # Expert specialization metrics
                     if 'expert_specialization' in paper_metrics:
                         es = paper_metrics['expert_specialization']
                         if 'expert_diversity_score' in es and es['expert_diversity_score'] is not None:
-                            log_data['train_moe/paper/expert_specialization/diversity_score'] = es['expert_diversity_score']
+                            log_data['moe/paper/expert_specialization/diversity_score'] = es['expert_diversity_score']
                         if 'expert_similarity_mean' in es and es['expert_similarity_mean'] is not None:
-                            log_data['train_moe/paper/expert_specialization/similarity_mean'] = es['expert_similarity_mean']
+                            log_data['moe/paper/expert_specialization/similarity_mean'] = es['expert_similarity_mean']
                         if 'expert_specialization_strength' in es and es['expert_specialization_strength'] is not None:
-                            log_data['train_moe/paper/expert_specialization/specialization_strength'] = es['expert_specialization_strength']
+                            log_data['moe/paper/expert_specialization/specialization_strength'] = es['expert_specialization_strength']
                     
                     # Gram matrix quality
                     if 'gram_matrix_quality' in paper_metrics:
                         gm = paper_metrics['gram_matrix_quality']
                         if 'orthogonality' in gm and gm['orthogonality'] is not None:
-                            log_data['train_moe/paper/gram_matrix/orthogonality'] = gm['orthogonality']
+                            log_data['moe/paper/gram_matrix/orthogonality'] = gm['orthogonality']
                         if 'orthogonality_std' in gm and gm['orthogonality_std'] is not None:
-                            log_data['train_moe/paper/gram_matrix/orthogonality_std'] = gm['orthogonality_std']
+                            log_data['moe/paper/gram_matrix/orthogonality_std'] = gm['orthogonality_std']
                     
                     # Routing quality
                     if 'routing_quality' in paper_metrics:
                         rq = paper_metrics['routing_quality']
                         if 'routing_confidence' in rq and rq['routing_confidence'] is not None:
-                            log_data['train_moe/paper/routing/confidence'] = rq['routing_confidence']
+                            log_data['moe/paper/routing/confidence'] = rq['routing_confidence']
                         if 'cosine_similarity_mean' in rq and rq['cosine_similarity_mean'] is not None:
-                            log_data['train_moe/paper/routing/cosine_similarity_mean'] = rq['cosine_similarity_mean']
+                            log_data['moe/paper/routing/cosine_similarity_mean'] = rq['cosine_similarity_mean']
             except Exception as e:
                 self._log_debug(f"Warning: Failed to get paper metrics: {e}")
         
-        # Vision 모듈 사용 통계 추가 (step별 증가량 계산) - train prefix 추가
+        # Vision 모듈 사용 통계 추가 (step별 증가량 계산) - vision 카테고리로 분리
         if hasattr(self, 'prev_vision_stats'):
             step_vision_tower_calls = self.vision_usage_stats['vision_tower_calls'] - self.prev_vision_stats.get('vision_tower_calls', 0)
             step_projector_calls = self.vision_usage_stats['projector_calls'] - self.prev_vision_stats.get('projector_calls', 0)
             step_pixel_values = self.vision_usage_stats['pixel_values_received'] - self.prev_vision_stats.get('pixel_values_received', 0)
             step_image_features = self.vision_usage_stats['image_features_generated'] - self.prev_vision_stats.get('image_features_generated', 0)
             
-            # Vision 사용 통계는 항상 로깅 (0이어도)
-            log_data['train_moe/vision/vision_tower_calls_per_step'] = step_vision_tower_calls
-            log_data['train_moe/vision/projector_calls_per_step'] = step_projector_calls
-            log_data['train_moe/vision/pixel_values_per_step'] = step_pixel_values
-            log_data['train_moe/vision/image_features_per_step'] = step_image_features
+            # Vision 사용 통계는 항상 로깅 (0이어도) - vision 카테고리로 분리
+            log_data['multi_modality/vision_tower_calls_per_step'] = step_vision_tower_calls
+            log_data['multi_modality/projector_calls_per_step'] = step_projector_calls
+            log_data['multi_modality/pixel_values_per_step'] = step_pixel_values
+            log_data['multi_modality/image_features_per_step'] = step_image_features
             
-            # 누적 통계도 함께 로깅
-            log_data['train_moe/vision/vision_tower_calls_total'] = self.vision_usage_stats['vision_tower_calls']
-            log_data['train_moe/vision/projector_calls_total'] = self.vision_usage_stats['projector_calls']
-            log_data['train_moe/vision/pixel_values_total'] = self.vision_usage_stats['pixel_values_received']
-            log_data['train_moe/vision/image_features_total'] = self.vision_usage_stats['image_features_generated']
+            # 누적 통계도 함께 로깅 - vision 카테고리로 분리
+            log_data['multi_modality/vision_tower_calls_total'] = self.vision_usage_stats['vision_tower_calls']
+            log_data['multi_modality/projector_calls_total'] = self.vision_usage_stats['projector_calls']
+            log_data['multi_modality/pixel_values_total'] = self.vision_usage_stats['pixel_values_received']
+            log_data['multi_modality/image_features_total'] = self.vision_usage_stats['image_features_generated']
             
-            # Vision 사용률 (이미지가 있는 배치 비율)
-            log_data['train_moe/vision/vision_usage_rate'] = 1.0 if step_vision_tower_calls > 0 else 0.0
+            # Vision 사용률 (이미지가 있는 배치 비율) - vision 카테고리로 분리
+            log_data['multi_modality/vision_usage_rate'] = 1.0 if step_vision_tower_calls > 0 else 0.0
             
-            # Vision tower 출력 통계
+            # Vision tower 출력 통계 - vision 카테고리로 분리
             if self.vision_tower_outputs:
                 recent_outputs = self.vision_tower_outputs[-10:]  # 최근 10개
-                log_data['train_moe/vision/tower_output_mean'] = np.mean([o['mean'] for o in recent_outputs])
-                log_data['train_moe/vision/tower_output_std'] = np.mean([o['std'] for o in recent_outputs])
-                log_data['train_moe/vision/tower_output_min'] = np.min([o['min'] for o in recent_outputs])
-                log_data['train_moe/vision/tower_output_max'] = np.max([o['max'] for o in recent_outputs])
+                log_data['multi_modality/tower_output_mean'] = np.mean([o['mean'] for o in recent_outputs])
+                log_data['multi_modality/tower_output_std'] = np.mean([o['std'] for o in recent_outputs])
+                log_data['multi_modality/tower_output_min'] = np.min([o['min'] for o in recent_outputs])
+                log_data['multi_modality/tower_output_max'] = np.max([o['max'] for o in recent_outputs])
             
-            # Projector 출력 통계
+            # Projector 출력 통계 - vision 카테고리로 분리
             if self.projector_outputs:
                 recent_outputs = self.projector_outputs[-10:]  # 최근 10개
-                log_data['train_moe/vision/projector_output_mean'] = np.mean([o['mean'] for o in recent_outputs])
-                log_data['train_moe/vision/projector_output_std'] = np.mean([o['std'] for o in recent_outputs])
-                log_data['train_moe/vision/projector_output_min'] = np.min([o['min'] for o in recent_outputs])
-                log_data['train_moe/vision/projector_output_max'] = np.max([o['max'] for o in recent_outputs])
+                log_data['multi_modality/projector_output_mean'] = np.mean([o['mean'] for o in recent_outputs])
+                log_data['multi_modality/projector_output_std'] = np.mean([o['std'] for o in recent_outputs])
+                log_data['multi_modality/projector_output_min'] = np.min([o['min'] for o in recent_outputs])
+                log_data['multi_modality/projector_output_max'] = np.max([o['max'] for o in recent_outputs])
             
-            # Router의 requires_grad 상태 체크 (MoE upcycling의 핵심) - train prefix 추가
+            # Router의 requires_grad 상태 체크 (MoE upcycling의 핵심) - router 카테고리로 분리
             if self.model is not None:
                 router_count = 0
                 router_trainable_count = 0
@@ -1114,15 +1218,15 @@ class TorchMoECallback:
                     except ImportError:
                         pass
                     
-                    # Router 통계 로깅
+                    # Router 통계 로깅 - router 카테고리로 분리
                     if router_count > 0:
-                        log_data['train_moe/router/total_routers'] = router_count
-                        log_data['train_moe/router/trainable_routers'] = router_trainable_count
-                        log_data['train_moe/router/requires_grad'] = 1.0 if router_trainable_count > 0 else 0.0
-                        log_data['train_moe/router/trainable_params'] = router_trainable_params
-                        log_data['train_moe/router/total_params'] = router_total_params
-                        log_data['train_moe/router/trainable_ratio'] = router_trainable_params / max(router_total_params, 1)
-                        log_data['train_moe/router/trainable_router_ratio'] = router_trainable_count / max(router_count, 1)
+                        log_data['train/router/total_routers'] = router_count
+                        log_data['train/router/trainable_routers'] = router_trainable_count
+                        log_data['train/router/requires_grad'] = 1.0 if router_trainable_count > 0 else 0.0
+                        log_data['train/router/trainable_params'] = router_trainable_params
+                        log_data['train/router/total_params'] = router_total_params
+                        log_data['train/router/trainable_ratio'] = router_trainable_params / max(router_total_params, 1)
+                        log_data['train/router/trainable_router_ratio'] = router_trainable_count / max(router_count, 1)
                 except Exception as e:
                     process_info = _get_process_info()
                     import traceback
@@ -1135,36 +1239,24 @@ class TorchMoECallback:
                         f"  Traceback:\n{traceback.format_exc()}"
                     )
                     self._log_debug(error_msg)
-                    print(error_msg)
         
-        # log_data가 비어있어도 최소한의 디버그 정보는 로깅
+        # log_data가 비어있어도 최소한의 디버그 정보는 로깅 - moe 카테고리로 분리
         if not log_data:
-            log_data['train_moe/no_metrics'] = 1.0
-            log_data['train_moe/layer_outputs_count'] = len(self.layer_outputs)
-            log_data['train_moe/hooks_count'] = len(self.hooks)
-            log_data['train_moe/vision_hooks_count'] = len(self.vision_hooks)
-            log_data['train_moe/metrics_empty'] = 1.0 if not metrics else 0.0
+            log_data['moe/no_metrics'] = 1.0
+            log_data['moe/layer_outputs_count'] = len(self.layer_outputs)
+            log_data['moe/hooks_count'] = len(self.hooks)
+            log_data['moe/vision_hooks_count'] = len(self.vision_hooks)
+            log_data['moe/metrics_empty'] = 1.0 if not metrics else 0.0
         
         # log_data를 저장하여 Trainer의 logs에 추가할 수 있도록 함
         self.last_log_data = log_data
 
-        # 콘솔 출력 (debug_logging이 True일 때만)
-        if self.is_main_process and self.debug_logging:
-            print(f"\n[MoE Callback] Step {current_step} MoE Metrics ({len(log_data)} metrics):")
-            for key, value in log_data.items():
-                # train_moe/ prefix 제거하여 콘솔에 출력
-                display_key = key.replace('train_moe/', '') if key.startswith('train_moe/') else key
-                if 'avg_' in display_key or 'total_' in display_key or 'paper/' in display_key or 'router/' in display_key or 'vision/' in display_key or 'moe/' in display_key:
-                    if value is not None and isinstance(value, (int, float)):
-                        print(f"  {display_key}: {value:.4f}")
-                    else:
-                        print(f"  {display_key}: {value}")
-
-        # 기존 log_to_console 옵션도 지원
-        if self.log_to_console:
+        # 콘솔 출력 (log_to_console=True일 때만)
+        if self.is_main_process and self.log_to_console:
             self._log_debug(f"Step {current_step} MoE Metrics ({len(log_data)} metrics):")
             for key, value in log_data.items():
-                display_key = key.replace('train_moe/', '') if key.startswith('train_moe/') else key
+                # train/ prefix 제거하여 콘솔에 출력
+                display_key = key.replace('train/', '') if key.startswith('train/') else key
                 if 'avg_' in display_key or 'total_' in display_key or 'paper/' in display_key or 'router/' in display_key or 'vision/' in display_key or 'moe/' in display_key:
                     if value is not None and isinstance(value, (int, float)):
                         self._log_debug(f"  {display_key}: {value:.4f}")
@@ -1192,7 +1284,7 @@ class TorchMoECallback:
                 history = self.expert_usage_history[layer_name]
                 # 최소 2개 이상의 데이터 필요 (10개에서 완화)
                 if len(history) < 2:
-                    if self.debug_logging:
+                    if self.log_to_console:
                         self._log_debug(f"Insufficient data for {layer_name} heatmap (need at least 2 steps, got {len(history)})")
                     continue
                 
@@ -1246,13 +1338,17 @@ class TorchMoECallback:
                     # Heatmap 데이터를 pending에 저장 (on_log에서 로깅)
                     try:
                         import wandb
-                        if current_step not in self.pending_heatmaps:
-                            self.pending_heatmaps[current_step] = {}
-                        self.pending_heatmaps[current_step][layer_name] = wandb.Image(plt)
-                        if self.debug_logging:
-                            self._log_debug(f"✅ Generated heatmap for {layer_name} at step {current_step}")
+                        if self.is_main_process:
+                            if current_step not in self.pending_heatmaps:
+                                self.pending_heatmaps[current_step] = {}
+                            self.pending_heatmaps[current_step][layer_name] = wandb.Image(plt)
+                            if self.log_to_console:
+                                self._log_debug(f"✅ Generated heatmap for {layer_name} at step {current_step}")
+                        else:
+                            if self.log_to_console:
+                                self._log_debug(f"Heatmap generation skipped on non-main process")
                     except ImportError:
-                        if self.debug_logging:
+                        if self.log_to_console:
                             self._log_debug(f"⚠️ wandb not available for heatmap generation")
                     except Exception as e:
                         process_info = _get_process_info()
@@ -1266,9 +1362,9 @@ class TorchMoECallback:
                             f"  Error: {type(e).__name__}: {str(e)}\n"
                             f"  Traceback:\n{traceback.format_exc()}"
                         )
-                        if self.debug_logging:
-                            self._log_debug(error_msg)
+                        # 에러는 항상 출력
                         print(error_msg)
+
                     
                     # 파일로 저장
                     if self.save_detailed_logs:
@@ -1276,27 +1372,31 @@ class TorchMoECallback:
                             safe_layer_name = layer_name.replace(".", "_").replace("/", "_")
                             heatmap_path = os.path.join(self.log_dir, f'{safe_layer_name}_heatmap_step_{current_step}.png')
                             plt.savefig(heatmap_path, dpi=150, bbox_inches='tight')
-                            if self.debug_logging:
+                            if self.log_to_console:
                                 self._log_debug(f"Heatmap saved to {heatmap_path}")
                         except Exception as e:
-                            self._log_debug(f"Warning: Failed to save heatmap: {e}")
+                            if self.log_to_console:
+                                self._log_debug(f"Warning: Failed to save heatmap: {e}")
                     
                     plt.close()
                     heatmap_created = True
                     
                 except Exception as e:
                     import traceback
-                    self._log_debug(f"Error creating heatmap for {layer_name}: {e}\n{traceback.format_exc()}")
+                    if self.log_to_console:
+                        self._log_debug(f"Error creating heatmap for {layer_name}: {e}\n{traceback.format_exc()}")
                     continue
             
-            if not heatmap_created and self.debug_logging:
+            if not heatmap_created and self.log_to_console:
                 self._log_debug(f"No heatmaps were created at step {current_step}")
                 
         except ImportError as e:
-            self._log_debug(f"Warning: matplotlib/seaborn not available for heatmap logging: {e}")
+            if self.log_to_console:
+                self._log_debug(f"Warning: matplotlib/seaborn not available for heatmap logging: {e}")
         except Exception as e:
             import traceback
-            self._log_debug(f"Error during heatmap logging: {e}\n{traceback.format_exc()}")
+            if self.log_to_console:
+                self._log_debug(f"Error during heatmap logging: {e}\n{traceback.format_exc()}")
     
     def _check_alerts(self, metrics):
         """경고 상황 체크"""
@@ -1360,8 +1460,9 @@ class TorchMoECallback:
                 **alert
             })
             
-            # 경고 메시지는 항상 출력 (debug_logging 또는 log_to_console이 True면)
-            self._log_debug(f"⚠️  MoE Alert at step {current_step}: {alert['message']}")
+            # 경고 메시지는 log_to_console일 때만 출력
+            if self.log_to_console:
+                self._log_debug(f"⚠️  MoE Alert at step {current_step}: {alert['message']}")
             
             # Alert 데이터를 pending에 저장 (on_log에서 로깅)
             if current_step not in self.pending_alerts:
@@ -1426,7 +1527,6 @@ class TransformersMoECallbackWrapper(TrainerCallback):
     def __init__(self, torch_callback: TorchMoECallback):
         self.torch_callback = torch_callback
         self._model_registered = False
-        self.last_logged_step = -1
     
     def on_train_begin(
         self,
@@ -1512,36 +1612,76 @@ class TransformersMoECallbackWrapper(TrainerCallback):
         if not self.torch_callback.is_main_process:
             return
 
-        # Step monotonicity 체크 - 이미 로깅한 step보다 작은 step은 무시
-        if state.global_step <= self.last_logged_step:
-            if self.torch_callback.debug_logging:
-                self.torch_callback._log_debug(f"⚠️ Skipping wandb log for step {state.global_step} (last logged: {self.last_logged_step})")
-            return
-
         # logs가 None이면 빈 dict로 초기화
         if logs is None:
             logs = {}
 
+        # global_step을 logs에 명시적으로 추가 (wandb에서 step 추적용)
+        logs['train/global_step'] = float(state.global_step)
+
         # 해당 step의 pending 메트릭 확인
-        current_metrics = self.torch_callback.pending_metrics.get(state.global_step)
+        # on_log는 logging_steps마다 호출되므로, 최근 step의 메트릭을 찾아야 함
+        current_metrics = None
+        target_step = state.global_step
+        
+        # 정확한 step의 메트릭이 없으면, 최근 step의 메트릭을 찾음
+        if target_step not in self.torch_callback.pending_metrics:
+            # 최근 step의 메트릭 찾기 (현재 step 이하의 가장 가까운 step)
+            available_steps = [s for s in self.torch_callback.pending_metrics.keys() if s <= target_step]
+            if available_steps:
+                target_step = max(available_steps)
+                current_metrics = self.torch_callback.pending_metrics.get(target_step)
+                if self.torch_callback.log_to_console:
+                    self.torch_callback._log_debug(f"⚠️ Using metrics from step {target_step} for on_log at step {state.global_step}")
+            else:
+                # 아직 pending 메트릭이 없으면, on_step_end에서 생성된 메트릭을 직접 사용
+                if hasattr(self.torch_callback, 'last_log_data') and self.torch_callback.last_log_data:
+                    current_metrics = self.torch_callback.last_log_data.copy()
+                    if self.torch_callback.log_to_console:
+                        self.torch_callback._log_debug(f"⚠️ Using last_log_data for step {state.global_step}")
+        else:
+            current_metrics = self.torch_callback.pending_metrics.get(target_step)
+        
         if current_metrics:
-            # pending 메트릭을 logs에 추가
+            # pending 메트릭을 logs에 추가 (Trainer의 WandbCallback이 자동으로 로깅)
             logs.update(current_metrics)
 
-            # Trainer의 logs.update()만으로는 wandb에 로깅이 안 될 수 있으므로 직접 로깅
+            # wandb에 직접 로깅 (Trainer의 로깅과 독립적으로 보장)
+            # step은 state.global_step을 사용하여 Trainer와 동기화
             try:
                 import wandb
+                # wandb.run이 None이 아니거나, wandb.init이 호출되었는지 확인
                 if wandb.run is not None:
-                    # Trainer가 이미 로깅한 step과 동일한 step을 사용
-                    process_info = _get_process_info()
-                    wandb.log(current_metrics, step=state.global_step, commit=False)
+                    # prefix별로 그룹화
+                    grouped_metrics = {}
+                    for key, value in current_metrics.items():
+                        # prefix 추출 (예: 'moe/', 'multi_modality/', 'train/router/')
+                        if '/' in key:
+                            prefix = key.split('/')[0] + '/'
+                        else:
+                            prefix = 'other/'
+                        
+                        if prefix not in grouped_metrics:
+                            grouped_metrics[prefix] = {}
+                        grouped_metrics[prefix][key] = value
+                    
+                    # 각 prefix 그룹을 10개씩 쪼개서 로깅
+                    for prefix, metrics_group in grouped_metrics.items():
+                        metrics_list = list(metrics_group.items())
+                        chunk_size = 10
+                        
+                        for i in range(0, len(metrics_list), chunk_size):
+                            chunk = dict(metrics_list[i:i + chunk_size])
+                            self.torch_callback._log_debug(f"Logging {len(chunk)} {prefix} metrics (chunk {i//chunk_size + 1}) at step {state.global_step}")
+                            print(chunk)
+                            wandb.run.log(chunk, step=state.global_step, commit=False)
 
                     # Pending heatmap 로깅
                     if state.global_step in self.torch_callback.pending_heatmaps:
                         heatmap_data = self.torch_callback.pending_heatmaps[state.global_step]
                         for layer_name, image in heatmap_data.items():
-                            wandb.log({
-                                f'train_moe/moe/{layer_name}/usage_heatmap': image
+                            wandb.run.log({
+                                f'moe/{layer_name}/usage_heatmap': image
                             }, step=state.global_step, commit=False)
                         # 로깅 후 pending에서 제거
                         del self.torch_callback.pending_heatmaps[state.global_step]
@@ -1550,20 +1690,23 @@ class TransformersMoECallbackWrapper(TrainerCallback):
                     if state.global_step in self.torch_callback.pending_alerts:
                         alert_data = self.torch_callback.pending_alerts[state.global_step]
                         for alert in alert_data:
-                            wandb.log({
-                                f'alerts/{alert["type"]}': 1,
-                                f'alerts/{alert["layer"]}_severity': alert['severity']
+                            wandb.run.log({
+                                f'train/alerts/{alert["type"]}': 1,
+                                f'train/alerts/{alert["layer"]}_severity': alert['severity']
                             }, step=state.global_step, commit=False)
                         # 로깅 후 pending에서 제거
                         del self.torch_callback.pending_alerts[state.global_step]
 
-                    # 로깅 성공 후 pending 메트릭 제거
-                    del self.torch_callback.pending_metrics[state.global_step]
-
-                    # Step tracking 업데이트
-                    self.last_logged_step = state.global_step
-                    if self.torch_callback.is_main_process and self.torch_callback.debug_logging:
-                        print(f"[MoE Callback] ✅ Logged {len(current_metrics)} MoE metrics to wandb at step {state.global_step} (Process: rank={process_info['rank']}, RANK={process_info['RANK']})")
+                    # 로깅 성공 후 pending 메트릭 제거 (target_step이 아닌 state.global_step 기준)
+                    # 여러 step의 메트릭이 누적되어 있을 수 있으므로, 현재 step 이하의 모든 메트릭 제거
+                    steps_to_remove = [s for s in self.torch_callback.pending_metrics.keys() if s <= state.global_step]
+                    for step in steps_to_remove:
+                        if step in self.torch_callback.pending_metrics:
+                            del self.torch_callback.pending_metrics[step]
+                else:
+                    # wandb.run이 None이면 logs에만 추가 (Trainer의 WandbCallback이 처리)
+                    if self.torch_callback.log_to_console:
+                        self.torch_callback._log_debug(f"⚠️ wandb.run is None at step {state.global_step}, relying on Trainer's WandbCallback")
             except Exception as e:
                 process_info = _get_process_info()
                 import traceback
@@ -1578,17 +1721,16 @@ class TransformersMoECallbackWrapper(TrainerCallback):
                     f"  current_metrics keys: {list(current_metrics.keys())[:10] if current_metrics else 'None'}\n"
                     f"  wandb.run: {wandb.run is not None if 'wandb' in globals() else 'wandb not imported'}"
                 )
+                # 에러는 항상 출력
                 print(error_msg)
-                if self.torch_callback.is_main_process:
-                    self.torch_callback._log_debug(error_msg)
         else:
-            # 해당 step의 pending 메트릭이 없으면 경고
-            if self.torch_callback.debug_logging:
+            # 해당 step의 pending 메트릭이 없으면 경고 (log_to_console일 때만)
+            if self.torch_callback.log_to_console:
                 self.torch_callback._log_debug(f"⚠️ No pending metrics available at step {state.global_step}")
             # 최소한의 디버그 정보라도 추가
-            logs['train_moe/moe/callback_error'] = 1.0
-            logs['train_moe/moe/layer_outputs_count'] = len(self.torch_callback.layer_outputs) if hasattr(self.torch_callback, 'layer_outputs') else 0
-            logs['train_moe/moe/hooks_count'] = len(self.torch_callback.hooks) if hasattr(self.torch_callback, 'hooks') else 0
+            logs['moe/callback_error'] = 1.0
+            logs['moe/layer_outputs_count'] = len(self.torch_callback.layer_outputs) if hasattr(self.torch_callback, 'layer_outputs') else 0
+            logs['moe/hooks_count'] = len(self.torch_callback.hooks) if hasattr(self.torch_callback, 'hooks') else 0
     
     def on_evaluate(
         self,
