@@ -73,11 +73,11 @@ export TOKENIZERS_PARALLELISM=false
 # CUDA allocator tuning to reduce fragmentation and OOM risk
 export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:64,expandable_segments:True
 # Avoid heavy sync/blocking debug flags which increase memory/stalls
-export CUDA_LAUNCH_BLOCKING=0
-export TORCH_USE_CUDA_DSA=0
+export CUDA_LAUNCH_BLOCKING=1
+export TORCH_USE_CUDA_DSA=1
 export FLASH_ATTENTION_2_ENABLED=true
 # if system could use flash attention 3, use the following variables
-export FLASH_ATTENTION_DETERMINISTIC=0
+export FLASH_ATTENTION_DETERMINISTIC=1
 export FLASH_ATTENTION_SKIP_ALIBI=1
 export TORCH_CUDNN_V8_API_ENABLED=1
 
@@ -85,15 +85,21 @@ export OMP_NUM_THREADS=$(nproc)  # 논리 코어 전체
 
 export TORCH_DISTRIBUTED_DEBUG=OFF
 export NCCL_DEBUG=WARN
-export DEEPSPEED_LOG_LEVEL=INFO
+export DEEPSPEED_LOG_LEVEL=DEBUG
 export WANDB_LOG_MODEL=end
 
 export TORCH_DISTRIBUTED_NCCL_ASYNC_ERROR_HANDLING=1
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 export NCCL_SHM_DISABLE=1
+export NCCL_P2P_DISABLE=1
 export NCCL_IB_DISABLE=1
 export NCCL_BLOCKING_WAIT=1 
 export NCCL_ASYNC_ERROR_HANDLING=1
+export NCCL_TIMEOUT=1800
+# export NCCL_DEBUG_SUBSYS=COLL
+# export NCCL_DEBUG=INFO
+export NCCL_PROTO=LL
+export NCCL_ALGO=Ring
 export DEEPSPEED_AUTOTP=1
 export DS_AUTOTP=1
 export DEEPSPEED_ENABLE_TP=1

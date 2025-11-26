@@ -915,6 +915,127 @@ def main(
     
     # Add custom training progress callback
     from transformers import TrainerCallback
+    
+    # 배치 정보를 저장하는 callback (OOM 디버깅용)
+    class BatchTrackingCallback(TrainerCallback):
+        """배치 정보를 추적하여 OOM 발생 시 디버깅 정보 제공"""
+        def __init__(self, trainer_ref):
+            self.last_batch_info = None
+            self.last_batch_step = -1
+            self.trainer_ref = trainer_ref  # Trainer 참조
+        
+        def on_step_begin(self, args, state, control, **kwargs):
+            """Step 시작 시 배치 정보 저장 시도"""
+            try:
+                # Trainer의 내부 상태에서 배치 확인
+                trainer = kwargs.get('trainer') or self.trainer_ref
+                if trainer is not None:
+                    # Trainer의 _current_batch 또는 최근 배치 확인
+                    if hasattr(trainer, '_current_batch') and trainer._current_batch is not None:
+                        self._save_batch_info(trainer._current_batch, state.global_step, trainer)
+            except Exception:
+                pass  # 배치 정보 저장 실패해도 학습은 계속
+        
+        def on_step_end(self, args, state, control, **kwargs):
+            """Step 종료 시 배치 정보 저장 시도"""
+            try:
+                trainer = kwargs.get('trainer') or self.trainer_ref
+                if trainer is not None:
+                    # Trainer의 내부 상태에서 배치 확인
+                    if hasattr(trainer, '_current_batch') and trainer._current_batch is not None:
+                        self._save_batch_info(trainer._current_batch, state.global_step, trainer)
+            except Exception:
+                pass
+        
+        def _save_batch_info(self, batch, step, trainer):
+            """배치 정보를 메모리 효율적으로 저장"""
+            try:
+                batch_info = {}
+                
+                # Input IDs 정보
+                if 'input_ids' in batch and torch.is_tensor(batch['input_ids']):
+                    input_ids = batch['input_ids']
+                    batch_info['input_ids_shape'] = list(input_ids.shape)
+                    if len(input_ids.shape) > 1:
+                        # 각 샘플의 실제 길이 (pad 제외)
+                        pad_token_id = 0
+                        # processing_class에서 tokenizer 가져오기 (deprecated된 tokenizer 대신)
+                        processing_class = getattr(trainer, 'processing_class', None)
+                        if processing_class is not None:
+                            # AutoProcessor인 경우 tokenizer 속성에 접근
+                            tokenizer = getattr(processing_class, 'tokenizer', processing_class)
+                            pad_token_id = getattr(tokenizer, 'pad_token_id', 0) or getattr(tokenizer, 'eos_token_id', 0)
+                        
+                        sample_lengths = (input_ids != pad_token_id).sum(dim=1).cpu().tolist()
+                        batch_info['sample_lengths'] = sample_lengths[:10]  # 최대 10개만
+                        batch_info['max_length'] = max(sample_lengths) if sample_lengths else 0
+                        batch_info['min_length'] = min(sample_lengths) if sample_lengths else 0
+                        batch_info['avg_length'] = sum(sample_lengths) / len(sample_lengths) if sample_lengths else 0
+                        batch_info['total_tokens'] = input_ids.numel()
+                
+                # Attention mask 정보
+                if 'attention_mask' in batch and torch.is_tensor(batch['attention_mask']):
+                    attn_mask = batch['attention_mask']
+                    batch_info['attention_mask_shape'] = list(attn_mask.shape)
+                    batch_info['attention_mask_total'] = attn_mask.numel()
+                
+                # Pixel values (이미지) 정보
+                if 'pixel_values' in batch and torch.is_tensor(batch['pixel_values']):
+                    pixel_values = batch['pixel_values']
+                    batch_info['pixel_values_shape'] = list(pixel_values.shape)
+                    batch_info['pixel_values_dtype'] = str(pixel_values.dtype)
+                    batch_info['pixel_values_memory_mb'] = pixel_values.numel() * pixel_values.element_size() / 1024 / 1024
+                    batch_info['num_images'] = pixel_values.shape[0] if len(pixel_values.shape) > 0 else 0
+                
+                # Image grid 정보
+                if 'image_grid_thw' in batch:
+                    batch_info['image_grid_thw'] = batch['image_grid_thw']
+                
+                # Labels 정보
+                if 'labels' in batch and torch.is_tensor(batch['labels']):
+                    labels = batch['labels']
+                    batch_info['labels_shape'] = list(labels.shape)
+                    if labels.numel() > 0:
+                        non_ignore = (labels != -100).sum().item()
+                        batch_info['non_ignore_tokens'] = non_ignore
+                        batch_info['ignore_tokens'] = (labels == -100).sum().item()
+                
+                # 배치 크기
+                if 'input_ids' in batch and torch.is_tensor(batch['input_ids']):
+                    batch_info['batch_size'] = batch['input_ids'].shape[0] if len(batch['input_ids'].shape) > 0 else 1
+                
+                self.last_batch_info = batch_info
+                self.last_batch_step = step
+            except Exception as e:
+                pass  # 배치 정보 저장 실패해도 학습은 계속
+    
+    # 배치 추적 callback 추가
+    batch_tracker = BatchTrackingCallback(trainer)
+    trainer.add_callback(batch_tracker)
+    
+    # Trainer의 training_step을 override하여 배치 정보 저장
+    original_training_step = trainer.training_step
+    
+    def training_step_with_batch_tracking(self, model, inputs, num_items_in_batch=None):
+        """배치 정보를 저장하는 training_step wrapper"""
+        try:
+            # 배치 정보를 trainer에 저장
+            self._current_batch = inputs
+            # 배치 정보를 callback에도 저장
+            if hasattr(self, 'state') and self.state:
+                batch_tracker._save_batch_info(inputs, self.state.global_step, self)
+        except Exception:
+            pass  # 배치 정보 저장 실패해도 학습은 계속
+        
+        # 원래 training_step 호출 (인자 개수에 맞게)
+        if num_items_in_batch is not None:
+            return original_training_step(model, inputs, num_items_in_batch)
+        else:
+            return original_training_step(model, inputs)
+    
+    import types
+    trainer.training_step = types.MethodType(training_step_with_batch_tracking, trainer)
+    
     class DetailedTrainingCallback(TrainerCallback):
         def __init__(self, logger):
             self.logger = logger
@@ -1106,6 +1227,154 @@ def main(
                 except Exception as batch_e:
                     logger.error(f"❌ Could not get batch info: {batch_e}")
             
+            # 현재 배치의 데이터 샘플 정보 수집
+            logger.error("📊 Collecting data sample information at OOM...")
+            try:
+                # 배치 추적 callback에서 저장된 정보 사용
+                batch_info = None
+                if hasattr(trainer, 'callback_handler') and trainer.callback_handler is not None:
+                    for callback in trainer.callback_handler.callbacks:
+                        if hasattr(callback, 'last_batch_info') and callback.last_batch_info is not None:
+                            batch_info = callback.last_batch_info
+                            logger.error(f"❌ Last processed batch information (step {getattr(callback, 'last_batch_step', 'unknown')}):")
+                            break
+                
+                if batch_info:
+                    # Input IDs 정보
+                    if 'input_ids_shape' in batch_info:
+                        logger.error(f"  - Input IDs shape: {batch_info['input_ids_shape']}")
+                        logger.error(f"  - Input IDs total tokens: {batch_info.get('total_tokens', 'N/A')}")
+                        if 'sample_lengths' in batch_info:
+                            logger.error(f"  - Sample lengths: {batch_info['sample_lengths']}")
+                            logger.error(f"  - Max sample length: {batch_info.get('max_length', 'N/A')}")
+                    
+                    # Attention mask 정보
+                    if 'attention_mask_shape' in batch_info:
+                        logger.error(f"  - Attention mask shape: {batch_info['attention_mask_shape']}")
+                        logger.error(f"  - Attention mask total elements: {batch_info.get('attention_mask_total', 'N/A')}")
+                    
+                    # Pixel values (이미지) 정보
+                    if 'pixel_values_shape' in batch_info:
+                        logger.error(f"  - Pixel values shape: {batch_info['pixel_values_shape']}")
+                        logger.error(f"  - Pixel values memory (MB): {batch_info.get('pixel_values_memory_mb', 'N/A'):.2f}")
+                        logger.error(f"  - Number of images in batch: {batch_info.get('num_images', 'N/A')}")
+                    
+                    # Image grid 정보
+                    if 'image_grid_thw' in batch_info:
+                        logger.error(f"  - Image grid info: {batch_info['image_grid_thw']}")
+                    
+                    # Labels 정보
+                    if 'labels_shape' in batch_info:
+                        logger.error(f"  - Labels shape: {batch_info['labels_shape']}")
+                        logger.error(f"  - Non-ignore tokens: {batch_info.get('non_ignore_tokens', 'N/A')}")
+                
+                # Trainer의 내부 상태에서 현재 배치 정보 확인 (fallback)
+                if not batch_info:
+                    if hasattr(trainer, '_current_batch') and trainer._current_batch is not None:
+                        batch = trainer._current_batch
+                        logger.error(f"❌ Current batch information (from trainer._current_batch):")
+                        logger.error(f"  - Batch keys: {list(batch.keys()) if isinstance(batch, dict) else 'N/A'}")
+                        
+                        # Input IDs 정보
+                        if 'input_ids' in batch and torch.is_tensor(batch['input_ids']):
+                            input_ids = batch['input_ids']
+                            logger.error(f"  - Input IDs shape: {input_ids.shape}")
+                            logger.error(f"  - Input IDs total tokens: {input_ids.numel()}")
+                            
+                            # 각 샘플의 길이
+                            if len(input_ids.shape) > 1:
+                                # processing_class에서 tokenizer 가져오기 (deprecated된 tokenizer 대신)
+                                processing_class = getattr(trainer, 'processing_class', None)
+                                pad_token_id = 0
+                                if processing_class is not None:
+                                    # AutoProcessor인 경우 tokenizer 속성에 접근
+                                    tokenizer = getattr(processing_class, 'tokenizer', processing_class)
+                                    pad_token_id = getattr(tokenizer, 'pad_token_id', 0) or getattr(tokenizer, 'eos_token_id', 0)
+                                sample_lengths = (input_ids != pad_token_id).sum(dim=1).cpu().tolist()
+                                logger.error(f"  - Sample lengths: {sample_lengths}")
+                                logger.error(f"  - Max sample length: {max(sample_lengths) if sample_lengths else 'N/A'}")
+                                logger.error(f"  - Min sample length: {min(sample_lengths) if sample_lengths else 'N/A'}")
+                                logger.error(f"  - Avg sample length: {sum(sample_lengths) / len(sample_lengths) if sample_lengths else 'N/A':.2f}")
+                        
+                        # Pixel values (이미지) 정보
+                        if 'pixel_values' in batch and torch.is_tensor(batch['pixel_values']):
+                            pixel_values = batch['pixel_values']
+                            logger.error(f"  - Pixel values shape: {pixel_values.shape}")
+                            logger.error(f"  - Pixel values memory (MB): {pixel_values.numel() * pixel_values.element_size() / 1024 / 1024:.2f}")
+                            logger.error(f"  - Number of images in batch: {pixel_values.shape[0] if len(pixel_values.shape) > 0 else 'N/A'}")
+                
+                # 최근 처리된 데이터셋 샘플 확인 (가능한 경우)
+                if hasattr(trainer, 'train_dataset') and trainer.train_dataset is not None:
+                    try:
+                        state = trainer.state
+                        if state and hasattr(state, 'global_step'):
+                            # 현재 step에서 처리 중인 샘플 인덱스 추정
+                            dataset_size = len(trainer.train_dataset) if hasattr(trainer.train_dataset, '__len__') else 'unknown'
+                            logger.error(f"  - Dataset size: {dataset_size}")
+                            
+                            # 샘플 몇 개 확인 (메모리 절약을 위해 최소한만)
+                            if dataset_size != 'unknown' and dataset_size > 0:
+                                sample_indices = []
+                                if hasattr(trainer, 'per_device_train_batch_size'):
+                                    batch_size = trainer.per_device_train_batch_size
+                                    if hasattr(trainer, 'gradient_accumulation_steps'):
+                                        batch_size *= trainer.gradient_accumulation_steps
+                                    
+                                    # 현재 step에서 처리 중인 샘플 범위 추정
+                                    start_idx = (state.global_step * batch_size) % dataset_size
+                                    end_idx = min(start_idx + batch_size, dataset_size)
+                                    sample_indices = list(range(start_idx, end_idx))[:5]  # 최대 5개만
+                                
+                                if sample_indices:
+                                    logger.error(f"  - Estimated sample indices at OOM: {sample_indices}")
+                                    for idx in sample_indices[:3]:  # 최대 3개만 상세 확인
+                                        try:
+                                            sample = trainer.train_dataset[idx]
+                                            sample_info = {}
+                                            
+                                            # Messages 정보
+                                            if 'messages' in sample:
+                                                messages = sample['messages']
+                                                if isinstance(messages, list):
+                                                    total_text_len = 0
+                                                    for msg in messages:
+                                                        if isinstance(msg, dict) and 'content' in msg:
+                                                            content = msg['content']
+                                                            if isinstance(content, list):
+                                                                for item in content:
+                                                                    if isinstance(item, dict) and 'text' in item:
+                                                                        total_text_len += len(str(item['text']))
+                                                            elif isinstance(content, str):
+                                                                total_text_len += len(content)
+                                                    sample_info['messages_text_length'] = total_text_len
+                                                    sample_info['num_messages'] = len(messages)
+                                            
+                                            # Images 정보
+                                            if 'images' in sample:
+                                                images = sample['images']
+                                                if isinstance(images, list):
+                                                    sample_info['num_images'] = len(images)
+                                                    if images:
+                                                        try:
+                                                            from PIL import Image
+                                                            if isinstance(images[0], Image.Image):
+                                                                sample_info['image_sizes'] = [img.size for img in images[:3]]
+                                                        except:
+                                                            pass
+                                                elif images is not None:
+                                                    sample_info['has_image'] = True
+                                            
+                                            logger.error(f"    Sample {idx}: {sample_info}")
+                                        except Exception as sample_e:
+                                            logger.error(f"    Sample {idx}: Could not inspect ({sample_e})")
+                    except Exception as dataset_e:
+                        logger.error(f"  - Could not inspect dataset: {dataset_e}")
+                
+            except Exception as data_collect_e:
+                logger.error(f"❌ Failed to collect data sample information: {data_collect_e}")
+                import traceback
+                logger.error(f"  Traceback: {traceback.format_exc()}")
+            
             logger.error("❌ 메모리 정리 후 재시도...")
             clear_gpu_memory()
             logger.error("❌ GPU 메모리 정리 완료.")
@@ -1122,6 +1391,7 @@ def main(
             logger.error("   4. 다른 프로세스가 GPU를 사용 중인지 확인 (nvidia-smi)")
             logger.error("   5. DeepSpeed ZeRO-3 CPU offload가 제대로 작동하는지 확인")
             logger.error("   6. 이미지가 포함된 샘플이 많으면 이미지 전용 데이터셋으로 분리 고려")
+            logger.error("   7. 위의 데이터 샘플 정보를 확인하여 문제가 되는 샘플을 필터링하거나 처리 방식 변경 고려")
             
         else:
             logger.error(f"❌ Other RuntimeError: {error_msg}")

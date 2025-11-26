@@ -71,6 +71,8 @@ class TorchMoECallback:
         num_experts: int,
         log_every_n_steps: int = 1,  # 기본값을 1로 변경하여 매 step마다 로깅
         log_heatmap_every: int = 1000,
+        log_tsne_every: int = 5000,  # t-SNE 시각화 주기 (계산 비용이 높으므로 기본값을 크게 설정)
+        tsne_sample_size: int = 2000,  # t-SNE 계산용 샘플 크기
         alert_threshold_imbalance: float = 5.0,
         unused_expert_threshold: float = 0.3,
         entropy_threshold: float = 0.1,
@@ -88,6 +90,8 @@ class TorchMoECallback:
     ):
         self.log_every_n_steps = log_every_n_steps
         self.log_heatmap_every = log_heatmap_every
+        self.log_tsne_every = log_tsne_every
+        self.tsne_sample_size = tsne_sample_size
         self.alert_threshold_imbalance = alert_threshold_imbalance
         self.unused_expert_threshold = unused_expert_threshold
         self.num_experts = num_experts
@@ -130,6 +134,13 @@ class TorchMoECallback:
         
         # Layer별 expert usage tracking (실제 검증용)
         self.layer_expert_usage_counts = {}  # layer_name -> torch.Tensor [num_experts]
+        
+        # t-SNE 시각화용 데이터 버퍼 (메모리 절약을 위해 최근 N개 step만 유지)
+        self.tsne_data_buffer = defaultdict(lambda: {
+            'hidden_states': deque(maxlen=50),  # 최근 50개 step의 hidden states
+            'expert_assignments': deque(maxlen=50),
+            'routing_weights': deque(maxlen=50)
+        })
         
         
         # Vision 모듈 모니터링 (vision_tower, multi_modal_projector)
@@ -380,6 +391,22 @@ class TorchMoECallback:
                 if not self.is_main_process:
                     return
 
+                # t-SNE용 데이터 수집 (메모리 절약을 위해 최근 step만)
+                # input[0]은 hidden states (MoE layer 입력)
+                if isinstance(input, tuple) and len(input) > 0:
+                    hidden_states = input[0]
+                    if torch.is_tensor(hidden_states) and hidden_states.numel() > 0:
+                        # CPU로 이동하고 flatten (메모리 절약)
+                        hidden_states_cpu = hidden_states.detach().to('cpu', non_blocking=True)
+                        # [batch, seq, hidden_dim] -> [batch*seq, hidden_dim]
+                        if hidden_states_cpu.dim() == 3:
+                            hidden_states_flat = hidden_states_cpu.reshape(-1, hidden_states_cpu.size(-1))
+                            # 샘플링하여 메모리 절약 (최대 1000개 토큰만)
+                            if hidden_states_flat.size(0) > 1000:
+                                indices = torch.randperm(hidden_states_flat.size(0))[:1000]
+                                hidden_states_flat = hidden_states_flat[indices]
+                            self.tsne_data_buffer[layer_name]['hidden_states'].append(hidden_states_flat)
+
                 routing_info = self._extract_routing_info(module, input, output)
                 if routing_info:
                     # Store only lightweight, CPU-detached summaries to avoid GPU memory growth
@@ -432,6 +459,17 @@ class TorchMoECallback:
                             val = val.detach().to('cpu')
                         lightweight_entry['expression_loss'] = val
                     self.layer_outputs[layer_name] = lightweight_entry
+                    
+                    # t-SNE용 expert assignments 저장
+                    if 'expert_assignments' in lightweight_entry:
+                        ea = lightweight_entry['expert_assignments']
+                        if torch.is_tensor(ea) and ea.numel() > 0:
+                            # 샘플링하여 메모리 절약
+                            if ea.size(0) > 1000:
+                                indices = torch.randperm(ea.size(0))[:1000]
+                                ea = ea[indices]
+                            self.tsne_data_buffer[layer_name]['expert_assignments'].append(ea)
+                    
                     # 디버깅 로그는 항상 출력 (step 정보 제거)
                     # self._log_debug(f"{layer_name}: extracted {list(routing_info.keys())}")
                 else:
@@ -696,6 +734,10 @@ class TorchMoECallback:
         # 히트맵 생성
         if current_step % self.log_heatmap_every == 0:
             self._generate_heatmaps(current_step)
+        
+        # t-SNE 시각화 생성
+        if current_step % self.log_tsne_every == 0:
+            self._generate_tsne_visualizations(current_step)
 
         # 경고 체크
         alerts = self._check_alerts(step_metrics)
@@ -715,6 +757,251 @@ class TorchMoECallback:
                 self._log_debug(f"[MoE Generation] Logging generations at step {current_step}")
             self._log_generations(current_step)
 
+    @torch.no_grad()
+    def _test_vlm_capabilities(self, model, tokenizer):
+        """VLM 기능 테스트: 멀티모달과 텍스트 전용 케이스 모두 테스트"""
+        if not self.is_main_process:
+            return
+        
+        self._log_debug("="*80)
+        self._log_debug("🔍 VLM Capabilities Test (Training Start)")
+        self._log_debug("="*80)
+        
+        test_results = {
+            "multimodal_tests": [],
+            "text_only_tests": [],
+            "chat_template_tests": []
+        }
+        
+        original_mode = model.training
+        model.eval()
+        try:
+            # 테스트 1: 멀티모달 (이미지 + 텍스트) 테스트
+            self._log_debug("\n📸 Test 1: Multimodal (Image + Text) Generation")
+            try:
+                sample_image_url = "https://huggingface.co/spaces/merve/chameleon-7b/resolve/main/bee.jpg"
+                image = load_image(sample_image_url)
+                
+                # Chat template 적용 테스트
+                multimodal_messages = [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "Describe this image in Korean."},
+                            {"type": "image"}
+                        ]
+                    }
+                ]
+                
+                # Chat template 적용
+                try:
+                    chat_template_result = tokenizer.apply_chat_template(
+                        multimodal_messages,
+                        tokenize=False,
+                        add_generation_prompt=True
+                    )
+                    test_results["chat_template_tests"].append({
+                        "type": "multimodal",
+                        "status": "success",
+                        "template_length": len(chat_template_result)
+                    })
+                    self._log_debug(f"  ✅ Chat template applied successfully (length: {len(chat_template_result)})")
+                except Exception as e:
+                    test_results["chat_template_tests"].append({
+                        "type": "multimodal",
+                        "status": "failed",
+                        "error": str(e)
+                    })
+                    self._log_debug(f"  ❌ Chat template failed: {e}")
+                    raise
+                
+                # 토크나이징 및 생성 테스트
+                test_input_text = chat_template_result.replace("<bos>", "")[:-1] if "<bos>" in chat_template_result else chat_template_result
+                inputs = tokenizer(
+                    text=test_input_text,
+                    images=image,
+                    return_tensors="pt"
+                )
+                inputs = {k: v.to(model.device) for k, v in inputs.items()}
+                
+                pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+                start_time = time.time()
+                outputs = model.generate(
+                    **inputs,
+                    max_new_tokens=30,
+                    num_return_sequences=1,
+                    do_sample=False,
+                    pad_token_id=pad_token_id,
+                    eos_token_id=tokenizer.eos_token_id,
+                    use_cache=True,
+                )
+                
+                input_length = inputs['input_ids'].shape[1]
+                generated_text = tokenizer.decode(
+                    outputs[0][input_length:],
+                    skip_special_tokens=True
+                )
+                end_time = time.time()
+                test_results["multimodal_tests"].append({
+                    "status": "success",
+                    "generated_length": len(generated_text),
+                    "generated_preview": generated_text.strip()[:100]
+                })
+
+                self._log_debug(f"  ✅ Multimodal generation successful (time: {end_time - start_time} seconds)")
+                self._log_debug(f"     Generated: {generated_text.strip()[:100]}...")
+                
+            except Exception as e:
+                test_results["multimodal_tests"].append({
+                    "status": "failed",
+                    "error": str(e)
+                })
+                self._log_debug(f"  ❌ Multimodal test failed: {e}")
+                import traceback
+                self._log_debug(f"     Traceback: {traceback.format_exc()}")
+            
+            # 테스트 2: 텍스트 전용 테스트
+            self._log_debug("\n📝 Test 2: Text-Only Generation")
+            try:
+                text_only_messages = [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "What is the capital of France?"}
+                        ]
+                    }
+                ]
+                
+                # Chat template 적용 테스트
+                try:
+                    chat_template_result = tokenizer.apply_chat_template(
+                        text_only_messages,
+                        tokenize=False,
+                        add_generation_prompt=True
+                    )
+                    test_results["chat_template_tests"].append({
+                        "type": "text_only",
+                        "status": "success",
+                        "template_length": len(chat_template_result)
+                    })
+                    self._log_debug(f"  ✅ Chat template applied successfully (length: {len(chat_template_result)})")
+                except Exception as e:
+                    test_results["chat_template_tests"].append({
+                        "type": "text_only",
+                        "status": "failed",
+                        "error": str(e)
+                    })
+                    self._log_debug(f"  ❌ Chat template failed: {e}")
+                    raise
+                
+                # 토크나이징 및 생성 테스트
+                test_input_text = chat_template_result.replace("<bos>", "")[:-1] if "<bos>" in chat_template_result else chat_template_result
+                
+                # 텍스트 전용이므로 images 파라미터 없이 처리
+                if hasattr(tokenizer, 'tokenizer'):
+                    # AutoProcessor인 경우
+                    inputs = tokenizer(
+                        text=test_input_text,
+                        return_tensors="pt"
+                    )
+                else:
+                    # AutoTokenizer인 경우
+                    inputs = tokenizer(
+                        test_input_text,
+                        return_tensors="pt"
+                    )
+                
+                inputs = {k: v.to(model.device) for k, v in inputs.items()}
+                
+                pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+                
+                outputs = model.generate(
+                    **inputs,
+                    max_new_tokens=30,
+                    num_return_sequences=1,
+                    do_sample=False,
+                    pad_token_id=pad_token_id,
+                    eos_token_id=tokenizer.eos_token_id,
+                    use_cache=True,
+                )
+                
+                input_length = inputs['input_ids'].shape[1]
+                generated_text = tokenizer.decode(
+                    outputs[0][input_length:],
+                    skip_special_tokens=True
+                )
+                
+                test_results["text_only_tests"].append({
+                    "status": "success",
+                    "generated_length": len(generated_text),
+                    "generated_preview": generated_text.strip()[:100]
+                })
+                self._log_debug(f"  ✅ Text-only generation successful")
+                self._log_debug(f"     Generated: {generated_text.strip()[:100]}...")
+                
+            except Exception as e:
+                test_results["text_only_tests"].append({
+                    "status": "failed",
+                    "error": str(e)
+                })
+                self._log_debug(f"  ❌ Text-only test failed: {e}")
+                import traceback
+                self._log_debug(f"     Traceback: {traceback.format_exc()}")
+            
+            # 테스트 결과 요약
+            self._log_debug("\n" + "="*80)
+            self._log_debug("📊 VLM Test Summary")
+            self._log_debug("="*80)
+            
+            multimodal_success = any(t.get("status") == "success" for t in test_results["multimodal_tests"])
+            text_only_success = any(t.get("status") == "success" for t in test_results["text_only_tests"])
+            chat_template_success = all(t.get("status") == "success" for t in test_results["chat_template_tests"])
+            
+            self._log_debug(f"  Multimodal Test: {'✅ PASS' if multimodal_success else '❌ FAIL'}")
+            self._log_debug(f"  Text-Only Test: {'✅ PASS' if text_only_success else '❌ FAIL'}")
+            self._log_debug(f"  Chat Template Test: {'✅ PASS' if chat_template_success else '❌ FAIL'}")
+            
+            # wandb에 로깅
+            if self.logger and hasattr(self.logger, 'log'):
+                try:
+                    wandb_log_data = {
+                        'vlm_test/multimodal_success': 1.0 if multimodal_success else 0.0,
+                        'vlm_test/text_only_success': 1.0 if text_only_success else 0.0,
+                        'vlm_test/chat_template_success': 1.0 if chat_template_success else 0.0,
+                    }
+                    
+                    # 상세 결과도 추가
+                    if test_results["multimodal_tests"]:
+                        mm_result = test_results["multimodal_tests"][0]
+                        if mm_result.get("status") == "success":
+                            wandb_log_data['vlm_test/multimodal_generated_length'] = mm_result.get("generated_length", 0)
+                    
+                    if test_results["text_only_tests"]:
+                        to_result = test_results["text_only_tests"][0]
+                        if to_result.get("status") == "success":
+                            wandb_log_data['vlm_test/text_only_generated_length'] = to_result.get("generated_length", 0)
+                    
+                    self.logger.log(wandb_log_data, step=0, commit=True)
+                    self._log_debug(f"  ✅ Test results logged to wandb")
+                except Exception as e:
+                    self._log_debug(f"  ⚠️ Failed to log test results to wandb: {e}")
+            
+            # 전체 테스트 성공 여부
+            all_tests_passed = multimodal_success and text_only_success and chat_template_success
+            if all_tests_passed:
+                self._log_debug("\n✅ All VLM tests passed!")
+            else:
+                self._log_debug("\n⚠️ Some VLM tests failed. Check the logs above for details.")
+            
+            self._log_debug("="*80 + "\n")
+            
+        except Exception as e:
+            self._log_debug(f"❌ VLM test error: {e}")
+            import traceback
+            self._log_debug(traceback.format_exc())
+        finally:
+            model.train(original_mode)
+    
     @torch.no_grad()
     def _log_generations(self, current_step: int):
         """모델 생성 결과 로깅"""
@@ -759,61 +1046,131 @@ class TorchMoECallback:
             original_mode = self.model.training
             self.model.eval()
 
-            for sample_image_url in sample_image_urls:
-                if sample_count >= self.max_generation_samples:
-                    break
+            # 처리할 이미지 URL 선택
+            images_to_process = sample_image_urls[:self.max_generation_samples]
+            
+            # 배치 처리로 CPU 사용률 감소 및 속도 향상
+            try:
+                # 모든 이미지를 먼저 로드
+                images = [load_image(url) for url in images_to_process]
+                
+                # 배치 토크나이징 (이미지가 있는 경우 개별 처리 필요)
+                # Vision 모델의 경우 배치 처리가 복잡할 수 있으므로 개별 처리 유지하되 최적화
+                pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id
+                test_input_text = test_input.replace("<bos>", "")[:-1]
+                
+                for idx, image in enumerate(images):
+                    if sample_count >= self.max_generation_samples:
+                        break
+                    
+                    try:
+                        # 입력 토큰화
+                        inputs = self.tokenizer(
+                            text=test_input_text,
+                            images=image,
+                            return_tensors="pt"
+                        )
+                        inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
 
-                try:
-                    # 입력 토큰화
-                    image = load_image(sample_image_url)
+                        # 생성 실행 (최적화된 설정)
+                        outputs = self.model.generate(
+                            **inputs,
+                            max_new_tokens=50,  # 100 -> 50으로 줄여서 속도 향상
+                            num_return_sequences=1,
+                            do_sample=False,  # greedy decoding으로 속도 향상 및 CPU 부하 감소
+                            pad_token_id=pad_token_id,
+                            eos_token_id=self.tokenizer.eos_token_id,
+                            use_cache=True,  # 캐시 사용으로 속도 향상
+                        )
 
-                    inputs = self.tokenizer(
-                        text=test_input.replace("<bos>", "")[:-1],
-                        images=image,
-                        return_tensors="pt")
-                    inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
+                        # 생성된 텍스트 디코딩
+                        input_length = inputs['input_ids'].shape[1]
+                        generated_text = self.tokenizer.decode(
+                            outputs[0][input_length:],
+                            skip_special_tokens=True
+                        )
 
-                    # 생성 실행
-                    outputs = self.model.generate(
-                        **inputs,
-                        max_new_tokens=100,
-                        num_return_sequences=1,
-                        do_sample=True,
-                        temperature=0.7,
-                        pad_token_id=self.tokenizer.eos_token_id,
-                        eos_token_id=self.tokenizer.eos_token_id,
-                    )
+                        # 로그 데이터 구성
+                        log_entry = {
+                            "step": current_step,
+                            "generation_step": self.generation_step_count,
+                            "sample_index": sample_count,
+                            "prompt": "Describe this image in Korean.",
+                            "generated": generated_text.strip(),
+                            "full_response": self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+                        }
 
-                    # 생성된 텍스트 디코딩
-                    input_length = inputs['input_ids'].shape[1]
-                    generated_text = self.tokenizer.decode(
-                        outputs[0][input_length:],
-                        skip_special_tokens=True
-                    )
+                        generation_logs.append(log_entry)
+                        sample_count += 1
 
-                    # 로그 데이터 구성
-                    log_entry = {
-                        "step": current_step,
-                        "generation_step": self.generation_step_count,
-                        "sample_index": sample_count,
-                        "prompt": "Describe this image in Korean.",
-                        "generated": generated_text.strip(),
-                        "full_response": self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-                    }
+                        # 콘솔 로그 (간소화)
+                        if self.log_to_console:
+                            self._log_debug(f"Generation sample {sample_count}: {generated_text.strip()[:60]}...")
 
-                    generation_logs.append(log_entry)
-                    sample_count += 1
+                    except Exception as e:
+                        self._log_debug(f"Error generating for sample {sample_count}: {e}")
+                        sample_count += 1
+                        continue
+                        
+            except Exception as batch_error:
+                # 배치 처리 실패 시 개별 처리로 fallback
+                self._log_debug(f"⚠️ Batch processing failed, falling back to individual: {batch_error}")
+                
+                for sample_image_url in images_to_process:
+                    if sample_count >= self.max_generation_samples:
+                        break
 
-                    # 콘솔 로그
-                    if self.log_to_console:
-                        self._log_debug(f"Generation sample {sample_count}:")
-                        self._log_debug(f"  Prompt: {test_input}")
-                        self._log_debug(f"  Generated: {generated_text.strip()[:100]}...")
+                    try:
+                        # 입력 토큰화
+                        image = load_image(sample_image_url)
 
-                except Exception as e:
-                    self._log_debug(f"Error generating for sample {sample_count}: {e}")
-                    sample_count += 1
-                    continue
+                        inputs = self.tokenizer(
+                            text=test_input_text,
+                            images=image,
+                            return_tensors="pt")
+                        inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
+
+                        pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id
+
+                        # 생성 실행 (최적화된 설정)
+                        outputs = self.model.generate(
+                            **inputs,
+                            max_new_tokens=50,
+                            num_return_sequences=1,
+                            do_sample=False,
+                            pad_token_id=pad_token_id,
+                            eos_token_id=self.tokenizer.eos_token_id,
+                            use_cache=True,
+                        )
+
+                        # 생성된 텍스트 디코딩
+                        input_length = inputs['input_ids'].shape[1]
+                        generated_text = self.tokenizer.decode(
+                            outputs[0][input_length:],
+                            skip_special_tokens=True
+                        )
+
+                        # 로그 데이터 구성
+                        log_entry = {
+                            "step": current_step,
+                            "generation_step": self.generation_step_count,
+                            "sample_index": sample_count,
+                            "prompt": "Describe this image in Korean.",
+                            "generated": generated_text.strip(),
+                            "full_response": self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+                        }
+
+                        generation_logs.append(log_entry)
+                        sample_count += 1
+
+                        # 콘솔 로그 (간소화)
+                        if self.log_to_console:
+                            self._log_debug(f"Generation sample {sample_count}: {generated_text.strip()[:60]}...")
+
+                    except Exception as e:
+                        self._log_debug(f"Error generating for sample {sample_count}: {e}")
+                        sample_count += 1
+                        continue
 
             # 생성 로그 파일 저장
             if generation_logs:
@@ -1398,6 +1755,134 @@ class TorchMoECallback:
             if self.log_to_console:
                 self._log_debug(f"Error during heatmap logging: {e}\n{traceback.format_exc()}")
     
+    def _generate_tsne_visualizations(self, current_step: int):
+        """Layer별 t-SNE 시각화 생성 (expert clustering 시각화)"""
+        if not self.tsne_data_buffer:
+            if self.log_to_console:
+                self._log_debug(f"No t-SNE data available at step {current_step}")
+            return
+        
+        try:
+            from sklearn.manifold import TSNE
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+            
+            tsne_created = False
+            
+            for layer_name, buffer in self.tsne_data_buffer.items():
+                hidden_states_list = buffer['hidden_states']
+                expert_assignments_list = buffer['expert_assignments']
+                
+                if not hidden_states_list or not expert_assignments_list:
+                    continue
+                
+                # 최근 데이터만 사용 (메모리 절약)
+                recent_hidden = list(hidden_states_list)[-10:]  # 최근 10개 step
+                recent_experts = list(expert_assignments_list)[-10:]
+                
+                if not recent_hidden or not recent_experts:
+                    continue
+                
+                try:
+                    # 데이터 결합
+                    all_hidden = torch.cat(recent_hidden, dim=0).numpy()  # [num_tokens, hidden_dim]
+                    all_experts = torch.cat(recent_experts, dim=0).numpy()  # [num_tokens]
+                    
+                    # 샘플링 (t-SNE 계산 비용 절감)
+                    if len(all_hidden) > self.tsne_sample_size:
+                        indices = np.random.choice(len(all_hidden), self.tsne_sample_size, replace=False)
+                        sampled_hidden = all_hidden[indices]
+                        sampled_experts = all_experts[indices]
+                    else:
+                        sampled_hidden = all_hidden
+                        sampled_experts = all_experts
+                    
+                    if len(sampled_hidden) < 10:  # 최소 샘플 수 확인
+                        if self.log_to_console:
+                            self._log_debug(f"Insufficient samples for {layer_name} t-SNE: {len(sampled_hidden)}")
+                        continue
+                    
+                    # t-SNE 계산
+                    if self.log_to_console:
+                        self._log_debug(f"Computing t-SNE for {layer_name} with {len(sampled_hidden)} samples...")
+                    
+                    tsne = TSNE(n_components=2, random_state=42, perplexity=min(30, len(sampled_hidden) - 1))
+                    embeddings_2d = tsne.fit_transform(sampled_hidden)
+                    
+                    # 시각화
+                    num_experts = int(sampled_experts.max() + 1) if len(sampled_experts) > 0 else self.num_experts
+                    fig, ax = plt.subplots(1, 1, figsize=(12, 10))
+                    
+                    # Expert별로 색상 구분
+                    colors = plt.cm.tab20(np.linspace(0, 1, num_experts))
+                    for expert_id in range(num_experts):
+                        mask = sampled_experts == expert_id
+                        if mask.sum() > 0:
+                            ax.scatter(
+                                embeddings_2d[mask, 0],
+                                embeddings_2d[mask, 1],
+                                label=f'Expert {expert_id}',
+                                alpha=0.6,
+                                s=20,
+                                c=[colors[expert_id % len(colors)]]
+                            )
+                    
+                    ax.set_title(f'{layer_name} Token Clustering by Expert (t-SNE)\nStep {current_step}', fontsize=14)
+                    ax.set_xlabel('t-SNE Dimension 1', fontsize=12)
+                    ax.set_ylabel('t-SNE Dimension 2', fontsize=12)
+                    ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=8)
+                    ax.grid(alpha=0.3)
+                    plt.tight_layout()
+                    
+                    # wandb에 로깅
+                    try:
+                        import wandb
+                        if self.is_main_process and wandb.run is not None:
+                            if current_step not in self.pending_heatmaps:
+                                self.pending_heatmaps[current_step] = {}
+                            self.pending_heatmaps[current_step][f'{layer_name}_tsne'] = wandb.Image(plt)
+                            if self.log_to_console:
+                                self._log_debug(f"✅ Generated t-SNE visualization for {layer_name} at step {current_step}")
+                    except ImportError:
+                        if self.log_to_console:
+                            self._log_debug(f"⚠️ wandb not available for t-SNE visualization")
+                    except Exception as e:
+                        if self.log_to_console:
+                            self._log_debug(f"Warning: Failed to log t-SNE to wandb: {e}")
+                    
+                    # 파일로 저장
+                    if self.save_detailed_logs:
+                        try:
+                            safe_layer_name = layer_name.replace(".", "_").replace("/", "_")
+                            tsne_path = os.path.join(self.log_dir, f'{safe_layer_name}_tsne_step_{current_step}.png')
+                            plt.savefig(tsne_path, dpi=150, bbox_inches='tight')
+                            if self.log_to_console:
+                                self._log_debug(f"t-SNE visualization saved to {tsne_path}")
+                        except Exception as e:
+                            if self.log_to_console:
+                                self._log_debug(f"Warning: Failed to save t-SNE visualization: {e}")
+                    
+                    plt.close()
+                    tsne_created = True
+                    
+                except Exception as e:
+                    import traceback
+                    if self.log_to_console:
+                        self._log_debug(f"Error creating t-SNE for {layer_name}: {e}\n{traceback.format_exc()}")
+                    continue
+            
+            if not tsne_created and self.log_to_console:
+                self._log_debug(f"No t-SNE visualizations were created at step {current_step}")
+                
+        except ImportError as e:
+            if self.log_to_console:
+                self._log_debug(f"Warning: sklearn/matplotlib not available for t-SNE visualization: {e}")
+        except Exception as e:
+            import traceback
+            if self.log_to_console:
+                self._log_debug(f"Error during t-SNE visualization: {e}\n{traceback.format_exc()}")
+    
     def _check_alerts(self, metrics):
         """경고 상황 체크"""
         alerts = []
@@ -1537,7 +2022,7 @@ class TransformersMoECallbackWrapper(TrainerCallback):
         tokenizer=None,
         **kwargs
     ):
-        """훈련 시작 시 모델과 토크나이저 등록"""
+        """훈련 시작 시 모델과 토크나이저 등록 및 VLM 테스트"""
         if model is not None and not self._model_registered:
             self.torch_callback.register_model(model, tokenizer)
             self._model_registered = True
@@ -1566,6 +2051,10 @@ class TransformersMoECallbackWrapper(TrainerCallback):
             pass
         except Exception as e:
             self.torch_callback._log_debug(f"⚠️ Error setting wandb logger: {e}")
+        
+        # VLM 테스트: 멀티모달과 텍스트 전용 케이스 모두 테스트
+        # if model is not None and tokenizer is not None:
+        self.torch_callback._test_vlm_capabilities(model, tokenizer)
     
     def on_step_begin(
         self, 
@@ -1644,6 +2133,7 @@ class TransformersMoECallbackWrapper(TrainerCallback):
         
         if current_metrics:
             # pending 메트릭을 logs에 추가 (Trainer의 WandbCallback이 자동으로 로깅)
+            # 이 부분은 항상 실행되어야 함 (wandb 로깅 실패해도 Trainer의 로깅은 유지)
             logs.update(current_metrics)
 
             # wandb에 직접 로깅 (Trainer의 로깅과 독립적으로 보장)
@@ -1666,52 +2156,75 @@ class TransformersMoECallbackWrapper(TrainerCallback):
                         grouped_metrics[prefix][key] = value
                     
                     # 각 prefix 그룹을 10개씩 쪼개서 로깅
-                    for prefix, metrics_group in grouped_metrics.items():
-                        metrics_list = list(metrics_group.items())
-                        chunk_size = 10
-                        
-                        for i in range(0, len(metrics_list), chunk_size):
-                            chunk = dict(metrics_list[i:i + chunk_size])
-                            self.torch_callback._log_debug(f"Logging {len(chunk)} {prefix} metrics (chunk {i//chunk_size + 1}) at step {state.global_step}")
-                            print(chunk)
-                            wandb.run.log(chunk, step=state.global_step, commit=False)
+                    try:
+                        for prefix, metrics_group in grouped_metrics.items():
+                            metrics_list = list(metrics_group.items())
+                            chunk_size = 10
+                            
+                            for i in range(0, len(metrics_list), chunk_size):
+                                chunk = dict(metrics_list[i:i + chunk_size])
+                                self.torch_callback._log_debug(f"Logging {len(chunk)} {prefix} metrics (chunk {i//chunk_size + 1}) at step {state.global_step}")
+                                wandb.run.log(chunk, step=state.global_step, commit=False)
+                    except Exception as e:
+                        # 메트릭 로깅 실패해도 계속 진행
+                        process_info = _get_process_info()
+                        self.torch_callback._log_debug(f"⚠️ Error logging metrics to wandb: {e} (rank={process_info['rank']})")
 
-                    # Pending heatmap 로깅
-                    if state.global_step in self.torch_callback.pending_heatmaps:
-                        heatmap_data = self.torch_callback.pending_heatmaps[state.global_step]
-                        for layer_name, image in heatmap_data.items():
-                            wandb.run.log({
-                                f'moe/{layer_name}/usage_heatmap': image
-                            }, step=state.global_step, commit=False)
-                        # 로깅 후 pending에서 제거
-                        del self.torch_callback.pending_heatmaps[state.global_step]
+                    # Pending heatmap 및 t-SNE 로깅 (별도 try-except로 분리)
+                    try:
+                        if state.global_step in self.torch_callback.pending_heatmaps:
+                            heatmap_data = self.torch_callback.pending_heatmaps[state.global_step]
+                            for layer_name, image in heatmap_data.items():
+                                if layer_name.endswith('_tsne'):
+                                    # t-SNE 시각화
+                                    wandb.run.log({
+                                        f'moe/{layer_name}/tsne_visualization': image
+                                    }, step=state.global_step, commit=False)
+                                else:
+                                    # Heatmap
+                                    wandb.run.log({
+                                        f'moe/{layer_name}/usage_heatmap': image
+                                    }, step=state.global_step, commit=False)
+                            # 로깅 후 pending에서 제거
+                            del self.torch_callback.pending_heatmaps[state.global_step]
+                    except Exception as e:
+                        # Heatmap/t-SNE 로깅 실패해도 메트릭 로깅은 계속
+                        self.torch_callback._log_debug(f"⚠️ Error logging heatmaps/t-SNE to wandb: {e}")
 
-                    # Pending alert 로깅
-                    if state.global_step in self.torch_callback.pending_alerts:
-                        alert_data = self.torch_callback.pending_alerts[state.global_step]
-                        for alert in alert_data:
-                            wandb.run.log({
-                                f'train/alerts/{alert["type"]}': 1,
-                                f'train/alerts/{alert["layer"]}_severity': alert['severity']
-                            }, step=state.global_step, commit=False)
-                        # 로깅 후 pending에서 제거
-                        del self.torch_callback.pending_alerts[state.global_step]
+                    # Pending alert 로깅 (별도 try-except로 분리)
+                    try:
+                        if state.global_step in self.torch_callback.pending_alerts:
+                            alert_data = self.torch_callback.pending_alerts[state.global_step]
+                            for alert in alert_data:
+                                wandb.run.log({
+                                    f'train/alerts/{alert["type"]}': 1,
+                                    f'train/alerts/{alert["layer"]}_severity': alert['severity']
+                                }, step=state.global_step, commit=False)
+                            # 로깅 후 pending에서 제거
+                            del self.torch_callback.pending_alerts[state.global_step]
+                    except Exception as e:
+                        # Alert 로깅 실패해도 메트릭 로깅은 계속
+                        self.torch_callback._log_debug(f"⚠️ Error logging alerts to wandb: {e}")
 
                     # 로깅 성공 후 pending 메트릭 제거 (target_step이 아닌 state.global_step 기준)
                     # 여러 step의 메트릭이 누적되어 있을 수 있으므로, 현재 step 이하의 모든 메트릭 제거
-                    steps_to_remove = [s for s in self.torch_callback.pending_metrics.keys() if s <= state.global_step]
-                    for step in steps_to_remove:
-                        if step in self.torch_callback.pending_metrics:
-                            del self.torch_callback.pending_metrics[step]
+                    try:
+                        steps_to_remove = [s for s in self.torch_callback.pending_metrics.keys() if s <= state.global_step]
+                        for step in steps_to_remove:
+                            if step in self.torch_callback.pending_metrics:
+                                del self.torch_callback.pending_metrics[step]
+                    except Exception as e:
+                        self.torch_callback._log_debug(f"⚠️ Error cleaning up pending metrics: {e}")
                 else:
                     # wandb.run이 None이면 logs에만 추가 (Trainer의 WandbCallback이 처리)
                     if self.torch_callback.log_to_console:
                         self.torch_callback._log_debug(f"⚠️ wandb.run is None at step {state.global_step}, relying on Trainer's WandbCallback")
             except Exception as e:
+                # 전체 wandb 로깅 실패해도 logs.update는 이미 실행되었으므로 Trainer의 로깅은 유지
                 process_info = _get_process_info()
                 import traceback
                 error_msg = (
-                    f"[MoE Callback] ❌ ERROR in on_log:\n"
+                    f"[MoE Callback] ❌ ERROR in on_log (wandb logging):\n"
                     f"  Process: rank={process_info['rank']}, local_rank={process_info['local_rank']}, "
                     f"RANK={process_info['RANK']}, LOCAL_RANK={process_info['LOCAL_RANK']}\n"
                     f"  Step: {state.global_step}\n"
@@ -1719,7 +2232,7 @@ class TransformersMoECallbackWrapper(TrainerCallback):
                     f"  Error: {type(e).__name__}: {str(e)}\n"
                     f"  Traceback:\n{traceback.format_exc()}\n"
                     f"  current_metrics keys: {list(current_metrics.keys())[:10] if current_metrics else 'None'}\n"
-                    f"  wandb.run: {wandb.run is not None if 'wandb' in globals() else 'wandb not imported'}"
+                    f"  Note: Metrics are still added to logs, Trainer's WandbCallback will handle logging"
                 )
                 # 에러는 항상 출력
                 print(error_msg)
@@ -1924,6 +2437,8 @@ def create_moe_callback_for_transformers(
     generation_log_dir: str = "./moe_generation_logs",
     max_generation_samples: int = 3,
     generation_log_every: int = 100,
+    log_tsne_every: int = 5000,
+    tsne_sample_size: int = 2000,
     **kwargs
 ) -> TransformersMoECallbackWrapper:
     """Transformers용 MoE 콜백 생성 편의 함수"""
@@ -1935,6 +2450,8 @@ def create_moe_callback_for_transformers(
         generation_log_dir=generation_log_dir,
         max_generation_samples=max_generation_samples,
         generation_log_every=generation_log_every,
+        log_tsne_every=log_tsne_every,
+        tsne_sample_size=tsne_sample_size,
         force_all_ranks=False,  # Multi-GPU 환경에서 rank 0에서만 실행
         **kwargs
     )

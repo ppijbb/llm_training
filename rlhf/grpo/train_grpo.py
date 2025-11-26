@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import unsloth
+from unsloth.tokenizer_utils import wandb
 import weave
 from transformers.utils import is_flash_attn_2_available
 import inspect
@@ -511,7 +512,7 @@ def main():
         print(f"   최대 샘플 수: {max_samples}")
         print(f"   로깅 주기: 매 {log_every} step마다")
         print(f"{'='*80}\n")
-
+        wandb.init(project="nlp-cmdbot")
         # Create trainer with model initialization kwargs, reward functions, and generation logging (항상 활성화)
         trainer = create_grpo_trainer(
             config=config,

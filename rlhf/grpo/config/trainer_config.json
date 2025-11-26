@@ -10,7 +10,7 @@
   "gradient_accumulation_steps": 1,
   "eval_accumulation_steps": 1,
   "eval_steps": 100,
-  "output_dir": "./grpo_outputs",
+  "output_dir": "/mls/conan/training_logs/grpo_outputs",
   "beta": 0.1,
   "use_transformers_paged": false,
   "gradient_checkpointing": true,

@@ -10,13 +10,26 @@
         "grad_accum_dtype": "bf16"
     },
     "pipeline_parallelism": {
-        "enabled": false,
-        "partition_method": "uniform",
+        "enabled": true,
+        "partition_method": "type:transformer",
         "num_partitions": 2
-      },
-      "tensor_parallelism": {
-        "tp_size": 2
-      },
+    },
+    "tensor_parallelism": {
+        "autotp_size": 2
+    },
+    "sequence_parallel_size": 1,
+    "moe": {
+        "num_experts": 8,
+        "ep_size": 2,
+        "k": 1,
+        "capacity_factor": 1.0,
+        "eval_capacity_factor": 1.0,
+        "min_capacity": 4,
+        "use_residual": false,
+        "noisy_gate_policy": "None",
+        "drop_tokens": true,
+        "enable_expert_tensor_parallelism": true
+    },
     "fp16": {
         "enabled": false,
         "auto_cast": false,
@@ -30,7 +43,6 @@
     "bf16": {
         "enabled": true
     },
-
     "optimizer": {
         "type": "AdamW",
         "params": {
@@ -54,11 +66,19 @@
         "num_sliding_window_blocks": 3
     },
     "scheduler": {
-        "type": "WarmupCosineLR",
+        "type": "OneCycle",
         "params": {
-            "warmup_num_steps": "auto",
-            "total_num_steps": "auto",
-            "warmup_type": "log"
+            "cycle_first_step_size": 200,
+            "cycle_first_stair_count": 0,
+            "cycle_second_step_size": 200,
+            "cycle_second_stair_count": 0,
+            "decay_step_size": 200,
+            "cycle_min_lr": 1e-6,
+            "cycle_max_lr": 8e-5,
+            "decay_lr_rate": 0.001,
+            "cycle_min_mom": 0.85,
+            "cycle_max_mom": 0.99,
+            "decay_mom_rate": 0.0
         }
     },
     "activation_checkpointing": {
@@ -88,14 +108,14 @@
         "zero_hpz_partition_size": 1,
         "overlap_comm": true,
         "contiguous_gradients": true,
-        "allgather_partitions": true,
+        "allgather_partitions": false,
         "reduce_scatter": true,
         "sub_group_size": 1e6,
-        "reduce_bucket_size": 2e8,
-        "allgather_bucket_size": 2e8,
+        "reduce_bucket_size": 1e8,
+        "allgather_bucket_size": 1e8,
         "stage3_param_persistence_threshold": 1e6,
-        "stage3_max_live_parameters": 5e8,
-        "stage3_max_reuse_distance": 5e8,
+        "stage3_max_live_parameters": 1e9,
+        "stage3_max_reuse_distance": 1e8,
         "stage3_prefetch_bucket_size": 1e7,
         "stage3_gather_16bit_weights_on_model_save": true
     },
@@ -112,19 +132,20 @@
         "min_difficulty": 65536,
         "max_difficulty": 128000,
         "schedule_type": "fixed_linear",
+        "curriculum_autoresume": true,
         "schedule_config": {
-          "total_curriculum_step": 15000,
+          "total_curriculum_step": 32,
           "difficulty_step": 8
         }
     },
     "comms_logger": {
-        "enabled": false,
+        "enabled": true,
         "verbose": false,
         "prof_all": false,
         "debug": false
     },
     "flops_profiler": {
-        "enabled": false,
+        "enabled": true,
         "profile_step": 1,
         "module_depth": -1,
         "top_modules": 3,
@@ -135,6 +156,6 @@
         "enabled": true,
         "project": "g3moe-sft",
         "group": null,
-        "team": null
+        "team": "kevintb"
     }
 } 

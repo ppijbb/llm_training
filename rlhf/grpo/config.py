@@ -30,7 +30,7 @@ def create_quick_test_config() -> GRPOConfig:
     """빠른 테스트를 위한 설정"""
     return create_grpo_config(
         model_name="unsloth/Qwen3-0.6B-bnb-4bit",
-        output_dir="./test_grpo_outputs",
+        output_dir="/mls/conan/training_logs/test_grpo_outputs",
         max_steps=10,
         logging_steps=1,
         save_steps=5,
@@ -42,7 +42,7 @@ def create_production_config(model_name: str = "unsloth/Qwen3-0.6B-bnb-4bit") ->
     """프로덕션 학습을 위한 설정"""
     return create_grpo_config(
         model_name=model_name,
-        output_dir=f"./grpo_outputs_{model_name}",
+        output_dir=f"/mls/conan/training_logs/grpo_outputs_{model_name}",
         max_steps=-1,
         logging_steps=50,
         save_steps=1000,
