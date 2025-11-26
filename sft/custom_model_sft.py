@@ -902,7 +902,7 @@ def main(
             num_experts=model_config["g3moe_params"]["n_routed_experts"],
             log_every_n_steps=1,             # 매 스텝마다 로그 기록
             logger=wandb,                    # 사용할 로거 지정 (wandb)
-            log_to_console=False,            # 콘솔에도 주요 메트릭 출력
+            log_to_console=True,             # 콘솔에도 주요 메트릭 출력 (디버깅용)
             debug_logging=True,              # 디버그 로깅 활성화
                        #  === (선택사항) ===  #
             log_heatmap_every=5,             # 500 스텝마다 Expert 사용률 히트맵 로깅

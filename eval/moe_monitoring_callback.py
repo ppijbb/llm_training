@@ -103,7 +103,7 @@ class TorchMoECallback:
         self.log_dir = log_dir
         self.debug_logging = debug_logging
         self.force_all_ranks = bool(force_all_ranks)
-        self.is_main_process = True if self.force_all_ranks else _is_main_process()
+        self.is_main_process = True  # 항상 모든 프로세스에서 실행
         self.last_logged_step = -1
 
         # Generation logging 설정
@@ -184,11 +184,7 @@ class TorchMoECallback:
             os.makedirs(generation_log_dir, exist_ok=True)
     
     def _log_debug(self, message: str):
-        """내부 디버그 메시지 로깅 - rank 0에서만 출력"""
-        # rank 0에서만 출력
-        if not self.is_main_process:
-            return
-        
+        """내부 디버그 메시지 로깅"""
         # log_to_console이 True일 때만 출력 (debug_logging은 wandb에만 기록)
         if self.log_to_console:
             prefix = "[MoE Debug]" if self.debug_logging else "[MoE]"
@@ -233,12 +229,24 @@ class TorchMoECallback:
     
     def _register_hooks(self):
         """MoE 레이어에 forward hooks 등록"""
+        moe_count = 0
         for name, module in self.model.named_modules():
             if self._is_moe_layer(module):
                 hook = module.register_forward_hook(
                     self._create_hook_fn(name)
                 )
                 self.hooks.append(hook)
+                moe_count += 1
+                if moe_count <= 3:  # 처음 3개만 로그
+                    self._log_debug(f"  ✓ Hook registered for: {name}")
+        
+        if moe_count == 0:
+            self._log_debug("❌ WARNING: No MoE layers found! Model structure:")
+            # 모델 구조 일부 출력
+            for name, module in list(self.model.named_modules())[:20]:
+                self._log_debug(f"    - {name}: {type(module).__name__}")
+        
+        self._log_debug(f"📊 Total MoE hooks registered: {len(self.hooks)}")
         
         # Vision 모듈 hooks 등록
         self._register_vision_hooks()
@@ -248,21 +256,37 @@ class TorchMoECallback:
         # 실제 사용 중인 MoE 레이어 클래스들
         moe_class_names = [
             'G3MoESharedExpertsLayer', 'G3MoESparseGRINBlock', 'G3MoEGRINMoE',
-            'GRINMoESparseMoeBlock', 'G2MoEGRINMoeLayer',
+            'GRINMoESparseMoeBlock', 'G2MoEGRINMoeLayer', 'GramSpecMoEBlock',
             # 일반적인 패턴들도 유지
             'gate', 'router', 'expert', 'moe',
             'SparseMLP', 'MixtralSparseMoeBlock', 'SwitchTransformerMLP'
         ]
         
         module_name = module.__class__.__name__
-        is_moe = (any(cls_name in module_name for cls_name in moe_class_names) or 
-                  hasattr(module, 'gate') or hasattr(module, 'router') or
-                  hasattr(module, 'experts'))
         
-        # 디버깅 정보
-        # if is_moe:
-        #     self._log_debug(f"Detected MoE layer: {module_name}")
-            
+        # 클래스 이름으로 체크
+        is_moe_by_name = any(cls_name in module_name for cls_name in moe_class_names)
+        
+        # 속성으로 체크 (router, experts 등)
+        has_router = hasattr(module, 'router')
+        has_experts = hasattr(module, 'experts')
+        has_gate = hasattr(module, 'gate')
+        
+        # G3MoE 특정 체크: router가 G3MoERouter인지 확인
+        is_g3moe_router = False
+        if has_router:
+            router = getattr(module, 'router', None)
+            if router is not None:
+                router_class_name = router.__class__.__name__
+                is_g3moe_router = ('G3MoERouter' in router_class_name or 
+                                  'GramSpecRouter' in router_class_name or
+                                  getattr(router, '_is_g3moe_router', False))
+        
+        is_moe = (is_moe_by_name or 
+                  (has_router and has_experts) or  # router와 experts 둘 다 있으면 MoE
+                  (is_g3moe_router and has_experts) or  # G3MoE router + experts
+                  has_gate)
+        
         return is_moe
     
     def _register_vision_hooks(self):
@@ -300,8 +324,6 @@ class TorchMoECallback:
         # Vision tower hook 등록
         if vision_tower is not None:
             def vision_tower_hook(module, input, output):
-                if not self.is_main_process:
-                    return
                 try:
                     self.vision_usage_stats['vision_tower_calls'] += 1
                     
@@ -355,8 +377,6 @@ class TorchMoECallback:
         # Projector hook 등록
         if projector is not None:
             def projector_hook(module, input, output):
-                if not self.is_main_process:
-                    return
                 try:
                     self.vision_usage_stats['projector_calls'] += 1
                     if isinstance(output, torch.Tensor):
@@ -387,10 +407,6 @@ class TorchMoECallback:
         """특정 레이어용 hook 함수 생성"""
         def hook_fn(module, input, output):
             try:
-                # Rank 0에서만 routing info 저장
-                if not self.is_main_process:
-                    return
-
                 # t-SNE용 데이터 수집 (메모리 절약을 위해 최근 step만)
                 # input[0]은 hidden states (MoE layer 입력)
                 if isinstance(input, tuple) and len(input) > 0:
@@ -678,10 +694,6 @@ class TorchMoECallback:
     
     def on_step_begin(self):
         """Step 시작 시 호출"""
-        # Rank 0에서만 MoE callback 실행
-        if not self.is_main_process:
-            return
-
         self.layer_outputs.clear()
 
         # Vision 통계는 누적되므로 초기화하지 않음
@@ -690,23 +702,33 @@ class TorchMoECallback:
     
     def on_step_end(self, current_step: int, **kwargs):
         """Step 종료 시 호출 - current_step은 필수 매개변수"""
-        # Rank 0에서만 MoE callback 실행
-        if not self.is_main_process:
-            return
-
         # 현재 step 추적 (디버그 메시지 로깅용)
         self._current_step = current_step
 
         # 강제 모든 랭크 로깅 허용 및 hook 실패 시 모델 상태에서 수집하여 항상 지표 산출
         if not self.layer_outputs:
+            if self.log_to_console:
+                self._log_debug(f"⚠️ Step {current_step}: No layer_outputs from hooks. Attempting to collect from model state...")
             collected = self._collect_from_model_state()
             if not collected:
                 if self.log_to_console:
-                    self._log_debug(f"Step {current_step}: no routing info captured via hooks or model state.")
+                    self._log_debug(f"❌ Step {current_step}: No routing info captured via hooks or model state.")
+                    self._log_debug(f"   - Hooks count: {len(self.hooks)}")
+                    self._log_debug(f"   - Model is None: {self.model is None}")
+                    if self.model is not None:
+                        # 모델에서 MoE 레이어 찾기 시도
+                        moe_layers_found = []
+                        for name, module in self.model.named_modules():
+                            if self._is_moe_layer(module):
+                                moe_layers_found.append(name)
+                        self._log_debug(f"   - MoE layers in model: {len(moe_layers_found)}")
+                        if moe_layers_found:
+                            self._log_debug(f"   - Sample MoE layers: {moe_layers_found[:3]}")
             else:
                 self.layer_outputs.update(collected)
                 if self.log_to_console:
-                    self._log_debug(f"Step {current_step}: collected {len(collected)} routing info from model state")
+                    self._log_debug(f"✅ Step {current_step}: Collected {len(collected)} routing info from model state")
+                    self._log_debug(f"   - Collected layer names: {list(collected.keys())[:3]}")
 
         # 메트릭 계산
         step_metrics = self._calculate_step_metrics()
@@ -753,14 +775,20 @@ class TorchMoECallback:
             current_step % self.generation_log_every == 0 and
             self.model is not None and
             self.tokenizer is not None):
-            if self.is_main_process:
-                self._log_debug(f"[MoE Generation] Logging generations at step {current_step}")
+            self._log_debug(f"[MoE Generation] Logging generations at step {current_step}")
             self._log_generations(current_step)
 
     @torch.no_grad()
     def _test_vlm_capabilities(self, model, tokenizer):
         """VLM 기능 테스트: 멀티모달과 텍스트 전용 케이스 모두 테스트"""
-        if not self.is_main_process:
+        # tokenizer가 None이면 테스트 스킵
+        if tokenizer is None:
+            self._log_debug("⚠️ VLM test skipped: tokenizer is None")
+            return
+        
+        # model이 None이면 테스트 스킵
+        if model is None:
+            self._log_debug("⚠️ VLM test skipped: model is None")
             return
         
         self._log_debug("="*80)
@@ -1185,8 +1213,7 @@ class TorchMoECallback:
                 self._log_debug(f"Generation logs saved to {log_file}")
 
                 # 로거에 생성 결과 로깅 (Wandb 등)
-                # Main process가 아니면 로깅하지 않음
-                if self.logger and hasattr(self.logger, 'log') and self.is_main_process:
+                if self.logger and hasattr(self.logger, 'log'):
                     try:
                         gen_log_data = {}
                         for i, log_entry in enumerate(generation_logs):
@@ -1387,10 +1414,6 @@ class TorchMoECallback:
     
     def _log_metrics(self, metrics, current_step: int):
         """메트릭 로깅"""
-        # Main process가 아니면 로깅하지 않음
-        if not self.is_main_process:
-            return
-        
         # 디버깅: 메트릭 계산 시작 (wandb에만 기록, console 출력 안 함)
         
         log_data = {}
@@ -1609,7 +1632,7 @@ class TorchMoECallback:
         self.last_log_data = log_data
 
         # 콘솔 출력 (log_to_console=True일 때만)
-        if self.is_main_process and self.log_to_console:
+        if self.log_to_console:
             self._log_debug(f"Step {current_step} MoE Metrics ({len(log_data)} metrics):")
             for key, value in log_data.items():
                 # train/ prefix 제거하여 콘솔에 출력
@@ -1695,15 +1718,11 @@ class TorchMoECallback:
                     # Heatmap 데이터를 pending에 저장 (on_log에서 로깅)
                     try:
                         import wandb
-                        if self.is_main_process:
-                            if current_step not in self.pending_heatmaps:
-                                self.pending_heatmaps[current_step] = {}
-                            self.pending_heatmaps[current_step][layer_name] = wandb.Image(plt)
-                            if self.log_to_console:
-                                self._log_debug(f"✅ Generated heatmap for {layer_name} at step {current_step}")
-                        else:
-                            if self.log_to_console:
-                                self._log_debug(f"Heatmap generation skipped on non-main process")
+                        if current_step not in self.pending_heatmaps:
+                            self.pending_heatmaps[current_step] = {}
+                        self.pending_heatmaps[current_step][layer_name] = wandb.Image(plt)
+                        if self.log_to_console:
+                            self._log_debug(f"✅ Generated heatmap for {layer_name} at step {current_step}")
                     except ImportError:
                         if self.log_to_console:
                             self._log_debug(f"⚠️ wandb not available for heatmap generation")
@@ -1838,7 +1857,7 @@ class TorchMoECallback:
                     # wandb에 로깅
                     try:
                         import wandb
-                        if self.is_main_process and wandb.run is not None:
+                        if wandb.run is not None:
                             if current_step not in self.pending_heatmaps:
                                 self.pending_heatmaps[current_step] = {}
                             self.pending_heatmaps[current_step][f'{layer_name}_tsne'] = wandb.Image(plt)
@@ -1960,8 +1979,6 @@ class TorchMoECallback:
     
     def _save_detailed_log(self, metrics, current_step: int):
         """상세 로그 저장"""
-        if not self.is_main_process:
-            return
         log_entry = {
             'step': current_step,
             'timestamp': time.time(),
@@ -2024,9 +2041,25 @@ class TransformersMoECallbackWrapper(TrainerCallback):
     ):
         """훈련 시작 시 모델과 토크나이저 등록 및 VLM 테스트"""
         if model is not None and not self._model_registered:
-            self.torch_callback.register_model(model, tokenizer)
+            # DeepSpeed 래핑된 모델 처리
+            actual_model = model
+            if hasattr(model, 'module'):  # DeepSpeed 래핑
+                actual_model = model.module
+                self.torch_callback._log_debug("⚠️ Detected DeepSpeed wrapped model, using model.module")
+            
+            self.torch_callback.register_model(actual_model, tokenizer)
             self._model_registered = True
-            self.torch_callback._log_debug(f"MoE monitoring registered for model with {len(self.torch_callback.hooks)} MoE layers")
+            self.torch_callback._log_debug(f"✅ MoE monitoring registered for model with {len(self.torch_callback.hooks)} MoE layers")
+            
+            # 디버그: 등록된 MoE 레이어 이름 출력
+            if self.torch_callback.hooks:
+                moe_layer_names = []
+                for name, module in actual_model.named_modules():
+                    if self.torch_callback._is_moe_layer(module):
+                        moe_layer_names.append(name)
+                self.torch_callback._log_debug(f"📋 Registered MoE layers: {moe_layer_names[:5]}..." if len(moe_layer_names) > 5 else f"📋 Registered MoE layers: {moe_layer_names}")
+            else:
+                self.torch_callback._log_debug("❌ WARNING: No MoE layers detected! Check model structure.")
 
             if self.torch_callback.enable_generation_logging:
                 if tokenizer is not None:
@@ -2053,8 +2086,14 @@ class TransformersMoECallbackWrapper(TrainerCallback):
             self.torch_callback._log_debug(f"⚠️ Error setting wandb logger: {e}")
         
         # VLM 테스트: 멀티모달과 텍스트 전용 케이스 모두 테스트
-        # if model is not None and tokenizer is not None:
-        self.torch_callback._test_vlm_capabilities(model, tokenizer)
+        # tokenizer와 model이 모두 있을 때만 테스트
+        if tokenizer is not None and actual_model is not None:
+            self.torch_callback._test_vlm_capabilities(actual_model, tokenizer)
+        else:
+            if tokenizer is None:
+                self.torch_callback._log_debug("⚠️ VLM test skipped: tokenizer is None")
+            if actual_model is None:
+                self.torch_callback._log_debug("⚠️ VLM test skipped: model is None")
     
     def on_step_begin(
         self, 
@@ -2075,10 +2114,6 @@ class TransformersMoECallbackWrapper(TrainerCallback):
         **kwargs
     ):
         """Step 종료"""
-        # rank 0에서만 MoE 콜백 실행
-        if not self.torch_callback.is_main_process:
-            return
-            
         # PyTorch callback 호출 - Transformers의 global_step 사용
         self.torch_callback.on_step_end(current_step=state.global_step)
 
@@ -2097,10 +2132,6 @@ class TransformersMoECallbackWrapper(TrainerCallback):
         **kwargs
     ):
         """Trainer가 로깅할 때 호출 - 여기서 MoE 메트릭을 logs에 추가"""
-        # rank 0에서만 MoE 콜백 실행
-        if not self.torch_callback.is_main_process:
-            return
-
         # logs가 None이면 빈 dict로 초기화
         if logs is None:
             logs = {}
@@ -2256,9 +2287,6 @@ class TransformersMoECallbackWrapper(TrainerCallback):
         **kwargs
     ):
         """Evaluation 시점에 GramSpec 지표 측정"""
-        if not self.torch_callback.is_main_process:
-            return
-        
         # GramSpecAnalyzer가 없으면 스킵
         if self.torch_callback.gramspec_analyzer is None:
             return
@@ -2452,7 +2480,7 @@ def create_moe_callback_for_transformers(
         generation_log_every=generation_log_every,
         log_tsne_every=log_tsne_every,
         tsne_sample_size=tsne_sample_size,
-        force_all_ranks=False,  # Multi-GPU 환경에서 rank 0에서만 실행
+        force_all_ranks=True,  # 모든 프로세스에서 실행 (이미 is_main_process 체크 제거됨)
         **kwargs
     )
 
