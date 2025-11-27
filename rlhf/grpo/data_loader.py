@@ -164,7 +164,11 @@ class GRPODataLoader:
             if "prompt" in example and not ("chosen" in example and "rejected" in example):
                 if self.data_mode == "cmd":
                     # Fixed system prompt 붙여서 넘기기
-                    example["prompt"] = f"Process the flowing utterance into dental commands. Given tooth numbering system is {example['numbering_system']}\n\n" + example["prompt"]
+                    example["prompt"] = (
+                        f"Process the flowing utterance into dental commands. Given tooth numbering system is {example['numbering_system']}"
+                        f"\n\n"
+                        f"utterance: {example['prompt']}"
+                        )
                 return {"prompt": example["prompt"]}
 
             # UltraFeedback 형식 변환

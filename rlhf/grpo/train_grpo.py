@@ -302,7 +302,7 @@ def create_config_from_args(args) -> GRPOConfig:
         # 기본 설정 생성
         config = create_grpo_config(
             model_name=f"unsloth/{args.model}-bnb-4bit" if not args.model.startswith("unsloth/") else args.model,
-            output_dir="./grpo_outputs"
+            output_dir=args.output_dir if args.output_dir else "./grpo_outputs"
         )
         logger.info(f"🔧 Using default configuration for {args.model}")
     
