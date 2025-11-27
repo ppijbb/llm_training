@@ -869,7 +869,10 @@ class G3MoERouter(nn.Module):
         routing_i = torch.eye(self.num_experts, device=routing_logits.device)
         
         # Speciality penalty: encourage orthogonal expert representations
-        speciality_penalty = torch.mean((F.normalize(gram - routing_i.unsqueeze(0).unsqueeze(0), dim=-1) ** 2).sum(dim=(-2,-1)))
+        # Gram matrix와 identity matrix의 차이를 Frobenius norm으로 측정
+        diff = gram - routing_i.unsqueeze(0).unsqueeze(0)  # [batch, seq, num_experts, num_experts]
+        # 각 position에서 Frobenius norm의 제곱 계산
+        speciality_penalty = torch.mean((diff ** 2).sum(dim=(-2, -1)))  # [batch, seq] -> scalar
         
         # Cosine similarity between expression and routing logits
         # cos = F.cosine_similarity(expression_logits, routing_logits, dim=-1)  # [-1, 1]
@@ -881,6 +884,10 @@ class G3MoERouter(nn.Module):
         # 이렇게 하면 각 expert의 표현 정보가 더 잘 반영됨
         # speciality_penalty: [batch, seq] -> [batch, seq, 1, 1] for broadcasting
         domain_scores = domain_orthogonality * (1.0 + speciality_penalty.unsqueeze(-1).unsqueeze(-1))
+        
+        # Temperature Scaling 적용: Softmax가 뾰족해지도록 스케일링
+        # 일반적인 Attention처럼 sqrt(d)로 스케일링하거나 상수를 곱함
+        domain_scores = domain_scores * 10.0
         
         # Sparsemixer를 통한 최종 expert 선택 및 가중치 계산
         # domain_scores를 [batch*seq, num_experts] 형태로 변환
@@ -2127,9 +2134,9 @@ class G3MoEForCausalLM(G3MoEPreTrainedModel, GenerationMixin):
                 loss += outputs.speciality_loss * 0.01  # 가중치 적용
             
             # Cosine similarities loss (평균값으로 변환)
-            if outputs.cosine_similarities is not None:
-                cosine_loss = outputs.cosine_similarities.mean()
-                loss += cosine_loss * 0.005  # 가중치 적용
+            # if outputs.cosine_similarities is not None:
+            #     cosine_loss = outputs.cosine_similarities.mean()
+            #     loss += cosine_loss * 0.005  # 가중치 적용 (제거: 라우팅 방향과 충돌)
             
             # HN context loss는 제거 (이미 speciality_loss에 포함됨)
             if outputs.expression_loss is not None:
@@ -2669,9 +2676,9 @@ class G3MoEForConditionalGeneration(G3MoEPreTrainedModel, GenerationMixin):
                 loss += outputs.speciality_loss * 0.01  # 가중치 적용
             
             # Cosine similarities loss (평균값으로 변환)
-            if outputs.cosine_similarities is not None:
-                cosine_loss = outputs.cosine_similarities.mean()
-                loss += cosine_loss * 0.005  # 가중치 적용
+            # if outputs.cosine_similarities is not None:
+            #     cosine_loss = outputs.cosine_similarities.mean()
+            #     loss += cosine_loss * 0.005  # 가중치 적용 (제거: 라우팅 방향과 충돌)
             
             if outputs.expression_loss is not None:
                 expression_loss = outputs.expression_loss.mean()

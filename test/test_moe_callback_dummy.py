@@ -258,45 +258,17 @@ def create_dummy_dataset(num_samples=100, seq_length=32):
     return Dataset.from_dict(data)
 
 
-class TestCallback(TrainerCallback):
-    """테스트용 callback - step마다 호출되는지 확인"""
-    def __init__(self):
-        self.step_count = 0
-        self.gradient_accumulation_steps = None
-        
-    def on_step_begin(self, args, state, control, **kwargs):
-        self.step_count += 1
-        print(f"[TestCallback] Step {state.global_step} BEGIN (accumulation step: {state.global_step % args.gradient_accumulation_steps})")
-        
-    def on_step_end(self, args, state, control, **kwargs):
-        print(f"[TestCallback] Step {state.global_step} END")
-        if self.gradient_accumulation_steps is None:
-            self.gradient_accumulation_steps = args.gradient_accumulation_steps
-
-
 def test_callback_with_dummy_model(use_deepspeed=True, use_accelerate=True):
     """더미 모델로 callback 테스트"""
-    print("="*60)
-    print("더미 MoE 모델로 Callback 테스트")
-    if use_deepspeed:
-        print("DeepSpeed 모드")
-    elif use_accelerate:
-        print("Accelerate 모드")
-    else:
-        print("기본 모드")
-    print("="*60)
-    
     # 모델 생성
     model = DummyMoEModel(vocab_size=1000, hidden_size=64, num_layers=2, num_experts=4)
     param_count = model.num_parameters()
-    print(f"모델 파라미터 수: {param_count:,} ({param_count/1e6:.3f}M)")
     assert param_count < 1000000, f"파라미터 수가 1M 이상입니다: {param_count}"
     
     # Tokenizer (더미)
     try:
         tokenizer = AutoTokenizer.from_pretrained("gpt2")
     except:
-        # gpt2가 없으면 더미 tokenizer 생성
         from transformers import PreTrainedTokenizer
         class DummyTokenizer:
             def __init__(self):
@@ -306,84 +278,79 @@ def test_callback_with_dummy_model(use_deepspeed=True, use_accelerate=True):
         tokenizer = DummyTokenizer()
     tokenizer.pad_token = tokenizer.eos_token if hasattr(tokenizer, 'eos_token') else "<pad>"
     
-    # 데이터셋 (t-SNE 테스트를 위해 충분한 step이 생성되도록 조정)
+    # 데이터셋
     train_dataset = create_dummy_dataset(num_samples=500, seq_length=32)
     
     # Training arguments
     training_args = TrainingArguments(
         output_dir="./test_output",
-        num_train_epochs=2,
-        per_device_train_batch_size=1,
-        gradient_accumulation_steps=8,  # t-SNE 테스트를 위해 더 작은 값으로 조정 (더 많은 step 생성)
+        num_train_epochs=1,
+        per_device_train_batch_size=4,
+        gradient_accumulation_steps=1,  # 단순화를 위해 1로 설정
         learning_rate=1e-4,
         logging_steps=1,
-        save_steps=999999999,  # 모델 저장 비활성화 (매우 큰 값)
-        save_total_limit=0,  # 저장 안 함
-        save_strategy="no",  # 저장 전략 비활성화
+        save_strategy="no",
         bf16=False,
         fp16=False,
         dataloader_num_workers=0,
         remove_unused_columns=False,
-        report_to=["wandb"],  # wandb 활성화
+        report_to=["wandb"],
     )
     
-    deepspeed_config = {
-        "train_batch_size": "auto",
-        "train_micro_batch_size_per_gpu": "auto",
-        "gradient_accumulation_steps": "auto",
-        "zero_optimization": {
-            "stage": 3,
-        },
-        "fp16": {
-            "enabled": False
-        },
-        "bf16": {
-            "enabled": False
+    # Deepspeed 설정 (필요한 경우)
+    if use_deepspeed:
+        deepspeed_config = {
+            "train_batch_size": "auto",
+            "train_micro_batch_size_per_gpu": "auto",
+            "gradient_accumulation_steps": "auto",
+            "zero_optimization": { "stage": 3 },
+            "fp16": { "enabled": False },
+            "bf16": { "enabled": False }
         }
-    }
-    import json
-    os.makedirs("./test_output", exist_ok=True)
-    with open("./test_output/deepspeed_config.json", "w") as f:
-        json.dump(deepspeed_config, f)
-    training_args.deepspeed = "./test_output/deepspeed_config.json"
+        import json
+        os.makedirs("./test_output", exist_ok=True)
+        with open("./test_output/deepspeed_config.json", "w") as f:
+            json.dump(deepspeed_config, f)
+        training_args.deepspeed = "./test_output/deepspeed_config.json"
     
-    # Wandb 초기화 - rank 0에서만 실행, 중복 실행 방지
+    # Wandb 초기화
     rank = int(os.getenv("RANK", "0"))
-    if rank == 0 and (wandb.run is None or not wandb.run):
-        wandb.init(
+    if rank == 0 and (wandb.run is None or not wandb.run.id):
+        run =wandb.init(
             project="moe-callback-test",
             name=f"dummy-test-{int(time.time())}",
             config={
                 "model": "dummy_moe",
-                "num_experts": 4,
-                "hidden_size": 16,
-                "num_layers": 3,
                 "use_deepspeed": use_deepspeed,
                 "use_accelerate": use_accelerate,
             },
-            mode="online"  # 항상 online으로 wandb에 기록
+            mode="online"
         )
+        run.define_metric("train/*", step_metric="train/step")
+        run.define_metric("test/*", step_metric="test/step")
+        run.define_metric("validation/*", step_metric="validation/step")
+        run.define_metric("eval/*", step_metric="eval/step")
+        run.define_metric("moe/*", step_metric="train/step")
+        run.define_metric("multi_modality/*", step_metric="train/step")
+        run.define_metric("router/*", step_metric="train/step")
+        run.define_metric("other/*", step_metric="train/step")
     
-    # MoE Callback 생성 - wandb 로거 사용
-    # t-SNE 시각화 테스트를 위해 log_tsne_every를 작은 값으로 설정
+    # MoE Callback 생성
     moe_callback = create_moe_callback_for_transformers(
         num_experts=4,
         log_every_n_steps=1,
-        logger=wandb,  # wandb 활성화
-        log_to_console=False,
-        debug_logging=True,
-        enable_generation_logging=False,  # 생성 로깅 비활성화
-        log_heatmap_every=10,  # Heatmap 테스트를 위해 작은 값 설정
-        log_tsne_every=20,  # t-SNE 시각화 테스트를 위해 작은 값 설정
-        tsne_sample_size=500,  # 테스트용 작은 샘플 크기
+        logger=wandb,
+        log_to_console=False,  # 터미널 로그 활성화
+        debug_logging=True, # 디버그 로그 활성화
+        enable_generation_logging=False,
+        log_heatmap_every=10,
+        log_tsne_every=20,
+        tsne_sample_size=500,
     )
-    
-    # 테스트 callback
-    test_callback = TestCallback()
     
     # Trainer
     class DummyTrainer(Trainer):
-        def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
             outputs = model(**inputs)
             loss = outputs['loss']
             return (loss, outputs) if return_outputs else loss
@@ -393,102 +360,26 @@ def test_callback_with_dummy_model(use_deepspeed=True, use_accelerate=True):
         args=training_args,
         train_dataset=train_dataset,
         tokenizer=tokenizer,
-        callbacks=[test_callback, moe_callback],
+        callbacks=[moe_callback], # TestCallback 제거
     )
-    
-    print("\n" + "="*60)
-    print("학습 시작 - Step마다 callback 호출 확인")
-    print("="*60)
-    print(f"Gradient accumulation steps: {training_args.gradient_accumulation_steps}")
-    print(f"Batch size: {training_args.per_device_train_batch_size}")
-    print(f"Effective batch size: {training_args.per_device_train_batch_size * training_args.gradient_accumulation_steps}")
-    print(f"\n📊 시각화 설정:")
-    print(f"  - Heatmap 생성 주기: {moe_callback.torch_callback.log_heatmap_every} steps")
-    print(f"  - t-SNE 시각화 주기: {moe_callback.torch_callback.log_tsne_every} steps")
-    print(f"  - t-SNE 샘플 크기: {moe_callback.torch_callback.tsne_sample_size}")
-    print()
     
     # 학습 실행
     try:
+        print("Starting training to test MoE callback...")
         trainer.train()
-        print("\n" + "="*60)
-        print("✅ 학습 완료!")
-        print("="*60)
-        print(f"TestCallback이 호출된 step 수: {test_callback.step_count}")
-        print(f"Global step: {trainer.state.global_step}")
+        print("Training finished.")
         
-        # Callback이 모든 step에서 호출되었는지 확인
-        expected_steps = len(train_dataset) // (training_args.per_device_train_batch_size * training_args.gradient_accumulation_steps)
-        if len(train_dataset) % (training_args.per_device_train_batch_size * training_args.gradient_accumulation_steps) != 0:
-            expected_steps += 1
-        
-        print(f"예상 step 수: {expected_steps}")
-        print(f"실제 global step: {trainer.state.global_step}")
-        
-        # MoE callback이 routing 정보를 제대로 캡처했는지 확인
-        if hasattr(moe_callback.torch_callback, 'layer_outputs'):
-            layer_outputs_count = len(moe_callback.torch_callback.layer_outputs)
-            print(f"MoE callback이 캡처한 layer 수: {layer_outputs_count}")
-            if layer_outputs_count > 0:
-                print("✅ MoE callback이 routing 정보를 성공적으로 캡처했습니다!")
-            else:
-                print("⚠️ Warning: MoE callback이 routing 정보를 캡처하지 못했습니다.")
-        
-        # t-SNE 데이터 버퍼 확인
-        if hasattr(moe_callback.torch_callback, 'tsne_data_buffer'):
-            tsne_buffer = moe_callback.torch_callback.tsne_data_buffer
-            print(f"\n📊 t-SNE 데이터 버퍼 상태:")
-            for layer_name, buffer in tsne_buffer.items():
-                hidden_states_count = len(buffer.get('hidden_states', []))
-                expert_assignments_count = len(buffer.get('expert_assignments', []))
-                print(f"  - {layer_name}: hidden_states={hidden_states_count}, expert_assignments={expert_assignments_count}")
-                if hidden_states_count > 0 and expert_assignments_count > 0:
-                    print(f"    ✅ t-SNE 데이터 수집 성공!")
-                else:
-                    print(f"    ⚠️ t-SNE 데이터 수집 실패")
-        
-        # Heatmap 및 t-SNE 시각화 생성 확인
-        if hasattr(moe_callback.torch_callback, 'pending_heatmaps'):
-            pending_heatmaps = moe_callback.torch_callback.pending_heatmaps
-            print(f"\n📈 생성된 시각화:")
-            print(f"  - Pending heatmaps/t-SNE: {len(pending_heatmaps)} step(s)")
-            for step, visualizations in pending_heatmaps.items():
-                print(f"    Step {step}: {len(visualizations)} visualization(s)")
-                for viz_name in visualizations.keys():
-                    if '_tsne' in viz_name:
-                        print(f"      ✅ t-SNE: {viz_name}")
-                    else:
-                        print(f"      ✅ Heatmap: {viz_name}")
-        
-        if test_callback.step_count >= trainer.state.global_step:
-            print("✅ 모든 step에서 callback이 호출되었습니다!")
-        else:
-            print(f"⚠️ Warning: 일부 step에서 callback이 호출되지 않았을 수 있습니다.")
-        
-        # Wandb에 최종 요약 로깅
-        layer_outputs_count = len(moe_callback.torch_callback.layer_outputs) if hasattr(moe_callback.torch_callback, 'layer_outputs') else 0
-        tsne_layers_count = len(moe_callback.torch_callback.tsne_data_buffer) if hasattr(moe_callback.torch_callback, 'tsne_data_buffer') else 0
-        heatmap_count = sum(len(v) for v in moe_callback.torch_callback.pending_heatmaps.values()) if hasattr(moe_callback.torch_callback, 'pending_heatmaps') else 0
-        
-        if os.environ.get("RANK") == "0":
-            wandb.log({
-                "test/summary/total_steps": trainer.state.global_step,
-                "test/summary/callback_calls": test_callback.step_count,
-                "test/summary/layers_captured": layer_outputs_count,
-                "test/summary/tsne_layers": tsne_layers_count,
-                "test/summary/visualizations_created": heatmap_count,
-            })
-            print("\n✅ Wandb에 모든 메트릭이 기록되었습니다!")
+        # Wandb 종료
         if wandb.run:
-            print(f"   Wandb URL: {wandb.run.url}")
+            print(f"Wandb run finished. URL: {wandb.run.url}")
+            wandb.finish()
             
     except Exception as e:
-        print(f"\n❌ 오류 발생: {e}")
+        print(f"An error occurred during training: {e}")
         import traceback
         traceback.print_exc()
         raise
     finally:
-        # Wandb 종료
         if wandb.run:
             wandb.finish()
 

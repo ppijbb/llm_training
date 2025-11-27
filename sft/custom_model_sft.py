@@ -863,13 +863,13 @@ def main(
                 config=config,
                 mode="online"  # 항상 online으로 wandb에 기록
             )
-            run.define_metric("train/*", step_metric="train/step")
+            run.define_metric("train/*", step_metric="train/global_step")
             run.define_metric("validation/*", step_metric="validation/step")
             run.define_metric("eval/*", step_metric="eval/step")
-            run.define_metric("moe/*", step_metric="train/step")
-            run.define_metric("multi_modality/*", step_metric="train/step")
-            run.define_metric("router/*", step_metric="train/step")
-            run.define_metric("other/*", step_metric="train/step")
+            run.define_metric("moe/*", step_metric="train/global_step")
+            run.define_metric("multi_modality/*", step_metric="train/global_step")
+            run.define_metric("router/*", step_metric="train/global_step")
+            run.define_metric("other/*", step_metric="train/global_step")
 
             logger.info("✅ wandb initialized after Trainer creation")
         elif wandb.run is not None:
@@ -904,6 +904,7 @@ def main(
             logger=wandb,                    # 사용할 로거 지정 (wandb)
             log_to_console=True,             # 콘솔에도 주요 메트릭 출력 (디버깅용)
             debug_logging=True,              # 디버그 로깅 활성화
+            tokenizer=tokenizer,             # ✅ tokenizer 직접 전달
                        #  === (선택사항) ===  #
             log_heatmap_every=5,             # 500 스텝마다 Expert 사용률 히트맵 로깅
             alert_threshold_imbalance=4.0,   # 특정 Expert 사용률이 평균의 4배를 초과하면 경고

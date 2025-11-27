@@ -237,8 +237,6 @@ class TorchMoECallback:
                 )
                 self.hooks.append(hook)
                 moe_count += 1
-                if moe_count <= 3:  # 처음 3개만 로그
-                    self._log_debug(f"  ✓ Hook registered for: {name}")
         
         if moe_count == 0:
             self._log_debug("❌ WARNING: No MoE layers found! Model structure:")
@@ -407,6 +405,15 @@ class TorchMoECallback:
         """특정 레이어용 hook 함수 생성"""
         def hook_fn(module, input, output):
             try:
+                # 디버그: hook이 호출되는지 확인 (처음 몇 번만)
+                if not hasattr(self, '_hook_call_count'):
+                    self._hook_call_count = {}
+                if layer_name not in self._hook_call_count:
+                    self._hook_call_count[layer_name] = 0
+                self._hook_call_count[layer_name] += 1
+                # if self._hook_call_count[layer_name] <= 3 and self.log_to_console:
+                #     self._log_debug(f"🔍 Hook called for {layer_name} (call #{self._hook_call_count[layer_name]})")
+                
                 # t-SNE용 데이터 수집 (메모리 절약을 위해 최근 step만)
                 # input[0]은 hidden states (MoE layer 입력)
                 if isinstance(input, tuple) and len(input) > 0:
@@ -425,6 +432,8 @@ class TorchMoECallback:
 
                 routing_info = self._extract_routing_info(module, input, output)
                 if routing_info:
+                    # if self._hook_call_count[layer_name] <= 3 and self.log_to_console:
+                    #     self._log_debug(f"  ✅ Extracted routing info: {list(routing_info.keys())}")
                     # Store only lightweight, CPU-detached summaries to avoid GPU memory growth
                     lightweight_entry = {}
                     if 'expert_assignments' in routing_info and routing_info['expert_assignments'] is not None:
@@ -489,7 +498,22 @@ class TorchMoECallback:
                     # 디버깅 로그는 항상 출력 (step 정보 제거)
                     # self._log_debug(f"{layer_name}: extracted {list(routing_info.keys())}")
                 else:
-                    self._log_debug(f"{layer_name}: no routing info extracted")
+                    if self._hook_call_count[layer_name] <= 3 and self.log_to_console:
+                        # 디버그: 왜 routing_info가 None인지 확인
+                        has_last_selected = hasattr(module, 'last_selected_experts')
+                        output_is_tuple = isinstance(output, tuple)
+                        output_len = len(output) if output_is_tuple else 0
+                        self._log_debug(f"  ❌ No routing info extracted for {layer_name}")
+                        self._log_debug(f"     - has last_selected_experts: {has_last_selected}")
+                        if has_last_selected:
+                            se = module.last_selected_experts
+                            self._log_debug(f"     - last_selected_experts shape: {se.shape if torch.is_tensor(se) else type(se)}")
+                        self._log_debug(f"     - output is tuple: {output_is_tuple}, len: {output_len}")
+                        if output_is_tuple and len(output) >= 2:
+                            router_info = output[-1]
+                            self._log_debug(f"     - router_info type: {type(router_info)}, is tuple: {isinstance(router_info, tuple)}")
+                            if isinstance(router_info, tuple):
+                                self._log_debug(f"     - router_info len: {len(router_info)}")
             except Exception as e:
                 self._log_debug(f"Warning: Failed to extract routing info from {layer_name}: {e}")
         return hook_fn
@@ -535,7 +559,7 @@ class TorchMoECallback:
             # Speciality penalty, expression loss 등은 forward 중에 계산되므로
             # 별도로 저장하지 않음 (모니터링 콜백에서는 hook으로 추출 불가)
         
-        # 실제 G3MoE/GRIN 모델 구조에 맞춘 추출
+        # 실제 G3MoE/GRIN 모델 구조에 맞춘 추출 (우선순위: output에서 직접 추출)
         # G3MoEGRINMoE output: (hidden_states, (routing_probs_full, hn, speciality_loss, cosine_similarities, expression_loss))
         # G3MoEDecoderLayer output: (hidden_states, (self_attn_weights?), (router_logits, hn, speciality_loss, cosine_similarities, expression_loss))
         if isinstance(output, tuple) and len(output) >= 2:
@@ -550,25 +574,28 @@ class TorchMoECallback:
                 cosine_similarities = router_info_tuple[3]
                 expression_loss = router_info_tuple[4]
                 
-                # routing_probs_full에서 expert assignments 추출 (이미 softmax된 확률)
-                # 하지만 last_selected_experts가 있으면 그것을 우선 사용
+                # ✅ routing_probs_full에서 expert assignments 추출 (last_selected_experts보다 우선)
+                # hook이 forward 중에 호출되므로 output에서 직접 추출하는 것이 더 안정적
                 if routing_probs_full is not None and torch.is_tensor(routing_probs_full):
-                    # expert_assignments가 아직 없으면 routing_probs_full에서 추출
-                    if 'expert_assignments' not in routing_info:
-                        # top-k를 고려하여 argmax로 추출 (하지만 실제로는 last_selected_experts 사용 권장)
-                        if routing_probs_full.dim() >= 2:
-                            expert_assignments = routing_probs_full.argmax(dim=-1)
+                    # routing_probs_full: [batch*seq, num_experts] 형태의 softmax 확률
+                    if routing_probs_full.dim() >= 2:
+                        # top-k를 고려하여 top-1 expert 선택 (argmax)
+                        expert_assignments = routing_probs_full.argmax(dim=-1)  # [batch*seq]
+                        # last_selected_experts가 없거나 이미 추출한 경우에만 사용
+                        if 'expert_assignments' not in routing_info:
                             routing_info['expert_assignments'] = expert_assignments.flatten()
-                        else:
-                            expert_assignments = routing_probs_full.argmax(dim=-1)
+                        # routing_probs는 항상 업데이트 (entropy 계산용)
+                        routing_info['routing_probs'] = routing_probs_full.flatten()
+                        # num_experts 정보도 추출
+                        if 'num_experts' not in routing_info:
+                            routing_info['num_experts'] = routing_probs_full.size(-1)
+                    else:
+                        expert_assignments = routing_probs_full.argmax(dim=-1)
+                        if 'expert_assignments' not in routing_info:
                             routing_info['expert_assignments'] = expert_assignments
-                    
-                    # routing_probs가 없으면 routing_probs_full 사용
-                    if 'routing_probs' not in routing_info:
-                        if routing_probs_full.dim() >= 2:
-                            routing_info['routing_probs'] = routing_probs_full.flatten()
-                        else:
-                            routing_info['routing_probs'] = routing_probs_full
+                        routing_info['routing_probs'] = routing_probs_full
+                        if 'num_experts' not in routing_info and hasattr(module, 'num_experts'):
+                            routing_info['num_experts'] = module.num_experts
                 
                 # Loss 메트릭 저장 (CPU로 이동)
                 if speciality_loss is not None:
@@ -709,6 +736,14 @@ class TorchMoECallback:
         if not self.layer_outputs:
             if self.log_to_console:
                 self._log_debug(f"⚠️ Step {current_step}: No layer_outputs from hooks. Attempting to collect from model state...")
+                # Hook 호출 횟수 확인
+                if hasattr(self, '_hook_call_count'):
+                    total_calls = sum(self._hook_call_count.values())
+                    self._log_debug(f"   - Total hook calls so far: {total_calls}")
+                    if total_calls == 0:
+                        self._log_debug(f"   - ⚠️ WARNING: Hooks were never called! Check if model forward is being executed.")
+                    else:
+                        self._log_debug(f"   - Hook calls per layer: {dict(list(self._hook_call_count.items())[:5])}")
             collected = self._collect_from_model_state()
             if not collected:
                 if self.log_to_console:
@@ -721,6 +756,10 @@ class TorchMoECallback:
                         for name, module in self.model.named_modules():
                             if self._is_moe_layer(module):
                                 moe_layers_found.append(name)
+                                # 첫 번째 MoE 레이어에서 last_selected_experts 확인
+                                if len(moe_layers_found) == 1 and hasattr(module, 'last_selected_experts'):
+                                    se = module.last_selected_experts
+                                    self._log_debug(f"   - Sample MoE layer '{name}' has last_selected_experts: {se.shape if torch.is_tensor(se) else type(se)}")
                         self._log_debug(f"   - MoE layers in model: {len(moe_layers_found)}")
                         if moe_layers_found:
                             self._log_debug(f"   - Sample MoE layers: {moe_layers_found[:3]}")
@@ -729,6 +768,27 @@ class TorchMoECallback:
                 if self.log_to_console:
                     self._log_debug(f"✅ Step {current_step}: Collected {len(collected)} routing info from model state")
                     self._log_debug(f"   - Collected layer names: {list(collected.keys())[:3]}")
+        else:
+            if self.log_to_console and current_step % 10 == 0:  # 10 step마다만 로그
+                self._log_debug(f"✅ Step {current_step}: layer_outputs has {len(self.layer_outputs)} entries")
+                # 실제 MoE 레이어 수와 비교
+                if self.model is not None:
+                    moe_layers_in_model = []
+                    for name, module in self.model.named_modules():
+                        if self._is_moe_layer(module):
+                            moe_layers_in_model.append(name)
+                    if len(moe_layers_in_model) != len(self.layer_outputs):
+                        self._log_debug(f"   ⚠️ Mismatch: {len(moe_layers_in_model)} MoE layers in model, but {len(self.layer_outputs)} in layer_outputs")
+                        missing_layers = [l for l in moe_layers_in_model if l not in self.layer_outputs]
+                        if missing_layers:
+                            self._log_debug(f"   ⚠️ Missing layers in layer_outputs: {missing_layers[:5]}")
+                        # 누락된 레이어는 모델 상태에서 수집 시도
+                        if missing_layers:
+                            collected = self._collect_from_model_state()
+                            for layer_name in missing_layers:
+                                if layer_name in collected:
+                                    self.layer_outputs[layer_name] = collected[layer_name]
+                                    self._log_debug(f"   ✅ Collected missing layer '{layer_name}' from model state")
 
         # 메트릭 계산
         step_metrics = self._calculate_step_metrics()
@@ -739,19 +799,41 @@ class TorchMoECallback:
         if not step_metrics:
             if self.log_to_console:
                 self._log_debug(f"Step {current_step}: step_metrics is empty! layer_outputs: {len(self.layer_outputs)}")
+                if self.layer_outputs:
+                    # layer_outputs는 있는데 메트릭이 없는 경우 - 첫 번째 레이어 확인
+                    first_layer = list(self.layer_outputs.keys())[0]
+                    first_data = self.layer_outputs[first_layer]
+                    self._log_debug(f"   - First layer '{first_layer}' data keys: {list(first_data.keys())}")
+                    if 'expert_assignments' in first_data:
+                        ea = first_data['expert_assignments']
+                        self._log_debug(f"   - expert_assignments: shape={ea.shape if torch.is_tensor(ea) else 'N/A'}, numel={ea.numel() if torch.is_tensor(ea) else 'N/A'}")
 
         # _log_metrics를 매 step마다 호출하여 log_data 생성
-        # (실제 wandb 로깅은 on_log에서 하므로, 여기서는 pending에 저장)
         self._log_metrics(step_metrics, current_step)
 
-        # pending_metrics에 step별로 저장 (on_log에서만 wandb 로깅)
+        # ✅ on_step_end에서는 pending에만 저장, wandb 로깅은 on_log에서 Trainer와 함께 처리
+        # (step 충돌 방지를 위해 직접 wandb 로깅하지 않음)
         if hasattr(self, 'last_log_data') and self.last_log_data:
+            # pending에 저장 (on_log에서 Trainer의 WandbCallback과 함께 로깅)
             self.pending_metrics[current_step] = self.last_log_data.copy()
-            if self.log_to_console:
-                self._log_debug(f"Step {current_step}: stored {len(self.last_log_data)} metrics in pending")
+            
+            if self.log_to_console and (current_step % 10 == 0 or current_step <= 5):
+                moe_metrics = {
+                    k: v for k, v in self.last_log_data.items() 
+                    if (k.startswith('moe/') or 
+                        k.startswith('multi_modality/') or 
+                        k.startswith('train/router/'))
+                }
+                self._log_debug(f"✅ Step {current_step}: stored {len(moe_metrics)} MoE metrics in pending (will be logged in on_log)")
         else:
-            if self.log_to_console:
-                self._log_debug(f"Step {current_step}: no metrics to store in pending")
+            if self.log_to_console and (current_step % 10 == 0 or current_step <= 5):
+                self._log_debug(f"⚠️ Step {current_step}: no last_log_data to store")
+                self._log_debug(f"   - has last_log_data attr: {hasattr(self, 'last_log_data')}")
+                if hasattr(self, 'last_log_data'):
+                    self._log_debug(f"   - last_log_data is None/empty: {self.last_log_data is None or not self.last_log_data}")
+                # step_metrics 확인
+                if hasattr(self, 'last_metrics'):
+                    self._log_debug(f"   - last_metrics: {self.last_metrics}")
 
         # 히트맵 생성
         if current_step % self.log_heatmap_every == 0:
@@ -778,6 +860,41 @@ class TorchMoECallback:
             self._log_debug(f"[MoE Generation] Logging generations at step {current_step}")
             self._log_generations(current_step)
 
+    def _get_tokenizer_ids(self, tokenizer):
+        """Processor 또는 Tokenizer에서 pad_token_id와 eos_token_id를 안전하게 가져오기"""
+        # Processor 객체인 경우 실제 토크나이저에 접근
+        actual_tokenizer = tokenizer
+        if hasattr(tokenizer, 'tokenizer'):
+            actual_tokenizer = tokenizer.tokenizer
+        
+        # pad_token_id 가져오기
+        pad_token_id = None
+        if hasattr(actual_tokenizer, 'pad_token_id') and actual_tokenizer.pad_token_id is not None:
+            pad_token_id = actual_tokenizer.pad_token_id
+        elif hasattr(tokenizer, 'pad_token') and tokenizer.pad_token is not None:
+            # pad_token이 있으면 tokenizer를 통해 id로 변환
+            if hasattr(tokenizer, 'convert_tokens_to_ids'):
+                pad_token_id = tokenizer.convert_tokens_to_ids(tokenizer.pad_token)
+            elif hasattr(actual_tokenizer, 'convert_tokens_to_ids'):
+                pad_token_id = actual_tokenizer.convert_tokens_to_ids(tokenizer.pad_token)
+        
+        # eos_token_id 가져오기
+        eos_token_id = None
+        if hasattr(actual_tokenizer, 'eos_token_id') and actual_tokenizer.eos_token_id is not None:
+            eos_token_id = actual_tokenizer.eos_token_id
+        elif hasattr(tokenizer, 'eos_token') and tokenizer.eos_token is not None:
+            # eos_token이 있으면 tokenizer를 통해 id로 변환
+            if hasattr(tokenizer, 'convert_tokens_to_ids'):
+                eos_token_id = tokenizer.convert_tokens_to_ids(tokenizer.eos_token)
+            elif hasattr(actual_tokenizer, 'convert_tokens_to_ids'):
+                eos_token_id = actual_tokenizer.convert_tokens_to_ids(tokenizer.eos_token)
+        
+        # fallback: pad_token_id가 없으면 eos_token_id 사용
+        if pad_token_id is None:
+            pad_token_id = eos_token_id
+        
+        return pad_token_id, eos_token_id
+    
     @torch.no_grad()
     def _test_vlm_capabilities(self, model, tokenizer):
         """VLM 기능 테스트: 멀티모달과 텍스트 전용 케이스 모두 테스트"""
@@ -852,7 +969,7 @@ class TorchMoECallback:
                 )
                 inputs = {k: v.to(model.device) for k, v in inputs.items()}
                 
-                pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+                pad_token_id, eos_token_id = self._get_tokenizer_ids(tokenizer)
                 start_time = time.time()
                 outputs = model.generate(
                     **inputs,
@@ -860,7 +977,7 @@ class TorchMoECallback:
                     num_return_sequences=1,
                     do_sample=False,
                     pad_token_id=pad_token_id,
-                    eos_token_id=tokenizer.eos_token_id,
+                    eos_token_id=eos_token_id,
                     use_cache=True,
                 )
                 
@@ -941,7 +1058,7 @@ class TorchMoECallback:
                 
                 inputs = {k: v.to(model.device) for k, v in inputs.items()}
                 
-                pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+                pad_token_id, eos_token_id = self._get_tokenizer_ids(tokenizer)
                 
                 outputs = model.generate(
                     **inputs,
@@ -949,7 +1066,7 @@ class TorchMoECallback:
                     num_return_sequences=1,
                     do_sample=False,
                     pad_token_id=pad_token_id,
-                    eos_token_id=tokenizer.eos_token_id,
+                    eos_token_id=eos_token_id,
                     use_cache=True,
                 )
                 
@@ -1239,6 +1356,14 @@ class TorchMoECallback:
         """현재 step의 메트릭 계산"""
         metrics = {}
         
+        # 디버그: layer_outputs에 포함된 레이어 확인
+        if self.log_to_console and len(self.layer_outputs) > 0:
+            layer_names = list(self.layer_outputs.keys())
+            if len(layer_names) <= 10:
+                self._log_debug(f"📊 _calculate_step_metrics: processing {len(layer_names)} layers: {layer_names}")
+            else:
+                self._log_debug(f"📊 _calculate_step_metrics: processing {len(layer_names)} layers (first 10: {layer_names[:10]})")
+        
         for layer_name, routing_info in self.layer_outputs.items():
             layer_metrics = {}
             
@@ -1419,14 +1544,30 @@ class TorchMoECallback:
         log_data = {}
         
         # 레이어별 메트릭 (moe 카테고리로 분리)
+        logged_layers = []
         for layer_name, layer_metrics in metrics.items():
             if layer_name.startswith('_'):
                 continue  # 내부 메트릭은 건너뛰기
+            logged_layers.append(layer_name)
             for metric_name, value in layer_metrics.items():
                 if torch.is_tensor(value) and value.numel() == 1:
                     log_data[f'moe/{layer_name}/{metric_name}'] = value.item()
                 elif isinstance(value, (int, float)):
                     log_data[f'moe/{layer_name}/{metric_name}'] = value
+        
+        # 디버그: 로깅된 레이어 확인
+        if self.log_to_console and current_step % 10 == 0:
+            self._log_debug(f"📊 _log_metrics at step {current_step}: logged {len(logged_layers)} layers")
+            if len(logged_layers) <= 10:
+                self._log_debug(f"   Logged layers: {logged_layers}")
+            else:
+                self._log_debug(f"   Logged layers (first 10): {logged_layers[:10]}")
+            # layer_outputs와 비교
+            if hasattr(self, 'layer_outputs'):
+                layer_outputs_keys = list(self.layer_outputs.keys())
+                missing_layers = [l for l in layer_outputs_keys if l not in logged_layers]
+                if missing_layers:
+                    self._log_debug(f"   ⚠️ Missing layers in metrics: {missing_layers[:10]}")
         
         # 전체 평균 메트릭 (moe 카테고리로 분리)
         if metrics:
@@ -1630,6 +1771,15 @@ class TorchMoECallback:
         
         # log_data를 저장하여 Trainer의 logs에 추가할 수 있도록 함
         self.last_log_data = log_data
+        
+        # 디버그: log_data 생성 확인 (초기 step에서만)
+        if self.log_to_console and current_step <= 5:
+            self._log_debug(f"✅ _log_metrics at step {current_step}: created {len(log_data)} metrics")
+            if log_data:
+                sample_keys = list(log_data.keys())[:5]
+                self._log_debug(f"   Sample keys: {sample_keys}")
+            else:
+                self._log_debug(f"   ⚠️ log_data is empty! metrics dict: {list(metrics.keys()) if metrics else 'empty'}")
 
         # 콘솔 출력 (log_to_console=True일 때만)
         if self.log_to_console:
@@ -2040,6 +2190,42 @@ class TransformersMoECallbackWrapper(TrainerCallback):
         **kwargs
     ):
         """훈련 시작 시 모델과 토크나이저 등록 및 VLM 테스트"""
+        # ✅ tokenizer가 None이면 여러 방법으로 가져오기 시도
+        if tokenizer is None:
+            # 방법 1: kwargs에서 trainer 가져오기
+            trainer = kwargs.get('trainer')
+            if trainer is not None:
+                # SFTTrainer는 processing_class를 사용
+                if hasattr(trainer, 'processing_class') and trainer.processing_class is not None:
+                    tokenizer = trainer.processing_class
+                    self.torch_callback._log_debug("✅ Retrieved tokenizer from trainer.processing_class")
+                # 일반 Trainer는 tokenizer 속성 사용
+                elif hasattr(trainer, 'tokenizer') and trainer.tokenizer is not None:
+                    tokenizer = trainer.tokenizer
+                    self.torch_callback._log_debug("✅ Retrieved tokenizer from trainer.tokenizer")
+            
+            # 방법 2: kwargs에서 직접 tokenizer 찾기
+            if tokenizer is None:
+                tokenizer = kwargs.get('tokenizer') or kwargs.get('processing_class')
+                if tokenizer is not None:
+                    self.torch_callback._log_debug("✅ Retrieved tokenizer from kwargs")
+            
+            # 방법 3: torch_callback에 이미 저장된 tokenizer 사용
+            if tokenizer is None and hasattr(self.torch_callback, 'tokenizer') and self.torch_callback.tokenizer is not None:
+                tokenizer = self.torch_callback.tokenizer
+                self.torch_callback._log_debug("✅ Using tokenizer from torch_callback.tokenizer")
+            
+            if tokenizer is None:
+                self.torch_callback._log_debug("⚠️ Could not retrieve tokenizer from any source")
+                self.torch_callback._log_debug(f"   - kwargs keys: {list(kwargs.keys())}")
+                if trainer is not None:
+                    self.torch_callback._log_debug(f"   - trainer has processing_class: {hasattr(trainer, 'processing_class')}")
+                    if hasattr(trainer, 'processing_class'):
+                        self.torch_callback._log_debug(f"   - trainer.processing_class: {trainer.processing_class}")
+                    self.torch_callback._log_debug(f"   - trainer has tokenizer: {hasattr(trainer, 'tokenizer')}")
+                    if hasattr(trainer, 'tokenizer'):
+                        self.torch_callback._log_debug(f"   - trainer.tokenizer: {trainer.tokenizer}")
+        
         if model is not None and not self._model_registered:
             # DeepSpeed 래핑된 모델 처리
             actual_model = model
@@ -2087,8 +2273,12 @@ class TransformersMoECallbackWrapper(TrainerCallback):
         
         # VLM 테스트: 멀티모달과 텍스트 전용 케이스 모두 테스트
         # tokenizer와 model이 모두 있을 때만 테스트
-        if tokenizer is not None and actual_model is not None:
-            self.torch_callback._test_vlm_capabilities(actual_model, tokenizer)
+        actual_model = model
+        if hasattr(model, 'module'):  # DeepSpeed 래핑
+            actual_model = model.module
+        
+        # if tokenizer is not None and actual_model is not None:
+        #     self.torch_callback._test_vlm_capabilities(actual_model, tokenizer)
         else:
             if tokenizer is None:
                 self.torch_callback._log_debug("⚠️ VLM test skipped: tokenizer is None")
@@ -2131,14 +2321,14 @@ class TransformersMoECallbackWrapper(TrainerCallback):
         logs: Optional[Dict[str, float]] = None,
         **kwargs
     ):
-        """Trainer가 로깅할 때 호출 - 여기서 MoE 메트릭을 logs에 추가"""
+        """Trainer가 로깅할 때 호출 - MoE 메트릭을 logs에 추가하여 Trainer의 WandbCallback이 로깅"""
         # logs가 None이면 빈 dict로 초기화
         if logs is None:
             logs = {}
 
         # global_step을 logs에 명시적으로 추가 (wandb에서 step 추적용)
         logs['train/global_step'] = float(state.global_step)
-
+        
         # 해당 step의 pending 메트릭 확인
         # on_log는 logging_steps마다 호출되므로, 최근 step의 메트릭을 찾아야 함
         current_metrics = None
@@ -2151,130 +2341,101 @@ class TransformersMoECallbackWrapper(TrainerCallback):
             if available_steps:
                 target_step = max(available_steps)
                 current_metrics = self.torch_callback.pending_metrics.get(target_step)
-                if self.torch_callback.log_to_console:
-                    self.torch_callback._log_debug(f"⚠️ Using metrics from step {target_step} for on_log at step {state.global_step}")
+                if self.torch_callback.log_to_console and state.global_step % 10 == 0:
+                    self.torch_callback._log_debug(f"📊 Using metrics from step {target_step} for on_log at step {state.global_step}")
             else:
                 # 아직 pending 메트릭이 없으면, on_step_end에서 생성된 메트릭을 직접 사용
                 if hasattr(self.torch_callback, 'last_log_data') and self.torch_callback.last_log_data:
                     current_metrics = self.torch_callback.last_log_data.copy()
-                    if self.torch_callback.log_to_console:
-                        self.torch_callback._log_debug(f"⚠️ Using last_log_data for step {state.global_step}")
+                    if self.torch_callback.log_to_console and state.global_step % 10 == 0:
+                        self.torch_callback._log_debug(f"📊 Using last_log_data for step {state.global_step}")
         else:
             current_metrics = self.torch_callback.pending_metrics.get(target_step)
         
         if current_metrics:
-            # pending 메트릭을 logs에 추가 (Trainer의 WandbCallback이 자동으로 로깅)
-            # 이 부분은 항상 실행되어야 함 (wandb 로깅 실패해도 Trainer의 로깅은 유지)
+            # ✅ logs에 추가 (Trainer의 다른 로깅과 함께)
             logs.update(current_metrics)
-
-            # wandb에 직접 로깅 (Trainer의 로깅과 독립적으로 보장)
-            # step은 state.global_step을 사용하여 Trainer와 동기화
+            
+            # ✅ MoE 메트릭을 wandb에 직접 로깅 (Trainer의 WandbCallback이 일부만 로깅할 수 있으므로)
             try:
                 import wandb
-                # wandb.run이 None이 아니거나, wandb.init이 호출되었는지 확인
-                if wandb.run is not None:
-                    # prefix별로 그룹화
-                    grouped_metrics = {}
-                    for key, value in current_metrics.items():
-                        # prefix 추출 (예: 'moe/', 'multi_modality/', 'train/router/')
-                        if '/' in key:
-                            prefix = key.split('/')[0] + '/'
-                        else:
-                            prefix = 'other/'
-                        
-                        if prefix not in grouped_metrics:
-                            grouped_metrics[prefix] = {}
-                        grouped_metrics[prefix][key] = value
+                if wandb.run is not None and _is_main_process():
+                    # MoE 관련 메트릭만 필터링
+                    moe_metrics = {
+                        k: v for k, v in current_metrics.items() 
+                        if (k.startswith('moe/') or 
+                            k.startswith('multi_modality/') or 
+                            k.startswith('train/router/'))
+                    }
                     
-                    # 각 prefix 그룹을 10개씩 쪼개서 로깅
-                    try:
-                        for prefix, metrics_group in grouped_metrics.items():
-                            metrics_list = list(metrics_group.items())
-                            chunk_size = 10
-                            
-                            for i in range(0, len(metrics_list), chunk_size):
-                                chunk = dict(metrics_list[i:i + chunk_size])
-                                self.torch_callback._log_debug(f"Logging {len(chunk)} {prefix} metrics (chunk {i//chunk_size + 1}) at step {state.global_step}")
-                                wandb.run.log(chunk, step=state.global_step, commit=False)
-                    except Exception as e:
-                        # 메트릭 로깅 실패해도 계속 진행
-                        process_info = _get_process_info()
-                        self.torch_callback._log_debug(f"⚠️ Error logging metrics to wandb: {e} (rank={process_info['rank']})")
-
-                    # Pending heatmap 및 t-SNE 로깅 (별도 try-except로 분리)
-                    try:
-                        if state.global_step in self.torch_callback.pending_heatmaps:
-                            heatmap_data = self.torch_callback.pending_heatmaps[state.global_step]
-                            for layer_name, image in heatmap_data.items():
-                                if layer_name.endswith('_tsne'):
-                                    # t-SNE 시각화
-                                    wandb.run.log({
-                                        f'moe/{layer_name}/tsne_visualization': image
-                                    }, step=state.global_step, commit=False)
-                                else:
-                                    # Heatmap
-                                    wandb.run.log({
-                                        f'moe/{layer_name}/usage_heatmap': image
-                                    }, step=state.global_step, commit=False)
-                            # 로깅 후 pending에서 제거
-                            del self.torch_callback.pending_heatmaps[state.global_step]
-                    except Exception as e:
-                        # Heatmap/t-SNE 로깅 실패해도 메트릭 로깅은 계속
-                        self.torch_callback._log_debug(f"⚠️ Error logging heatmaps/t-SNE to wandb: {e}")
-
-                    # Pending alert 로깅 (별도 try-except로 분리)
-                    try:
-                        if state.global_step in self.torch_callback.pending_alerts:
-                            alert_data = self.torch_callback.pending_alerts[state.global_step]
-                            for alert in alert_data:
+                    if moe_metrics:
+                        # ✅ Trainer의 step을 명시적으로 사용하여 로깅
+                        # commit=False로 설정하여 Trainer의 로깅과 함께 처리 (step 충돌 방지)
+                        wandb.run.log(moe_metrics, step=state.global_step, commit=False)
+                        
+                        if self.torch_callback.log_to_console and state.global_step % 10 == 0:
+                            self.torch_callback._log_debug(f"📤 on_log step {state.global_step}: logged {len(moe_metrics)} MoE metrics to wandb")
+                            sample_keys = list(moe_metrics.keys())[:10]
+                            self.torch_callback._log_debug(f"   Sample keys: {sample_keys}")
+                    
+                    # Heatmap/t-SNE는 별도 로깅 (이미지이므로)
+                    if state.global_step in self.torch_callback.pending_heatmaps:
+                        heatmap_data = self.torch_callback.pending_heatmaps[state.global_step]
+                        for layer_name, image in heatmap_data.items():
+                            if layer_name.endswith('_tsne'):
                                 wandb.run.log({
-                                    f'train/alerts/{alert["type"]}': 1,
-                                    f'train/alerts/{alert["layer"]}_severity': alert['severity']
-                                }, step=state.global_step, commit=False)
-                            # 로깅 후 pending에서 제거
-                            del self.torch_callback.pending_alerts[state.global_step]
-                    except Exception as e:
-                        # Alert 로깅 실패해도 메트릭 로깅은 계속
-                        self.torch_callback._log_debug(f"⚠️ Error logging alerts to wandb: {e}")
-
-                    # 로깅 성공 후 pending 메트릭 제거 (target_step이 아닌 state.global_step 기준)
-                    # 여러 step의 메트릭이 누적되어 있을 수 있으므로, 현재 step 이하의 모든 메트릭 제거
-                    try:
-                        steps_to_remove = [s for s in self.torch_callback.pending_metrics.keys() if s <= state.global_step]
-                        for step in steps_to_remove:
-                            if step in self.torch_callback.pending_metrics:
-                                del self.torch_callback.pending_metrics[step]
-                    except Exception as e:
-                        self.torch_callback._log_debug(f"⚠️ Error cleaning up pending metrics: {e}")
-                else:
-                    # wandb.run이 None이면 logs에만 추가 (Trainer의 WandbCallback이 처리)
-                    if self.torch_callback.log_to_console:
-                        self.torch_callback._log_debug(f"⚠️ wandb.run is None at step {state.global_step}, relying on Trainer's WandbCallback")
+                                    f'moe/{layer_name}/tsne_visualization': image
+                                }, commit=False)
+                            else:
+                                wandb.run.log({
+                                    f'moe/{layer_name}/usage_heatmap': image
+                                }, commit=False)
+                        del self.torch_callback.pending_heatmaps[state.global_step]
+                    
+                    # Pending alert 로깅
+                    if state.global_step in self.torch_callback.pending_alerts:
+                        alert_data = self.torch_callback.pending_alerts[state.global_step]
+                        for alert in alert_data:
+                            wandb.run.log({
+                                f'train/alerts/{alert["type"]}': 1,
+                                f'train/alerts/{alert["layer"]}_severity': alert['severity']
+                            }, commit=False)
+                        del self.torch_callback.pending_alerts[state.global_step]
             except Exception as e:
-                # 전체 wandb 로깅 실패해도 logs.update는 이미 실행되었으므로 Trainer의 로깅은 유지
-                process_info = _get_process_info()
-                import traceback
-                error_msg = (
-                    f"[MoE Callback] ❌ ERROR in on_log (wandb logging):\n"
-                    f"  Process: rank={process_info['rank']}, local_rank={process_info['local_rank']}, "
-                    f"RANK={process_info['RANK']}, LOCAL_RANK={process_info['LOCAL_RANK']}\n"
-                    f"  Step: {state.global_step}\n"
-                    f"  Method: on_log\n"
-                    f"  Error: {type(e).__name__}: {str(e)}\n"
-                    f"  Traceback:\n{traceback.format_exc()}\n"
-                    f"  current_metrics keys: {list(current_metrics.keys())[:10] if current_metrics else 'None'}\n"
-                    f"  Note: Metrics are still added to logs, Trainer's WandbCallback will handle logging"
-                )
-                # 에러는 항상 출력
-                print(error_msg)
+                if self.torch_callback.log_to_console:
+                    import traceback
+                    self.torch_callback._log_debug(f"⚠️ Error logging MoE metrics to wandb in on_log: {e}")
+                    if state.global_step % 50 == 0:
+                        self.torch_callback._log_debug(f"   Traceback: {traceback.format_exc()}")
+            
+            # 디버그: current_metrics 내용 확인 (10 step마다만)
+            if self.torch_callback.log_to_console and state.global_step % 10 == 0:
+                moe_keys = [k for k in current_metrics.keys() if k.startswith('moe/') or k.startswith('multi_modality/') or k.startswith('train/router/')]
+                self.torch_callback._log_debug(f"📊 on_log step {state.global_step}: total {len(moe_keys)} MoE metrics available")
+            
+            # 로깅 후 pending 메트릭 제거 (메모리 절약)
+            try:
+                steps_to_remove = [s for s in self.torch_callback.pending_metrics.keys() if s <= state.global_step]
+                for step in steps_to_remove:
+                    if step in self.torch_callback.pending_metrics:
+                        del self.torch_callback.pending_metrics[step]
+            except Exception as e:
+                if self.torch_callback.log_to_console:
+                    self.torch_callback._log_debug(f"⚠️ Error cleaning up pending metrics: {e}")
         else:
             # 해당 step의 pending 메트릭이 없으면 경고 (log_to_console일 때만)
             if self.torch_callback.log_to_console:
                 self.torch_callback._log_debug(f"⚠️ No pending metrics available at step {state.global_step}")
+                self.torch_callback._log_debug(f"   - pending_metrics keys: {list(self.torch_callback.pending_metrics.keys())[:10]}")
+                self.torch_callback._log_debug(f"   - last_log_data exists: {hasattr(self.torch_callback, 'last_log_data') and self.torch_callback.last_log_data is not None}")
+                if hasattr(self.torch_callback, 'last_log_data') and self.torch_callback.last_log_data:
+                    self.torch_callback._log_debug(f"   - last_log_data keys: {list(self.torch_callback.last_log_data.keys())[:10]}")
+                self.torch_callback._log_debug(f"   - layer_outputs count: {len(self.torch_callback.layer_outputs)}")
             # 최소한의 디버그 정보라도 추가
             logs['moe/callback_error'] = 1.0
             logs['moe/layer_outputs_count'] = len(self.torch_callback.layer_outputs) if hasattr(self.torch_callback, 'layer_outputs') else 0
             logs['moe/hooks_count'] = len(self.torch_callback.hooks) if hasattr(self.torch_callback, 'hooks') else 0
+            logs['moe/pending_metrics_count'] = len(self.torch_callback.pending_metrics) if hasattr(self.torch_callback, 'pending_metrics') else 0
     
     def on_evaluate(
         self,
@@ -2467,6 +2628,7 @@ def create_moe_callback_for_transformers(
     generation_log_every: int = 100,
     log_tsne_every: int = 5000,
     tsne_sample_size: int = 2000,
+    tokenizer=None,  # ✅ tokenizer를 직접 전달할 수 있도록 추가
     **kwargs
 ) -> TransformersMoECallbackWrapper:
     """Transformers용 MoE 콜백 생성 편의 함수"""
@@ -2483,6 +2645,10 @@ def create_moe_callback_for_transformers(
         force_all_ranks=True,  # 모든 프로세스에서 실행 (이미 is_main_process 체크 제거됨)
         **kwargs
     )
+    
+    # ✅ tokenizer가 전달되면 미리 설정 (VLM 테스트를 위해 필수)
+    if tokenizer is not None:
+        torch_callback.set_tokenizer(tokenizer)
 
     return TransformersMoECallbackWrapper(torch_callback)
 
