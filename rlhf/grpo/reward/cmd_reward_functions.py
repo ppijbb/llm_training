@@ -5,6 +5,7 @@ CommandRewardFunction과 각 component들을 정의합니다.
 """
 import logging
 import re
+import difflib
 from typing import Dict, Any, List, Set
 from reward.reward_functions import RewardComponent
 
@@ -14,10 +15,10 @@ logger = logging.getLogger(__name__)
 class ToothNumberComponent(RewardComponent):
     """
     치아 번호 매칭 (F1 + 엄격한 페널티)
-    가중치: 0.50
+    가중치: 0.40
     """
     
-    def __init__(self, weight: float = 0.50):
+    def __init__(self, weight: float = 0.40):
         super().__init__(name="tooth_number", weight=weight)
         
         # 엄격한 설정
@@ -34,21 +35,6 @@ class ToothNumberComponent(RewardComponent):
             completion: 생성된 텍스트 (str)
             ground_truth: 정답 라벨 (str)
             **kwargs: 추가 인자 (labels 등)
-        
-        Examples:
-            GT: "number 7, 8, 9"
-            
-            Gen1: "number 7, 8, 9" 
-                → Perfect! F1=1.0 + bonus=0.2 → 1.2 (clipped to 1.0)
-            
-            Gen2: "number 7, 8"
-                → Missing 9: F1=0.8 - missing_penalty(0.3) → 0.5
-            
-            Gen3: "number 7, 8, 9, 10"
-                → Hallucination: F1=0.86 - hallucination_penalty(0.4) → 0.46
-            
-            Gen4: "number 1, 2, 3"
-                → Completely wrong: F1=0.0 - wrong_tooth_penalty(0.5) → -0.5 (clipped to 0.0)
         """
         # 형식 안전 처리
         if ground_truth is None and 'labels' in kwargs:
@@ -130,7 +116,6 @@ class ToothNumberComponent(RewardComponent):
         """
         엄격한 치아 번호 추출
         - number X 패턴만 인정
-        - repeat X는 치아 번호가 아닌 경우도 있으므로 컨텍스트 분석
         """
         teeth = []
         
@@ -164,10 +149,10 @@ class ToothNumberComponent(RewardComponent):
 class CommandKeywordComponent(RewardComponent):
     """
     명령어 키워드 정확 매칭 (Label 기반)
-    가중치: 0.25
+    가중치: 0.20
     """
     
-    def __init__(self, weight: float = 0.25):
+    def __init__(self, weight: float = 0.20):
         super().__init__(name="command_keyword", weight=weight)
         
         # 핵심 명령어 정의
@@ -206,24 +191,6 @@ class CommandKeywordComponent(RewardComponent):
             else:
                 completion = str(completion)
         
-        """
-        Label의 각 명령어 단위(;로 구분)를 정확히 매칭
-        
-        Examples:
-            GT: "number 7, pocket depth 5 3 2; number 7, mobility 2"
-            
-            Gen1: "number 7, pocket depth 5 3 2; number 7, mobility 2"
-                → 100% 매칭 → 1.0
-            
-            Gen2: "number 7, probing 5 3 2; number 7, mobility 2"
-                → probing=pocket depth (동의어) → 0.95
-            
-            Gen3: "number 7, pocket depth 5 3 2"
-                → mobility 누락 → 0.5
-            
-            Gen4: "number 7, bleeding"
-                → 완전히 다른 명령어 → 0.1
-        """
         # Label을 명령어 단위로 파싱
         gen_commands = self._parse_commands(completion)
         gt_commands = self._parse_commands(ground_truth)
@@ -342,10 +309,95 @@ class CommandKeywordComponent(RewardComponent):
                 found.add(cmd)
         return found
 
+
+class InstructionComplianceComponent(RewardComponent):
+    """
+    Instruction 준수 여부 및 환각 체크 (Reflection & Penalty)
+    가중치: 0.20
+    """
+    def __init__(self, weight: float = 0.20):
+        super().__init__(name="instruction_compliance", weight=weight)
+        # 금지된 메타 명령어 패턴 (확장되지 않은 형태)
+        self.forbidden_patterns = [
+            r'\brepeat\b', r'\bothers\b', r'\ball\b', r'\bagain\b', r'\bexcept\b'
+        ]
+        # 기본 허용 키워드 (이 외의 단어가 GT에 없으면 환각 의심)
+        self.base_keywords = {
+            'number', 'buccal', 'lingual', 'palatal', 'mesial', 'middle', 'distal',
+            'probing', 'pocket', 'depth', 'bleeding', 'suppuration', 'plaque', 'calculus',
+            'mobility', 'furcation', 'recession', 'gingival', 'margin',
+            'implant', 'fixture', 'crown', 'bridge', 'pontic', 'missing', 'impacted',
+            'jump', 'back', 'clear', 'delete'
+        }
+
+    def calculate(self, completion: str, ground_truth: str = None, **kwargs) -> float:
+        score = 1.0
+        completion_lower = str(completion).lower()
+        ground_truth_lower = str(ground_truth).lower() if ground_truth else ""
+
+        # 1. 금지된 명령어 사용 체크 (Penalty)
+        for pattern in self.forbidden_patterns:
+            if re.search(pattern, completion_lower):
+                score -= 0.2  # 금지어 사용 시 감점
+
+        # 2. 포맷 규칙 체크: "number N"으로 시작 여부 (Semicolon 단위)
+        commands = completion_lower.split(';')
+        valid_format_count = 0
+        total_commands = 0
+        for cmd in commands:
+            cmd = cmd.strip()
+            if not cmd: continue
+            total_commands += 1
+            # "number 숫자"로 시작해야 함
+            if re.match(r'^number\s+\d+', cmd):
+                valid_format_count += 1
+        
+        if total_commands > 0:
+            format_ratio = valid_format_count / total_commands
+            # 포맷 준수율이 낮으면 점수 깎음
+            score *= format_ratio
+
+        # 3. 환각 체크 (Reflection with GT)
+        # GT에 없는 단어를 사용했는지 체크 (단, base_keywords는 제외)
+        # 이는 모델이 없는 명령어를 지어내는 것을 방지함
+        if ground_truth_lower:
+            gen_words = set(re.findall(r'[a-z]+', completion_lower))
+            gt_words = set(re.findall(r'[a-z]+', ground_truth_lower))
+            
+            # GT에 없고, 기본 키워드도 아닌 단어들
+            hallucinated_words = gen_words - gt_words - self.base_keywords
+            if hallucinated_words:
+                # 환각 단어가 있으면 감점 (단어 개수에 비례하여)
+                penalty = min(0.5, len(hallucinated_words) * 0.1)
+                score -= penalty
+
+        return max(0.0, score)
+
+
+class SequenceSimilarityComponent(RewardComponent):
+    """
+    정답과의 시퀀스 유사도 (LCS ratio)
+    가중치: 0.10
+    """
+    def __init__(self, weight: float = 0.10):
+        super().__init__(name="sequence_similarity", weight=weight)
+
+    def calculate(self, completion: str, ground_truth: str = None, **kwargs) -> float:
+        if not ground_truth:
+            return 0.0
+        
+        completion = str(completion)
+        ground_truth = str(ground_truth)
+        
+        # SequenceMatcher를 이용한 유사도 계산
+        matcher = difflib.SequenceMatcher(None, completion, ground_truth)
+        return matcher.ratio()
+
+
 class StructuralComponent(RewardComponent):
-    """구조 정확도 (가중치: 0.15)"""
+    """구조 정확도 (가중치: 0.05)"""
     
-    def __init__(self, weight: float = 0.15):
+    def __init__(self, weight: float = 0.05):
         super().__init__(name="command_structural", weight=weight)
     
     def calculate(self, completion: str, ground_truth: str = None, **kwargs) -> float:
@@ -365,10 +417,11 @@ class StructuralComponent(RewardComponent):
         
         return 1.0 - (count_diff / max_count) if max_count > 0 else 1.0
 
+
 class NumericalValueComponent(RewardComponent):
-    """수치값 정확도 (가중치: 0.10)"""
+    """수치값 정확도 (가중치: 0.05)"""
     
-    def __init__(self, weight: float = 0.15):
+    def __init__(self, weight: float = 0.05):
         super().__init__(name="numerical_value", weight=weight)       
 
     def calculate(self, completion: str, ground_truth: str = None, **kwargs) -> float:
@@ -393,6 +446,7 @@ class NumericalValueComponent(RewardComponent):
         
         matches = sum(1 for g in gt_seqs if g in gen_seqs)
         return matches / len(gt_seqs)
+
 
 class ComponentRewardWrapper:
     """개별 component를 독립적인 reward function으로 동작하게 만드는 wrapper"""
@@ -447,10 +501,12 @@ class CommandRewardFunction:
     
     def __init__(self, config: Dict = None):
         self.components = [
-            ToothNumberComponent(weight=0.50),      # 치아 번호 - 최우선
-            CommandKeywordComponent(weight=0.25),   # 명령어 키워드
-            StructuralComponent(weight=0.15),       # 구조
-            NumericalValueComponent(weight=0.10)    # 수치값
+            ToothNumberComponent(weight=0.40),          # 치아 번호 정확도 (가장 중요)
+            CommandKeywordComponent(weight=0.20),       # 명령어 키워드 매칭
+            InstructionComplianceComponent(weight=0.20), # 지시 준수 및 환각 체크 (New)
+            SequenceSimilarityComponent(weight=0.10),   # 전체 시퀀스 유사도 (New)
+            StructuralComponent(weight=0.05),           # 구조적 정확도
+            NumericalValueComponent(weight=0.05)        # 수치값 정확도
         ]
         self.config = config or {}
     

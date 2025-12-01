@@ -89,8 +89,30 @@ class GenerationLoggingCallback(TrainerCallback):
             "Mark number 18, furcation 2, 19, suppuration distal with proximal bleeding, 20, 4 3 3",
         ]
 
+        # 학습에 사용하는 system prompt (data_loader.py의 _build_adaptive_cmd_prompt와 동일한 형식)
+        system_prompt = """🦷 PERIODONTAL CHARTING ASSISTANT
+
+TASK: Convert natural language into structured command sequences.
+
+CRITICAL: Use ONLY commands from AVAILABLE COMMANDS MAP below.
+
+TOOTH NUMBERING: UNS
+[UNS] Q1(1-8), Q2(9-16), Q3(17-24), Q4(25-32)
+Quadrant: Q1 → teeth 1–8, Q2 → 9–16, Q3 → 17–24, Q4 → 25–32
+
+COMMON RULES:
+- Single line output, semicolons (;) separate commands
+- Always start with "number N"
+- Three numbers = probing values (NOT tooth number)
+- Never output meta-commands: expand "repeat", "others", "all" to explicit commands
+- VALIDATION: Check that all commands in your output exist in AVAILABLE COMMANDS MAP above
+
+"""
+
         try:
-            prompts_to_process = sample_prompts[:self.max_samples]
+            # 각 sample_prompt 앞에 system prompt 추가
+            prompts_to_process = [system_prompt + f"Convert: {prompt}\n\nOutput (commands only):" 
+                                 for prompt in sample_prompts[:self.max_samples]]
             inputs = tokenizer(
                 text=prompts_to_process, 
                 return_tensors="pt", 
@@ -117,12 +139,16 @@ class GenerationLoggingCallback(TrainerCallback):
             generated_ids = outputs[:, input_ids_len:]
             generated_texts = tokenizer.batch_decode(generated_ids, skip_special_tokens=True, clean_up_tokenization_spaces=True)
             
-            for i, (prompt, generated_only) in enumerate(zip(prompts_to_process, generated_texts)):
+            # 원본 프롬프트 (system prompt 없이)
+            original_prompts = sample_prompts[:self.max_samples]
+            
+            for i, (full_prompt, original_prompt, generated_only) in enumerate(zip(prompts_to_process, original_prompts, generated_texts)):
                 log_entry = {
                     "step": current_step,
                     "generation_step": self.eval_step_count,
                     "sample_index": i,
-                    "prompt": prompt,
+                    "original_prompt": original_prompt,  # system prompt 없는 원본
+                    "full_prompt": full_prompt,  # system prompt 포함 전체
                     "generated": generated_only.strip(),
                 }
                 generation_logs.append(log_entry)
@@ -195,12 +221,19 @@ class CustomGRPOTrainer(GRPOTrainer):
 
     def _prepare_inputs(self, inputs):
         if not self.model.training:
-            # During evaluation, just move inputs to device
-            try:
-                device = next(self.model.parameters()).device
-                return {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
-            except StopIteration: # No parameters
-                return inputs
+            # During evaluation, check input type first
+            # If inputs is a dict, move to device
+            # If inputs is a list or other type, let parent class handle it
+            if isinstance(inputs, dict):
+                try:
+                    device = next(self.model.parameters()).device
+                    return {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
+                except StopIteration:  # No parameters
+                    return inputs
+            else:
+                # For list or other types, use parent implementation
+                # TRL GRPOTrainer may have special handling for these
+                return super()._prepare_inputs(inputs)
         return super()._prepare_inputs(inputs)
         
     def prediction_step(
@@ -213,10 +246,19 @@ class CustomGRPOTrainer(GRPOTrainer):
         if model.training:
             return super().prediction_step(model, inputs, prediction_loss_only, ignore_keys)
 
+        # Prepare inputs (may return dict, list, or other types)
         inputs = self._prepare_inputs(inputs)
+        
+        # Check if inputs is a dict with labels
+        if not isinstance(inputs, dict):
+            # If inputs is not a dict (e.g., list), use parent implementation
+            return super().prediction_step(model, inputs, prediction_loss_only, ignore_keys)
+        
+        # If no labels, return None values
         if 'labels' not in inputs:
             return None, None, None
 
+        # Process dict inputs with labels
         with torch.no_grad():
             outputs = model(**inputs)
             loss = outputs.get("loss")
