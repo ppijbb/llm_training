@@ -21,6 +21,14 @@ from .g3moe_model import (
     G3MoEForConditionalGeneration,
     G3MoEModel,
 )
+from .gramspec_moe_config import GramSpecMoEConfig, GramSpecMoETextConfig
+from .gramspec_moe_model import (
+    GramSpecMoEPreTrainedModel,
+    GramSpecMoETextModel,
+    GramSpecMoEForCausalLM,
+    GramSpecMoEForConditionalGeneration,
+    GramSpecMoEModel,
+)
 from .g2moe_config import *
 from .g2moe_model import *
 
@@ -32,4 +40,11 @@ __all__ = [
     "G3MoEForCausalLM",
     "G3MoEForConditionalGeneration",
     "G3MoEModel",
+    "GramSpecMoEConfig",
+    "GramSpecMoETextConfig",
+    "GramSpecMoEPreTrainedModel",
+    "GramSpecMoETextModel",
+    "GramSpecMoEForCausalLM",
+    "GramSpecMoEForConditionalGeneration",
+    "GramSpecMoEModel",
 ]

@@ -62,6 +62,11 @@ class GramSpecAnalyzer:
         self.expert_similarity_mean_history = []
         self.expert_specialization_strength_history = []
         
+        # 논문 필수 지표 히스토리
+        self.expert_overlap_history = []  # Expert Overlap (Jaccard Similarity)
+        self.gini_coefficient_history = []  # Gini Coefficient
+        self.min_max_expert_load_ratio_history = []  # Min-max Expert Load Ratio
+        
     def analyze_routing_step(
         self,
         routing_logits: torch.Tensor,  # [batch*seq, num_experts, router_dim]
@@ -147,6 +152,22 @@ class GramSpecAnalyzer:
         # Load balancing 히스토리 저장
         if 'expert_token_counts' in load_balancing_metrics:
             self.expert_token_counts_history.append(load_balancing_metrics['expert_token_counts'])
+        
+        # 논문 필수 지표 히스토리 저장
+        if 'gini_coefficient' in load_balancing_metrics:
+            if not hasattr(self, 'gini_coefficient_history'):
+                self.gini_coefficient_history = []
+            self.gini_coefficient_history.append(load_balancing_metrics['gini_coefficient'])
+        
+        if 'min_max_expert_load_ratio' in load_balancing_metrics:
+            if not hasattr(self, 'min_max_expert_load_ratio_history'):
+                self.min_max_expert_load_ratio_history = []
+            self.min_max_expert_load_ratio_history.append(load_balancing_metrics['min_max_expert_load_ratio'])
+        
+        if 'expert_overlap_mean' in specialization_metrics:
+            if not hasattr(self, 'expert_overlap_history'):
+                self.expert_overlap_history = []
+            self.expert_overlap_history.append(specialization_metrics['expert_overlap_mean'])
         if 'load_balancing_coefficient' in load_balancing_metrics:
             self.load_balancing_coefficient_history.append(load_balancing_metrics['load_balancing_coefficient'])
         if 'expert_utilization_rate' in load_balancing_metrics:
@@ -306,6 +327,42 @@ class GramSpecAnalyzer:
         max_activation_prob = activation_probs.max().item()
         expert_concentration = max_activation_prob * self.num_experts  # Normalized
         
+        # Expert Overlap (Jaccard Similarity) - 논문 필수 지표
+        # 각 expert pair 간 token set의 Jaccard similarity 계산
+        # selected_experts: [batch*seq, top_k]
+        batch_seq_len = selected_experts.size(0)
+        expert_token_sets = {}
+        for expert_idx in range(self.num_experts):
+            # 각 expert가 처리한 토큰 인덱스 집합
+            expert_mask = (selected_experts == expert_idx).any(dim=1)  # [batch*seq]
+            expert_token_sets[expert_idx] = set(torch.where(expert_mask)[0].cpu().numpy().tolist())
+        
+        # 모든 expert pair 간 Jaccard similarity 계산
+        expert_overlaps = []
+        for i in range(self.num_experts):
+            for j in range(i + 1, self.num_experts):
+                set_i = expert_token_sets.get(i, set())
+                set_j = expert_token_sets.get(j, set())
+                
+                if len(set_i) == 0 and len(set_j) == 0:
+                    # 둘 다 사용되지 않음
+                    jaccard = 1.0  # 완전히 겹침 (둘 다 비어있음)
+                elif len(set_i) == 0 or len(set_j) == 0:
+                    # 하나만 사용됨
+                    jaccard = 0.0  # 겹침 없음
+                else:
+                    # Jaccard similarity: |A ∩ B| / |A ∪ B|
+                    intersection = len(set_i & set_j)
+                    union = len(set_i | set_j)
+                    jaccard = intersection / union if union > 0 else 0.0
+                
+                expert_overlaps.append(jaccard)
+        
+        # 평균 Expert Overlap (낮을수록 specialization 우수)
+        expert_overlap_mean = np.mean(expert_overlaps) if expert_overlaps else 0.0
+        expert_overlap_std = np.std(expert_overlaps) if expert_overlaps else 0.0
+        expert_overlap_max = np.max(expert_overlaps) if expert_overlaps else 0.0
+        
         return {
             'expert_activation_entropy': normalized_entropy.item(),
             'expert_similarity_mean': expert_similarity_mean.item(),
@@ -316,6 +373,10 @@ class GramSpecAnalyzer:
             'expert_specialization_strength': specialization_strength,
             'expert_concentration': expert_concentration,
             'expert_utilization_rate': (expert_activation_counts > 0).float().mean().item(),
+            # Expert Overlap (Jaccard Similarity) - 논문 필수 지표
+            'expert_overlap_mean': expert_overlap_mean,
+            'expert_overlap_std': expert_overlap_std,
+            'expert_overlap_max': expert_overlap_max,
         }
     
     def _compute_routing_decision_quality(
@@ -671,6 +732,27 @@ class GramSpecAnalyzer:
         # Standard deviation of tokens per expert (for aux loss calculation)
         std_tokens_per_expert = token_counts_std
         
+        # Gini Coefficient - 논문 필수 지표 (LPR paper에서 사용)
+        # Load distribution inequality 측정 (0 = perfect equality, 1 = perfect inequality)
+        # Formula: G = (2 * sum(i * sorted_loads[i])) / (n * sum(sorted_loads)) - (n + 1) / n
+        # Simplified: G = 1 - 2 * sum(cumulative_proportion) / n
+        expert_loads_sorted = torch.sort(expert_token_counts, descending=False)[0].cpu().numpy()
+        total_load = expert_loads_sorted.sum()
+        if total_load > 0:
+            # Cumulative proportion
+            cumulative_proportion = np.cumsum(expert_loads_sorted) / total_load
+            # Gini coefficient
+            n = len(expert_loads_sorted)
+            gini_coefficient = 1.0 - 2.0 * cumulative_proportion.sum() / (n + 1e-8)
+        else:
+            gini_coefficient = 0.0
+        
+        # Min-max Expert Load Ratio - 논문 필수 지표 (LPR paper에서 사용)
+        # min(expert_load) / max(expert_load) (높을수록 균형, 1.0 = perfect balance)
+        min_expert_load = expert_token_counts.min().item()
+        max_expert_load = expert_token_counts.max().item()
+        min_max_expert_load_ratio = min_expert_load / (max_expert_load + 1e-8)
+        
         return {
             'expert_token_counts': expert_token_counts.cpu().numpy().tolist(),
             'expert_weighted_counts': expert_weighted_counts.cpu().numpy().tolist(),
@@ -705,6 +787,9 @@ class GramSpecAnalyzer:
             'routing_type': routing_type,
             'token_choice_entropy': token_choice_entropy,
             'std_tokens_per_expert': std_tokens_per_expert,
+            # 논문 필수 지표 추가
+            'gini_coefficient': gini_coefficient,
+            'min_max_expert_load_ratio': min_max_expert_load_ratio,
         }
     
     def _compute_inference_cost_metrics(
@@ -835,6 +920,25 @@ class GramSpecAnalyzer:
             metrics['avg_expert_specialization_strength'] = np.mean(self.expert_specialization_strength_history)
             metrics['final_expert_specialization_strength'] = self.expert_specialization_strength_history[-1]
         
+        # 논문 필수 지표 집계
+        if hasattr(self, 'expert_overlap_history') and self.expert_overlap_history:
+            metrics['avg_expert_overlap'] = np.mean(self.expert_overlap_history)
+            metrics['final_expert_overlap'] = self.expert_overlap_history[-1]
+            metrics['min_expert_overlap'] = np.min(self.expert_overlap_history)
+            metrics['max_expert_overlap'] = np.max(self.expert_overlap_history)
+        
+        if hasattr(self, 'gini_coefficient_history') and self.gini_coefficient_history:
+            metrics['avg_gini_coefficient'] = np.mean(self.gini_coefficient_history)
+            metrics['final_gini_coefficient'] = self.gini_coefficient_history[-1]
+            metrics['min_gini_coefficient'] = np.min(self.gini_coefficient_history)
+            metrics['max_gini_coefficient'] = np.max(self.gini_coefficient_history)
+        
+        if hasattr(self, 'min_max_expert_load_ratio_history') and self.min_max_expert_load_ratio_history:
+            metrics['avg_min_max_expert_load_ratio'] = np.mean(self.min_max_expert_load_ratio_history)
+            metrics['final_min_max_expert_load_ratio'] = self.min_max_expert_load_ratio_history[-1]
+            metrics['min_min_max_expert_load_ratio'] = np.min(self.min_max_expert_load_ratio_history)
+            metrics['max_min_max_expert_load_ratio'] = np.max(self.min_max_expert_load_ratio_history)
+        
         # Capacity, Sparsity, Routing metrics 집계 (최신 스텝에서 가져옴)
         # 이들은 per-step metrics이므로 최신 값만 사용
         # 실제로는 per-layer metrics에서 집계해야 하지만, 여기서는 간단히 처리
@@ -876,6 +980,9 @@ class GramSpecAnalyzer:
                 'load_imbalance_ratio': aggregated.get('final_load_imbalance_ratio'),
                 'expert_utilization_rate': aggregated.get('expert_utilization_rate'),
                 'expert_token_distribution': aggregated.get('final_expert_token_counts'),
+                # 논문 필수 지표 추가
+                'gini_coefficient': aggregated.get('final_gini_coefficient'),
+                'min_max_expert_load_ratio': aggregated.get('final_min_max_expert_load_ratio'),
             },
             
             # Expert Specialization Metrics (필수)
@@ -883,6 +990,8 @@ class GramSpecAnalyzer:
                 'expert_diversity_score': aggregated.get('expert_diversity_score'),
                 'expert_similarity_mean': aggregated.get('expert_similarity_mean'),
                 'expert_specialization_strength': aggregated.get('expert_specialization_strength'),
+                # 논문 필수 지표 추가
+                'expert_overlap_mean': aggregated.get('final_expert_overlap'),
             },
             
             # Gram Matrix Quality

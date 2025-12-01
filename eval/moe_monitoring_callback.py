@@ -729,6 +729,14 @@ class TorchMoECallback:
     
     def on_step_end(self, current_step: int, **kwargs):
         """Step 종료 시 호출 - current_step은 필수 매개변수"""
+        
+        # G3MoERouter EMA 수동 업데이트 (Gradient Checkpointing 호환)
+        if self.model is not None:
+            for module in self.model.modules():
+                if hasattr(module, 'update_expert_load_ema') and hasattr(module, 'last_current_load') and module.last_current_load is not None:
+                    module.update_expert_load_ema(module.last_current_load)
+                    module.last_current_load = None
+
         # 현재 step 추적 (디버그 메시지 로깅용)
         self._current_step = current_step
 
@@ -2357,6 +2365,7 @@ class TransformersMoECallbackWrapper(TrainerCallback):
             logs.update(current_metrics)
             
             # ✅ MoE 메트릭을 wandb에 직접 로깅 (Trainer의 WandbCallback이 일부만 로깅할 수 있으므로)
+            # step을 명시하지 않으면 wandb가 자동으로 Trainer의 step을 사용 (충돌 없음)
             try:
                 import wandb
                 if wandb.run is not None and _is_main_process():
@@ -2369,14 +2378,15 @@ class TransformersMoECallbackWrapper(TrainerCallback):
                     }
                     
                     if moe_metrics:
-                        # ✅ Trainer의 step을 명시적으로 사용하여 로깅
-                        # commit=False로 설정하여 Trainer의 로깅과 함께 처리 (step 충돌 방지)
-                        wandb.run.log(moe_metrics, step=state.global_step, commit=False)
+                        # ✅ step을 명시하지 않고 로깅 (wandb가 Trainer의 step을 자동으로 사용)
+                        # commit=False로 설정하여 Trainer의 로깅과 함께 처리
+                        wandb.run.log(moe_metrics, commit=False)
                         
                         if self.torch_callback.log_to_console and state.global_step % 10 == 0:
-                            self.torch_callback._log_debug(f"📤 on_log step {state.global_step}: logged {len(moe_metrics)} MoE metrics to wandb")
-                            sample_keys = list(moe_metrics.keys())[:10]
-                            self.torch_callback._log_debug(f"   Sample keys: {sample_keys}")
+                            self.torch_callback._log_debug(f"📤 on_log step {state.global_step}: directly logged {len(moe_metrics)} MoE metrics to wandb")
+                            if state.global_step <= 5:
+                                sample_keys = list(moe_metrics.keys())[:10]
+                                self.torch_callback._log_debug(f"   Sample keys: {sample_keys}")
                     
                     # Heatmap/t-SNE는 별도 로깅 (이미지이므로)
                     if state.global_step in self.torch_callback.pending_heatmaps:
