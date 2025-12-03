@@ -313,9 +313,9 @@ class CommandKeywordComponent(RewardComponent):
 class InstructionComplianceComponent(RewardComponent):
     """
     Instruction 준수 여부 및 환각 체크 (Reflection & Penalty)
-    가중치: 0.20
+    가중치: 0.15
     """
-    def __init__(self, weight: float = 0.20):
+    def __init__(self, weight: float = 0.15):
         super().__init__(name="instruction_compliance", weight=weight)
         # 금지된 메타 명령어 패턴 (확장되지 않은 형태)
         self.forbidden_patterns = [
@@ -338,28 +338,41 @@ class InstructionComplianceComponent(RewardComponent):
         # 1. 금지된 명령어 사용 체크 (Penalty)
         for pattern in self.forbidden_patterns:
             if re.search(pattern, completion_lower):
-                score -= 0.2  # 금지어 사용 시 감점
+                score -= 0.3  # 금지어 사용 시 큰 감점
 
-        # 2. 포맷 규칙 체크: "number N"으로 시작 여부 (Semicolon 단위)
+        # 2. 포맷 규칙 체크: "number N, command" 형식이어야 함 (강화)
         commands = completion_lower.split(';')
         valid_format_count = 0
         total_commands = 0
+        format_errors = []
+        
         for cmd in commands:
             cmd = cmd.strip()
             if not cmd: continue
             total_commands += 1
-            # "number 숫자"로 시작해야 함
+            
+            # 올바른 형식: "number N, command, ..." (쉼표로 구분)
+            # 잘못된 형식: "number N; command" 또는 "number N"만 있음
             if re.match(r'^number\s+\d+', cmd):
-                valid_format_count += 1
+                # "number N, command" 형식인지 확인
+                if ',' in cmd:
+                    # 쉼표가 있으면 형식상 올바름
+                    valid_format_count += 1
+                else:
+                    # "number N"만 있고 명령어가 없음 - 심각한 오류
+                    format_errors.append("missing_command")
+            else:
+                format_errors.append("no_number_prefix")
         
         if total_commands > 0:
             format_ratio = valid_format_count / total_commands
-            # 포맷 준수율이 낮으면 점수 깎음
-            score *= format_ratio
+            # 포맷 오류가 많으면 강한 페널티
+            if format_ratio < 0.5:
+                score *= 0.3  # 절반 이상 형식 오류면 큰 감점
+            else:
+                score *= format_ratio
 
-        # 3. 환각 체크 (Reflection with GT)
-        # GT에 없는 단어를 사용했는지 체크 (단, base_keywords는 제외)
-        # 이는 모델이 없는 명령어를 지어내는 것을 방지함
+        # 3. 환각 체크 (Reflection with GT) - 강화
         if ground_truth_lower:
             gen_words = set(re.findall(r'[a-z]+', completion_lower))
             gt_words = set(re.findall(r'[a-z]+', ground_truth_lower))
@@ -367,8 +380,8 @@ class InstructionComplianceComponent(RewardComponent):
             # GT에 없고, 기본 키워드도 아닌 단어들
             hallucinated_words = gen_words - gt_words - self.base_keywords
             if hallucinated_words:
-                # 환각 단어가 있으면 감점 (단어 개수에 비례하여)
-                penalty = min(0.5, len(hallucinated_words) * 0.1)
+                # 환각 단어가 있으면 강한 감점
+                penalty = min(0.7, len(hallucinated_words) * 0.15)
                 score -= penalty
 
         return max(0.0, score)
@@ -376,10 +389,10 @@ class InstructionComplianceComponent(RewardComponent):
 
 class SequenceSimilarityComponent(RewardComponent):
     """
-    정답과의 시퀀스 유사도 (LCS ratio)
-    가중치: 0.10
+    정답과의 시퀀스 유사도 (LCS ratio + Token-level matching)
+    가중치: 0.25
     """
-    def __init__(self, weight: float = 0.10):
+    def __init__(self, weight: float = 0.25):
         super().__init__(name="sequence_similarity", weight=weight)
 
     def calculate(self, completion: str, ground_truth: str = None, **kwargs) -> float:
@@ -389,9 +402,66 @@ class SequenceSimilarityComponent(RewardComponent):
         completion = str(completion)
         ground_truth = str(ground_truth)
         
-        # SequenceMatcher를 이용한 유사도 계산
+        # 1. 전체 문자열 유사도 (LCS)
         matcher = difflib.SequenceMatcher(None, completion, ground_truth)
-        return matcher.ratio()
+        string_similarity = matcher.ratio()
+        
+        # 2. Token-level 유사도 (세미콜론으로 분리된 명령어 단위)
+        gen_commands = [c.strip() for c in completion.split(';') if c.strip()]
+        gt_commands = [c.strip() for c in ground_truth.split(';') if c.strip()]
+        
+        if not gt_commands:
+            return 1.0 if not gen_commands else 0.0
+        
+        if not gen_commands:
+            return 0.0
+        
+        # 각 GT 명령어에 대해 가장 유사한 Gen 명령어 찾기
+        matched_indices = set()
+        match_scores = []
+        
+        for gt_cmd in gt_commands:
+            best_score = 0.0
+            best_idx = -1
+            for idx, gen_cmd in enumerate(gen_commands):
+                if idx in matched_indices:
+                    continue
+                # 간단한 유사도 (공통 토큰 비율)
+                score = self._command_token_similarity(gen_cmd, gt_cmd)
+                if score > best_score:
+                    best_score = score
+                    best_idx = idx
+            
+            if best_idx >= 0:
+                matched_indices.add(best_idx)
+            match_scores.append(best_score)
+        
+        token_similarity = sum(match_scores) / len(gt_commands) if match_scores else 0.0
+        
+        # 3. 명령어 개수 페널티
+        count_penalty = 1.0
+        if len(gen_commands) != len(gt_commands):
+            count_diff = abs(len(gen_commands) - len(gt_commands))
+            count_penalty = 1.0 - (count_diff / max(len(gen_commands), len(gt_commands))) * 0.5
+        
+        # 종합 점수 (Token-level이 더 중요)
+        final_score = (token_similarity * 0.6 + string_similarity * 0.4) * count_penalty
+        
+        return max(0.0, min(1.0, final_score))
+    
+    def _command_token_similarity(self, cmd1: str, cmd2: str) -> float:
+        """두 명령어의 토큰 유사도"""
+        # 토큰화 (공백, 쉼표로 분리)
+        tokens1 = set(re.findall(r'[a-z0-9]+', cmd1.lower()))
+        tokens2 = set(re.findall(r'[a-z0-9]+', cmd2.lower()))
+        
+        if not tokens1 or not tokens2:
+            return 0.0
+        
+        intersection = tokens1 & tokens2
+        union = tokens1 | tokens2
+        
+        return len(intersection) / len(union) if union else 0.0
 
 
 class StructuralComponent(RewardComponent):
@@ -496,17 +566,149 @@ class ComponentRewardWrapper:
         return self.component_name
 
 
+class OrderPenaltyComponent(RewardComponent):
+    """
+    명령어 순서 오류 페널티
+    가중치: 0.15
+    """
+    def __init__(self, weight: float = 0.15):
+        super().__init__(name="order_penalty", weight=weight)
+    
+    def calculate(self, completion: str, ground_truth: str = None, **kwargs) -> float:
+        if not ground_truth:
+            return 0.0
+        
+        completion = str(completion)
+        ground_truth = str(ground_truth)
+        
+        # 명령어를 세미콜론으로 분리
+        gen_commands = [c.strip() for c in completion.split(';') if c.strip()]
+        gt_commands = [c.strip() for c in ground_truth.split(';') if c.strip()]
+        
+        if not gt_commands:
+            return 1.0 if not gen_commands else 0.0
+        
+        if not gen_commands:
+            return 0.0
+        
+        # 각 명령어를 정규화하여 비교 가능하게 만들기
+        gen_normalized = [self._normalize_command(cmd) for cmd in gen_commands]
+        gt_normalized = [self._normalize_command(cmd) for cmd in gt_commands]
+        
+        # LCS를 사용하여 순서가 맞는 명령어 찾기
+        lcs_length = self._lcs_length(gen_normalized, gt_normalized)
+        
+        # 순서 정확도 = LCS 길이 / GT 명령어 개수
+        order_accuracy = lcs_length / len(gt_normalized) if gt_normalized else 0.0
+        
+        # 순서 오류 페널티 계산
+        # 순서가 완전히 맞으면 1.0, 순서가 많이 틀렸으면 0.0에 가까움
+        score = order_accuracy
+        
+        # 추가 페널티: 순서가 완전히 뒤바뀐 경우
+        if len(gen_normalized) == len(gt_normalized):
+            # 역순인지 확인
+            if gen_normalized == list(reversed(gt_normalized)):
+                score = 0.2  # 완전 역순이면 강한 페널티
+        
+        # 순서 오류가 심각한 경우 추가 페널티
+        if order_accuracy < 0.5:
+            # 절반 이상 순서가 틀렸으면 추가 감점
+            score *= 0.5
+        
+        return max(0.0, score)
+    
+    def _normalize_command(self, cmd: str) -> str:
+        """명령어를 정규화하여 비교 가능하게 만들기"""
+        # 소문자 변환 및 공백 정규화
+        normalized = re.sub(r'\s+', ' ', cmd.lower().strip())
+        # 숫자 부분은 유지하되, 공백 제거
+        normalized = re.sub(r'(\d+)\s+(\d+)', r'\1 \2', normalized)
+        return normalized
+    
+    def _lcs_length(self, seq1: List[str], seq2: List[str]) -> int:
+        """두 시퀀스의 최장 공통 부분 수열(LCS) 길이 계산"""
+        m, n = len(seq1), len(seq2)
+        dp = [[0] * (n + 1) for _ in range(m + 1)]
+        
+        for i in range(1, m + 1):
+            for j in range(1, n + 1):
+                # 명령어 유사도 계산 (정확 일치 또는 높은 유사도)
+                similarity = self._command_similarity(seq1[i-1], seq2[j-1])
+                if similarity > 0.8:  # 80% 이상 유사하면 같은 명령어로 간주
+                    dp[i][j] = dp[i-1][j-1] + 1
+                else:
+                    dp[i][j] = max(dp[i-1][j], dp[i][j-1])
+        
+        return dp[m][n]
+    
+    def _command_similarity(self, cmd1: str, cmd2: str) -> float:
+        """두 명령어의 유사도 계산"""
+        if cmd1 == cmd2:
+            return 1.0
+        
+        # 토큰 기반 유사도
+        tokens1 = set(re.findall(r'[a-z0-9]+', cmd1))
+        tokens2 = set(re.findall(r'[a-z0-9]+', cmd2))
+        
+        if not tokens1 or not tokens2:
+            return 0.0
+        
+        intersection = tokens1 & tokens2
+        union = tokens1 | tokens2
+        
+        return len(intersection) / len(union) if union else 0.0
+
+
+class ExactMatchComponent(RewardComponent):
+    """
+    정확한 매칭 보너스 (Ground Truth와 완전 일치)
+    가중치: 0.10
+    """
+    def __init__(self, weight: float = 0.10):
+        super().__init__(name="exact_match", weight=weight)
+    
+    def calculate(self, completion: str, ground_truth: str = None, **kwargs) -> float:
+        if not ground_truth:
+            return 0.0
+        
+        completion = str(completion).strip()
+        ground_truth = str(ground_truth).strip()
+        
+        # 완전 일치
+        if completion == ground_truth:
+            return 1.0
+        
+        # 공백/대소문자 정규화 후 비교
+        completion_norm = re.sub(r'\s+', ' ', completion.lower().strip())
+        ground_truth_norm = re.sub(r'\s+', ' ', ground_truth.lower().strip())
+        
+        if completion_norm == ground_truth_norm:
+            return 0.95
+        
+        # 부분 일치 (GT의 주요 부분이 포함되어 있는지)
+        # GT의 80% 이상이 포함되어 있으면 보너스
+        if len(ground_truth_norm) > 0:
+            overlap_ratio = len(set(ground_truth_norm.split()) & set(completion_norm.split())) / len(set(ground_truth_norm.split()))
+            if overlap_ratio >= 0.8:
+                return 0.7
+        
+        return 0.0
+
+
 class CommandRewardFunction:
     """치과 명령어 GRPO Reward"""
     
     def __init__(self, config: Dict = None):
         self.components = [
-            ToothNumberComponent(weight=0.40),          # 치아 번호 정확도 (가장 중요)
-            CommandKeywordComponent(weight=0.20),       # 명령어 키워드 매칭
-            InstructionComplianceComponent(weight=0.20), # 지시 준수 및 환각 체크 (New)
-            SequenceSimilarityComponent(weight=0.10),   # 전체 시퀀스 유사도 (New)
-            StructuralComponent(weight=0.05),           # 구조적 정확도
-            NumericalValueComponent(weight=0.05)        # 수치값 정확도
+            SequenceSimilarityComponent(weight=0.25),   # 전체 시퀀스 유사도 (GT 중심)
+            ToothNumberComponent(weight=0.20),          # 치아 번호 정확도
+            OrderPenaltyComponent(weight=0.15),        # 명령어 순서 오류 페널티 (New)
+            CommandKeywordComponent(weight=0.15),       # 명령어 키워드 매칭
+            ExactMatchComponent(weight=0.10),          # 정확한 매칭 보너스
+            InstructionComplianceComponent(weight=0.10), # 지시 준수 및 환각 체크
+            StructuralComponent(weight=0.03),           # 구조적 정확도
+            NumericalValueComponent(weight=0.02)        # 수치값 정확도
         ]
         self.config = config or {}
     

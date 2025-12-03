@@ -110,9 +110,45 @@ COMMON RULES:
 """
 
         try:
-            # 각 sample_prompt 앞에 system prompt 추가
-            prompts_to_process = [system_prompt + f"Convert: {prompt}\n\nOutput (commands only):" 
-                                 for prompt in sample_prompts[:self.max_samples]]
+            # Chat template을 사용하여 system prompt와 user prompt 분리
+            # tokenizer에 chat_template이 있는지 확인
+            has_chat_template = hasattr(tokenizer, 'apply_chat_template') and tokenizer.chat_template is not None
+            
+            if has_chat_template:
+                # Chat template 사용 (Qwen, Llama 등)
+                messages_list = []
+                for prompt in sample_prompts[:self.max_samples]:
+                    messages = [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": f"Convert: {prompt}\n\nOutput (commands only):"}
+                    ]
+                    messages_list.append(messages)
+                
+                # 각 메시지를 chat template으로 변환
+                prompts_to_process = []
+                for messages in messages_list:
+                    try:
+                        # add_generation_prompt 파라미터 지원 여부 확인
+                        prompt_text = tokenizer.apply_chat_template(
+                            messages, 
+                            tokenize=False, 
+                            add_generation_prompt=True
+                        )
+                    except TypeError:
+                        # add_generation_prompt가 지원되지 않는 경우
+                        prompt_text = tokenizer.apply_chat_template(
+                            messages, 
+                            tokenize=False
+                        )
+                    prompts_to_process.append(prompt_text)
+            else:
+                # Chat template이 없는 경우 (fallback)
+                # 일반적인 형식: system prompt + user prompt
+                prompts_to_process = [
+                    f"{system_prompt}Convert: {prompt}\n\nOutput (commands only):"
+                    for prompt in sample_prompts[:self.max_samples]
+                ]
+            
             inputs = tokenizer(
                 text=prompts_to_process, 
                 return_tensors="pt", 
@@ -316,7 +352,10 @@ class UnslothGRPOTrainWorkflow:
             self.model = FastLanguageModel.get_peft_model(
                 self.model,
                 r=16,
-                target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+                target_modules=[
+                    "q_proj", #"k_proj", "v_proj", 
+                    "o_proj", 
+                    "gate_proj", "up_proj", "down_proj"],
                 lora_alpha=16,
                 lora_dropout=0,
                 bias="none",

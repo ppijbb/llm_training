@@ -47,6 +47,7 @@ from optimizers.deepspeed_optimizer_registry import register_custom_optimizers
 from eval.callbacks import ModelEvalCallback
 from eval.ifeval_callback import IFEvalCallback
 from eval.moe_monitoring_callback import create_moe_callback_for_transformers
+from eval.router_weight_callback import RouterWeightTrackingCallback
 
 # Register custom optimizers with DeepSpeed
 register_custom_optimizers()
@@ -508,8 +509,368 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
 
     # Setup LoRA if requested
     if model_config["use_lora"]:
-        # G3MoERouter는 PEFT에서 지원하지 않으므로 target_modules에서 제외
-        # Router는 PEFT 적용 후 수동으로 trainable로 설정
+        # MoE 레이어 기반으로 router와 서브모듈 찾기
+        # 모델 구조: model.language_model.layers.{layer_idx}.moe.router
+        logger.info("🔍 Scanning model structure for trainable MoE modules...")
+        from models.g3moe_model import G3MoEGRINMoE, G3MoERouter
+        
+        # 1. MoE 레이어 찾기 (여러 방법 시도)
+        moe_layers = []
+        
+        # 방법 1: isinstance로 찾기
+        for name, module in model.named_modules():
+            if isinstance(module, G3MoEGRINMoE):
+                moe_layers.append(name)
+                logger.info(f"✓ Found MoE layer (isinstance): {name}")
+        
+        # 방법 2: 이름 패턴으로 찾기 (isinstance로 못 찾은 경우)
+        if not moe_layers:
+            logger.warning("⚠️ No MoE layers found with isinstance - trying name pattern...")
+            for name, module in model.named_modules():
+                # "moe"가 이름에 포함되고 router 속성이 있는 모듈 찾기
+                if '.moe' in name and hasattr(module, 'router'):
+                    if isinstance(module.router, G3MoERouter):
+                        if name not in moe_layers:
+                            moe_layers.append(name)
+                            logger.info(f"✓ Found MoE layer (name pattern): {name}")
+        
+        # 방법 3: DecoderLayer에서 moe 속성 찾기
+        if not moe_layers:
+            logger.warning("⚠️ Still no MoE layers found - trying decoder layer structure...")
+            for name, module in model.named_modules():
+                # layers.{idx}.moe 패턴 찾기
+                if '.layers.' in name and name.endswith('.moe'):
+                    if hasattr(module, 'router'):
+                        if name not in moe_layers:
+                            moe_layers.append(name)
+                            logger.info(f"✓ Found MoE layer (decoder structure): {name}")
+        
+        # MoE 레이어를 찾지 못한 경우, router를 직접 찾기
+        if not moe_layers:
+            logger.warning("⚠️ No MoE layers found with isinstance - trying to find routers directly...")
+            # Router를 직접 찾아서 역으로 MoE 레이어 경로 추론
+            routers_found_directly = []
+            for name, module in model.named_modules():
+                if isinstance(module, G3MoERouter):
+                    routers_found_directly.append(name)
+                    # router 경로에서 moe 레이어 경로 추론
+                    # 예: model.language_model.layers.0.moe.router -> model.language_model.layers.0.moe
+                    if '.moe.router' in name:
+                        moe_path = name.rsplit('.router', 1)[0]  # router 앞부분
+                        if moe_path not in moe_layers:
+                            moe_layers.append(moe_path)
+                            logger.info(f"✓ Inferred MoE layer from router: {moe_path} (router: {name})")
+                    elif name.endswith('.router'):
+                        # router만 있고 moe가 이름에 없는 경우
+                        moe_path = name.rsplit('.router', 1)[0]
+                        if moe_path not in moe_layers:
+                            moe_layers.append(moe_path)
+                            logger.info(f"✓ Inferred MoE layer from router: {moe_path} (router: {name})")
+            
+            if routers_found_directly:
+                logger.info(f"✓ Found {len(routers_found_directly)} router(s) directly")
+                # router_full_paths에 직접 추가 (나중에 사용)
+                if 'router_full_paths' not in locals():
+                    router_full_paths = []
+                for router_name in routers_found_directly:
+                    if router_name not in router_full_paths:
+                        router_full_paths.append(router_name)
+        
+        if not moe_layers:
+            logger.error("❌ No MoE layers found - router modules cannot be located")
+            logger.error("   This is a critical error! Check model structure.")
+            # 디버깅: moe 관련 모듈 모두 출력
+            logger.error("   Searching for 'moe' in module names...")
+            moe_related = []
+            for name, module in model.named_modules():
+                if 'moe' in name.lower():
+                    moe_related.append((name, type(module).__name__))
+            if moe_related:
+                logger.error(f"   Found {len(moe_related)} modules with 'moe' in name (first 20):")
+                for name, mod_type in moe_related[:20]:
+                    logger.error(f"     {name}: {mod_type}")
+            else:
+                logger.error("   No modules with 'moe' in name found!")
+            # Router 직접 찾기
+            logger.error("   Searching for routers directly...")
+            routers_found = []
+            for name, module in model.named_modules():
+                if isinstance(module, G3MoERouter):
+                    routers_found.append(name)
+            if routers_found:
+                logger.error(f"   Found {len(routers_found)} router(s) directly:")
+                for router_name in routers_found[:10]:
+                    logger.error(f"     {router_name}")
+                logger.error("   Will use these router paths directly for modules_to_save")
+                # Router 경로를 직접 사용
+                if 'router_full_paths' not in locals():
+                    router_full_paths = []
+                for router_name in routers_found:
+                    router_full_paths.append(router_name)
+                    logger.info(f"  ✓ Using router path directly: {router_name}")
+            else:
+                logger.error("   No routers found either!")
+                logger.error("   Available modules (first 50):")
+                for i, (name, module) in enumerate(model.named_modules()):
+                    if i < 50:
+                        logger.error(f"     {name}: {type(module).__name__}")
+                    else:
+                        break
+        
+        # 2. 각 MoE 레이어의 router와 서브모듈 찾기
+        # (또는 router를 직접 찾은 경우 처리)
+        modules_to_save_list = []
+        # router_full_paths 초기화 (이미 찾은 router가 있으면 유지)
+        if 'router_full_paths' not in locals() or not router_full_paths:
+            router_full_paths = []
+        router_submodule_paths = {
+            'load_balancer': [],
+            'expression_projector': [],
+            'linear_projection': [],
+        }
+        
+        def get_module_by_path(model, path):
+            """경로로 모듈 가져오기
+            경로가 'model.'로 시작하면 제거 (named_modules()는 'model.'로 시작하지만 실제 접근은 그렇지 않음)
+            """
+            module = model
+            # 경로가 'model.'로 시작하면 제거
+            if path.startswith('model.'):
+                path = path[6:]  # 'model.' 제거
+            parts = path.split('.')
+            for part in parts:
+                if hasattr(module, part):
+                    module = getattr(module, part)
+                else:
+                    return None
+            return module
+        
+        # Router를 직접 찾은 경우 (moe_layers가 비어있고 router_full_paths가 있는 경우)
+        if not moe_layers and router_full_paths:
+            logger.info("⚠️ Using routers found directly (MoE layers not found)")
+            # Router 경로에서 서브모듈 찾기
+            for router_path in router_full_paths:
+                router_module = get_module_by_path(model, router_path)
+                if router_module and isinstance(router_module, G3MoERouter):
+                    # 서브모듈들 찾기 (동일한 로직)
+                    if hasattr(router_module, 'load_balancer'):
+                        load_balancer_module = router_module.load_balancer
+                        for name, mod in model.named_modules():
+                            if mod is load_balancer_module:
+                                router_submodule_paths['load_balancer'].append(name)
+                                logger.info(f"    → Found load_balancer: {name}")
+                                break
+                        else:
+                            load_balancer_path = f"{router_path}.load_balancer"
+                            router_submodule_paths['load_balancer'].append(load_balancer_path)
+                            logger.info(f"    → Found load_balancer (constructed): {load_balancer_path}")
+                    
+                    if hasattr(router_module, 'expression_projector'):
+                        expression_projector_module = router_module.expression_projector
+                        ep_actual_path = None
+                        for name, mod in model.named_modules():
+                            if mod is expression_projector_module:
+                                ep_actual_path = name
+                                router_submodule_paths['expression_projector'].append(name)
+                                logger.info(f"    → Found expression_projector: {name}")
+                                break
+                        else:
+                            ep_actual_path = f"{router_path}.expression_projector"
+                            router_submodule_paths['expression_projector'].append(ep_actual_path)
+                            logger.info(f"    → Found expression_projector (constructed): {ep_actual_path}")
+                        
+                        if ep_actual_path and hasattr(expression_projector_module, 'linear_projection'):
+                            linear_projection_module = expression_projector_module.linear_projection
+                            for name, mod in model.named_modules():
+                                if mod is linear_projection_module:
+                                    router_submodule_paths['linear_projection'].append(name)
+                                    logger.info(f"      → Found linear_projection: {name}")
+                                    break
+                            else:
+                                linear_projection_path = f"{ep_actual_path}.linear_projection"
+                                router_submodule_paths['linear_projection'].append(linear_projection_path)
+                                logger.info(f"      → Found linear_projection (constructed): {linear_projection_path}")
+        
+        def has_trainable_params(module):
+            """학습 가능한 파라미터가 있는지 확인"""
+            if module is None:
+                return False
+            params = list(module.parameters(recurse=False))
+            return len(params) > 0 and any(p.requires_grad for p in params)
+        
+        # 각 MoE 레이어에서 router 찾기
+        # 주의: global_router가 공유되므로 named_modules()로 찾으면 하나의 경로만 나올 수 있음
+        # 따라서 각 MoE 레이어 경로를 기반으로 router 경로를 구성해야 함
+        logger.info(f"🔍 Processing {len(moe_layers)} MoE layers to find routers and submodules...")
+        logger.info(f"   MoE layers list: {moe_layers}")
+        if not moe_layers:
+            logger.error("❌ CRITICAL: moe_layers is empty! Cannot proceed with router detection.")
+        for moe_name in moe_layers:
+            logger.info(f"  Processing MoE layer: {moe_name}")
+            # MoE 모듈 가져오기
+            moe_module = get_module_by_path(model, moe_name)
+            if moe_module is None:
+                logger.error(f"  ❌ Cannot access MoE module at {moe_name}")
+                continue
+            logger.info(f"    ✓ Successfully accessed MoE module (type: {type(moe_module).__name__})")
+            
+            # router 속성 확인
+            if not hasattr(moe_module, 'router'):
+                logger.error(f"  ❌ MoE module {moe_name} has no 'router' attribute")
+                continue
+            
+            router_module = moe_module.router
+            if not isinstance(router_module, G3MoERouter):
+                logger.error(f"  ❌ Router at {moe_name}.router is not G3MoERouter (type: {type(router_module).__name__})")
+                continue
+            logger.info(f"    ✓ Found router (type: {type(router_module).__name__})")
+            
+            # MoE 레이어 경로를 기반으로 router 경로 구성
+            # global_router가 공유되므로 각 MoE 레이어마다 다른 경로를 가짐
+            router_actual_path = f"{moe_name}.router"
+            
+            # 실제로 해당 경로에 router가 있는지 확인
+            router_at_path = get_module_by_path(model, router_actual_path)
+            if router_at_path is router_module:
+                router_full_paths.append(router_actual_path)
+                logger.info(f"    ✓ Found router at path: {router_actual_path}")
+            else:
+                # 경로가 맞지 않으면 named_modules로 찾기 시도
+                router_found_path = None
+                for name, mod in model.named_modules():
+                    if mod is router_module and name.endswith('.router'):
+                        # 같은 router 객체이지만 다른 경로일 수 있음
+                        # MoE 레이어와 일치하는지 확인
+                        moe_base = moe_name.split('.moe')[0] if '.moe' in moe_name else moe_name
+                        if name.startswith(moe_base):
+                            router_found_path = name
+                            break
+                
+                if router_found_path:
+                    router_actual_path = router_found_path
+                    router_full_paths.append(router_found_path)
+                    logger.info(f"    ✓ Found router at path (via named_modules): {router_found_path}")
+                else:
+                    # 구성된 경로 사용
+                    router_full_paths.append(router_actual_path)
+                    logger.info(f"    ✓ Using constructed router path: {router_actual_path}")
+            
+            # router 내부 서브모듈들 찾기
+            # load_balancer
+            if hasattr(router_module, 'load_balancer'):
+                load_balancer_module = router_module.load_balancer
+                # 실제 경로 찾기
+                for name, mod in model.named_modules():
+                    if mod is load_balancer_module:
+                        router_submodule_paths['load_balancer'].append(name)
+                        logger.info(f"    → Found load_balancer: {name}")
+                        break
+                else:
+                    # 경로를 찾지 못했으면 구성된 경로 사용
+                    load_balancer_path = f"{router_actual_path}.load_balancer"
+                    router_submodule_paths['load_balancer'].append(load_balancer_path)
+                    logger.info(f"    → Found load_balancer (using constructed path): {load_balancer_path}")
+            
+            # expression_projector
+            if hasattr(router_module, 'expression_projector'):
+                expression_projector_module = router_module.expression_projector
+                # 실제 경로 찾기
+                ep_actual_path = None
+                for name, mod in model.named_modules():
+                    if mod is expression_projector_module:
+                        ep_actual_path = name
+                        router_submodule_paths['expression_projector'].append(name)
+                        logger.info(f"    → Found expression_projector: {name}")
+                        break
+                else:
+                    # 경로를 찾지 못했으면 구성된 경로 사용
+                    ep_actual_path = f"{router_actual_path}.expression_projector"
+                    router_submodule_paths['expression_projector'].append(ep_actual_path)
+                    logger.info(f"    → Found expression_projector (using constructed path): {ep_actual_path}")
+                
+                # linear_projection (expression_projector 내부)
+                if ep_actual_path and hasattr(expression_projector_module, 'linear_projection'):
+                    linear_projection_module = expression_projector_module.linear_projection
+                    # 실제 경로 찾기
+                    for name, mod in model.named_modules():
+                        if mod is linear_projection_module:
+                            router_submodule_paths['linear_projection'].append(name)
+                            logger.info(f"      → Found linear_projection: {name}")
+                            break
+                    else:
+                        # 경로를 찾지 못했으면 구성된 경로 사용
+                        linear_projection_path = f"{ep_actual_path}.linear_projection"
+                        router_submodule_paths['linear_projection'].append(linear_projection_path)
+                        logger.info(f"      → Found linear_projection (using constructed path): {linear_projection_path}")
+        
+        # 3. PEFT modules_to_save에 추가
+        # 전체 경로를 모두 추가 (각 MoE 레이어마다 다른 경로이므로 모두 포함해야 함)
+        logger.info("=" * 80)
+        logger.info("📋 BEFORE ADDING TO modules_to_save:")
+        logger.info(f"   router_full_paths count: {len(router_full_paths)}")
+        logger.info(f"   router_full_paths: {router_full_paths}")
+        logger.info(f"   router_submodule_paths:")
+        for submodule_type, paths in router_submodule_paths.items():
+            logger.info(f"     {submodule_type}: {len(paths)} paths - {paths}")
+        logger.info("=" * 80)
+        
+        seen_paths = set()
+        
+        # router 모듈 추가 (전체 경로)
+        logger.info(f"🔍 Adding {len(router_full_paths)} router(s) to modules_to_save...")
+        for full_path in router_full_paths:
+            if full_path not in seen_paths:
+                modules_to_save_list.append(full_path)
+                seen_paths.add(full_path)
+                logger.info(f"  ✓ Added router to modules_to_save: {full_path}")
+            else:
+                logger.warning(f"  ⚠️ Skipping duplicate router path: {full_path}")
+        
+        # 서브모듈들 추가 (전체 경로)
+        logger.info(f"🔍 Adding submodules to modules_to_save...")
+        for submodule_type, paths in router_submodule_paths.items():
+            logger.info(f"  Processing {submodule_type}: {len(paths)} paths")
+            for full_path in paths:
+                if full_path not in seen_paths:
+                    modules_to_save_list.append(full_path)
+                    seen_paths.add(full_path)
+                    logger.info(f"    ✓ Added {submodule_type} to modules_to_save: {full_path}")
+                else:
+                    logger.warning(f"    ⚠️ Skipping duplicate {submodule_type} path: {full_path}")
+        
+        # 4. expert_load_ema는 register_buffer로 등록된 버퍼이므로 modules_to_save에 포함되지 않음
+        #    router 모듈 자체를 저장하면 자동으로 포함됨
+        expert_load_ema_paths = []
+        for name, _ in model.named_buffers():
+            if 'expert_load_ema' in name:
+                expert_load_ema_paths.append(name)
+        
+        if expert_load_ema_paths:
+            logger.info(f"  → Found {len(expert_load_ema_paths)} expert_load_ema buffer(s) (will be saved with router module)")
+        
+        logger.info("=" * 80)
+        logger.info("📋 FINAL modules_to_save_list BEFORE LoraConfig:")
+        logger.info(f"   Total count: {len(modules_to_save_list)}")
+        if modules_to_save_list:
+            logger.info(f"   ✓ Found {len(modules_to_save_list)} trainable module(s) to add to modules_to_save")
+            logger.info(f"   Router paths: {len(router_full_paths)}, Submodule paths: {sum(len(v) for v in router_submodule_paths.values())}")
+            logger.info(f"   Full modules_to_save list:")
+            for i, path in enumerate(modules_to_save_list):
+                logger.info(f"     [{i}] {path}")
+            logger.info(f"   Router full paths: {router_full_paths}")
+            logger.info(f"   Load balancer paths: {router_submodule_paths['load_balancer']}")
+            logger.info(f"   Expression projector paths: {router_submodule_paths['expression_projector']}")
+            logger.info(f"   Linear projection paths: {router_submodule_paths['linear_projection']}")
+        else:
+            logger.error("❌ CRITICAL: modules_to_save_list is EMPTY!")
+            logger.error(f"   MoE layers found: {len(moe_layers)}")
+            logger.error(f"   Router paths found: {len(router_full_paths)}")
+            logger.error(f"   router_full_paths: {router_full_paths}")
+            logger.error(f"   router_submodule_paths: {router_submodule_paths}")
+        logger.info("=" * 80)
+        
+        # LoRA 설정: router를 modules_to_save에 추가하여 PEFT가 자동으로 trainable로 설정하도록 함
+        logger.info(f"🔧 Creating LoraConfig with modules_to_save={modules_to_save_list if modules_to_save_list else None}")
         lora_config = LoraConfig(
             r=model_config["lora_r"],
             lora_alpha=model_config["lora_alpha"],
@@ -520,12 +881,14 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
                 # "router", "routing_temperature", "global_router" 제외 - PEFT 미지원
                 "rnn.weight_ih_l0", "rnn.weight_hh_l0"
             ],
-            # modules_to_save에서도 router 제외 (PEFT가 처리할 수 없음)
+            # Router 모듈을 modules_to_save에 추가 - PEFT가 자동으로 trainable로 설정하고 저장함
+            modules_to_save=modules_to_save_list if modules_to_save_list else None,
             bias="none",
             task_type=TaskType.CAUSAL_LM,
             inference_mode=False,  # 훈련 모드 명시
             fan_in_fan_out=False,  # LoRA 호환성 향상
         )
+        logger.info(f"✅ LoraConfig created. modules_to_save={lora_config.modules_to_save}")
         model = get_peft_model(model, lora_config)
         model.enable_input_require_grads()
         model.print_trainable_parameters()
@@ -536,20 +899,116 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
                 module.lora_A.requires_grad_(True)
                 module.lora_B.requires_grad_(True)
         
-        # G3MoERouter를 찾아서 trainable로 설정 (PEFT 적용 후)
-        from models.g3moe_model import G3MoERouter
-        router_count = 0
-        for name, module in model.named_modules():
-            if isinstance(module, G3MoERouter):
-                for p in module.parameters(recurse=True):
-                    p.requires_grad_(True)
-                router_count += 1
-                logger.info(f"✓ Router module '{name}' set to trainable (not LoRA-wrapped)")
-        
-        if router_count > 0:
-            logger.info(f"✓ {router_count} router module(s) set to fully trainable")
+        # CRITICAL: modules_to_save에 추가한 모듈들은 저장만 되고 자동으로 학습되지 않음
+        # 명시적으로 requires_grad=True 설정 필요
+        logger.info("🔧 Setting requires_grad=True for modules_to_save modules...")
+        if modules_to_save_list:
+            for module_path in modules_to_save_list:
+                try:
+                    module = get_module_by_path(model, module_path)
+                    if module is not None:
+                        # 모든 파라미터에 requires_grad=True 설정
+                        param_count = 0
+                        for param in module.parameters(recurse=True):
+                            if not param.requires_grad:
+                                param.requires_grad_(True)
+                                param_count += 1
+                        if param_count > 0:
+                            logger.info(f"  ✓ Enabled training for {module_path} ({param_count} params)")
+                        else:
+                            logger.debug(f"  → {module_path} already has requires_grad=True")
+                    else:
+                        logger.warning(f"  ⚠️ Cannot access module at {module_path}")
+                except Exception as e:
+                    logger.error(f"  ❌ Error setting requires_grad for {module_path}: {e}")
         else:
-            logger.warning("⚠️ No G3MoERouter modules found - router may not be trainable")
+            logger.warning("⚠️ modules_to_save_list is empty - no modules to enable training")
+        
+        # PEFT가 modules_to_save에 추가한 router 모듈이 trainable인지 확인
+        logger.info("🔍 Verifying trainable status of router modules after PEFT setup...")
+        if modules_to_save_list and router_full_paths:
+            verified_modules = {
+                'routers': [],
+                'load_balancers': [],
+                'expression_projectors': [],
+                'linear_projections': [],
+            }
+            
+            # MoE 레이어 기반으로 검증
+            for moe_name in moe_layers:
+                router_path = f"{moe_name}.router"
+                
+                # router 검증
+                router_module = get_module_by_path(model, router_path)
+                if router_module is not None and isinstance(router_module, G3MoERouter):
+                    trainable_params = sum(1 for p in router_module.parameters(recurse=True) if p.requires_grad)
+                    total_params = sum(1 for p in router_module.parameters(recurse=True))
+                    if trainable_params > 0:
+                        verified_modules['routers'].append({
+                            'path': router_path,
+                            'trainable': trainable_params,
+                            'total': total_params
+                        })
+                        logger.info(f"  ✓ Router '{router_path}' is trainable ({trainable_params}/{total_params} params)")
+                    else:
+                        logger.warning(f"  ⚠️ Router '{router_path}' has no trainable parameters")
+                    
+                    # load_balancer 검증
+                    load_balancer_path = f"{router_path}.load_balancer"
+                    load_balancer_module = get_module_by_path(model, load_balancer_path)
+                    if load_balancer_module is not None:
+                        trainable_params = sum(1 for p in load_balancer_module.parameters(recurse=True) if p.requires_grad)
+                        total_params = sum(1 for p in load_balancer_module.parameters(recurse=True))
+                        if trainable_params > 0:
+                            verified_modules['load_balancers'].append({
+                                'path': load_balancer_path,
+                                'trainable': trainable_params,
+                                'total': total_params
+                            })
+                            logger.info(f"    ✓ Load balancer '{load_balancer_path}' is trainable ({trainable_params}/{total_params} params)")
+                    
+                    # expression_projector 검증
+                    expression_projector_path = f"{router_path}.expression_projector"
+                    expression_projector_module = get_module_by_path(model, expression_projector_path)
+                    if expression_projector_module is not None:
+                        trainable_params = sum(1 for p in expression_projector_module.parameters(recurse=True) if p.requires_grad)
+                        total_params = sum(1 for p in expression_projector_module.parameters(recurse=True))
+                        if trainable_params > 0:
+                            verified_modules['expression_projectors'].append({
+                                'path': expression_projector_path,
+                                'trainable': trainable_params,
+                                'total': total_params
+                            })
+                            logger.info(f"    ✓ Expression projector '{expression_projector_path}' is trainable ({trainable_params}/{total_params} params)")
+                        
+                        # linear_projection 검증
+                        linear_projection_path = f"{expression_projector_path}.linear_projection"
+                        linear_projection_module = get_module_by_path(model, linear_projection_path)
+                        if linear_projection_module is not None:
+                            trainable_params = sum(1 for p in linear_projection_module.parameters(recurse=True) if p.requires_grad)
+                            total_params = sum(1 for p in linear_projection_module.parameters(recurse=True))
+                            if trainable_params > 0:
+                                verified_modules['linear_projections'].append({
+                                    'path': linear_projection_path,
+                                    'trainable': trainable_params,
+                                    'total': total_params
+                                })
+                                logger.info(f"      ✓ Linear projection '{linear_projection_path}' is trainable ({trainable_params}/{total_params} params)")
+            
+            # 검증 결과 요약
+            total_verified = sum(len(v) for v in verified_modules.values())
+            logger.info(f"✅ Verification complete: {total_verified} trainable module(s) found")
+            logger.info(f"   - Routers: {len(verified_modules['routers'])}")
+            logger.info(f"   - Load balancers: {len(verified_modules['load_balancers'])}")
+            logger.info(f"   - Expression projectors: {len(verified_modules['expression_projectors'])}")
+            logger.info(f"   - Linear projections: {len(verified_modules['linear_projections'])}")
+            
+            if total_verified == 0:
+                logger.error("❌ No trainable router modules found after PEFT setup! Training may fail.")
+            elif total_verified < len(router_full_paths):
+                logger.warning(f"⚠️ Only {total_verified}/{len(router_full_paths)} router modules are trainable")
+        elif not router_full_paths:
+            logger.warning("⚠️ No router paths found - skipping verification")
         # DDP 정적 그래프 비활성화: MoE 라우팅/LoRA로 스텝마다 활성 파라미터가 달라질 수 있으므로 동적 그래프 허용
         if hasattr(model, '_set_static_graph'):
             model._set_static_graph(True)
@@ -564,7 +1023,9 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
             print(f"⚠️ BF16 cast warning: {cast_e}")
         print("✓ LoRA 적용")
         
-    return model, tokenizer
+    # modules_to_save_list 반환 (Trainer 생성 후 optimizer에 추가하기 위해)
+    modules_to_save_list_to_return = modules_to_save_list if 'modules_to_save_list' in locals() else None
+    return model, tokenizer, modules_to_save_list_to_return
 
 
 def setup_dataset(data_config: Dict[str, Any], tokenizer):
@@ -761,7 +1222,12 @@ def main(
     register_custom_optimizers()
     # Setup model and tokenizer
     print("Setting up model and tokenizer...")
-    model, tokenizer = setup_model_and_tokenizer(model_config)
+    setup_result = setup_model_and_tokenizer(model_config)
+    if len(setup_result) == 3:
+        model, tokenizer, modules_to_save_list = setup_result
+    else:
+        model, tokenizer = setup_result
+        modules_to_save_list = None
     
     # Setup dataset
     print("Setting up dataset...")
@@ -896,6 +1362,182 @@ def main(
     except Exception as e:
         print(f"⚠️ Gradient checkpointing 설정 확인 실패: {e}, 기본값 사용")
         pass
+    # ✅ Router 파라미터 검증 및 학습 가능하도록 강제 설정
+    def ensure_router_in_optimizer(trainer, model, modules_to_save_list=None):
+        """Router 파라미터가 올바르게 학습 가능한지 검증하고 필요시 수정"""
+        try:
+            from models.g3moe_model import G3MoERouter
+            from models.g3moe_model import ExpressionProjector
+            
+            router_params = []
+            router_param_names = []
+            expression_projector_params = []
+            load_balancer_params = []
+            seen_param_ids = set()  # 중복 방지를 위한 set
+            
+            # get_module_by_path 함수 정의 (함수 내부에서 사용)
+            def get_module_by_path_inner(model, path):
+                """경로로 모듈 가져오기"""
+                module = model
+                if path.startswith('model.'):
+                    path = path[6:]  # 'model.' 제거
+                parts = path.split('.')
+                for part in parts:
+                    if hasattr(module, part):
+                        module = getattr(module, part)
+                    else:
+                        return None
+                return module
+            
+            # modules_to_save_list에서 모든 모듈의 파라미터 찾기
+            if modules_to_save_list:
+                logger.info("🔍 Collecting parameters from modules_to_save modules...")
+                for module_path in modules_to_save_list:
+                    try:
+                        module = get_module_by_path_inner(model, module_path)
+                        if module is not None:
+                            for param_name, param in module.named_parameters(recurse=True):
+                                param_id = id(param)
+                                if param_id not in seen_param_ids:
+                                    router_params.append(param)
+                                    router_param_names.append(f"{module_path}.{param_name}")
+                                    seen_param_ids.add(param_id)
+                                    # 타입별 분류
+                                    if 'load_balancer' in module_path:
+                                        load_balancer_params.append(param)
+                                    elif 'expression_projector' in module_path:
+                                        expression_projector_params.append(param)
+                    except Exception as e:
+                        logger.warning(f"  ⚠️ Error accessing {module_path}: {e}")
+            
+            # 추가로 named_modules로도 찾기 (백업)
+            if not router_params:
+                logger.info("🔍 Fallback: Finding router parameters via named_modules...")
+                for name, module in model.named_modules():
+                    if isinstance(module, G3MoERouter):
+                        # Load balancer 파라미터
+                        if hasattr(module, 'load_balancer'):
+                            for param_name, param in module.load_balancer.named_parameters(recurse=True):
+                                param_id = id(param)
+                                if param_id not in seen_param_ids:
+                                    router_params.append(param)
+                                    load_balancer_params.append(param)
+                                    router_param_names.append(f"{name}.load_balancer.{param_name}")
+                                    seen_param_ids.add(param_id)
+                        
+                        # Expression projector 파라미터
+                        if hasattr(module, 'expression_projector'):
+                            expr_proj = module.expression_projector
+                            for param_name, param in expr_proj.named_parameters(recurse=True):
+                                param_id = id(param)
+                                if param_id not in seen_param_ids:
+                                    router_params.append(param)
+                                    expression_projector_params.append(param)
+                                    router_param_names.append(f"{name}.expression_projector.{param_name}")
+                                    seen_param_ids.add(param_id)
+                            
+                            # linear_projection이 별도로 있는 경우
+                            if hasattr(expr_proj, 'linear_projection'):
+                                for param_name, param in expr_proj.linear_projection.named_parameters(recurse=True):
+                                    param_id = id(param)
+                                    if param_id not in seen_param_ids:
+                                        router_params.append(param)
+                                        expression_projector_params.append(param)
+                                        router_param_names.append(f"{name}.expression_projector.linear_projection.{param_name}")
+                                        seen_param_ids.add(param_id)
+            
+            if router_params:
+                logger.info(f"✅ Found {len(router_params)} router parameters for validation")
+                logger.info(f"   - Load balancer params: {len(load_balancer_params)}")
+                logger.info(f"   - Expression projector params: {len(expression_projector_params)}")
+                logger.info(f"   Router param names (first 10): {router_param_names[:10]}")
+                
+                # Step 1: requires_grad=True 강제 설정
+                logger.info("🔧 Step 1: Ensuring requires_grad=True for all router parameters...")
+                fixed_count = 0
+                for param in router_params:
+                    if not param.requires_grad:
+                        param.requires_grad_(True)
+                        fixed_count += 1
+                
+                if fixed_count > 0:
+                    logger.info(f"  ✓ Fixed {fixed_count} parameters: set requires_grad=True")
+                else:
+                    logger.info(f"  ✓ All {len(router_params)} parameters already have requires_grad=True")
+                
+                # 재확인
+                trainable_count = sum(1 for p in router_params if p.requires_grad)
+                logger.info(f"✅ Router parameters: {trainable_count}/{len(router_params)} trainable (after fix)")
+                
+                if trainable_count < len(router_params):
+                    logger.error(f"❌ CRITICAL: {len(router_params) - trainable_count} router parameters still not trainable after fix!")
+                    # 상세 정보 출력
+                    for i, param in enumerate(router_params):
+                        if not param.requires_grad:
+                            logger.error(f"   Param {i}: {router_param_names[i] if i < len(router_param_names) else 'unknown'}, requires_grad={param.requires_grad}")
+                
+                # Expression projector 파라미터 상세 확인
+                expr_trainable = sum(1 for p in expression_projector_params if p.requires_grad)
+                logger.info(f"✅ Expression projector parameters: {expr_trainable}/{len(expression_projector_params)} trainable")
+                if expression_projector_params:
+                    for i, param in enumerate(expression_projector_params[:3]):  # 처음 3개만
+                        logger.info(f"   Expression projector param {i}: shape={param.shape}, requires_grad={param.requires_grad}, dtype={param.dtype}")
+                
+                # Step 2: Optimizer 포함 여부 확인 및 추가
+                logger.info("🔧 Step 2: Checking optimizer inclusion...")
+                if hasattr(trainer, 'optimizer') and trainer.optimizer is not None:
+                    optimizer_param_ids = {id(p) for group in trainer.optimizer.param_groups for p in group['params']}
+                    router_param_ids = {id(p) for p in router_params}
+                    in_optimizer = router_param_ids & optimizer_param_ids
+                    logger.info(f"✅ Router params in optimizer: {len(in_optimizer)}/{len(router_params)}")
+                    
+                    if len(in_optimizer) < len(router_params):
+                        missing_count = len(router_params) - len(in_optimizer)
+                        missing_params = [p for p in router_params if id(p) not in optimizer_param_ids]
+                        logger.warning(f"⚠️ {missing_count} router parameters are not in optimizer!")
+                        
+                        # Optimizer에 명시적으로 추가 시도
+                        if len(trainer.optimizer.param_groups) > 0:
+                            logger.info(f"🔧 Attempting to add {missing_count} missing parameters to optimizer...")
+                            # 첫 번째 param_group에 추가 (일반적으로 기본 학습률 사용)
+                            trainer.optimizer.param_groups[0]['params'].extend(missing_params)
+                            logger.info(f"  ✓ Added {len(missing_params)} parameters to optimizer param_groups[0]")
+                            
+                            # 재확인
+                            optimizer_param_ids_after = {id(p) for group in trainer.optimizer.param_groups for p in group['params']}
+                            in_optimizer_after = router_param_ids & optimizer_param_ids_after
+                            logger.info(f"✅ Router params in optimizer (after fix): {len(in_optimizer_after)}/{len(router_params)}")
+                        else:
+                            logger.error("❌ No param_groups found in optimizer - cannot add parameters")
+                elif hasattr(trainer, 'deepspeed') and trainer.deepspeed is not None:
+                    # DeepSpeed의 경우 requires_grad=True인 파라미터가 자동으로 optimizer에 포함됨
+                    logger.info("✅ DeepSpeed detected - router params with requires_grad=True will be included automatically")
+                    logger.info("   DeepSpeed will handle optimizer registration during training initialization")
+                else:
+                    logger.warning("⚠️ Optimizer not yet initialized - will be checked after training starts")
+                    logger.info("   Note: Some optimizers (e.g., DeepSpeed) initialize lazily")
+            else:
+                logger.error("❌ CRITICAL: No router parameters found in model!")
+                logger.error("   This means router modules are not accessible or have no parameters")
+        except Exception as e:
+            import traceback
+            logger.error(f"❌ Error validating router weights: {e}")
+            logger.error(f"   Traceback: {traceback.format_exc()}")
+    
+    # Trainer 생성 후 router 파라미터를 optimizer에 추가
+    # DeepSpeed의 경우 trainer.train() 호출 전에 해야 함
+    logger.info("=" * 80)
+    logger.info("🔍 FINAL CHECK: Ensuring router parameters are trainable and in optimizer...")
+    logger.info("=" * 80)
+    actual_model = trainer.model
+    if hasattr(trainer.model, 'module'):  # DeepSpeed 래핑
+        actual_model = trainer.model.module
+    
+    # modules_to_save_list 전달 (setup_model_and_tokenizer에서 생성됨)
+    # main 함수에서 modules_to_save_list가 정의되어 있음
+    ensure_router_in_optimizer(trainer, actual_model, modules_to_save_list)
+    logger.info("=" * 80)
+    
     # Add MoE monitoring callback
     trainer.add_callback(
         create_moe_callback_for_transformers(
@@ -913,6 +1555,18 @@ def main(
             save_detailed_logs=False,        # 상세 JSON 로그 저장 여부
             enable_generation_logging=True,  # 생성 로깅 활성화
         ))
+    
+    # Add Router Weight Tracking callback (weight 변화 체크 및 학습 중단)
+    router_weight_callback = RouterWeightTrackingCallback(
+        save_dir=os.path.join(training_args.output_dir, "router_weight_logs"),
+        log_every_n_steps=1,  # 매 step마다 체크
+        check_weight_change=True,  # weight 변화 체크 활성화
+        min_change_threshold=1e-8,  # 최소 변화 임계값
+        check_after_steps=2,  # step 후부터 체크 시작 (step 부터 변화 데이터 있음)
+        verbose=True,
+    )
+    trainer.add_callback(router_weight_callback)
+    logger.info("✅ RouterWeightTrackingCallback added (will stop training if router weights don't change)")
     
     # Add custom training progress callback
     from transformers import TrainerCallback

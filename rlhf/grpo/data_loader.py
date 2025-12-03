@@ -433,8 +433,8 @@ class GRPODataLoader:
         numbering_system: str,
         ground_truth: Optional[str] = None,
         numbering_method: Optional[str] = None
-    ) -> str:
-        """답지 기반 적응형 프롬프트 생성 (로직 + 포맷 규칙)"""
+    ) -> List[Dict[str, str]]:
+        """답지 기반 적응형 프롬프트 생성 (system prompt + user prompt 분리)"""
         
         # Numbering system 정보
         if numbering_system == "FDI":
@@ -447,8 +447,8 @@ class GRPODataLoader:
         if numbering_method:
             numbering_info = numbering_method
         
-        # 기본 출력 형식
-        base_prompt = f"""🦷 PERIODONTAL CHARTING ASSISTANT
+        # System prompt 구성
+        system_prompt = f"""🦷 PERIODONTAL CHARTING ASSISTANT
 
 TASK: Convert natural language into structured command sequences.
 
@@ -462,7 +462,7 @@ Quadrant: {quadrant_mapping}
         
         # 전체 명령어 맵 (평가용)
         if self.available_commands:
-            base_prompt += self._format_available_commands_map() + "\n\n"
+            system_prompt += self._format_available_commands_map() + "\n\n"
         
         # ground_truth 패턴 분석 및 규칙 생성
         patterns = self._analyze_ground_truth_patterns(ground_truth) if ground_truth else {}
@@ -471,13 +471,13 @@ Quadrant: {quadrant_mapping}
         
         # 1. FORMAT RULES (Output Structure)
         if format_rules:
-            base_prompt += "FORMAT RULES (Output Structure):\n"
-            base_prompt += format_rules + "\n\n"
+            system_prompt += "FORMAT RULES (Output Structure):\n"
+            system_prompt += format_rules + "\n\n"
         
         # 2. TRANSFORMATION LOGIC (How to process Input)
         if logic_rules:
-            base_prompt += "TRANSFORMATION LOGIC (How to process Input):\n"
-            base_prompt += "\n".join([f"- {r}" for r in logic_rules]) + "\n\n"
+            system_prompt += "TRANSFORMATION LOGIC (How to process Input):\n"
+            system_prompt += "\n".join([f"- {r}" for r in logic_rules]) + "\n\n"
         
         # 공통 규칙 (최소화)
         common_rules = """COMMON RULES:
@@ -489,10 +489,16 @@ Quadrant: {quadrant_mapping}
 
 """
         
-        base_prompt += common_rules
-        base_prompt += f"Convert: {utterance}\n\nOutput (commands only):"
+        system_prompt += common_rules
         
-        return base_prompt
+        # User prompt 구성
+        user_prompt = f"Convert: {utterance}\n\nOutput (commands only):"
+        
+        # Messages 형식으로 반환 (chat template 사용)
+        return [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ]
 
     def prepare_grpo_data(
         self,
@@ -543,17 +549,23 @@ Quadrant: {quadrant_mapping}
 
             if "prompt" in example and not ("chosen" in example and "rejected" in example):
                 if self.data_mode == "cmd":
-                    # 적응형 프롬프트 생성 (로직 + 포맷 규칙 + 명령어 맵)
+                    # 적응형 프롬프트 생성 (system prompt + user prompt 분리)
                     numbering_system = example.get('numbering_system', 'UNS')
                     numbering_method = example.get('numbering_method', None)
                     ground_truth = example.get('ground_truth') or example.get('label')
+                    utterance = example['prompt']  # 원본 utterance
                     
-                    example["prompt"] = self._build_adaptive_cmd_prompt(
-                        utterance=example['prompt'],
+                    # Messages 형식으로 프롬프트 생성
+                    messages = self._build_adaptive_cmd_prompt(
+                        utterance=utterance,
                         numbering_system=numbering_system,
                         ground_truth=ground_truth,
                         numbering_method=numbering_method
                     )
+                    
+                    # TRL은 messages 형식 또는 문자열 형식 모두 지원
+                    # messages 형식으로 저장 (chat template 사용)
+                    example["prompt"] = messages
                 return {"prompt": example["prompt"]}
 
             # UltraFeedback 형식 변환
