@@ -7,6 +7,44 @@ from copy import deepcopy
 from transformers import TrainerCallback, TrainerControl, TrainerState, TrainingArguments
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 
+# DeepSpeed 지원을 위한 유틸리티 함수
+def get_inference_model_for_generate(model):
+    """
+    DeepSpeed로 감싸진 모델에서 실제 모델을 추출합니다.
+    ZeRO Stage 3의 경우 GatheredParameters 컨텍스트를 반환합니다.
+    
+    Returns:
+        tuple: (actual_model, context_manager) 또는 (actual_model, None)
+    """
+    # DeepSpeed로 감싸진 모델인지 확인
+    if hasattr(model, 'module'):
+        # DeepSpeed engine이 있는지 확인
+        if hasattr(model, 'engine'):
+            engine = model.engine
+            # ZeRO stage 확인
+            try:
+                zero_stage = engine.zero_optimization_stage()
+            except:
+                zero_stage = 0
+            
+            # ZeRO Stage 3인 경우 GatheredParameters 필요
+            if zero_stage == 3:
+                try:
+                    import deepspeed
+                    return model.module, deepspeed.zero.GatheredParameters(model.parameters(), modifier_rank=None)
+                except ImportError:
+                    # deepspeed가 없으면 그냥 module 사용
+                    return model.module, None
+            else:
+                # ZeRO 0, 1, 2는 그냥 module 사용
+                return model.module, None
+        else:
+            # DDP 등 다른 래핑
+            return model.module, None
+    else:
+        # 래핑되지 않은 모델
+        return model, None
+
 try:
     from datasets import load_dataset
 except ImportError:
@@ -151,9 +189,12 @@ class IFEvalCallback(TrainerCallback):
         # Prepare for evaluation
         model.eval()
         
+        # DeepSpeed 모델 처리: 실제 모델 추출
+        inference_model, gather_context = get_inference_model_for_generate(model)
+        
         # Enable cache for faster generation
-        use_cache_orig = getattr(model.config, "use_cache", False)
-        model.config.use_cache = True
+        use_cache_orig = getattr(inference_model.config, "use_cache", False)
+        inference_model.config.use_cache = True
         
         print(f"\n===== Running IFEval evaluation ({self.eval_count}) =====")
         
@@ -176,17 +217,25 @@ class IFEvalCallback(TrainerCallback):
                 # Get pad token ID with appropriate fallback options
                 pad_token_id = getattr(tokenizer, "pad_token_id", None)
                 if pad_token_id is None:
-                    pad_token_id = getattr(model.config, "pad_token_id", 0)
+                    pad_token_id = getattr(inference_model.config, "pad_token_id", 0)
                 
                 # Add pad_token_id to generation config if not present
                 gen_config = self.generation_config.copy()
                 if "pad_token_id" not in gen_config:
                     gen_config["pad_token_id"] = pad_token_id
                 
-                outputs_tok = model.generate(
-                    **prompts_tok,
-                    **gen_config
-                ).to("cpu")
+                # ZeRO Stage 3인 경우 GatheredParameters 컨텍스트 사용
+                if gather_context is not None:
+                    with gather_context:
+                        outputs_tok = inference_model.generate(
+                            **prompts_tok,
+                            **gen_config
+                        ).to("cpu")
+                else:
+                    outputs_tok = inference_model.generate(
+                        **prompts_tok,
+                        **gen_config
+                    ).to("cpu")
             
             # Decode responses
             outputs = [
@@ -259,7 +308,7 @@ class IFEvalCallback(TrainerCallback):
             print(f"Error running IFEval: {e}")
         
         # Restore original use_cache setting
-        model.config.use_cache = use_cache_orig
+        inference_model.config.use_cache = use_cache_orig
         
         return control
     

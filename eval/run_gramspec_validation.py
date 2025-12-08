@@ -31,15 +31,39 @@ def evaluate_model_perplexity(
     
     with torch.no_grad():
         for i, text in enumerate(tqdm(eval_dataset[:max_samples], desc="Evaluating perplexity")):
-            inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
-            inputs = {k: v.to(device) for k, v in inputs.items()}
-            
-            outputs = model(**inputs, labels=inputs['input_ids'])
-            loss = outputs.loss
-            num_tokens = inputs['input_ids'].numel()
-            
-            total_loss += loss.item() * num_tokens
-            total_tokens += num_tokens
+            try:
+                inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
+                inputs = {k: v.to(device) for k, v in inputs.items()}
+                
+                # labels가 있는 경우와 없는 경우 모두 처리
+                if 'input_ids' in inputs:
+                    # labels를 input_ids로 설정 (language modeling)
+                    labels = inputs['input_ids'].clone()
+                    inputs['labels'] = labels
+                
+                outputs = model(**inputs)
+                
+                # loss가 outputs에 있는지 확인
+                if hasattr(outputs, 'loss') and outputs.loss is not None:
+                    loss = outputs.loss
+                else:
+                    # loss가 없으면 logits에서 계산
+                    logits = outputs.logits if hasattr(outputs, 'logits') else None
+                    if logits is not None and 'labels' in inputs:
+                        shift_logits = logits[..., :-1, :].contiguous()
+                        shift_labels = labels[..., 1:].contiguous()
+                        loss_fct = torch.nn.CrossEntropyLoss()
+                        loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+                    else:
+                        continue  # loss를 계산할 수 없으면 스킵
+                
+                num_tokens = inputs['input_ids'].numel()
+                
+                total_loss += loss.item() * num_tokens
+                total_tokens += num_tokens
+            except Exception as e:
+                # 개별 샘플 오류는 스킵
+                continue
     
     perplexity = torch.exp(torch.tensor(total_loss / total_tokens)).item()
     return {'perplexity': perplexity, 'loss': total_loss / total_tokens}

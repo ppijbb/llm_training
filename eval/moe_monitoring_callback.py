@@ -22,6 +22,37 @@ try:
 except ImportError:
     GRAMSPEC_VALIDATION_AVAILABLE = False
 
+# 벤치마크 도구 import
+try:
+    from eval.analyze_expert_specialization import (
+        collect_expert_activations,
+        compute_expert_similarity,
+        analyze_expert_task_correlation,
+    )
+    EXPERT_SPECIALIZATION_AVAILABLE = True
+except ImportError:
+    EXPERT_SPECIALIZATION_AVAILABLE = False
+
+try:
+    from eval.run_gramspec_validation import (
+        evaluate_model_perplexity,
+        run_expression_ablation_study,
+        run_information_processing_comparison,
+    )
+    GRAMSPEC_VALIDATION_SCRIPT_AVAILABLE = True
+except ImportError:
+    GRAMSPEC_VALIDATION_SCRIPT_AVAILABLE = False
+
+try:
+    from eval.measure_efficiency import (
+        measure_forward_throughput,
+        measure_generation_latency,
+        estimate_flops,
+    )
+    EFFICIENCY_MEASUREMENT_AVAILABLE = True
+except ImportError:
+    EFFICIENCY_MEASUREMENT_AVAILABLE = False
+
 def _is_main_process() -> bool:
     """Best-effort check for rank-0 to gate logging/plotting on distributed runs."""
     try:
@@ -191,8 +222,10 @@ class TorchMoECallback:
             print(f"{prefix} {message}")
     
     def register_model(self, model: torch.nn.Module, tokenizer=None):
-        """모델에 hooks 등록하고 토크나이저 설정"""
-        self.model = model
+        """모델에 hooks 등록하고 토크나이저 설정 (치명적 버그 수정: DeepSpeed 래핑 대응)"""
+        # DeepSpeed 래핑 처리 (model.module이 실제 모델)
+        actual_model = model.module if hasattr(model, 'module') else model
+        self.model = actual_model  # ← 이거 안 하면 hook이 wrapper에 걸림
         self.tokenizer = tokenizer
         self._register_hooks()
         
@@ -251,13 +284,18 @@ class TorchMoECallback:
     
     def _is_moe_layer(self, module):
         """MoE 레이어 감지"""
-        # 실제 사용 중인 MoE 레이어 클래스들
+        # 실제 사용 중인 MoE 레이어 클래스들 (치명적 버그 수정: GramSpecMoEGRINMoE 추가)
         moe_class_names = [
-            'G3MoESharedExpertsLayer', 'G3MoESparseGRINBlock', 'G3MoEGRINMoE',
-            'GRINMoESparseMoeBlock', 'G2MoEGRINMoeLayer', 'GramSpecMoEBlock',
-            # 일반적인 패턴들도 유지
-            'gate', 'router', 'expert', 'moe',
-            'SparseMLP', 'MixtralSparseMoeBlock', 'SwitchTransformerMLP'
+            'GramSpecMoEGRINMoE',      # ← 이거 없으면 hook 0개 (가장 중요!)
+            'G3MoESharedExpertsLayer', 
+            'G3MoESparseGRINBlock', 
+            'G3MoEGRINMoE',
+            'GRINMoESparseMoeBlock', 
+            'G2MoEGRINMoeLayer', 
+            'GramSpecMoEBlock',
+            'MixtralSparseMoeBlock',   # 일반적인 패턴들도 유지
+            'SparseMLP', 
+            'SwitchTransformerMLP'
         ]
         
         module_name = module.__class__.__name__
@@ -277,7 +315,9 @@ class TorchMoECallback:
             if router is not None:
                 router_class_name = router.__class__.__name__
                 is_g3moe_router = ('G3MoERouter' in router_class_name or 
+                                  'GramSpecMoERouter' in router_class_name or
                                   'GramSpecRouter' in router_class_name or
+                                  getattr(router, '_is_gramspec_moe_router', False) or
                                   getattr(router, '_is_g3moe_router', False))
         
         is_moe = (is_moe_by_name or 
@@ -520,13 +560,38 @@ class TorchMoECallback:
     
     @torch.no_grad()
     def _extract_routing_info(self, module, input, output):
-        """모듈에서 라우팅 정보 추출"""
+        """모듈에서 라우팅 정보 추출 (치명적 버그 수정: router의 last_xxx 속성 직접 읽기)"""
         routing_info = {}
         # Lightweight mode: avoid retaining large tensors by default
         lightweight = True
 
-        # G3MoE 모델의 라우팅 정보 추출 (우선순위 1: 모듈에서 저장된 정보)
-        if hasattr(module, 'last_selected_experts'):
+        # ===== 우선순위 1: Router에서 직접 추출 (가장 안정적) =====
+        router = getattr(module, 'router', None)
+        if router is not None:
+            # Router의 last_xxx 속성들이 실제로 존재함 (코드 확인 완료)
+            if hasattr(router, 'last_selected_experts') and router.last_selected_experts is not None:
+                selected_experts = router.last_selected_experts
+                # selected_experts: [batch*seq, top_k] 형태
+                if selected_experts.dim() == 2:
+                    selected_experts_flat = selected_experts.flatten()
+                    routing_info['expert_assignments'] = selected_experts_flat
+                else:
+                    routing_info['expert_assignments'] = selected_experts.flatten() if selected_experts.dim() > 0 else selected_experts
+            
+            if hasattr(router, 'last_routing_weights') and router.last_routing_weights is not None:
+                routing_weights = router.last_routing_weights
+                if routing_weights.dim() == 2:
+                    routing_info['routing_probs'] = routing_weights.flatten()
+                else:
+                    routing_info['routing_probs'] = routing_weights.flatten() if routing_weights.dim() > 0 else routing_weights
+            
+            if hasattr(router, 'num_experts'):
+                routing_info['num_experts'] = router.num_experts
+            elif hasattr(router, 'last_num_experts'):
+                routing_info['num_experts'] = router.last_num_experts
+
+        # ===== 우선순위 2: 모듈에서 직접 저장된 정보 (fallback) =====
+        if 'expert_assignments' not in routing_info and hasattr(module, 'last_selected_experts'):
             selected_experts = module.last_selected_experts
             # selected_experts: [batch*seq, top_k] 형태
             if selected_experts.dim() == 2:
@@ -546,18 +611,32 @@ class TorchMoECallback:
             else:
                 routing_info['expert_assignments'] = selected_experts
         
-        # GramSpec 관련 추가 정보 추출
-        if hasattr(module, 'router') and hasattr(module.router, 'expression_projector'):
-            # Expression projection 정보 (lightweight mode에서는 제외)
-            if not lightweight:
-                # Expression logits는 너무 클 수 있으므로 평균만 저장
-                pass
-        
-        # Router에서 직접 추출 가능한 정보
-        if hasattr(module, 'router'):
-            router = module.router
-            # Speciality penalty, expression loss 등은 forward 중에 계산되므로
-            # 별도로 저장하지 않음 (모니터링 콜백에서는 hook으로 추출 불가)
+        # ===== Router에서 Loss 메트릭 직접 추출 (치명적 버그 수정) =====
+        if router is not None:
+            # Router의 last_xxx 속성에서 loss 메트릭 추출
+            if hasattr(router, 'last_speciality_loss') and router.last_speciality_loss is not None:
+                val = router.last_speciality_loss
+                if torch.is_tensor(val):
+                    val = val.detach().to('cpu')
+                routing_info['speciality_loss'] = val
+            elif hasattr(router, 'last_ortho_loss') and router.last_ortho_loss is not None:
+                # ortho_loss를 speciality_loss로도 사용
+                val = router.last_ortho_loss
+                if torch.is_tensor(val):
+                    val = val.detach().to('cpu')
+                routing_info['speciality_loss'] = val
+            
+            if hasattr(router, 'last_cosine_similarities') and router.last_cosine_similarities is not None:
+                val = router.last_cosine_similarities
+                if torch.is_tensor(val):
+                    val = val.detach().to('cpu')
+                routing_info['cosine_similarities'] = val
+            
+            if hasattr(router, 'last_expression_reg_loss') and router.last_expression_reg_loss is not None:
+                val = router.last_expression_reg_loss
+                if torch.is_tensor(val):
+                    val = val.detach().to('cpu')
+                routing_info['expression_loss'] = val
         
         # 실제 G3MoE/GRIN 모델 구조에 맞춘 추출 (우선순위: output에서 직접 추출)
         # G3MoEGRINMoE output: (hidden_states, (routing_probs_full, hn, speciality_loss, cosine_similarities, expression_loss))
@@ -1445,7 +1524,20 @@ class TorchMoECallback:
                     'max_usage_ratio': usage_distribution.max() / (usage_distribution.mean() + 1e-8),
                     'unused_experts': (usage_counts == 0).sum().item(),
                     'active_experts': (usage_counts > 0).sum().item(),
+                    # utilization_mean: usage_distribution의 평균 (각 expert의 평균 사용률)
+                    'utilization_mean': usage_distribution.mean().item(),
                 })
+                
+                # MaxVio (Global Load Imbalance) calculation
+                try:
+                    maxvio = self._calculate_maxvio(usage_counts, num_experts)
+                    # 유효한 값인 경우에만 추가 (None이 아닌 경우)
+                    if maxvio is not None:
+                        layer_metrics['maxvio'] = maxvio
+                except Exception as e:
+                    if self.log_to_console:
+                        self._log_debug(f"Warning: Failed to calculate MaxVio for {layer_name}: {e}")
+                    # 0으로 fallback하지 않음 - 메트릭을 추가하지 않음
             
             if routing_probs is not None:
                 # 라우팅 엔트로피
@@ -1462,6 +1554,28 @@ class TorchMoECallback:
                     'min_entropy': token_entropy.min(),
                     'max_entropy': token_entropy.max(),
                 })
+                
+                # Routing variance calculation
+                try:
+                    routing_variance = self._calculate_routing_variance(routing_probs)
+                    # 유효한 값인 경우에만 추가 (None이 아닌 경우)
+                    if routing_variance is not None:
+                        layer_metrics['routing_variance'] = routing_variance
+                except Exception as e:
+                    if self.log_to_console:
+                        self._log_debug(f"Warning: Failed to calculate routing variance for {layer_name}: {e}")
+                    # 0으로 fallback하지 않음 - 메트릭을 추가하지 않음
+                
+                # Top-k score gap calculation
+                try:
+                    topk_gap = self._calculate_topk_score_gap(routing_probs)
+                    # 유효한 값인 경우에만 추가 (None이 아닌 경우)
+                    if topk_gap is not None:
+                        layer_metrics['topk_score_gap'] = topk_gap
+                except Exception as e:
+                    if self.log_to_console:
+                        self._log_debug(f"Warning: Failed to calculate top-k gap for {layer_name}: {e}")
+                    # 0으로 fallback하지 않음 - 메트릭을 추가하지 않음
             
             # G3MoE specific metrics
             if 'speciality_loss' in routing_info and routing_info['speciality_loss'] is not None:
@@ -1485,6 +1599,27 @@ class TorchMoECallback:
                 else:
                     layer_metrics['expression_loss'] = float(val)
             
+            # Gram matrix orthogonality calculation (if routing_logits available)
+            # Check multiple possible keys for routing logits
+            routing_logits = (routing_info.get('gate_logits') or 
+                            routing_info.get('routing_logits') or
+                            routing_info.get('router_logits'))
+            if routing_logits is not None and torch.is_tensor(routing_logits) and routing_logits.numel() > 0:
+                try:
+                    # Ensure routing_logits is on CPU for calculation
+                    if routing_logits.is_cuda:
+                        routing_logits_cpu = routing_logits.detach().cpu()
+                    else:
+                        routing_logits_cpu = routing_logits.detach()
+                    gram_ortho = self._calculate_gram_orthogonality(routing_logits_cpu)
+                    # 유효한 값인 경우에만 추가 (None이 아닌 경우)
+                    if gram_ortho is not None:
+                        layer_metrics['gram_orthogonality'] = gram_ortho
+                except Exception as e:
+                    if self.log_to_console and hasattr(self, '_current_step') and self._current_step % 100 == 0:
+                        self._log_debug(f"Warning: Failed to calculate Gram orthogonality for {layer_name}: {e}")
+                    # Don't add gram_orthogonality if calculation fails - gracefully skip
+            
             metrics[layer_name] = layer_metrics
         
         # Layer-wise balance 분석 (실제 검증 지표)
@@ -1504,6 +1639,148 @@ class TorchMoECallback:
                 metrics['_layer_wise_balance'] = layer_balance_metrics
         
         return metrics
+
+    @torch.no_grad()
+    def _calculate_maxvio(self, usage_counts, num_experts):
+        """Calculate MaxVio (Global Load Imbalance) metric.
+        
+        MaxVio = max(|load_i - target|) / target
+        where target = total_tokens / num_experts
+        
+        Args:
+            usage_counts: Tensor of shape [num_experts] with token counts per expert
+            num_experts: Number of experts
+            
+        Returns:
+            MaxVio value as float, or None if calculation is not possible
+        """
+        if usage_counts is None or usage_counts.numel() == 0:
+            return None
+        
+        total_tokens = usage_counts.sum().float()
+        if total_tokens == 0:
+            return None
+        
+        target_per_expert = total_tokens / num_experts
+        deviations = torch.abs(usage_counts.float() - target_per_expert)
+        maxvio = deviations.max() / (target_per_expert + 1e-8)
+        return maxvio.item()
+    
+    @torch.no_grad()
+    def _calculate_routing_variance(self, routing_probs):
+        """Calculate routing variance metric.
+        
+        Measures the variance of routing probability distributions across experts.
+        Higher variance indicates more discriminative routing decisions.
+        
+        Args:
+            routing_probs: Tensor of shape [N, num_experts] with routing probabilities
+            
+        Returns:
+            Average variance across tokens as float, or None if calculation is not possible
+        """
+        if routing_probs is None or routing_probs.numel() == 0:
+            return None
+        
+        # Ensure 2D: [N, num_experts]
+        if routing_probs.dim() > 2:
+            routing_probs = routing_probs.view(-1, routing_probs.size(-1))
+        elif routing_probs.dim() == 1:
+            # Single token case, reshape to [1, num_experts]
+            routing_probs = routing_probs.unsqueeze(0)
+        
+        # Need at least 2 experts for variance calculation
+        if routing_probs.size(-1) < 2:
+            return None
+        
+        # Calculate variance across experts for each token, then average
+        token_variances = torch.var(routing_probs, dim=-1)
+        return token_variances.mean().item()
+    
+    @torch.no_grad()
+    def _calculate_topk_score_gap(self, routing_probs):
+        """Calculate top-k score gap metric.
+        
+        Measures the difference between top-1 and top-2 routing scores.
+        Larger gap indicates more confident routing decisions.
+        
+        Args:
+            routing_probs: Tensor of shape [N, num_experts] with routing probabilities
+            
+        Returns:
+            Average gap between top-1 and top-2 scores as float, or None if calculation is not possible
+        """
+        if routing_probs is None or routing_probs.numel() == 0:
+            return None
+        
+        # Ensure 2D: [N, num_experts]
+        if routing_probs.dim() > 2:
+            routing_probs = routing_probs.view(-1, routing_probs.size(-1))
+        elif routing_probs.dim() == 1:
+            routing_probs = routing_probs.unsqueeze(0)
+        
+        # Need at least 2 experts for top-k gap
+        if routing_probs.size(-1) < 2:
+            return None
+        
+        # Get top-2 values for each token
+        top_k_values, _ = torch.topk(routing_probs, k=min(2, routing_probs.size(-1)), dim=-1)
+        
+        if top_k_values.size(-1) < 2:
+            return None
+        
+        # Calculate gap: top-1 - top-2
+        gap = (top_k_values[:, 0] - top_k_values[:, 1]).mean()
+        return gap.item()
+    
+    @torch.no_grad()
+    def _calculate_gram_orthogonality(self, routing_logits):
+        """Calculate Gram matrix orthogonality metric.
+        
+        Measures how orthogonal the expert representations are by computing
+        the Frobenius norm of (Gram - I) where Gram is the Gram matrix of
+        normalized routing logits.
+        
+        Args:
+            routing_logits: Tensor of shape [N, num_experts, router_dim] or [N, router_dim]
+            
+        Returns:
+            Orthogonality residual (Frobenius norm) as float, or None if calculation is not possible
+        """
+        if routing_logits is None or routing_logits.numel() == 0:
+            return None
+        
+        # Handle different input shapes
+        if routing_logits.dim() == 2:
+            # [N, router_dim] - single expert representation per token
+            # Normalize
+            normalized = F.normalize(routing_logits, p=2, dim=-1)
+            # Compute Gram matrix: [N, router_dim] @ [router_dim, N] = [N, N]
+            gram = torch.matmul(normalized, normalized.t())
+            # Identity matrix
+            identity = torch.eye(gram.size(0), device=gram.device, dtype=gram.dtype)
+            # Frobenius norm of difference
+            diff = gram - identity
+            ortho_residual = torch.norm(diff, p='fro').item()
+            return ortho_residual
+        elif routing_logits.dim() == 3:
+            # [N, num_experts, router_dim] - multiple expert representations per token
+            # Normalize each expert representation
+            normalized = F.normalize(routing_logits, p=2, dim=-1)
+            # Compute Gram matrix: [N, num_experts, router_dim] @ [N, router_dim, num_experts] = [N, num_experts, num_experts]
+            gram = torch.matmul(normalized, normalized.transpose(-2, -1))
+            # Identity matrix for each token
+            num_experts = gram.size(-1)
+            identity = torch.eye(num_experts, device=gram.device, dtype=gram.dtype)
+            identity = identity.unsqueeze(0).expand(gram.size(0), -1, -1)
+            # Frobenius norm of difference for each token, then average
+            diff = gram - identity
+            # Compute Frobenius norm per token: [N, num_experts, num_experts] -> [N]
+            token_norms = torch.norm(diff.view(diff.size(0), -1), p='fro', dim=-1)
+            ortho_residual = token_norms.mean().item()
+            return ortho_residual
+        else:
+            return None
 
     @torch.no_grad()
     def _collect_from_model_state(self):
@@ -1597,6 +1874,37 @@ class TorchMoECallback:
             if unused_values:
                 log_data['moe/total_unused_experts'] = sum(unused_values)
             
+            # Utilization mean aggregation
+            utilization_mean_values = [m['utilization_mean'] 
+                                      for m in metrics.values() 
+                                      if isinstance(m, dict) and not isinstance(m, str) and 'utilization_mean' in m]
+            if utilization_mean_values:
+                log_data['moe/avg_utilization_mean'] = np.mean(utilization_mean_values)
+            
+            # MaxVio aggregation (None이 아닌 값만 포함)
+            maxvio_values = [m['maxvio'] 
+                            for m in metrics.values() 
+                            if isinstance(m, dict) and not isinstance(m, str) and 'maxvio' in m 
+                            and m['maxvio'] is not None]
+            if maxvio_values:
+                log_data['moe/avg_maxvio'] = np.mean(maxvio_values)
+            
+            # Routing variance aggregation (None이 아닌 값만 포함)
+            routing_variance_values = [m['routing_variance'] 
+                                      for m in metrics.values() 
+                                      if isinstance(m, dict) and not isinstance(m, str) and 'routing_variance' in m
+                                      and m['routing_variance'] is not None]
+            if routing_variance_values:
+                log_data['moe/avg_routing_variance'] = np.mean(routing_variance_values)
+            
+            # Top-k score gap aggregation (None이 아닌 값만 포함)
+            topk_gap_values = [m['topk_score_gap'] 
+                              for m in metrics.values() 
+                              if isinstance(m, dict) and not isinstance(m, str) and 'topk_score_gap' in m
+                              and m['topk_score_gap'] is not None]
+            if topk_gap_values:
+                log_data['moe/avg_topk_score_gap'] = np.mean(topk_gap_values)
+            
             # G3MoE specific metrics (평균 계산)
             speciality_loss_values = [m['speciality_loss'] 
                                      for m in metrics.values() 
@@ -1614,6 +1922,14 @@ class TorchMoECallback:
                 log_data['moe/avg_cosine_similarities'] = np.mean(cosine_similarities_values)
             if expression_loss_values:
                 log_data['moe/avg_expression_loss'] = np.mean(expression_loss_values)
+            
+            # Gram orthogonality aggregation (None이 아닌 값만 포함)
+            gram_ortho_values = [m['gram_orthogonality'] 
+                                for m in metrics.values() 
+                                if isinstance(m, dict) and not isinstance(m, str) and 'gram_orthogonality' in m
+                                and m['gram_orthogonality'] is not None]
+            if gram_ortho_values:
+                log_data['moe/avg_gram_orthogonality'] = np.mean(gram_ortho_values)
             
             # Layer-wise balance 메트릭 (실제 검증 지표) - moe 카테고리로 분리
             if '_layer_wise_balance' in metrics:
@@ -2447,6 +2763,286 @@ class TransformersMoECallbackWrapper(TrainerCallback):
             logs['moe/hooks_count'] = len(self.torch_callback.hooks) if hasattr(self.torch_callback, 'hooks') else 0
             logs['moe/pending_metrics_count'] = len(self.torch_callback.pending_metrics) if hasattr(self.torch_callback, 'pending_metrics') else 0
     
+    def _run_benchmarks(
+        self,
+        model,
+        tokenizer,
+        eval_dataloader,
+        state: TrainerState,
+        args: TrainingArguments,
+        **kwargs
+    ):
+        """벤치마크 실행"""
+        if not _is_main_process():
+            return
+        
+        benchmark_results = {}
+        output_dir = getattr(self.torch_callback, 'log_dir', './moe_logs')
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # 1. GramSpec MoE Analysis (이미 실행됨, 결과만 정리)
+        if GRAMSPEC_ANALYSIS_AVAILABLE and self.torch_callback.gramspec_analyzer is not None:
+            try:
+                self.torch_callback._log_debug("Running GramSpec MoE Analysis benchmark...")
+                analyzer = self.torch_callback.gramspec_analyzer
+                aggregated = analyzer.get_aggregated_metrics()
+                paper_summary = analyzer.get_paper_metrics_summary()
+                
+                benchmark_results['gramspec_moe_analysis'] = {
+                    'aggregated_metrics': aggregated,
+                    'paper_summary': paper_summary,
+                }
+                
+                if self.torch_callback.log_to_console:
+                    self.torch_callback._log_debug(f"  ✓ GramSpec MoE Analysis completed")
+            except Exception as e:
+                self.torch_callback._log_debug(f"  ✗ GramSpec MoE Analysis failed: {e}")
+                import traceback
+                if self.torch_callback.debug_logging:
+                    self.torch_callback._log_debug(traceback.format_exc())
+        
+        # 2. GramSpec Semantic Validation
+        if GRAMSPEC_VALIDATION_AVAILABLE:
+            try:
+                self.torch_callback._log_debug("Running GramSpec Semantic Validation benchmark...")
+                
+                # Layer-wise balance 분석을 위한 데이터 수집
+                if hasattr(self.torch_callback, 'layer_expert_usage_counts'):
+                    layer_expert_usage = self.torch_callback.layer_expert_usage_counts
+                    
+                    # num_layers 추정
+                    num_layers = len(layer_expert_usage) if layer_expert_usage else 0
+                    if num_layers == 0:
+                        # 모델에서 직접 추출 시도
+                        num_layers = sum(1 for _ in model.named_modules() if 'layer' in str(_).lower() or 'block' in str(_).lower())
+                    
+                    if num_layers > 0 and self.torch_callback.gramspec_validator is None:
+                        # Validator 초기화
+                        self.torch_callback.gramspec_validator = GramSpecSemanticValidator(
+                            num_layers=num_layers,
+                            num_experts=self.torch_callback.num_experts
+                        )
+                    
+                    if self.torch_callback.gramspec_validator is not None:
+                        layer_balance = self.torch_callback.gramspec_validator.analyze_layer_wise_balance(
+                            layer_expert_usage_counts=layer_expert_usage
+                        )
+                        benchmark_results['gramspec_semantic_validation'] = {
+                            'layer_wise_balance': layer_balance,
+                        }
+                        
+                        if self.torch_callback.log_to_console:
+                            self.torch_callback._log_debug(f"  ✓ GramSpec Semantic Validation completed")
+            except Exception as e:
+                self.torch_callback._log_debug(f"  ✗ GramSpec Semantic Validation failed: {e}")
+                import traceback
+                if self.torch_callback.debug_logging:
+                    self.torch_callback._log_debug(traceback.format_exc())
+        
+        # 3. Expert Specialization Analysis
+        if EXPERT_SPECIALIZATION_AVAILABLE and eval_dataloader is not None:
+            try:
+                self.torch_callback._log_debug("Running Expert Specialization Analysis benchmark...")
+                
+                # 샘플 데이터 수집
+                dataset_samples = []
+                max_samples = getattr(args, 'max_eval_samples', 100)
+                num_collected = 0
+                
+                model.eval()
+                with torch.no_grad():
+                    for batch in eval_dataloader:
+                        if num_collected >= max_samples:
+                            break
+                        
+                        # 텍스트 데이터 추출
+                        if 'input_ids' in batch and tokenizer is not None:
+                            input_ids = batch['input_ids']
+                            for i in range(input_ids.shape[0]):
+                                if num_collected >= max_samples:
+                                    break
+                                try:
+                                    text = tokenizer.decode(input_ids[i], skip_special_tokens=True)
+                                    if text.strip():
+                                        dataset_samples.append(text)
+                                        num_collected += 1
+                                except:
+                                    continue
+                
+                if dataset_samples:
+                    # Expert activations 수집
+                    expert_activations = collect_expert_activations(
+                        model=model,
+                        tokenizer=tokenizer,
+                        dataset=dataset_samples,
+                        device=next(model.parameters()).device.type if next(model.parameters()).is_cuda else "cpu",
+                        max_samples=min(len(dataset_samples), 100)  # 최대 100개 샘플
+                    )
+                    
+                    # Similarity 계산
+                    similarity_matrix = compute_expert_similarity(expert_activations)
+                    
+                    benchmark_results['expert_specialization'] = {
+                        'expert_activations_count': {str(k): len(v) for k, v in expert_activations.items()},
+                        'similarity_matrix': similarity_matrix.tolist() if len(similarity_matrix) > 0 else [],
+                    }
+                    
+                    if self.torch_callback.log_to_console:
+                        self.torch_callback._log_debug(f"  ✓ Expert Specialization Analysis completed ({len(dataset_samples)} samples)")
+            except Exception as e:
+                self.torch_callback._log_debug(f"  ✗ Expert Specialization Analysis failed: {e}")
+                import traceback
+                if self.torch_callback.debug_logging:
+                    self.torch_callback._log_debug(traceback.format_exc())
+        
+        # 4. GramSpec Validation (Perplexity 등)
+        if GRAMSPEC_VALIDATION_SCRIPT_AVAILABLE and eval_dataloader is not None:
+            try:
+                self.torch_callback._log_debug("Running GramSpec Validation benchmark...")
+                
+                # 샘플 데이터 수집
+                eval_dataset = []
+                max_samples = getattr(args, 'max_eval_samples', 100)
+                num_collected = 0
+                
+                model.eval()
+                with torch.no_grad():
+                    for batch in eval_dataloader:
+                        if num_collected >= max_samples:
+                            break
+                        
+                        if 'input_ids' in batch and tokenizer is not None:
+                            input_ids = batch['input_ids']
+                            for i in range(input_ids.shape[0]):
+                                if num_collected >= max_samples:
+                                    break
+                                try:
+                                    text = tokenizer.decode(input_ids[i], skip_special_tokens=True)
+                                    if text.strip():
+                                        eval_dataset.append(text)
+                                        num_collected += 1
+                                except:
+                                    continue
+                
+                if eval_dataset:
+                    # Perplexity 평가
+                    device = next(model.parameters()).device
+                    device_str = device.type if device.is_cuda else "cpu"
+                    try:
+                        perplexity_results = evaluate_model_perplexity(
+                            model=model,
+                            tokenizer=tokenizer,
+                            eval_dataset=eval_dataset,
+                            device=device_str,
+                            max_samples=len(eval_dataset)
+                        )
+                    except Exception as e:
+                        self.torch_callback._log_debug(f"  ⚠️ Perplexity evaluation error: {e}")
+                        perplexity_results = {'perplexity': 0.0, 'loss': 0.0}
+                    
+                    benchmark_results['gramspec_validation'] = {
+                        'perplexity': perplexity_results,
+                    }
+                    
+                    # Trainer에 로깅
+                    if 'trainer' in kwargs:
+                        trainer = kwargs['trainer']
+                        if hasattr(trainer, 'log'):
+                            trainer.log({
+                                'eval/benchmark/perplexity': perplexity_results.get('perplexity', 0.0),
+                                'eval/benchmark/loss': perplexity_results.get('loss', 0.0),
+                            })
+                    
+                    if self.torch_callback.log_to_console:
+                        self.torch_callback._log_debug(f"  ✓ GramSpec Validation completed (PPL: {perplexity_results.get('perplexity', 0.0):.4f})")
+            except Exception as e:
+                self.torch_callback._log_debug(f"  ✗ GramSpec Validation failed: {e}")
+                import traceback
+                if self.torch_callback.debug_logging:
+                    self.torch_callback._log_debug(traceback.format_exc())
+        
+        # 5. Efficiency Measurement
+        if EFFICIENCY_MEASUREMENT_AVAILABLE:
+            try:
+                self.torch_callback._log_debug("Running Efficiency Measurement benchmark...")
+                
+                device = next(model.parameters()).device.type if next(model.parameters()).is_cuda else "cpu"
+                input_text = "The capital of France is"  # 기본 입력 텍스트
+                
+                # Forward throughput 측정
+                forward_results = measure_forward_throughput(
+                    model=model,
+                    tokenizer=tokenizer,
+                    input_text=input_text,
+                    batch_sizes=[1, 4, 8],
+                    seq_length=512,
+                    num_runs=20,  # 빠른 측정을 위해 줄임
+                    warmup_runs=5,
+                    device=device,
+                )
+                
+                # Generation latency 측정
+                generation_results = measure_generation_latency(
+                    model=model,
+                    tokenizer=tokenizer,
+                    input_text=input_text,
+                    max_new_tokens=32,
+                    num_runs=20,
+                    warmup_runs=5,
+                    device=device,
+                )
+                
+                # FLOPs 추정 (선택적)
+                flops_results = {}
+                try:
+                    flops_results = estimate_flops(
+                        model=model,
+                        input_shape=(1, 512),
+                        device=device,
+                    )
+                except:
+                    pass
+                
+                benchmark_results['efficiency'] = {
+                    'forward_throughput': forward_results,
+                    'generation_latency': generation_results,
+                    'flops': flops_results,
+                }
+                
+                # Trainer에 로깅
+                if 'trainer' in kwargs:
+                    trainer = kwargs['trainer']
+                    if hasattr(trainer, 'log'):
+                        # 주요 지표만 로깅
+                        if 1 in forward_results:
+                            trainer.log({
+                                'eval/benchmark/tokens_per_sec': forward_results[1].get('tokens_per_sec', 0.0),
+                                'eval/benchmark/latency_ms': forward_results[1].get('latency_ms_mean', 0.0),
+                                'eval/benchmark/gen_latency_ms': generation_results.get('per_token_latency_ms_mean', 0.0),
+                            })
+                
+                if self.torch_callback.log_to_console:
+                    if 1 in forward_results:
+                        self.torch_callback._log_debug(f"  ✓ Efficiency Measurement completed ({forward_results[1].get('tokens_per_sec', 0.0):.2f} tokens/s)")
+            except Exception as e:
+                self.torch_callback._log_debug(f"  ✗ Efficiency Measurement failed: {e}")
+                import traceback
+                if self.torch_callback.debug_logging:
+                    self.torch_callback._log_debug(traceback.format_exc())
+        
+        # 벤치마크 결과 저장
+        if benchmark_results and self.torch_callback.save_detailed_logs:
+            benchmark_file = os.path.join(
+                output_dir,
+                f"benchmark_results_step_{state.global_step}.json"
+            )
+            with open(benchmark_file, 'w') as f:
+                json.dump(benchmark_results, f, indent=2)
+            self.torch_callback._log_debug(f"Benchmark results saved to {benchmark_file}")
+        
+        if self.torch_callback.log_to_console:
+            self.torch_callback._log_debug(f"Completed {len(benchmark_results)} benchmark(s)")
+
     def on_evaluate(
         self,
         args: TrainingArguments,
@@ -2592,6 +3188,17 @@ class TransformersMoECallbackWrapper(TrainerCallback):
                         with open(eval_result_file, 'w') as f:
                             json.dump(eval_results, f, indent=2)
                         self.torch_callback._log_debug(f"Eval metrics saved to {eval_result_file}")
+            
+            # 벤치마크 실행
+            if model is not None and tokenizer is not None:
+                self._run_benchmarks(
+                    model=model,
+                    tokenizer=tokenizer,
+                    eval_dataloader=dataloader,
+                    state=state,
+                    args=args,
+                    **kwargs
+                )
             else:
                 self.torch_callback._log_debug("⚠️ No eval dataloader available for metrics collection")
             

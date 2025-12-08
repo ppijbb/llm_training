@@ -25,6 +25,7 @@ from transformers import (
         AutoConfig,
         GenerationConfig
     )
+from transformers.trainer_callback import TrainerCallback
 from transformers.generation.stopping_criteria import StopStringCriteria, StoppingCriteriaList, MaxLengthCriteria
 from deepeval.benchmarks import MMLU
 
@@ -78,6 +79,44 @@ torch.compiler.disable()
 torch._dynamo.reset()
 
 
+# DeepSpeed 지원을 위한 유틸리티 함수
+def get_inference_model_for_generate(model):
+    """
+    DeepSpeed로 감싸진 모델에서 실제 모델을 추출합니다.
+    ZeRO Stage 3의 경우 GatheredParameters 컨텍스트를 반환합니다.
+    
+    Returns:
+        tuple: (actual_model, context_manager) 또는 (actual_model, None)
+    """
+    # DeepSpeed로 감싸진 모델인지 확인
+    if hasattr(model, 'module'):
+        # DeepSpeed engine이 있는지 확인
+        if hasattr(model, 'engine'):
+            engine = model.engine
+            # ZeRO stage 확인
+            try:
+                zero_stage = engine.zero_optimization_stage()
+            except:
+                zero_stage = 0
+            
+            # ZeRO Stage 3인 경우 GatheredParameters 필요
+            if zero_stage == 3:
+                try:
+                    import deepspeed
+                    return model.module, deepspeed.zero.GatheredParameters(model.parameters(), modifier_rank=None)
+                except ImportError:
+                    # deepspeed가 없으면 그냥 module 사용
+                    return model.module, None
+            else:
+                # ZeRO 0, 1, 2는 그냥 module 사용
+                return model.module, None
+        else:
+            # DDP 등 다른 래핑
+            return model.module, None
+    else:
+        # 래핑되지 않은 모델
+        return model, None
+
 @torch.inference_mode()
 def run_mme_evaluation(model, tokenizer, max_samples_per_task=50):
     """
@@ -97,7 +136,17 @@ def run_mme_evaluation(model, tokenizer, max_samples_per_task=50):
 
     tasks_to_run = ['color', 'count', 'position', 'posters', 'ocr']
     results = {}
-    device = model.device
+    
+    # DeepSpeed 모델 처리: 실제 모델 추출
+    inference_model, gather_context = get_inference_model_for_generate(model)
+    
+    # device 가져오기
+    if hasattr(model, 'device'):
+        device = model.device
+    elif hasattr(inference_model, 'device'):
+        device = inference_model.device
+    else:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
 
     for task in tasks_to_run:
         if task not in mme_dataset:
@@ -121,7 +170,12 @@ def run_mme_evaluation(model, tokenizer, max_samples_per_task=50):
             
             inputs = tokenizer(text=[prompt], images=[image], return_tensors="pt").to(device)
 
-            generated_ids = model.generate(**inputs, max_new_tokens=10, do_sample=False)
+            # ZeRO Stage 3인 경우 GatheredParameters 컨텍스트 사용
+            if gather_context is not None:
+                with gather_context:
+                    generated_ids = inference_model.generate(**inputs, max_new_tokens=10, do_sample=False)
+            else:
+                generated_ids = inference_model.generate(**inputs, max_new_tokens=10, do_sample=False)
             
             response_text = tokenizer.decode(generated_ids[0])
             cleaned_prompt = tokenizer.decode(inputs['input_ids'][0], skip_special_tokens=True)
@@ -761,3 +815,135 @@ class ModelEvalCallback(DeepEvalHuggingFaceCallback):
         **kwargs,
     ):
         super().on_train_begin(args, state, control, **kwargs)
+
+
+class SpecHornScheduler(TrainerCallback):
+    """
+    SpecHorn Scheduler: Dynamically adjusts hyperparameters based on real-time CV monitoring.
+    
+    - Monitors Coefficient of Variation (CV) at each training step
+    - Adjusts cap_penalty_scale when CV deviates from target range
+    - Gradually increases bias_scale and ortho_scale with training progress
+    - Optional Wandb logging
+    """
+    
+    def __init__(
+        self,
+        target_cv_min: float = 0.03,
+        target_cv_max: float = 0.08,
+        cap_penalty_min: float = 5.0,
+        cap_penalty_max: float = 30.0,
+        cap_penalty_step: float = 1.0,
+        bias_scale_min: float = 4.0,
+        bias_scale_max: float = 12.0,
+        ortho_scale_min: float = 0.1,
+        ortho_scale_max: float = 0.6,
+        use_wandb: bool = False,
+    ):
+        super().__init__()
+        self.target_cv_min = target_cv_min
+        self.target_cv_max = target_cv_max
+        self.cap_penalty_min = cap_penalty_min
+        self.cap_penalty_max = cap_penalty_max
+        self.cap_penalty_step = cap_penalty_step
+        self.bias_scale_min = bias_scale_min
+        self.bias_scale_max = bias_scale_max
+        self.ortho_scale_min = ortho_scale_min
+        self.ortho_scale_max = ortho_scale_max
+        self.use_wandb = use_wandb
+        
+    def on_step_end(
+        self,
+        args: TrainingArguments,
+        state: TrainerState,
+        control: TrainerControl,
+        model=None,
+        **kwargs,
+    ):
+        """Adjust hyperparameters based on real-time CV monitoring"""
+        if model is None:
+            return control
+        
+        # Only run on main process
+        if not _is_main_process():
+            return control
+        
+        # Get the router from the model
+        try:
+            # Navigate to the router (model structure may vary)
+            if hasattr(model, 'module'):
+                actual_model = model.module
+            else:
+                actual_model = model
+            
+            # Find router in the model
+            router = None
+            for name, module in actual_model.named_modules():
+                if hasattr(module, '_is_gramspec_moe_router'):
+                    router = module
+                    break
+            
+            if router is None:
+                return control
+            
+            # Get current CV from router's load_ema
+            with torch.no_grad():
+                load_sum = router.load_ema.sum() + 1e-8
+                normalized_load = router.load_ema / load_sum
+                mean_load = normalized_load.mean()
+                std_load = normalized_load.std()
+                current_cv = (std_load / (mean_load + 1e-8)).item()
+            
+            # Adjust cap_penalty_scale based on CV
+            if current_cv > self.target_cv_max:
+                # CV too high, increase penalty
+                new_penalty = min(
+                    router.cap_penalty_scale + self.cap_penalty_step,
+                    self.cap_penalty_max
+                )
+                router.cap_penalty_scale = new_penalty
+            elif current_cv < self.target_cv_min:
+                # CV too low, decrease penalty
+                new_penalty = max(
+                    router.cap_penalty_scale - self.cap_penalty_step,
+                    self.cap_penalty_min
+                )
+                router.cap_penalty_scale = new_penalty
+            
+            # Progressive scaling of bias_scale and ortho_scale
+            max_steps = state.max_steps if state.max_steps > 0 else 10000
+            progress = min(1.0, state.global_step / max_steps)
+            
+            # bias_scale: gradually increase from min to max
+            router.bias_scale = self.bias_scale_min + (self.bias_scale_max - self.bias_scale_min) * progress
+            
+            # ortho_scale: gradually increase from min to max
+            router.ortho_scale = self.ortho_scale_min + (self.ortho_scale_max - self.ortho_scale_min) * progress
+            
+            # Log to Wandb if enabled
+            if self.use_wandb and state.global_step % args.logging_steps == 0:
+                try:
+                    import wandb
+                    wandb.log({
+                        "spechorn/cv": current_cv,
+                        "spechorn/cap_penalty_scale": router.cap_penalty_scale,
+                        "spechorn/bias_scale": router.bias_scale,
+                        "spechorn/ortho_scale": router.ortho_scale,
+                        "spechorn/progress": progress,
+                        "step": state.global_step,
+                    })
+                except ImportError:
+                    pass
+            
+            # Log to console periodically
+            if state.global_step % (args.logging_steps * 10) == 0:
+                print(f"\n[SpecHorn Scheduler] Step {state.global_step}:")
+                print(f"  CV: {current_cv:.4f} (target: {self.target_cv_min:.2f}-{self.target_cv_max:.2f})")
+                print(f"  cap_penalty_scale: {router.cap_penalty_scale:.2f}")
+                print(f"  bias_scale: {router.bias_scale:.2f}")
+                print(f"  ortho_scale: {router.ortho_scale:.4f}")
+        
+        except Exception as e:
+            print(f"[SpecHornScheduler] Warning: Failed to adjust hyperparameters: {e}")
+        
+        return control

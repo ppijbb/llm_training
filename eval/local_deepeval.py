@@ -9,6 +9,44 @@ from transformers.generation.logits_process import LogitsProcessorList
 from deepeval.models.base_model import DeepEvalBaseLLM
 from outlines.inputs import Audio, Chat, Image, Video
 from outlines.processors import OutlinesLogitsProcessor
+
+# DeepSpeed 지원을 위한 유틸리티 함수
+def get_inference_model(model):
+    """
+    DeepSpeed로 감싸진 모델에서 실제 모델을 추출합니다.
+    ZeRO Stage 3의 경우 GatheredParameters 컨텍스트를 반환합니다.
+    
+    Returns:
+        tuple: (actual_model, context_manager) 또는 (actual_model, None)
+    """
+    # DeepSpeed로 감싸진 모델인지 확인
+    if hasattr(model, 'module'):
+        # DeepSpeed engine이 있는지 확인
+        if hasattr(model, 'engine'):
+            engine = model.engine
+            # ZeRO stage 확인
+            try:
+                zero_stage = engine.zero_optimization_stage()
+            except:
+                zero_stage = 0
+            
+            # ZeRO Stage 3인 경우 GatheredParameters 필요
+            if zero_stage == 3:
+                try:
+                    import deepspeed
+                    return model.module, deepspeed.zero.GatheredParameters(model.parameters(), modifier_rank=None)
+                except ImportError:
+                    # deepspeed가 없으면 그냥 module 사용
+                    return model.module, None
+            else:
+                # ZeRO 0, 1, 2는 그냥 module 사용
+                return model.module, None
+        else:
+            # DDP 등 다른 래핑
+            return model.module, None
+    else:
+        # 래핑되지 않은 모델
+        return model, None
 # from ..models import G3MoEForCausalLM, G3MoEConfig, Gemma3Config
 # If this import fails, try using an absolute import based on your project structure:
 try:
@@ -66,13 +104,25 @@ class CustomOutlinesTransformers(TransformersMultiModal):
         if "token_type_ids" in inference_kwargs:
             del inference_kwargs["token_type_ids"]
         input_ids = inputs["input_ids"]
-        output_ids = self.model.generate(
-            **inputs,
-            **inference_kwargs,
-        )
+        
+        # DeepSpeed 모델 처리: 실제 모델 추출
+        inference_model, gather_context = get_inference_model(self.model)
+        
+        # ZeRO Stage 3인 경우 GatheredParameters 컨텍스트 사용
+        if gather_context is not None:
+            with gather_context:
+                output_ids = inference_model.generate(
+                    **inputs,
+                    **inference_kwargs,
+                )
+        else:
+            output_ids = inference_model.generate(
+                **inputs,
+                **inference_kwargs,
+            )
 
         # encoder-decoder returns output_ids only, decoder-only returns full seq ids
-        if self.model.config.is_encoder_decoder:
+        if inference_model.config.is_encoder_decoder:
             generated_ids = output_ids
         else:
             generated_ids = output_ids[:, input_ids.shape[1] :]
