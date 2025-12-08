@@ -362,7 +362,7 @@ def get_generation_logging_settings(args) -> tuple[str, int, int]:
     max_samples = args.max_generation_samples
 
     # 로깅 주기 (기본값 50 step)
-    log_every = getattr(args, 'generation_log_every_n_steps', 50) if hasattr(args, 'generation_log_every_n_steps') else 50
+    log_every = getattr(args, 'generation_log_every_n_steps', 5) if hasattr(args, 'generation_log_every_n_steps') else 5
 
     return log_dir, max_samples, log_every
 
@@ -442,6 +442,24 @@ def create_reward_functions(args) -> List:
             logger.info(f"📁 Loaded reward config from {args.reward_config}")
         except Exception as e:
             logger.warning(f"⚠️ Failed to load reward config: {e}")
+    
+    # data.csv 경로를 config에 추가 (CommandRewardFunction에서 사용)
+    if hasattr(args, 'custom_data') and args.custom_data:
+        config['data_csv_path'] = args.custom_data
+        logger.info(f"📁 Using data.csv from: {args.custom_data}")
+    
+    # cmd_bot.csv 경로도 config에 추가 (기본 경로 시도)
+    if 'csv_file_path' not in config:
+        possible_paths = [
+            "cmd_bot.csv",
+            os.path.join(os.getcwd(), "cmd_bot.csv"),
+            os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "cmd_bot.csv")
+        ]
+        for path in possible_paths:
+            if os.path.exists(path):
+                config['csv_file_path'] = path
+                logger.info(f"📁 Using cmd_bot.csv from: {path}")
+                break
 
     # 보상 함수 타입에 따라 생성
     reward_functions = []

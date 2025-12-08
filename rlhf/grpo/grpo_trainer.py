@@ -9,7 +9,8 @@ import torch
 import numpy as np
 import json
 import os
-from typing import Dict, Any, List, Optional
+import copy
+from typing import Dict, Any, List, Optional, Union
 import traceback
 # Import TRL components
 from trl import GRPOTrainer, GRPOConfig
@@ -257,6 +258,25 @@ class CustomGRPOTrainer(GRPOTrainer):
 
     def _prepare_inputs(self, inputs):
         if not self.model.training:
+            # During evaluation, we need to duplicate the generation_batch by num_generations
+            # to match the expected format for _generate_and_score_completions
+            if isinstance(inputs, list) and len(inputs) > 0:
+                # Check if this is a generation batch that needs duplication
+                # The parent class expects num_generations duplicates of each prompt
+                num_generations = getattr(self, 'num_generations', 2)
+                original_size = len(inputs)
+                
+                # Check if inputs are already duplicated (size should be multiple of num_generations)
+                if original_size % num_generations != 0:
+                    # Duplicate each input num_generations times
+                    duplicated_inputs = []
+                    for item in inputs:
+                        for _ in range(num_generations):
+                            # Deep copy to avoid reference issues
+                            duplicated_inputs.append(copy.deepcopy(item))
+                    inputs = duplicated_inputs
+                    logger.info(f"📊 Evaluation: Duplicated batch from {original_size} to {len(inputs)} items (num_generations={num_generations})")
+            
             # During evaluation, check input type first
             # If inputs is a dict, move to device
             # If inputs is a list or other type, let parent class handle it
@@ -438,7 +458,7 @@ def create_grpo_trainer(
     reward_functions: Optional[List] = None,
     generation_log_dir: str = None,
     max_generation_samples: int = 5,
-    generation_log_every_n_steps: int = 50
+    generation_log_every_n_steps: int = 5
 ) -> UnslothGRPOTrainWorkflow:
     """Create GRPO trainer with given configuration, reward functions, and generation logging (항상 활성화)"""
     return UnslothGRPOTrainWorkflow(

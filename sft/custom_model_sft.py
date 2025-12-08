@@ -44,7 +44,7 @@ from data.multi_domain_sft_dataset import get_multi_domain_sft_dataset, create_s
 from training_utils.utils import format_parameters, load_config, setup_deepspeed_environment
 from optimizers.custom_optimizers import get_custom_optimizer
 from optimizers.deepspeed_optimizer_registry import register_custom_optimizers
-from eval.callbacks import ModelEvalCallback
+from eval.callbacks import ModelEvalCallback, SpecHornScheduler
 from eval.ifeval_callback import IFEvalCallback
 from eval.moe_monitoring_callback import create_moe_callback_for_transformers
 from eval.router_weight_callback import RouterWeightTrackingCallback
@@ -425,6 +425,28 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
         "use_bfloat16": True,
         "attn_implementation": attn_implementation
     }
+    
+    # Add SpecHorn parameters from config if present
+    spechorn_params = [
+        "routed_scaling_factor",
+        "spechorn_bias_scale",
+        "spechorn_cap_penalty_scale",
+        "spechorn_ortho_scale",
+        "spechorn_sinkhorn_eps",
+        "spechorn_sinkhorn_iter",
+        "spechorn_spec_update_every",
+        "sinkhorn_inference",
+    ]
+    for param in spechorn_params:
+        if param in g3moe_params:
+            g3moe_config[param] = g3moe_params[param]
+    
+    # Add all other g3moe_params that might be needed
+    # This ensures all parameters from config are passed to the model
+    for key, value in g3moe_params.items():
+        if key not in g3moe_config and key not in ["rope_scaling"]:
+            g3moe_config[key] = value
+    
     base_model_config["text_config"].update(g3moe_config)
     # Create G3MoE configuration
     config = G3MoEConfig(
@@ -1567,6 +1589,32 @@ def main(
     )
     trainer.add_callback(router_weight_callback)
     logger.info("✅ RouterWeightTrackingCallback added (will stop training if router weights don't change)")
+    
+    # Add SpecHorn Scheduler callback (SpecHorn hyperparameter scheduling)
+    # Get scheduler parameters from config if available
+    g3moe_params = model_config.get("g3moe_params", {})
+    spechorn_scheduler_config = {
+        "target_cv_min": g3moe_params.get("spechorn_target_cv_min", 0.03),
+        "target_cv_max": g3moe_params.get("spechorn_target_cv_max", 0.08),
+        "cap_penalty_min": g3moe_params.get("spechorn_cap_penalty_min", 5.0),
+        "cap_penalty_max": g3moe_params.get("spechorn_cap_penalty_max", 30.0),
+        "cap_penalty_step": g3moe_params.get("spechorn_cap_penalty_step", 1.0),
+        "bias_scale_min": g3moe_params.get("spechorn_bias_scale_min", 4.0),
+        "bias_scale_max": g3moe_params.get("spechorn_bias_scale_max", 12.0),
+        "ortho_scale_min": g3moe_params.get("spechorn_ortho_scale_min", 0.1),
+        "ortho_scale_max": g3moe_params.get("spechorn_ortho_scale_max", 0.6),
+        "use_wandb": training_config.get("report_to", []),
+    }
+    # Check if wandb is in report_to list
+    spechorn_scheduler_config["use_wandb"] = "wandb" in spechorn_scheduler_config["use_wandb"]
+    
+    spechorn_scheduler = SpecHornScheduler(**spechorn_scheduler_config)
+    trainer.add_callback(spechorn_scheduler)
+    logger.info("✅ SpecHornScheduler added (will adjust hyperparameters based on CV)")
+    logger.info(f"  - Config: target_cv=[{spechorn_scheduler_config['target_cv_min']:.2f}, {spechorn_scheduler_config['target_cv_max']:.2f}]")
+    logger.info(f"  - Config: cap_penalty=[{spechorn_scheduler_config['cap_penalty_min']:.1f}, {spechorn_scheduler_config['cap_penalty_max']:.1f}]")
+    logger.info(f"  - Config: bias_scale=[{spechorn_scheduler_config['bias_scale_min']:.1f}, {spechorn_scheduler_config['bias_scale_max']:.1f}]")
+    logger.info(f"  - Config: ortho_scale=[{spechorn_scheduler_config['ortho_scale_min']:.2f}, {spechorn_scheduler_config['ortho_scale_max']:.2f}]")
     
     # Add custom training progress callback
     from transformers import TrainerCallback
