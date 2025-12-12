@@ -168,7 +168,7 @@ cd "$PROJECT_ROOT"
 echo -e "${GREEN}Starting DeepSpeed training with $NUM_GPUS GPUs...${NC}"
 TRAIN_CMD="accelerate launch \
     --config_file $SCRIPT_DIR/../spectra_sft/config/accelerate.yaml \
-        $SCRIPT_DIR/train_SPECTRA.py --config $CONFIG_FILE"
+        $SCRIPT_DIR/train_spectra.py --config $CONFIG_FILE"
 
 # Run training with error handling
 if eval "$TRAIN_CMD"; then

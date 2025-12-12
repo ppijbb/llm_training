@@ -687,166 +687,81 @@ class ManualGRUCell(nn.Module):
         return next_h
 
 
-class NeuralGradientProjector(nn.Module):
+def differentiable_sinkhorn(cost: torch.Tensor, num_experts: int, epsilon: float = 0.05, iterations: int = 3) -> torch.Tensor:
     """
-    [Neural Gradient Projector]
-    Replaces GRU. Directly maps constraints violations (Errors) to dual potential updates (Delta).
-    Acts like a "Learned Learning Rate" or "Preconditioner" for Sinkhorn.
+    [Pure Math Sinkhorn - No Learning, Just Computing]
+    Differentiable Sinkhorn algorithm for optimal transport.
+    학습 파라미터가 0개이므로 망가지고 싶어도 망가질 수 없습니다.
+    
+    Args:
+        cost: [Batch, Experts] cost matrix (lower is better)
+        num_experts: number of experts
+        epsilon: temperature parameter
+        iterations: number of Sinkhorn iterations
+    
+    Returns:
+        Q: [Batch, Experts] doubly stochastic matrix (assignment probabilities)
     """
-    def __init__(self, row_dim: int, col_dim: int, hidden_dim: int):
-        super().__init__()
+    batch_tokens = cost.shape[0]
+    device = cost.device
+    dtype = cost.dtype
+    
+    # Validate epsilon
+    if epsilon <= 0:
+        raise ValueError(f"epsilon must be positive, got {epsilon}")
+    if iterations <= 0:
+        raise ValueError(f"iterations must be positive, got {iterations}")
+    
+    # Initialize Q: exp(-cost / epsilon)
+    cost_float = cost.float()
+    
+    # Clamp cost to prevent exp overflow
+    max_cost_ratio = 50.0
+    cost_clamped = cost_float / epsilon
+    cost_clamped = torch.clamp(cost_clamped, min=-max_cost_ratio, max=max_cost_ratio)
+    
+    Q = torch.exp(-cost_clamped).to(dtype=dtype)
+    
+    # Store original shape
+    original_shape = Q.shape
+    N, E = original_shape[0], original_shape[1]
+    target_load = float(N) / float(E)
+    
+    # Sinkhorn iterations (standard Sinkhorn-Knopp)
+    for i in range(iterations):
+        # Row normalization: 각 토큰의 확률 합 = 1
+        row_sum = Q.sum(dim=-1, keepdim=True) + 1e-8
+        Q = Q / row_sum
         
-        # Row Error Processing (Scalar -> Hidden)
-        self.row_proj = nn.Linear(row_dim, hidden_dim)
-        # Col Error Processing (Vector -> Hidden)
-        self.col_proj = nn.Linear(col_dim, hidden_dim)
+        # NaN/Inf check
+        if torch.isnan(Q).any() or torch.isinf(Q).any():
+            raise ValueError(f"NaN/Inf in Sinkhorn iteration {i} after row norm")
         
-        # Joint Processing (Fusion)
-        self.gate_proj = nn.Linear(hidden_dim, hidden_dim)
-        self.out_proj = nn.Linear(hidden_dim, row_dim + col_dim)  # Output: Delta U + Delta V
-
-        # Initialization
-        # Start with small weights to behave like standard Sinkhorn initially
-        nn.init.xavier_uniform_(self.row_proj.weight, gain=0.1)
-        nn.init.xavier_uniform_(self.col_proj.weight, gain=0.1)
-        nn.init.xavier_uniform_(self.gate_proj.weight)
-        nn.init.zeros_(self.out_proj.weight)
-        nn.init.zeros_(self.out_proj.bias)
-
-    def forward(self, row_error: torch.Tensor, col_error: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        # row_error: [B, 1]
-        # col_error: [1, E] (or [B, E])
+        # Column normalization: 각 전문가의 기대 토큰 수 = N/E
+        col_sum = Q.sum(dim=0, keepdim=True) + 1e-8
+        Q = Q / col_sum * target_load
         
-        # 1. Feature Extraction (No cat/expand needed)
-        h_row = self.row_proj(row_error)      # [B, H]
-        h_col = self.col_proj(col_error)      # [1, H] or [B, H] -> Broadcasts automatically
+        # NaN/Inf check
+        if torch.isnan(Q).any() or torch.isinf(Q).any():
+            raise ValueError(f"NaN/Inf in Sinkhorn iteration {i} after col norm")
         
-        # 2. Fusion & Gating (SiLU is excellent for smooth gating)
-        # h: [B, H]
-        h = F.silu(h_row + h_col)
-        
-        # 3. Gated Refinement (Optional but helps stability)
-        gate = torch.sigmoid(self.gate_proj(h))
-        h = h * gate
-        
-        # 4. Delta Prediction
-        delta = self.out_proj(h)  # [B, 1+E]
-        
-        # Split into u (scalar) and v (vector)
-        # Assuming first dim is u, rest is v
-        delta_u = delta[:, 0:1]  # [B, 1]
-        delta_v = delta[:, 1:]   # [B, E]
-        
-        return delta_u, delta_v
+        # Shape consistency check
+        assert Q.shape == original_shape, f"Shape changed in iteration {i}: {Q.shape} vs {original_shape}"
+    
+    # Final row normalization to ensure row sums = 1.0
+    row_sum = Q.sum(dim=-1, keepdim=True) + 1e-8
+    Q = Q / row_sum
+    
+    assert Q.shape == original_shape, f"Final shape mismatch: {Q.shape} vs {original_shape}"
+    assert Q.shape == cost.shape, f"Sinkhorn output shape mismatch: {Q.shape} vs {cost.shape}"
+    
+    return Q
 
 
-class DualPotentialLinearSolver(nn.Module):
-    """
-    [Structural Redesign: Explicit Dual Potential Solver]
-    Instead of modifying logits directly, we maintain explicit potentials (u, v).
-    Logits = Raw + u + v
-    This prevents 'drift' and ensures structural stability.
-    Replaces GRU with NeuralGradientProjector for direct Error -> Delta mapping.
-    """
-
-    def __init__(self, num_experts: int, n_iterations: int = 3):
-        super().__init__()
-        self.num_experts = num_experts
-        self.n_iterations = n_iterations
-        
-        # Hidden dimension for the projector (keep it small/fast)
-        self.hidden_dim = max(16, num_experts // 2)
-        
-        # The Core Solver Engine (Replaces GRU)
-        self.projector = NeuralGradientProjector(
-            row_dim=1, 
-            col_dim=num_experts, 
-            hidden_dim=self.hidden_dim
-        )
-
-    def forward(self, raw_logits: torch.Tensor, training: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            raw_logits: [Batch, Experts] (from Cosine Sim)
-            training: bool
-        """
-        input_shape = raw_logits.shape
-        # Flatten for processing
-        logits_2d = raw_logits.view(-1, self.num_experts)
-        batch_tokens = logits_2d.shape[0]
-        device = logits_2d.device
-        dtype = logits_2d.dtype
-
-        # ======================================================================
-        # 1. Setup Targets (Mass Conservation)
-        # ======================================================================
-        # Target Row Sum: log(1) = 0
-        target_row = torch.zeros(batch_tokens, 1, device=device, dtype=dtype)
-        
-        # Target Col Sum: log(N/E)
-        # 배치가 클수록 Col Target도 커져야 함 (Dynamic Target)
-        n_float = torch.tensor(batch_tokens, device=device, dtype=dtype)
-        e_float = torch.tensor(self.num_experts, device=device, dtype=dtype)
-        target_col_val = torch.log(n_float) - torch.log(e_float)
-        target_col = target_col_val.unsqueeze(0).expand(1, self.num_experts)
-
-        # ======================================================================
-        # 2. Dual Variables Initialization (Explicit u, v)
-        # ======================================================================
-        # u: Row Potential [B, 1]
-        # v: Col Potential [B, E] (Learned per batch to adapt to local distribution)
-        u = torch.zeros(batch_tokens, 1, device=device, dtype=dtype)
-        v = torch.zeros(batch_tokens, self.num_experts, device=device, dtype=dtype)
-
-        final_row_error = None
-        final_col_error = None
-        
-        # Iteration Count (Inference시 1회로 줄여도 됨)
-        iters = self.n_iterations
-
-        # ======================================================================
-        # 3. Optimization Loop (Gradient Descent in Dual Space)
-        # ======================================================================
-        for _ in range(iters):
-            # (A) Current Estimation
-            # Logits = Raw + u + v
-            current_logits = logits_2d + u + v
-            
-            # (B) Calculate Violations (Gradients)
-            curr_row_sum = torch.logsumexp(current_logits, dim=-1, keepdim=True)
-            curr_col_sum = torch.logsumexp(current_logits, dim=0, keepdim=True)
-
-            row_error = target_row - curr_row_sum  # [B, 1] (Target - Current)
-            col_error = target_col - curr_col_sum   # [1, E]
-            
-            final_row_error = row_error
-            final_col_error = col_error
-
-            # (C) Neural Update Step (Replaces GRU)
-            # "Error를 봤을 때 u와 v를 얼마나 움직여야 하는가?"를 학습
-            delta_u, delta_v = self.projector(row_error, col_error)
-            
-            # (D) Apply Update
-            u = u + delta_u
-            v = v + delta_v
-            
-            # Optional: Center v to prevent drift (Mean centering)
-            # v = v - v.mean(dim=-1, keepdim=True)
-
-        # ======================================================================
-        # 4. Final Construction & Loss
-        # ======================================================================
-        balanced_logits = logits_2d + u + v
-        
-        balance_loss = torch.tensor(0.0, device=device, dtype=dtype)
-        if training and final_row_error is not None:
-            # Squared Error Minimization
-            row_loss = (final_row_error ** 2).mean()
-            col_loss = (final_col_error ** 2).mean()  # Col error is broadcasted effectively
-            balance_loss = row_loss + col_loss
-
-        return balanced_logits.view(input_shape), balance_loss
-
+# [OSR] Neural Solver 제거 완료 - Pure Math Sinkhorn만 사용
+# [OSR] Neural Solver 클래스 제거 완료
+# NeuralGradientProjector와 DualPotentialLinearSolver는 제거됨
+# 이제 differentiable_sinkhorn 함수만 사용 (학습 파라미터 0개)
 
 def sparsemixer(scores, top_k, jitter_eps, training):
     assert top_k == 2
@@ -1006,14 +921,18 @@ class SPECTRARouter(nn.Module):
             hidden_size=self.num_experts * self.router_dim,
         )
         
-        # ===== Expression Projector (Newton-Schulz) =====
+        # ===== Expression Projector (Linear + Ortho Init) =====
+        # 복잡한 Newton-Schulz도 일단 뺍시다. OSR 척력이면 충분합니다.
         self.expression_projector = ExpressionProjector(
             self.hidden_size,
             self.num_experts * self.router_dim,
             self.num_experts,
-            method="newton_schulz",
+            method="linear",
         )
-        self.expression_projector.ortho_strength = 0.0  # 직교 강제 경로, 추가 제약 불필요
+        # Orthogonal initialization for better starting point
+        if hasattr(self.expression_projector, 'projection'):
+            nn.init.orthogonal_(self.expression_projector.projection.weight)
+        self.expression_projector.ortho_strength = 0.0  # OSR 척력이 직교성을 강제하므로 추가 제약 불필요
         
         # Bias Predictor (GRU 기반) - Sequential 분리 (LoRA 대상 선형층 노출)
         self.bias_predictor_hidden_dim = getattr(config, "bias_predictor_hidden_dim", 256)
@@ -1025,16 +944,8 @@ class SPECTRARouter(nn.Module):
         # Contrastive loss
         self.contrastive_loss = ContrastiveRouterLoss()
 
-        # Linear-only logit balancer (PEFT-friendly)
-        # [전략 3] Curriculum Learning: 초기에는 더 많은 iteration, 후반에는 적은 iteration
-        solver_iters = getattr(config, "sinkhorn_iter", 3)
-        self.solver_iters_base = solver_iters  # 기본 iteration 횟수
-        self.sinkhorn_solver = DualPotentialLinearSolver(
-            num_experts=self.num_experts,
-            n_iterations=solver_iters,
-        )
-        # Alias for downstream helper code
-        self.logit_balancer = self.sinkhorn_solver
+        # OSR Hyperparameters
+        self.repulsion_weight = getattr(config, "osr_repulsion_weight", 0.5)  # [핵심] OSR 척력 가중치
 
     def compute_adaptive_loss_weights(self, current_cv: float) -> dict:
         """CV에 따라 loss 가중치를 동적으로 조절"""
@@ -1260,6 +1171,44 @@ class SPECTRARouter(nn.Module):
         
         return normalized_entropy
 
+    def compute_osr_cost(self, similarity: torch.Tensor, expert_embeddings: torch.Tensor) -> torch.Tensor:
+        """
+        [OSR Core Logic]
+        Cost = -Similarity + lambda * Repulsion
+        Repulsion: 내가 좋아하는 전문가들이 '지들끼리도 비슷하면' 페널티를 줌.
+        
+        Args:
+            similarity: [Batch, Experts] cosine similarity between routing and expression vectors
+            expert_embeddings: [Experts, Dim] expert representation vectors
+        
+        Returns:
+            cost: [Batch, Experts] cost matrix (lower is better for Sinkhorn)
+        """
+        # 1. 전문가 간 유사도 (Gram Matrix)
+        # expert_embeddings: [Experts, Dim]
+        # G: [Experts, Experts]
+        expert_sim_matrix = torch.matmul(expert_embeddings, expert_embeddings.t())
+        
+        # 자기 자신과의 유사도(대각선)는 0으로 만듦 (자기 자신을 밀어내면 안 되니까)
+        identity = torch.eye(self.num_experts, device=similarity.device, dtype=similarity.dtype)
+        expert_sim_matrix = expert_sim_matrix * (1 - identity)
+        
+        # 양의 상관관계(비슷한 놈들)만 척력으로 사용 (ReLU)
+        repulsion_matrix = F.relu(expert_sim_matrix)
+        
+        # 2. 척력 계산 (Lateral Inhibition)
+        # "내가 전문가 E_i를 좋아하는데(Sim High), E_i가 E_j랑 비슷하면, E_i의 점수를 깎아라"
+        # Similarity: [Batch, Experts]
+        # Repulsion Score: [Batch, Experts]
+        repulsion_score = torch.matmul(similarity, repulsion_matrix)
+        
+        # 3. 최종 Cost (Sinkhorn은 Cost가 낮을수록 좋아함)
+        # Similarity가 높으면 Cost 낮춤 (-Sim)
+        # Repulsion이 높으면 Cost 높임 (+Rep)
+        cost = -similarity + self.repulsion_weight * repulsion_score
+        
+        return cost
+
     def predict_expert_bias_from_gru(self, hn: torch.Tensor) -> torch.Tensor:
         """개선된 Bias 예측: 더 강한 정규화"""
         last_hn = hn[-1]
@@ -1302,11 +1251,14 @@ class SPECTRARouter(nn.Module):
 
     @torch._dynamo.disable
     def forward(self, x, hn, top_k=2, jitter_eps=0.01):
-        # GRU-cell resolver routing + SpecHorn (orthogonal projector + Sinkhorn)
+        """
+        [OSR (Orthogonal Sinkhorn Routing) - Pure Math Version]
+        학습하지 말고, 수학으로 패버리는 방식.
+        """
         batch_size, seq_len, _ = x.shape
         tokens = batch_size * seq_len
 
-        # Flatten for GRU-cell processing
+        # Flatten for processing
         x_flat = x.view(tokens, -1)  # [tokens, hidden]
 
         if hn is None:
@@ -1316,68 +1268,73 @@ class SPECTRARouter(nn.Module):
         else:
             hn_flat = hn.view(tokens, -1)
 
+        # 1. GRU & Projector (Context Aware)
+        # 얘는 그냥 "상황 파악"만 하면 됩니다. 밸런싱은 수학이 합니다.
         routing_output_flat = self.load_balancer(x_flat, hn_flat)  # [tokens, E*R]
         hn_next = routing_output_flat.view_as(hn_flat)
         routing_output = routing_output_flat.view(batch_size, seq_len, self.num_experts, self.router_dim)
 
-        # Expression projection (orthogonalized inside ExpressionProjector)
+        # Expression projection
         proj = self.expression_projector(x_flat)  # [tokens, E*R]
         proj = proj.view(batch_size, seq_len, self.num_experts, self.router_dim)
 
-        # Normalize both branches
+        # 2. Normalize & Similarity
         routing_vec = F.normalize(routing_output, p=2, dim=-1)  # [B, S, E, R]
         expression_vec = F.normalize(proj, p=2, dim=-1)        # [B, S, E, R]
-
-        # Cosine similarity and cost
-        domain_orthogonality = (routing_vec * expression_vec).sum(dim=-1)  # [B, S, E]
-        cost = 2.0 - 2.0 * domain_orthogonality
-
-        # [전략 1, 2, 3] Global GRU Solver를 사용한 실시간 피드백 제어
-        # Cost를 logits로 변환 (음수 cost를 logits로 변환: 낮은 cost = 높은 logit)
-        cost_flat = cost.view(tokens, self.num_experts)
-        raw_logits = -cost_flat  # Cost가 낮을수록 logit이 높아지도록
         
-        # [전략 3] Curriculum Learning: 학습 진행에 따라 iteration 횟수 조절
-        progress = min(1.0, float(self.training_step) / self.curriculum_steps)
-        # 초반: 더 많은 iteration (3~5), 후반: 적은 iteration (1~3)
-        current_iters = max(1, int(self.solver_iters_base * (1.0 - 0.5 * progress)))
-        if self.training:
-            # 학습 중에는 동적으로 iteration 조절
-            self.sinkhorn_solver.n_iterations = current_iters
+        # Cosine Similarity [B, S, E]
+        similarity = (routing_vec * expression_vec).sum(dim=-1)  # [B, S, E]
+        domain_orthogonality = similarity  # Alias for compatibility
+
+        # 3. [OSR] Repulsive Cost Calculation
+        # 전문가 간의 유사도를 계산하기 위해 대표 벡터 추출
+        # 계산 효율성을 위해 현재 배치의 expression_vec 평균을 사용 (Dynamic Orthogonality)
+        # [Experts, Dim]
+        current_expert_repr = expression_vec.mean(dim=(0, 1))  # [E, R]
+        current_expert_repr = F.normalize(current_expert_repr, p=2, dim=-1)
         
-        # DualPotentialLinearSolver로 밸런싱 (실시간 피드백 제어)
-        balanced_logits, balance_loss = self.sinkhorn_solver(
-            raw_logits, 
-            training=self.training
+        flat_sim = similarity.view(-1, self.num_experts)  # [B*S, E]
+        
+        # Cost 계산 (척력 포함)
+        cost_matrix = self.compute_osr_cost(flat_sim, current_expert_repr)  # [B*S, E]
+        
+        # 4. Sinkhorn (Pass-through Gradient)
+        # Pure Math Sinkhorn - 학습 파라미터 0개
+        Q_flat = differentiable_sinkhorn(
+            cost_matrix,
+            num_experts=self.num_experts,
+            epsilon=self.sinkhorn_epsilon,
+            iterations=self.sinkhorn_iterations
         )
         
-        # Balanced logits를 확률로 변환
-        routing_probs_full = F.softmax(balanced_logits, dim=-1)
-        routing_probs_full = routing_probs_full.view(batch_size, seq_len, self.num_experts)
+        routing_probs_full = Q_flat.view(batch_size, seq_len, self.num_experts)
 
-        # Top-k selection
+        # 5. Top-k Selection
         top_k_probs, selected_experts = torch.topk(routing_probs_full, top_k, dim=-1)
         multiplier = top_k_probs
 
-        # Loss 계산
+        # 6. Loss 계산
         zero = torch.tensor(0.0, device=x.device, dtype=x.dtype, requires_grad=True)
         speciality_loss = zero
         contrastive_loss = zero
         expression_reg_loss = zero
         routing_uncertainty = zero
-        entropy_loss = zero
         load_balancing_loss = zero
         sinkhorn_loss = zero
-        ortho_loss = zero
+        balance_loss = zero  # Sinkhorn이 구조적으로 처리하므로 loss로 사용하지 않음
         
-        # [전략 1] Balance Loss: GRU Solver의 constraint violation loss
-        # 이 loss는 compute_adaptive_loss_weights에서 가중치가 적용됨
+        # Ortho Loss (Expression Projector의 직교성)
+        ortho_loss = self.expression_projector.orthogonal_loss()
+        
+        # [Sharpening] Entropy Minimization: "한 놈만 패라" (확실한 전문가 선택)
+        # routing_probs_full은 이미 Sinkhorn을 거친 확률입니다.
         if self.training:
-            # balance_loss는 이미 DualPotentialLinearSolver에서 계산됨
-            # 여기서는 그대로 전달 (가중치는 compute_adaptive_loss_weights에서 적용)
-            pass
+            # Entropy 계산: 낮을수록 좋음 (Sharp = 확실한 선택)
+            probs = routing_probs_full + 1e-8  # Numerical stability
+            entropy = -(probs * torch.log(probs)).sum(dim=-1).mean()  # [B, S, E] -> scalar
+            entropy_loss = entropy
         else:
-            balance_loss = zero
+            entropy_loss = zero
 
         return (
             multiplier,
@@ -1394,7 +1351,7 @@ class SPECTRARouter(nn.Module):
             load_balancing_loss,
             sinkhorn_loss,
             ortho_loss,
-            balance_loss,  # [전략 1] GRU Solver의 constraint violation loss 추가
+            balance_loss,
         )
 
 iterations = 0
@@ -2872,77 +2829,33 @@ class SPECTRAForCausalLM(SPECTRAPreTrainedModel, GenerationMixin):
                     expr_loss = outputs.cosine_similarities * cosine_similarities_loss_coef
                     loss += expr_loss
             
-            # Disable aux_loss (Switch-style LB) to avoid conflict with spectra_lb_loss
-            # if outputs.router_logits is not None:
-            #     aux_loss = load_balancing_loss_func(...)
-            #     loss += self.model.config.router_aux_loss_coef * aux_loss
+            # ======================================================================================
+            # [Minimalist Loss: Sinkhorn + Sharpening]
+            # Sinkhorn은 구조적으로 이미 부하 분산을 처리하므로 별도 loss 불필요
+            # Sharpening만 entropy minimization으로 처리
+            # ======================================================================================
             
-            # ======================================================================================
-            # [신규] Entropy Loss: 분포 평탄화를 위한 gradient 있는 loss (CV 감소)
-            # [수정] Router가 이미 Adaptive Weight를 적용했으므로, 여기서는 1.0을 사용
-            # ======================================================================================
-            router_entropy_coef = getattr(self.model.config, "router_entropy_coef", 1.0)  # 0.01 -> 1.0
+            # [Sharpening] Entropy Minimization: "한 놈만 패라" (확실한 전문가 선택)
+            # router_entropy_coef는 양수로 사용 (entropy를 낮추는 방향)
+            router_entropy_coef = getattr(self.model.config, "router_entropy_coef", 0.1)
             if outputs.entropy_loss is not None and router_entropy_coef > 0:
                 loss += outputs.entropy_loss * router_entropy_coef
             
-            # ======================================================================================
-            # [신규] Load Balancing Loss: CV 직접 최소화를 위한 gradient 있는 loss
-            # [수정] Router가 이미 Adaptive Weight를 적용했으므로, 여기서는 1.0을 사용 (가장 중요!)
-            # ======================================================================================
-            usage_uniformity_coef = getattr(self.model.config, "usage_uniformity_coef", 1.0)  # 0.01 -> 1.0
-            if outputs.load_balancing_loss is not None and usage_uniformity_coef > 0:
-                loss += outputs.load_balancing_loss * usage_uniformity_coef
-            
-            # ======================================================================================
-            # [SpecHorn-G] Sinkhorn Distillation Loss: GRU가 Sinkhorn을 학습하도록 하는 loss
-            # [수정] Router가 이미 Adaptive Weight를 적용했으므로, 여기서는 1.0을 사용
-            # ======================================================================================
-            sinkhorn_distillation_coef = getattr(self.model.config, "sinkhorn_distillation_coef", 1.0)  # 0.1 -> 1.0
-            if outputs.sinkhorn_loss is not None and sinkhorn_distillation_coef > 0:
-                loss += outputs.sinkhorn_loss * sinkhorn_distillation_coef
-            
-            # ======================================================================================
-            # [전략 1] Balance Loss: GRU Solver의 constraint violation loss (CV를 0으로 만드는 핵심)
-            # Router의 compute_adaptive_loss_weights에서 이미 가중치가 적용되지만,
-            # 여기서는 추가로 balance_loss_coef를 적용하여 더 강하게 만듦
-            # ======================================================================================
-            balance_loss_coef = getattr(self.model.config, "balance_loss_coef", 2.0)  # 기본값 2.0 (1.0 ~ 5.0 권장)
-            if outputs.balance_loss is not None and balance_loss_coef > 0:
-                # Router에서 이미 adaptive weight가 적용되었으므로, 여기서는 추가 가중치만 적용
-                # 실제로는 router의 compute_adaptive_loss_weights에서 이미 가중치가 적용되어 있음
-                # 하지만 명시적으로 여기서도 가중치를 적용하여 더 강하게 만듦
-                loss += outputs.balance_loss * balance_loss_coef
-            
-            # ======================================================================================
-            # [필수] Ortho Loss: 전문가들의 가중치 직교성 Loss (전문가들의 '본질(Weight)'을 찢어놓는 가장 중요한 Loss)
-            # ======================================================================================
-            ortho_loss_coef = getattr(self.model.config, "ortho_loss_coef", 0.05)
+            # [Optional] Ortho Loss: 보험으로 약하게 유지 (학습 초반 가이드)
+            # Sinkhorn + Sharpening만으로도 분리가 되지만, 초반 헤매지 않도록 도움
+            ortho_loss_coef = getattr(self.model.config, "ortho_loss_coef", 0.01)  # 0.05 -> 0.01 (약하게)
             if outputs.ortho_loss is not None and ortho_loss_coef > 0:
                 loss += outputs.ortho_loss * ortho_loss_coef
-
-            # Add bias magnitude loss for load balancing
-            # Collect bias magnitude from all routers in the model
-            if self.training:
-                gslb_coef = getattr(self.model.config, "gslb_coef", 0.0)
-                lb_bias_coef = getattr(self.model.config, "lb_bias_coef", 1.0)
-                if gslb_coef > 0:
-                    from models.spectra_model import SPECTRARouter
-                    total_bias_magnitude = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
-                    router_count = 0
-                    
-                    # Collect bias from all routers in the model using named_modules
-                    for name, module in self.model.named_modules():
-                        if isinstance(module, SPECTRARouter) and hasattr(module, 'expert_bias'):
-                            # Calculate bias magnitude (L2 norm squared)
-                            bias_magnitude = torch.norm(module.expert_bias, p=2) ** 2
-                            total_bias_magnitude = total_bias_magnitude + bias_magnitude
-                            router_count += 1
-                    
-                    if router_count > 0:
-                        # Average bias magnitude across all routers
-                        avg_bias_magnitude = total_bias_magnitude / router_count
-                        bias_loss = gslb_coef * lb_bias_coef * avg_bias_magnitude
-                        loss += bias_loss
+            
+            # ======================================================================================
+            # [제거된 Loss들]
+            # - gslb_coef: Sinkhorn이 구조적으로 처리
+            # - router_z_loss_coef: 불필요
+            # - sinkhorn_distillation_coef: Sharpening이 대신함
+            # - usage_uniformity_coef: Sinkhorn이 구조적으로 처리
+            # - load_balancing_loss: Sinkhorn이 구조적으로 처리
+            # - balance_loss: Sinkhorn이 구조적으로 처리
+            # ======================================================================================
 
         try:
             import torch.distributed as dist
@@ -3447,55 +3360,29 @@ class SPECTRAForConditionalGeneration(SPECTRAPreTrainedModel, GenerationMixin):
                     expr_loss = outputs.cosine_similarities * 0.001
                     loss += expr_loss
             
-            # Router entropy / usage balancing with tuple-safe handling
-            router_probs = outputs.router_logits
-            if isinstance(router_probs, tuple):
-                router_probs = tuple(t for t in router_probs if t is not None and t.numel() > 0)
-                router_probs = torch.cat(router_probs, dim=0) if len(router_probs) > 0 else None
-            if router_probs is not None:
-                probs = router_probs
-                if probs.dim() > 2:
-                    probs = probs.view(-1, probs.size(-1))
-                probs = probs.clamp_min(1e-8)
-                expert_load = probs.mean(dim=0)
-                load_mean = expert_load.mean().clamp_min(1e-6)
-                cv_metric = expert_load.std() / load_mean
-                router_entropy = -(probs * torch.log(probs)).sum(dim=-1).mean()
-
-                entropy_coef = getattr(self.config.text_config, "router_entropy_coef", 0.0)
-                usage_coef = getattr(self.config.text_config, "usage_uniformity_coef", 0.0)
-                if usage_coef > 0:
-                    loss = loss + usage_coef * cv_metric
-                if entropy_coef > 0:
-                    loss = loss + entropy_coef * router_entropy
+            # ======================================================================================
+            # [Minimalist Loss: Sinkhorn + Sharpening]
+            # Sinkhorn은 구조적으로 이미 부하 분산을 처리하므로 별도 loss 불필요
+            # Sharpening만 entropy minimization으로 처리
+            # ======================================================================================
             
-            # Disable aux_loss (Switch-style LB) to avoid conflict with spectra_lb_loss
-            # if outputs.router_logits is not None:
-            #     aux_loss = load_balancing_loss_func(...)
-            #     loss += self.config.text_config.router_aux_loss_coef * aux_loss
-
-            # Add SPECTRA-aligned low-overhead LB loss (lightweight load balancing)
-            if outputs.router_logits is not None:
-                gslb_coef = getattr(self.config.text_config, "gslb_coef", 0.0)
-                if gslb_coef > 0:
-                    lb_l2_coef = getattr(self.config.text_config, "lb_l2_coef", 1.0)
-                    lb_cv_coef = getattr(self.config.text_config, "lb_cv_coef", 0.5)
-                    lb_entropy_floor_coef = getattr(self.config.text_config, "lb_entropy_floor_coef", 0.0)
-                    lb_topk_l2_coef = getattr(self.config.text_config, "lb_topk_l2_coef", 0.0)
-                    lb_topk_cv_coef = getattr(self.config.text_config, "lb_topk_cv_coef", 0.0)
-
-                    spectra_loss = spectra_lb_loss(
-                        outputs.router_logits,
-                        self.config.text_config.n_routed_experts,
-                        lb_l2_coef=lb_l2_coef,
-                        lb_cv_coef=lb_cv_coef,
-                        lb_entropy_floor_coef=lb_entropy_floor_coef,
-                        top_k=self.config.text_config.num_experts_per_tok,
-                        lb_topk_l2_coef=lb_topk_l2_coef,
-                        lb_topk_cv_coef=lb_topk_cv_coef,
-                        attention_mask=attention_mask,
-                    )
-                    loss += gslb_coef * spectra_loss
+            # [Sharpening] Entropy Minimization: "한 놈만 패라" (확실한 전문가 선택)
+            # outputs.entropy_loss는 라우터에서 이미 계산되어 전달됨
+            router_entropy_coef = getattr(self.config.text_config, "router_entropy_coef", 0.1)
+            if outputs.entropy_loss is not None and router_entropy_coef > 0:
+                loss += outputs.entropy_loss * router_entropy_coef
+            
+            # [Optional] Ortho Loss: 보험으로 약하게 유지 (학습 초반 가이드)
+            ortho_loss_coef = getattr(self.config.text_config, "ortho_loss_coef", 0.01)
+            if outputs.ortho_loss is not None and ortho_loss_coef > 0:
+                loss += outputs.ortho_loss * ortho_loss_coef
+            
+            # ======================================================================================
+            # [제거된 Loss들]
+            # - gslb_coef: Sinkhorn이 구조적으로 처리
+            # - usage_uniformity_coef: Sinkhorn이 구조적으로 처리
+            # - aux_loss: Sinkhorn이 구조적으로 처리
+            # ======================================================================================
 
         if not return_dict:
             output = (logits,) + outputs[1:]

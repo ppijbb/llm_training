@@ -1514,7 +1514,7 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
             "topk_group": spectra_params.get("topk_group", 2),
             "num_experts_per_tok": spectra_params.get("num_experts_per_tok", 2),
             "first_k_dense_replace": spectra_params.get("first_k_dense_replace", 0),
-            "router_aux_loss_coef": spectra_params.get("router_aux_loss_coef", 1e-3),
+            "router_aux_loss_coef": 0.0,  # [Minimalist] Sinkhorn이 구조적으로 처리
             "router_jitter_noise": spectra_params.get("router_jitter_noise", 0.01),
             "input_jitter_noise": spectra_params.get("input_jitter_noise", 0.0),
             "router_dim": spectra_params.get("router_dim", 128),
@@ -1573,12 +1573,12 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
             "num_experts_per_tok": spectra_params["num_experts_per_tok"],
             "first_k_dense_replace": spectra_params["first_k_dense_replace"],
             "router_dim": spectra_params.get("router_dim", 128),
-            "router_aux_loss_coef": spectra_params["router_aux_loss_coef"],
+            "router_aux_loss_coef": 0.0,  # [Minimalist] Sinkhorn이 구조적으로 처리
             "router_jitter_noise": spectra_params["router_jitter_noise"],
             "input_jitter_noise": spectra_params["input_jitter_noise"],
-            "router_z_loss_coef": spectra_params.get("router_z_loss_coef", 1e-4),
-            "router_entropy_coef": spectra_params.get("router_entropy_coef", 1e-3),
-            "usage_uniformity_coef": spectra_params.get("usage_uniformity_coef", 1e-2),
+            "router_z_loss_coef": 0.0,  # [Minimalist] 불필요
+            "router_entropy_coef": spectra_params.get("router_entropy_coef", 0.1),  # [Sharpening] 확실한 선택 유도
+            "usage_uniformity_coef": 0.0,  # [Minimalist] Sinkhorn이 구조적으로 처리
             "ema_alpha": spectra_params.get("ema_alpha", 0.95),
             "balancing_strength": spectra_params.get("balancing_strength", 1e-2),
             "neftune_noise_alpha": spectra_params.get("neftune_noise_alpha", 0.0),
@@ -2610,7 +2610,7 @@ def main(
     if benchmark_eval_mode not in {"step", "epoch"}:
         benchmark_eval_mode = "step"
 
-    default_benchmark_freq = training_config.get("eval_steps", 1000)
+    default_benchmark_freq = 1000 # training_config.get("eval_steps", 1000)
     benchmark_eval_frequency = int(training_config.get("benchmark_eval_frequency", default_benchmark_freq) or default_benchmark_freq)
 
     if benchmark_eval_enabled:
@@ -2644,6 +2644,37 @@ def main(
         print(f"Model: Initializing from scratch (small model)")
     else:
         print(f"Model: {model_config.get('model_name_or_path', 'N/A')}")
+    
+    # Calculate and print model parameters
+    try:
+        # Get actual model (handle DeepSpeed wrapping)
+        model_to_count = trainer.model
+        if hasattr(model_to_count, 'module'):
+            model_to_count = model_to_count.module
+        
+        # Count total parameters
+        total_params = sum(p.numel() for p in model_to_count.parameters())
+        trainable_params = sum(p.numel() for p in model_to_count.parameters() if p.requires_grad)
+        
+        # Format in B (billion) or M (million) units
+        if total_params >= 1e9:
+            total_str = f"{total_params / 1e9:.2f}B"
+        elif total_params >= 1e6:
+            total_str = f"{total_params / 1e6:.2f}M"
+        else:
+            total_str = f"{total_params / 1e3:.2f}K"
+        
+        if trainable_params >= 1e9:
+            trainable_str = f"{trainable_params / 1e9:.2f}B"
+        elif trainable_params >= 1e6:
+            trainable_str = f"{trainable_params / 1e6:.2f}M"
+        else:
+            trainable_str = f"{trainable_params / 1e3:.2f}K"
+        
+        print(f"Model parameters: {total_str} total, {trainable_str} trainable")
+    except Exception as e:
+        print(f"Model parameters: Unable to calculate ({e})")
+    
     print(f"Dataset: {data_config['dataset_name']}")
     print(f"Max sequence length: {data_config['max_seq_length']}")
     print(f"Use LoRA: {model_config['use_lora']}")
