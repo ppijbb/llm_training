@@ -1,8 +1,8 @@
 # coding=utf-8
 """
-GramSpec Ablation Variants
+SPECTRA Ablation Variants
 
-Creates ablation variants of GramSpec MoE by removing/modifying components:
+Creates ablation variants of SPECTRA MoE by removing/modifying components:
 1. -Expression: Remove expression projector
 2. -GRU: Replace GRU with linear layer
 3. -SpecialityPenalty: Remove speciality penalty
@@ -15,13 +15,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Dict, Any
 
-from models.gramspec_moe import GramSpecRouter, GramSpecMoEBlock
+from models.spectra import SPECTRARouter, SPECTRABlock
 from models.g3moe_model import ExpressionProjector
 
 
 class AblationRouter(nn.Module):
     """
-    Base class for ablation variants of GramSpecRouter.
+    Base class for ablation variants of SPECTRARouter.
     """
     
     def __init__(
@@ -175,7 +175,7 @@ def create_ablation_router(
         balancing_strength: Load balancing strength
         ema_alpha: EMA alpha for load balancing
         ablation_type: Type of ablation
-            - "none": Full GramSpec (no ablation)
+            - "none": Full SPECTRA (no ablation)
             - "no_expression": Remove expression projector
             - "no_gru": Replace GRU with linear layer
             - "no_penalty": Remove speciality penalty
@@ -183,11 +183,11 @@ def create_ablation_router(
             - "standard_router": Use Switch-style router (from standard_moe_upcycle)
     
     Returns:
-        Router module (GramSpecRouter, AblationRouter, or SwitchRouter)
+        Router module (SPECTRARouter, AblationRouter, or SwitchRouter)
     """
     if ablation_type == "none":
-        # Full GramSpec
-        return GramSpecRouter(
+        # Full SPECTRA
+        return SPECTRARouter(
             hidden_size=hidden_size,
             num_experts=num_experts,
             router_dim=router_dim,
@@ -231,7 +231,7 @@ def create_ablation_moe_block(
     """
     Create an ablation variant MoE block.
     
-    Uses StandardMoEBlock if router is SwitchRouter, otherwise uses GramSpecMoEBlock.
+    Uses StandardMoEBlock if router is SwitchRouter, otherwise uses SPECTRABlock.
     """
     if isinstance(router, nn.Module) and hasattr(router, 'ablation_type') and router.ablation_type == "standard_router":
         from models.standard_moe_upcycle import StandardMoEBlock
@@ -249,7 +249,7 @@ def create_ablation_moe_block(
             freeze_shared_experts=freeze_shared_experts,
         )
     else:
-        return GramSpecMoEBlock(
+        return SPECTRABlock(
             router=router,
             expert_module_class=expert_module_class,
             expert_config=expert_config,

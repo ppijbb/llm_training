@@ -213,6 +213,13 @@ def get_model_eval_callback(
     benchmark_eval_frequency: int = 1000,  # Changed to 1000 steps default
     eval_mode: str = "step",  # Added eval_mode parameter with step as default
     mme_max_samples: int = 20,  # Limit MME samples for faster evaluation
+    # Lightweight benchmark controls
+    benchmark_max_samples_per_task: int = 3,
+    benchmark_gsm8k_max_samples: int = 3,
+    benchmark_max_tasks: Optional[int] = None,
+    benchmark_max_new_tokens: int = 64,
+    benchmark_disable_cot: bool = True,
+    benchmark_ifeval_max_samples: int = 5,  # IFEval n_problems limit
 ): 
     if evaluation_dataset is None:
         """ ref
@@ -277,6 +284,12 @@ def get_model_eval_callback(
         benchmark_eval_frequency=benchmark_eval_frequency,
         eval_mode=eval_mode,
         mme_max_samples=mme_max_samples,
+        benchmark_max_samples_per_task=benchmark_max_samples_per_task,
+        benchmark_gsm8k_max_samples=benchmark_gsm8k_max_samples,
+        benchmark_max_tasks=benchmark_max_tasks,
+        benchmark_max_new_tokens=benchmark_max_new_tokens,
+        benchmark_disable_cot=benchmark_disable_cot,
+        benchmark_ifeval_max_samples=benchmark_ifeval_max_samples,
     )
 
 class EmptyRichManager(RichManager): 
@@ -335,6 +348,12 @@ class ModelEvalCallback(DeepEvalHuggingFaceCallback):
         benchmark_eval_frequency: int = 1000,  # Changed to step-based (1000 steps)
         eval_mode: str = "step",  # Changed default to step-based
         mme_max_samples: int = 20,
+        benchmark_max_samples_per_task: int = 3,
+        benchmark_gsm8k_max_samples: int = 3,
+        benchmark_max_tasks: Optional[int] = None,
+        benchmark_max_new_tokens: int = 64,
+        benchmark_disable_cot: bool = True,
+        benchmark_ifeval_max_samples: int = 5,  # IFEval n_problems limit
         *args, 
         **kwargs
     )->None:
@@ -349,13 +368,23 @@ class ModelEvalCallback(DeepEvalHuggingFaceCallback):
         self.rich_manager = EmptyRichManager(show_table=show_table, total_train_epochs=trainer.args.num_train_epochs)
         self.eval_model = LocalModel(model=trainer.model, tokenizer=trainer.tokenizer)
         self.enable_benchmarks = enable_benchmarks
-        self.benchmarks_to_run = benchmarks_to_run
+        # Limit number of tasks if requested (to keep step eval light)
+        if benchmark_max_tasks is not None and benchmark_max_tasks > 0:
+            self.benchmarks_to_run = benchmarks_to_run[:benchmark_max_tasks]
+        else:
+            self.benchmarks_to_run = benchmarks_to_run
         self.benchmark_eval_frequency = benchmark_eval_frequency
         self.eval_mode = eval_mode  # "step" or "epoch"
         self.mme_max_samples = mme_max_samples
         self.benchmark_results_history = []
         self.last_eval_step = 0  # Track last evaluation step
         self.is_main_process = _is_main_process()
+        # Lightweight controls
+        self.benchmark_max_samples_per_task = max(1, benchmark_max_samples_per_task)
+        self.benchmark_gsm8k_max_samples = max(1, benchmark_gsm8k_max_samples)
+        self.benchmark_max_new_tokens = max(8, benchmark_max_new_tokens)
+        self.benchmark_disable_cot = benchmark_disable_cot
+        self.benchmark_ifeval_max_samples = max(1, benchmark_ifeval_max_samples)
         
         try:
             import deepspeed
@@ -418,7 +447,7 @@ class ModelEvalCallback(DeepEvalHuggingFaceCallback):
                 print(f"Step {state.global_step} Benchmark Evaluation")
                 print(f"{'='*60}")
                 
-                benchmark_results = self._run_benchmark_evaluation()
+                benchmark_results = self._run_benchmark_evaluation(mode="step")
                 
                 if benchmark_results:
                     self.benchmark_results_history.append({
@@ -473,7 +502,7 @@ class ModelEvalCallback(DeepEvalHuggingFaceCallback):
                     print(f"Epoch {state.epoch} Benchmark Evaluation")
                     print(f"{'='*60}")
                     
-                    benchmark_results = self._run_benchmark_evaluation()
+                    benchmark_results = self._run_benchmark_evaluation(mode="epoch")
                     
                     if benchmark_results:
                         self.benchmark_results_history.append({
@@ -495,11 +524,36 @@ class ModelEvalCallback(DeepEvalHuggingFaceCallback):
     @torch.no_grad()
     def _run_benchmark_evaluation(self, mode:str="epoch") -> Dict[str, float]:
         """
-        Run benchmark evaluation on the current model
+        Run benchmark evaluation on the current model with progress tracking
+        CRITICAL: Ensure model is in eval mode and no gradients are computed
         """
         results = {}
         
+        # CRITICAL: Save original model state and switch to eval mode
+        original_training_state = None
+        actual_model = None
+        trainer_model = None
+        
         try:
+            # Get actual model from trainer (handle DeepSpeed wrapping)
+            trainer_model = self.trainer.model
+            if hasattr(trainer_model, 'module'):
+                actual_model = trainer_model.module
+            else:
+                actual_model = trainer_model
+            
+            # Save original training state
+            if actual_model is not None:
+                original_training_state = actual_model.training
+                # CRITICAL: Switch to eval mode to disable gradient computation
+                actual_model.eval()
+                print("   🔧 Model switched to eval mode (gradients disabled)")
+            
+            # Clear GPU cache before benchmark evaluation
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+            
             # Get current model and tokenizer from trainer
             model = self.eval_model
             tokenizer = self.trainer.tokenizer
@@ -508,72 +562,113 @@ class ModelEvalCallback(DeepEvalHuggingFaceCallback):
                 print("Warning: No tokenizer available for benchmark evaluation")
                 return results
             
+            # Fast/slow controls
+            fast_mode = (mode != "epoch")
+            n_per_task = self.benchmark_max_samples_per_task if fast_mode else None
+            gsm8k_n = self.benchmark_gsm8k_max_samples if fast_mode else 1319
+            
+            # Track overall progress
+            total_benchmarks = len(self.benchmarks_to_run)
+            completed_benchmarks = 0
+            
+            print(f"\n📊 Running {total_benchmarks} benchmark(s): {', '.join(self.benchmarks_to_run)}")
+            print(f"   Mode: {'Fast (step)' if fast_mode else 'Full (epoch)'}")
+            if fast_mode:
+                print(f"   Samples per task: {n_per_task}")
+            print("-" * 60)
+            
             # Run text-based benchmarks using self as the model wrapper
             if 'mmlu' in self.benchmarks_to_run:
                 try:
-                    print("Running MMLU benchmark...")
+                    completed_benchmarks += 1
+                    print(f"\n[{completed_benchmarks}/{total_benchmarks}] 🔍 Running MMLU benchmark...")
+                    print(f"   Config: n_problems_per_task={n_per_task or 'all'}, n_shots=3")
+                    import time
+                    start_time = time.time()
                     mmlu_benchmark = MMLU(
-                        n_problems_per_task=5 if mode != "epoch" else None,
+                        n_problems_per_task=n_per_task or 5,
                         n_shots=3)
                     mmlu_benchmark.evaluate(model=self.eval_model)
+                    elapsed = time.time() - start_time
                     results['mmlu'] = mmlu_benchmark.overall_score
-                    print(f"MMLU Score: {mmlu_benchmark.overall_score:.4f}")
+                    print(f"   ✅ MMLU completed in {elapsed:.1f}s - Score: {mmlu_benchmark.overall_score:.4f}")
                 except Exception as e:
-                    print(f"MMLU evaluation failed: {e}")
+                    print(f"   ❌ MMLU evaluation failed: {e}")
                     results['mmlu'] = 0.0
             
             if 'hellaswag' in self.benchmarks_to_run:
                 try:
-                    print("Running HellaSwag benchmark...")
+                    completed_benchmarks += 1
+                    print(f"\n[{completed_benchmarks}/{total_benchmarks}] 🔍 Running HellaSwag benchmark...")
+                    print(f"   Config: n_problems_per_task={n_per_task or 'all'}, n_shots=3")
+                    import time
+                    start_time = time.time()
                     hellaswag_benchmark = HellaSwag(
-                        n_problems_per_task=5 if mode != "epoch" else None,
+                        n_problems_per_task=n_per_task or 5,
                         n_shots=3)
                     hellaswag_benchmark.evaluate(model=self.eval_model)
+                    elapsed = time.time() - start_time
                     results['hellaswag'] = hellaswag_benchmark.overall_score
-                    print(f"HellaSwag Score: {hellaswag_benchmark.overall_score:.4f}")
+                    print(f"   ✅ HellaSwag completed in {elapsed:.1f}s - Score: {hellaswag_benchmark.overall_score:.4f}")
                 except Exception as e:
-                    print(f"HellaSwag evaluation failed: {e}")
+                    print(f"   ❌ HellaSwag evaluation failed: {e}")
                     results['hellaswag'] = 0.0
             
             if 'gsm8k' in self.benchmarks_to_run:
                 try:
-                    print("Running GSM8K benchmark...")
+                    completed_benchmarks += 1
+                    print(f"\n[{completed_benchmarks}/{total_benchmarks}] 🔍 Running GSM8K benchmark...")
+                    enable_cot = False if (fast_mode and self.benchmark_disable_cot) else True
+                    print(f"   Config: n_problems={gsm8k_n}, n_shots=3, enable_cot={enable_cot}")
+                    import time
+                    start_time = time.time()
                     gsm8k_benchmark = GSM8K(
-                        n_problems=5 if mode != "epoch" else 1319, 
+                        n_problems=gsm8k_n, 
                         n_shots=3, 
-                        enable_cot=True,
+                        enable_cot=enable_cot,
                     )
                     gsm8k_benchmark.evaluate(model=self.eval_model)
+                    elapsed = time.time() - start_time
                     results['gsm8k'] = gsm8k_benchmark.overall_score
-                    print(f"GSM8K Score: {gsm8k_benchmark.overall_score:.4f}")
+                    print(f"   ✅ GSM8K completed in {elapsed:.1f}s - Score: {gsm8k_benchmark.overall_score:.4f}")
                 except Exception as e:
-                    print(f"GSM8K evaluation failed: {e}")
+                    print(f"   ❌ GSM8K evaluation failed: {e}")
                     results['gsm8k'] = 0.0
             
             if 'truthfulqa' in self.benchmarks_to_run:
                 try:
-                    print("Running TruthfulQA benchmark...")
+                    completed_benchmarks += 1
+                    print(f"\n[{completed_benchmarks}/{total_benchmarks}] 🔍 Running TruthfulQA benchmark...")
+                    print(f"   Config: n_problems_per_task={n_per_task or 'all'}")
+                    import time
+                    start_time = time.time()
                     truthfulqa_benchmark = TruthfulQA(
-                        n_problems_per_task=5 if mode != "epoch" else None,
+                        n_problems_per_task=n_per_task or 5,
                     )
                     truthfulqa_benchmark.evaluate(model=self.eval_model)
+                    elapsed = time.time() - start_time
                     results['truthfulqa'] = truthfulqa_benchmark.overall_score
-                    print(f"TruthfulQA Score: {truthfulqa_benchmark.overall_score:.4f}")
+                    print(f"   ✅ TruthfulQA completed in {elapsed:.1f}s - Score: {truthfulqa_benchmark.overall_score:.4f}")
                 except Exception as e:
-                    print(f"TruthfulQA evaluation failed: {e}")
+                    print(f"   ❌ TruthfulQA evaluation failed: {e}")
                     results['truthfulqa'] = 0.0
             
             if 'arc' in self.benchmarks_to_run:
                 try:
-                    print("Running ARC benchmark...")
+                    completed_benchmarks += 1
+                    print(f"\n[{completed_benchmarks}/{total_benchmarks}] 🔍 Running ARC benchmark...")
+                    print(f"   Config: n_problems={n_per_task or 'all'}, n_shots=3")
+                    import time
+                    start_time = time.time()
                     arc_benchmark = ARC(
-                        n_problems=5 if mode != "epoch" else None,
+                        n_problems=n_per_task or 5,
                         n_shots=3)
                     arc_benchmark.evaluate(model=self.eval_model)
+                    elapsed = time.time() - start_time
                     results['arc'] = arc_benchmark.overall_score
-                    print(f"ARC Score: {arc_benchmark.overall_score:.4f}")
+                    print(f"   ✅ ARC completed in {elapsed:.1f}s - Score: {arc_benchmark.overall_score:.4f}")
                 except Exception as e:
-                    print(f"ARC evaluation failed: {e}")
+                    print(f"   ❌ ARC evaluation failed: {e}")
                     results['arc'] = 0.0
             
             # if 'piqa' in self.benchmarks_to_run:
@@ -589,59 +684,80 @@ class ModelEvalCallback(DeepEvalHuggingFaceCallback):
             
             if 'bigbenchhard' in self.benchmarks_to_run:
                 try:
-                    print("Running BigBenchHard benchmark...")
+                    completed_benchmarks += 1
+                    print(f"\n[{completed_benchmarks}/{total_benchmarks}] 🔍 Running BigBenchHard benchmark...")
+                    print(f"   Config: n_problems_per_task={n_per_task or 'all'}, enable_cot=True")
+                    import time
+                    start_time = time.time()
                     bigbench_benchmark = BigBenchHard(
-                        n_problems_per_task=5 if mode != "epoch" else None,
+                        n_problems_per_task=n_per_task or 5,
                         enable_cot=True)
                     bigbench_benchmark.evaluate(model=self.eval_model)
+                    elapsed = time.time() - start_time
                     results['bigbenchhard'] = bigbench_benchmark.overall_score
-                    print(f"BigBenchHard Score: {bigbench_benchmark.overall_score:.4f}")
+                    print(f"   ✅ BigBenchHard completed in {elapsed:.1f}s - Score: {bigbench_benchmark.overall_score:.4f}")
                 except Exception as e:
-                    print(f"BigBenchHard evaluation failed: {e}")
+                    print(f"   ❌ BigBenchHard evaluation failed: {e}")
                     results['bigbenchhard'] = 0.0
             
             if 'humaneval' in self.benchmarks_to_run:
                 try:
-                    print("Running HumanEval benchmark...")
+                    completed_benchmarks += 1
+                    n_samples = 5 if mode != "epoch" else 200
+                    print(f"\n[{completed_benchmarks}/{total_benchmarks}] 🔍 Running HumanEval benchmark...")
+                    print(f"   Config: n={n_samples}")
+                    import time
+                    start_time = time.time()
                     humaneval_benchmark = HumanEval(
                         # tasks=[HumanEvalTask.HAS_CLOSE_ELEMENTS, HumanEvalTask.SORT_NUMBERS],
-                        n=5 if mode != "epoch" else 200,
+                        n=n_samples,
                     )
                     humaneval_benchmark.evaluate(model=self.eval_model)
+                    elapsed = time.time() - start_time
                     results['humaneval'] = humaneval_benchmark.overall_score
-                    print(f"HumanEval Score: {humaneval_benchmark.overall_score:.4f}")
+                    print(f"   ✅ HumanEval completed in {elapsed:.1f}s - Score: {humaneval_benchmark.overall_score:.4f}")
                 except Exception as e:
-                    print(f"HumanEval evaluation failed: {e}")
+                    print(f"   ❌ HumanEval evaluation failed: {e}")
                     results['humaneval'] = 0.0
             
             if 'squad' in self.benchmarks_to_run:
                 try:
-                    print("Running SQuAD benchmark...")
+                    completed_benchmarks += 1
+                    print(f"\n[{completed_benchmarks}/{total_benchmarks}] 🔍 Running SQuAD benchmark...")
+                    print(f"   Config: n_problems_per_task={n_per_task or 'all'}, n_shots=3")
+                    import time
+                    start_time = time.time()
                     squad_benchmark = SQuAD(
                         # tasks=[SQuADTask.PHARMACY, SQuADTask.NORMANS],
                         n_shots=3,
-                        n_problems_per_task=5 if mode != "epoch" else None,
+                        n_problems_per_task=n_per_task or 5,
                     )
                     squad_benchmark.evaluate(model=self.eval_model)
+                    elapsed = time.time() - start_time
                     results['squad'] = squad_benchmark.overall_score
-                    print(f"SQuAD Score: {squad_benchmark.overall_score:.4f}")
+                    print(f"   ✅ SQuAD completed in {elapsed:.1f}s - Score: {squad_benchmark.overall_score:.4f}")
                 except Exception as e:
-                    print(f"SQuAD evaluation failed: {e}")
+                    print(f"   ❌ SQuAD evaluation failed: {e}")
                     results['squad'] = 0.0
             
             if 'mathqa' in self.benchmarks_to_run:
                 try:
-                    print("Running MathQA benchmark...")
+                    completed_benchmarks += 1
+                    print(f"\n[{completed_benchmarks}/{total_benchmarks}] 🔍 Running MathQA benchmark...")
+                    print(f"   Config: n_problems_per_task={n_per_task or 'all'}, n_shots=3")
+                    import time
+                    start_time = time.time()
                     mathqa_benchmark = MathQA(
                         # tasks=[MathQATask.PROBABILITY, MathQATask.GEOMETRY],
                         n_shots=3,
-                        n_problems_per_task=5 if mode != "epoch" else None,
+                        n_problems_per_task=n_per_task or 5,
                     )
                     mathqa_benchmark.evaluate(model=self.eval_model)
+                    elapsed = time.time() - start_time
                     results['mathqa'] = mathqa_benchmark.overall_score
-                    print(f"MathQA Score: {mathqa_benchmark.overall_score:.4f}")
+                    print(f"   ✅ MathQA completed in {elapsed:.1f}s - Score: {mathqa_benchmark.overall_score:.4f}")
                 except Exception as e:
-                    print(f"MathQA evaluation failed: {e}")
+                    print(f"   ❌ MathQA evaluation failed: {e}")
                     results['mathqa'] = 0.0
             
             # if 'agieval' in self.benchmarks_to_run:
@@ -679,16 +795,40 @@ class ModelEvalCallback(DeepEvalHuggingFaceCallback):
             
             if 'boolq' in self.benchmarks_to_run:
                 try:
-                    print("Running BoolQ benchmark...")
+                    completed_benchmarks += 1
+                    print(f"\n[{completed_benchmarks}/{total_benchmarks}] 🔍 Running BoolQ benchmark...")
+                    print(f"   Config: n_problems={n_per_task or 'all'}, n_shots=3")
+                    import time
+                    start_time = time.time()
                     boolq_benchmark = BoolQ(
-                        n_problems=5 if mode != "epoch" else None,
+                        n_problems=n_per_task or 5,
                         n_shots=3)
                     boolq_benchmark.evaluate(model=self.eval_model)
+                    elapsed = time.time() - start_time
                     results['boolq'] = boolq_benchmark.overall_score
-                    print(f"BoolQ Score: {boolq_benchmark.overall_score:.4f}")
+                    print(f"   ✅ BoolQ completed in {elapsed:.1f}s - Score: {boolq_benchmark.overall_score:.4f}")
                 except Exception as e:
-                    print(f"BoolQ evaluation failed: {e}")
+                    print(f"   ❌ BoolQ evaluation failed: {e}")
                     results['boolq'] = 0.0
+            
+            if 'ifeval' in self.benchmarks_to_run:
+                try:
+                    completed_benchmarks += 1
+                    n_problems = self.benchmark_ifeval_max_samples if fast_mode else None
+                    print(f"\n[{completed_benchmarks}/{total_benchmarks}] 🔍 Running IFEval benchmark...")
+                    print(f"   Config: n_problems={n_problems or 'all'}")
+                    import time
+                    start_time = time.time()
+                    ifeval_benchmark = IFEval(
+                        n_problems=n_problems,
+                    )
+                    ifeval_benchmark.evaluate(model=self.eval_model)
+                    elapsed = time.time() - start_time
+                    results['ifeval'] = ifeval_benchmark.overall_score
+                    print(f"   ✅ IFEval completed in {elapsed:.1f}s - Score: {ifeval_benchmark.overall_score:.4f}")
+                except Exception as e:
+                    print(f"   ❌ IFEval evaluation failed: {e}")
+                    results['ifeval'] = 0.0
             
             # if 'cb' in self.benchmarks_to_run:
             #     try:
@@ -759,19 +899,61 @@ class ModelEvalCallback(DeepEvalHuggingFaceCallback):
             # Run vision-based benchmark (MME)
             if 'mme' in self.benchmarks_to_run:
                 try:
-                    print("Running MME benchmark...")
+                    completed_benchmarks += 1
+                    print(f"\n[{completed_benchmarks}/{total_benchmarks}] 🔍 Running MME benchmark...")
+                    print(f"   Config: max_samples_per_task={self.mme_max_samples}")
+                    import time
+                    start_time = time.time()
                     mme_results = run_mme_evaluation(model, tokenizer, self.mme_max_samples)
+                    elapsed = time.time() - start_time
                     if mme_results:
                         results.update(mme_results)
-                        print(f"MME Overall Score: {mme_results.get('overall', 0):.2f}%")
+                        overall_score = mme_results.get('overall', 0)
+                        print(f"   ✅ MME completed in {elapsed:.1f}s - Overall Score: {overall_score:.2f}%")
                 except Exception as e:
-                    print(f"MME evaluation failed: {e}")
+                    print(f"   ❌ MME evaluation failed: {e}")
                     results['mme_overall'] = 0.0
             
+            # Summary
+            print("\n" + "-" * 60)
+            print(f"📊 Benchmark Evaluation Summary ({completed_benchmarks}/{total_benchmarks} completed)")
+            print("-" * 60)
+            for metric_name, score in results.items():
+                print(f"   {metric_name.upper()}: {score:.4f}")
+            print("-" * 60)
+            
+            # Clear GPU cache after evaluation
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+            
         except Exception as e:
-            print(f"Benchmark evaluation failed: {e}")
+            print(f"\n❌ Benchmark evaluation failed: {e}")
             import traceback
             traceback.print_exc()
+        finally:
+            # CRITICAL: Always restore original training state, even if evaluation failed
+            try:
+                if actual_model is not None and original_training_state is not None:
+                    actual_model.train(original_training_state)
+                    if original_training_state:
+                        print("   🔧 Model restored to train mode (ready for training)")
+                    else:
+                        print("   🔧 Model kept in eval mode")
+                elif trainer_model is not None:
+                    # Fallback: try to restore trainer_model directly if actual_model is None
+                    if hasattr(trainer_model, 'train'):
+                        trainer_model.train()
+                        print("   🔧 Trainer model restored to train mode (fallback)")
+            except Exception as restore_error:
+                print(f"   ⚠️ Warning: Failed to restore model training state: {restore_error}")
+                # Try one more time with trainer.model directly
+                try:
+                    if hasattr(self.trainer, 'model') and hasattr(self.trainer.model, 'train'):
+                        self.trainer.model.train()
+                        print("   🔧 Trainer model restored to train mode (final fallback)")
+                except:
+                    pass
         
         return results
         
@@ -879,7 +1061,7 @@ class SpecHornScheduler(TrainerCallback):
             # Find router in the model
             router = None
             for name, module in actual_model.named_modules():
-                if hasattr(module, '_is_gramspec_moe_router'):
+                if hasattr(module, '_is_spectra_router'):
                     router = module
                     break
             

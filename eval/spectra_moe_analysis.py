@@ -1,8 +1,8 @@
 # coding=utf-8
 """
-GramSpec MoE 논문 검증을 위한 분석 도구
+SPECTRA MoE 논문 검증을 위한 분석 도구
 
-이 모듈은 GramSpec MoE의 핵심 주장을 검증하기 위한 다양한 지표를 제공합니다:
+이 모듈은 SPECTRA MoE의 핵심 주장을 검증하기 위한 다양한 지표를 제공합니다:
 1. Expert Specialization Metrics: Expert들이 실제로 다른 기능을 수행하는지
 2. Gram Matrix Quality: Gram matrix의 직교성 수준
 3. Routing Decision Quality: 라우팅 결정의 품질
@@ -18,9 +18,9 @@ from collections import defaultdict
 import json
 
 
-class GramSpecAnalyzer:
+class SPECTRAAnalyzer:
     """
-    GramSpec MoE의 핵심 주장을 검증하기 위한 분석 도구
+    SPECTRA MoE의 핵심 주장을 검증하기 위한 분석 도구
     
     논문에서 검증해야 할 주요 포인트:
     1. Gram matrix 기반 orthogonal constraint가 expert diversity를 향상시키는가?

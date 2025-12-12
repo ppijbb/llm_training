@@ -21,13 +21,13 @@ from .g3moe_model import (
     G3MoEForConditionalGeneration,
     G3MoEModel,
 )
-from .gramspec_moe_config import GramSpecMoEConfig, GramSpecMoETextConfig
-from .gramspec_moe_model import (
-    GramSpecMoEPreTrainedModel,
-    GramSpecMoETextModel,
-    GramSpecMoEForCausalLM,
-    GramSpecMoEForConditionalGeneration,
-    GramSpecMoEModel,
+from .spectra_config import SPECTRAConfig, SPECTRATextConfig
+from .spectra_model import (
+    SPECTRAPreTrainedModel,
+    SPECTRATextModel,
+    SPECTRAForCausalLM,
+    SPECTRAForConditionalGeneration,
+    SPECTRAModel,
 )
 from .g2moe_config import *
 from .g2moe_model import *
@@ -40,11 +40,11 @@ __all__ = [
     "G3MoEForCausalLM",
     "G3MoEForConditionalGeneration",
     "G3MoEModel",
-    "GramSpecMoEConfig",
-    "GramSpecMoETextConfig",
-    "GramSpecMoEPreTrainedModel",
-    "GramSpecMoETextModel",
-    "GramSpecMoEForCausalLM",
-    "GramSpecMoEForConditionalGeneration",
-    "GramSpecMoEModel",
+    "SpectraConfig",
+    "SpectraTextConfig",
+    "SpectraPreTrainedModel",
+    "SpectraTextModel",
+    "SpectraForCausalLM",
+    "SpectraForConditionalGeneration",
+    "SpectraModel",
 ]

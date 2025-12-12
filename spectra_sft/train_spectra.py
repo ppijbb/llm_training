@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GramSpecMoE SFT Training Script using Config File
+SPECTRA SFT Training Script using Config File
 """
 
 import os
@@ -36,7 +36,7 @@ import wandb
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Import custom modules  
-from models import GramSpecMoEForCausalLM, GramSpecMoEConfig, GramSpecMoEForConditionalGeneration, GramSpecMoETextConfig, GramSpecMoETextModel, GramSpecMoEModel
+from models import SPECTRAForCausalLM, SPECTRAConfig, SPECTRAForConditionalGeneration, SPECTRATextConfig, SPECTRATextModel, SPECTRAModel
 from data.base_model_sft_dataset import get_dataset, create_multimodal_collate_fn
 from data.simple_sft_dataset import get_simple_sft_dataset, create_simple_collate_fn, smoltalk_dataset, orca_mini_dataset, validate_image_data
 from data.multi_domain_sft_dataset import get_multi_domain_sft_dataset, create_simple_collate_fn as create_multi_domain_collate_fn, all_domains_dataset
@@ -45,31 +45,33 @@ from training_utils.utils import format_parameters, load_config, setup_deepspeed
 from optimizers.custom_optimizers import get_custom_optimizer
 from optimizers.deepspeed_optimizer_registry import register_custom_optimizers
 from eval.callbacks import ModelEvalCallback
-from eval.ifeval_callback import IFEvalCallback
+# IFEval is now integrated into ModelEvalCallback - no separate callback needed
+# from eval.ifeval_callback import IFEvalCallback
 from eval.moe_monitoring_callback import create_moe_callback_for_transformers
 from eval.router_weight_callback import RouterWeightTrackingCallback
 
 # Register custom optimizers with DeepSpeed
 register_custom_optimizers()
 try:
-    # AutoConfig.register("gramspec_moe", GramSpecMoEConfig)
-    AutoConfig.register("gramspec_moe", GramSpecMoEConfig)
-    AutoConfig.register("gramspec_moe_text", GramSpecMoETextConfig)
-    AutoModel.register(GramSpecMoEConfig, GramSpecMoEModel)
-    AutoModel.register(GramSpecMoETextConfig, GramSpecMoETextModel)
-    AutoModelForCausalLM.register(GramSpecMoEConfig, GramSpecMoEForConditionalGeneration)
+    # AutoConfig.register("spectra", SPECTRAConfig)
+    AutoConfig.register("spectra", SPECTRAConfig)
+    AutoConfig.register("spectra_text", SPECTRATextConfig)
+    AutoModel.register(SPECTRAConfig, SPECTRAModel)
+    AutoModel.register(SPECTRATextConfig, SPECTRATextModel)
+    AutoModelForCausalLM.register(SPECTRAConfig, SPECTRAForConditionalGeneration)
 
     from transformers.modeling_utils import VLMS
-    VLMS.append("gramspec_moe")
+    VLMS.append("spectra")
 except Exception as e:
-    import traceback
     traceback.format_exc()
-    print(f"Failed to register GramSpecMoE model: {e}")
-    print("GramSpecMoE cannot train without registering model... exiting...")
+    print(f"Failed to register SPECTRA model: {e}")
+    print("SPECTRA cannot train without registering model... exiting...")
     raise e
 
 transformers_logging.enable_progress_bar()
 transformers_logging.set_verbosity_warning()
+logger = logging.getLogger("wandb")
+logger.setLevel(logging.ERROR) 
 
 # Setup comprehensive logging system
 def setup_logging(log_dir: str = "logs", log_level: str = "INFO"):
@@ -176,6 +178,247 @@ def log_training_progress(logger, trainer, step: int = None, epoch: float = None
                     total_norm = total_norm ** (1. / 2)
                     logger.debug(f"📊 Gradient Norm: {total_norm:.6f}")
 
+def collect_environment_info():
+    """수집 가능한 모든 환경 정보를 수집"""
+    env_info = {
+        'timestamp': datetime.now().isoformat(),
+        'system': {},
+        'python': {},
+        'pytorch': {},
+        'cuda': {},
+        'gpu': {},
+        'transformers': {},
+        'deepspeed': {},
+        'environment_variables': {}
+    }
+    
+    try:
+        import platform
+        import sys
+        import subprocess
+        
+        # 시스템 정보
+        env_info['system'] = {
+            'platform': platform.platform(),
+            'system': platform.system(),
+            'release': platform.release(),
+            'version': platform.version(),
+            'machine': platform.machine(),
+            'processor': platform.processor(),
+            'hostname': platform.node(),
+            'cpu_count': os.cpu_count()
+        }
+        
+        # Python 정보
+        env_info['python'] = {
+            'version': sys.version,
+            'version_info': list(sys.version_info),
+            'executable': sys.executable,
+            'path': sys.path[:10]  # 처음 10개만
+        }
+        
+        # PyTorch 정보
+        env_info['pytorch'] = {
+            'version': torch.__version__,
+            'cuda_available': torch.cuda.is_available(),
+            'cuda_version': torch.version.cuda if torch.cuda.is_available() else None,
+            'cudnn_version': torch.backends.cudnn.version() if torch.cuda.is_available() and torch.backends.cudnn.is_available() else None,
+            'cudnn_enabled': torch.backends.cudnn.enabled if torch.cuda.is_available() else None,
+            'mps_available': hasattr(torch.backends, 'mps') and torch.backends.mps.is_available() if hasattr(torch.backends, 'mps') else False
+        }
+        
+        # CUDA 정보
+        if torch.cuda.is_available():
+            env_info['cuda'] = {
+                'device_count': torch.cuda.device_count(),
+                'current_device': torch.cuda.current_device(),
+                'device_name': torch.cuda.get_device_name(),
+                'device_capability': torch.cuda.get_device_capability(),
+                'memory_allocated_gb': torch.cuda.memory_allocated() / 1024**3,
+                'memory_reserved_gb': torch.cuda.memory_reserved() / 1024**3,
+                'max_memory_allocated_gb': torch.cuda.max_memory_allocated() / 1024**3,
+                'max_memory_reserved_gb': torch.cuda.max_memory_reserved() / 1024**3
+            }
+            
+            # 모든 GPU 정보
+            env_info['gpu'] = {}
+            for i in range(torch.cuda.device_count()):
+                try:
+                    props = torch.cuda.get_device_properties(i)
+                    env_info['gpu'][f'device_{i}'] = {
+                        'name': props.name,
+                        'total_memory_gb': props.total_memory / 1024**3,
+                        'major': props.major,
+                        'minor': props.minor,
+                        'multi_processor_count': props.multi_processor_count
+                    }
+                except Exception as e:
+                    env_info['gpu'][f'device_{i}'] = {'error': str(e)}
+        
+        # Transformers 정보
+        try:
+            from transformers import __version__ as transformers_version
+            env_info['transformers'] = {
+                'version': transformers_version
+            }
+        except:
+            pass
+        
+        # DeepSpeed 정보
+        try:
+            import deepspeed
+            env_info['deepspeed'] = {
+                'version': getattr(deepspeed, '__version__', 'unknown'),
+                'available': True
+            }
+        except:
+            env_info['deepspeed'] = {'available': False}
+        
+        # nvidia-smi 정보 (가능한 경우)
+        try:
+            result = subprocess.run(['nvidia-smi', '--query-gpu=index,name,memory.total,memory.used,memory.free,utilization.gpu', '--format=csv,noheader,nounits'], 
+                                  capture_output=True, text=True, timeout=5)
+            if result.returncode == 0:
+                env_info['gpu']['nvidia_smi'] = result.stdout.strip()
+        except:
+            pass
+        
+        # 중요한 환경 변수
+        important_env_vars = [
+            'CUDA_VISIBLE_DEVICES', 'PYTORCH_CUDA_ALLOC_CONF', 'DEEPSPEED_ZERO_INIT',
+            'TOKENIZERS_PARALLELISM', 'TORCH_NCCL_ASYNC_ERROR_HANDLING',
+            'WANDB_PROJECT', 'WANDB_RUN_NAME', 'HF_HOME', 'TRANSFORMERS_CACHE'
+        ]
+        for var in important_env_vars:
+            if var in os.environ:
+                env_info['environment_variables'][var] = os.environ[var]
+        
+    except Exception as e:
+        env_info['collection_error'] = str(e)
+        env_info['collection_traceback'] = traceback.format_exc()
+    
+    return env_info
+
+def save_oom_error_info(logger, trainer, error, batch_info=None, output_dir=None):
+    """OOM 에러 발생 시 모든 정보를 JSON 파일로 저장"""
+    try:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # 출력 디렉토리 결정
+        if output_dir is None:
+            if trainer is not None:
+                if hasattr(trainer, 'args') and hasattr(trainer.args, 'output_dir'):
+                    output_dir = trainer.args.output_dir
+                elif hasattr(trainer, 'training_args') and hasattr(trainer.training_args, 'output_dir'):
+                    output_dir = trainer.training_args.output_dir
+                else:
+                    output_dir = "logs"
+            else:
+                output_dir = "logs"
+        
+        os.makedirs(output_dir, exist_ok=True)
+        error_file = os.path.join(output_dir, f"oom_error_info_{timestamp}.json")
+        
+        # 환경 정보 수집
+        env_info = collect_environment_info()
+        
+        # 에러 정보
+        error_info = {
+            'error_type': type(error).__name__,
+            'error_message': str(error),
+            'error_traceback': traceback.format_exc()
+        }
+        
+        # Training state 정보
+        training_state = {}
+        if trainer is not None and hasattr(trainer, 'state') and trainer.state is not None:
+            state = trainer.state
+            training_state = {
+                'global_step': state.global_step,
+                'epoch': state.epoch,
+                'current_loss': getattr(state, 'log_history', [{}])[-1].get('train_loss', None),
+                'log_history': getattr(state, 'log_history', [])[-10:]  # 최근 10개만
+            }
+        
+        # Model state 정보
+        model_state = {}
+        if trainer is not None:
+            try:
+                model = trainer.model
+                if hasattr(model, 'module'):  # DeepSpeed 래핑
+                    model = model.module
+                
+                first_param = next(model.parameters())
+                model_state = {
+                    'device': str(first_param.device),
+                    'dtype': str(first_param.dtype),
+                    'requires_grad': bool(first_param.requires_grad),
+                    'num_parameters': sum(p.numel() for p in model.parameters()),
+                    'num_trainable_parameters': sum(p.numel() for p in model.parameters() if p.requires_grad)
+                }
+            except Exception as e:
+                model_state = {'error': str(e)}
+        
+        # Batch configuration 정보
+        batch_config = {}
+        if trainer is not None:
+            try:
+                batch_config = {
+                    'per_device_train_batch_size': getattr(trainer, 'per_device_train_batch_size', None),
+                    'gradient_accumulation_steps': getattr(trainer, 'gradient_accumulation_steps', None),
+                    'effective_batch_size': getattr(trainer, 'per_device_train_batch_size', 1) * getattr(trainer, 'gradient_accumulation_steps', 1),
+                    'max_length': getattr(trainer.args, 'max_length', None) if hasattr(trainer, 'args') else None
+                }
+            except Exception as e:
+                batch_config = {'error': str(e)}
+        
+        # Dataset 정보
+        dataset_info = {}
+        if trainer is not None:
+            try:
+                if hasattr(trainer, 'train_dataset') and trainer.train_dataset is not None:
+                    dataset_info = {
+                        'dataset_size': len(trainer.train_dataset) if hasattr(trainer.train_dataset, '__len__') else 'unknown',
+                        'dataset_type': type(trainer.train_dataset).__name__
+                    }
+            except Exception as e:
+                dataset_info = {'error': str(e)}
+        
+        # GPU 메모리 정보
+        gpu_memory = {}
+        if torch.cuda.is_available():
+            try:
+                gpu_memory = log_gpu_memory(logger, "OOM_ERROR")
+                if gpu_memory:
+                    gpu_memory['memory_summary'] = torch.cuda.memory_summary(device=None, abbreviated=False)
+            except Exception as e:
+                gpu_memory = {'error': str(e)}
+        
+        # 모든 정보 통합
+        oom_info = {
+            'timestamp': timestamp,
+            'environment': env_info,
+            'error': error_info,
+            'training_state': training_state,
+            'model_state': model_state,
+            'batch_config': batch_config,
+            'batch_info': batch_info,
+            'dataset_info': dataset_info,
+            'gpu_memory': gpu_memory
+        }
+        
+        # JSON 파일로 저장
+        with open(error_file, 'w', encoding='utf-8') as f:
+            json.dump(oom_info, f, indent=2, ensure_ascii=False, default=str)
+        
+        logger.error(f"💾 OOM 에러 정보가 저장되었습니다: {error_file}")
+        return error_file
+        
+    except Exception as e:
+        logger.error(f"❌ OOM 에러 정보 저장 실패: {e}")
+        logger.error(f"  Traceback: {traceback.format_exc()}")
+        return None
+
 def log_error_context(logger, error: Exception, context: str = ""):
     """Log detailed error context with system state"""
     logger.error(f"❌ Error in {context}: {str(error)}")
@@ -194,6 +437,395 @@ def log_error_context(logger, error: Exception, context: str = ""):
     logger.error(f"❌ System state - CUDA available: {torch.cuda.is_available()}, Device count: {torch.cuda.device_count()}")
     if torch.cuda.is_available():
         logger.error(f"❌ Current device: {torch.cuda.current_device()}, Device name: {torch.cuda.get_device_name()}")
+
+
+def handle_cuda_oom(e: torch.OutOfMemoryError, trainer, logger):
+    """
+    CUDA OOM (GPU 메모리 부족) 전용 처리 함수
+    
+    Args:
+        e: torch.OutOfMemoryError 예외 객체
+        trainer: Trainer 객체
+        logger: Logger 객체
+    """
+    error_msg = str(e)
+    logger.error("❌ CUDA Out of Memory Error 발생! (GPU 메모리 부족)")
+    logger.error(f"   에러 메시지: {error_msg}")
+    logger.error("   상세 정보를 수집합니다...")
+    
+    # 환경 정보 수집 및 로깅
+    logger.error("🌍 Collecting environment information...")
+    try:
+        env_info = collect_environment_info()
+        logger.error(f"❌ Environment at CUDA OOM:")
+        logger.error(f"  - System: {env_info.get('system', {}).get('platform', 'N/A')}")
+        logger.error(f"  - Python: {env_info.get('python', {}).get('version', 'N/A')[:50]}")
+        logger.error(f"  - PyTorch: {env_info.get('pytorch', {}).get('version', 'N/A')}")
+        logger.error(f"  - CUDA: {env_info.get('pytorch', {}).get('cuda_version', 'N/A')}")
+        if 'gpu' in env_info and env_info['gpu']:
+            for gpu_key, gpu_info in env_info['gpu'].items():
+                if isinstance(gpu_info, dict) and 'name' in gpu_info:
+                    logger.error(f"  - GPU {gpu_key}: {gpu_info.get('name', 'N/A')} ({gpu_info.get('total_memory_gb', 'N/A'):.2f}GB)")
+    except Exception as env_e:
+        logger.error(f"❌ Failed to collect environment info: {env_e}")
+    
+    # Log detailed memory state at OOM
+    log_gpu_memory(logger, "OOM_ERROR")
+    
+    # Log training state at OOM
+    if hasattr(trainer, 'state') and trainer.state is not None:
+        state = trainer.state
+        logger.error(f"❌ Training state at CUDA OOM:")
+        logger.error(f"  - Global step: {state.global_step}")
+        logger.error(f"  - Epoch: {state.epoch:.3f}")
+        logger.error(f"  - Current loss: {getattr(state, 'log_history', [{}])[-1].get('train_loss', 'N/A')}")
+    
+    # Log model state
+    logger.error(f"❌ Model state at CUDA OOM:")
+    try:
+        logger.error(f"  - Model device: {next(trainer.model.parameters()).device}")
+        logger.error(f"  - Model dtype: {next(trainer.model.parameters()).dtype}")
+        logger.error(f"  - Model requires_grad: {next(trainer.model.parameters()).requires_grad}")
+    except Exception as model_e:
+        logger.error(f"  - Could not get model state: {model_e}")
+    
+    # Log batch information
+    logger.error(f"❌ Batch configuration at CUDA OOM:")
+    try:
+        # Trainer의 설정에서 배치 정보 가져오기
+        batch_size = getattr(trainer, 'per_device_train_batch_size', None)
+        grad_accum = getattr(trainer, 'gradient_accumulation_steps', None)
+        num_devices = getattr(trainer.args, 'world_size', 1) if hasattr(trainer, 'args') else 1
+        
+        if batch_size is not None and grad_accum is not None:
+            effective_batch = batch_size * grad_accum * num_devices
+            logger.error(f"  - Per device batch size: {batch_size}")
+            logger.error(f"  - Gradient accumulation: {grad_accum}")
+            logger.error(f"  - Number of devices: {num_devices}")
+            logger.error(f"  - Effective batch size: {effective_batch}")
+        
+        # DataLoader에서 실제 배치 크기 확인
+        try:
+            train_dataloader = trainer.get_train_dataloader()
+            if hasattr(train_dataloader, 'batch_size'):
+                logger.error(f"  - DataLoader batch_size: {train_dataloader.batch_size}")
+            elif hasattr(train_dataloader, 'batch_sampler') and hasattr(train_dataloader.batch_sampler, 'batch_size'):
+                logger.error(f"  - BatchSampler batch_size: {train_dataloader.batch_sampler.batch_size}")
+        except Exception as dl_e:
+            logger.error(f"  - Could not get DataLoader batch size: {dl_e}")
+            
+    except Exception as batch_e:
+        logger.error(f"❌ Could not get batch info: {batch_e}")
+    
+    # 현재 배치의 데이터 샘플 정보 수집
+    logger.error("📊 Collecting data sample information at CUDA OOM...")
+    batch_info = None
+    try:
+        # 배치 추적 callback에서 저장된 정보 사용
+        if hasattr(trainer, 'callback_handler') and trainer.callback_handler is not None:
+            for callback in trainer.callback_handler.callbacks:
+                if hasattr(callback, 'last_batch_info') and callback.last_batch_info is not None:
+                    batch_info = callback.last_batch_info
+                    logger.error(f"❌ Last processed batch information (step {getattr(callback, 'last_batch_step', 'unknown')}):")
+                    break
+        
+        if batch_info:
+            # 배치 크기 정보 (우선 표시)
+            if 'actual_batch_size' in batch_info:
+                logger.error(f"  - Actual batch size (from tensor): {batch_info['actual_batch_size']}")
+            if 'per_device_batch_size' in batch_info:
+                logger.error(f"  - Per device batch size: {batch_info['per_device_batch_size']}")
+            if 'gradient_accumulation_steps' in batch_info:
+                logger.error(f"  - Gradient accumulation steps: {batch_info['gradient_accumulation_steps']}")
+            if 'num_devices' in batch_info:
+                logger.error(f"  - Number of devices: {batch_info['num_devices']}")
+            if 'effective_batch_size' in batch_info:
+                logger.error(f"  - Effective batch size: {batch_info['effective_batch_size']}")
+            if 'dataloader_batch_size' in batch_info:
+                logger.error(f"  - DataLoader batch size: {batch_info['dataloader_batch_size']}")
+            
+            # Input IDs 정보
+            if 'input_ids_shape' in batch_info:
+                logger.error(f"  - Input IDs shape: {batch_info['input_ids_shape']}")
+                logger.error(f"  - Input IDs total tokens: {batch_info.get('total_tokens', 'N/A')}")
+                if 'sample_lengths' in batch_info:
+                    logger.error(f"  - Sample lengths: {batch_info['sample_lengths']}")
+                    logger.error(f"  - Max sample length: {batch_info.get('max_length', 'N/A')}")
+                    logger.error(f"  - Min sample length: {batch_info.get('min_length', 'N/A')}")
+                    logger.error(f"  - Avg sample length: {batch_info.get('avg_length', 'N/A'):.2f}")
+            
+            # Attention mask 정보
+            if 'attention_mask_shape' in batch_info:
+                logger.error(f"  - Attention mask shape: {batch_info['attention_mask_shape']}")
+                logger.error(f"  - Attention mask total elements: {batch_info.get('attention_mask_total', 'N/A')}")
+            
+            # Pixel values (이미지) 정보
+            if 'pixel_values_shape' in batch_info:
+                logger.error(f"  - Pixel values shape: {batch_info['pixel_values_shape']}")
+                logger.error(f"  - Pixel values dtype: {batch_info.get('pixel_values_dtype', 'N/A')}")
+                logger.error(f"  - Pixel values memory (MB): {batch_info.get('pixel_values_memory_mb', 'N/A'):.2f}")
+                logger.error(f"  - Number of images in batch: {batch_info.get('num_images', 'N/A')}")
+            
+            # Image grid 정보
+            if 'image_grid_thw' in batch_info:
+                logger.error(f"  - Image grid info: {batch_info['image_grid_thw']}")
+            
+            # Labels 정보
+            if 'labels_shape' in batch_info:
+                logger.error(f"  - Labels shape: {batch_info['labels_shape']}")
+                logger.error(f"  - Non-ignore tokens: {batch_info.get('non_ignore_tokens', 'N/A')}")
+                logger.error(f"  - Ignore tokens: {batch_info.get('ignore_tokens', 'N/A')}")
+        
+        # Trainer의 내부 상태에서 현재 배치 정보 확인 (fallback)
+        if not batch_info:
+            if hasattr(trainer, '_current_batch') and trainer._current_batch is not None:
+                batch = trainer._current_batch
+                logger.error(f"❌ Current batch information (from trainer._current_batch):")
+                logger.error(f"  - Batch keys: {list(batch.keys()) if isinstance(batch, dict) else 'N/A'}")
+                
+                # Input IDs 정보
+                if 'input_ids' in batch and torch.is_tensor(batch['input_ids']):
+                    input_ids = batch['input_ids']
+                    logger.error(f"  - Input IDs shape: {input_ids.shape}")
+                    logger.error(f"  - Input IDs total tokens: {input_ids.numel()}")
+                    
+                    # 각 샘플의 길이
+                    if len(input_ids.shape) > 1:
+                        # processing_class에서 tokenizer 가져오기 (deprecated된 tokenizer 대신)
+                        processing_class = getattr(trainer, 'processing_class', None)
+                        pad_token_id = 0
+                        if processing_class is not None:
+                            # AutoProcessor인 경우 tokenizer 속성에 접근
+                            tokenizer = getattr(processing_class, 'tokenizer', processing_class)
+                            pad_token_id = getattr(tokenizer, 'pad_token_id', 0) or getattr(tokenizer, 'eos_token_id', 0)
+                        sample_lengths = (input_ids != pad_token_id).sum(dim=1).cpu().tolist()
+                        logger.error(f"  - Sample lengths: {sample_lengths}")
+                        logger.error(f"  - Max sample length: {max(sample_lengths) if sample_lengths else 'N/A'}")
+                        logger.error(f"  - Min sample length: {min(sample_lengths) if sample_lengths else 'N/A'}")
+                        logger.error(f"  - Avg sample length: {sum(sample_lengths) / len(sample_lengths) if sample_lengths else 'N/A':.2f}")
+                
+                # Pixel values (이미지) 정보
+                if 'pixel_values' in batch and torch.is_tensor(batch['pixel_values']):
+                    pixel_values = batch['pixel_values']
+                    logger.error(f"  - Pixel values shape: {pixel_values.shape}")
+                    logger.error(f"  - Pixel values memory (MB): {pixel_values.numel() * pixel_values.element_size() / 1024 / 1024:.2f}")
+                    logger.error(f"  - Number of images in batch: {pixel_values.shape[0] if len(pixel_values.shape) > 0 else 'N/A'}")
+        
+        # 최근 처리된 데이터셋 샘플 확인 (가능한 경우)
+        if hasattr(trainer, 'train_dataset') and trainer.train_dataset is not None:
+            try:
+                state = trainer.state
+                if state and hasattr(state, 'global_step'):
+                    # 현재 step에서 처리 중인 샘플 인덱스 추정
+                    dataset_size = len(trainer.train_dataset) if hasattr(trainer.train_dataset, '__len__') else 'unknown'
+                    logger.error(f"  - Dataset size: {dataset_size}")
+                    
+                    # 샘플 몇 개 확인 (메모리 절약을 위해 최소한만)
+                    if dataset_size != 'unknown' and dataset_size > 0:
+                        sample_indices = []
+                        if hasattr(trainer, 'per_device_train_batch_size'):
+                            batch_size = trainer.per_device_train_batch_size
+                            if hasattr(trainer, 'gradient_accumulation_steps'):
+                                batch_size *= trainer.gradient_accumulation_steps
+                            
+                            # 현재 step에서 처리 중인 샘플 범위 추정
+                            start_idx = (state.global_step * batch_size) % dataset_size
+                            end_idx = min(start_idx + batch_size, dataset_size)
+                            sample_indices = list(range(start_idx, end_idx))[:5]  # 최대 5개만
+                        
+                        if sample_indices:
+                            logger.error(f"  - Estimated sample indices at CUDA OOM: {sample_indices}")
+                            for idx in sample_indices[:3]:  # 최대 3개만 상세 확인
+                                try:
+                                    sample = trainer.train_dataset[idx]
+                                    sample_info = {}
+                                    
+                                    # Messages 정보
+                                    if 'messages' in sample:
+                                        messages = sample['messages']
+                                        if isinstance(messages, list):
+                                            total_text_len = 0
+                                            for msg in messages:
+                                                if isinstance(msg, dict) and 'content' in msg:
+                                                    content = msg['content']
+                                                    if isinstance(content, list):
+                                                        for item in content:
+                                                            if isinstance(item, dict) and 'text' in item:
+                                                                total_text_len += len(str(item['text']))
+                                                    elif isinstance(content, str):
+                                                        total_text_len += len(content)
+                                            sample_info['messages_text_length'] = total_text_len
+                                            sample_info['num_messages'] = len(messages)
+                                    
+                                    # Images 정보
+                                    if 'images' in sample:
+                                        images = sample['images']
+                                        if isinstance(images, list):
+                                            sample_info['num_images'] = len(images)
+                                            if images:
+                                                try:
+                                                    from PIL import Image
+                                                    if isinstance(images[0], Image.Image):
+                                                        sample_info['image_sizes'] = [img.size for img in images[:3]]
+                                                except:
+                                                    pass
+                                        elif images is not None:
+                                            sample_info['has_image'] = True
+                                    
+                                    logger.error(f"    Sample {idx}: {sample_info}")
+                                except Exception as sample_e:
+                                    logger.error(f"    Sample {idx}: Could not inspect ({sample_e})")
+            except Exception as dataset_e:
+                logger.error(f"  - Could not inspect dataset: {dataset_e}")
+    
+    except Exception as data_collect_e:
+        logger.error(f"❌ Failed to collect data sample information: {data_collect_e}")
+        logger.error(f"  Traceback: {traceback.format_exc()}")
+    
+    # 모든 정보를 JSON 파일로 저장
+    logger.error("💾 Saving CUDA OOM error information to file...")
+    try:
+        output_dir = None
+        if hasattr(trainer, 'args') and hasattr(trainer.args, 'output_dir'):
+            output_dir = trainer.args.output_dir
+        elif hasattr(trainer, 'training_args') and hasattr(trainer.training_args, 'output_dir'):
+            output_dir = trainer.training_args.output_dir
+        
+        error_file = save_oom_error_info(logger, trainer, e, batch_info=batch_info, output_dir=output_dir)
+        if error_file:
+            logger.error(f"✅ CUDA OOM 에러 정보가 저장되었습니다: {error_file}")
+            logger.error(f"   파일을 확인하여 상세한 환경 정보와 데이터 정보를 확인할 수 있습니다.")
+    except Exception as save_e:
+        logger.error(f"❌ CUDA OOM 에러 정보 저장 중 오류 발생: {save_e}")
+        logger.error(f"  Traceback: {traceback.format_exc()}")
+    
+    logger.error("❌ GPU 메모리 정리 중...")
+    clear_gpu_memory()
+    logger.error("❌ GPU 메모리 정리 완료.")
+    logger.error("💡 CUDA OOM 해결 방법 제안:")
+    logger.error("   1. per_device_train_batch_size를 더 줄이기 (현재: {})".format(
+        trainer.per_device_train_batch_size if hasattr(trainer, 'per_device_train_batch_size') else 'N/A'
+    ))
+    logger.error("   2. gradient_accumulation_steps를 더 늘리기 (현재: {})".format(
+        trainer.gradient_accumulation_steps if hasattr(trainer, 'gradient_accumulation_steps') else 'N/A'
+    ))
+    logger.error("   3. max_length를 줄이기 (현재: {})".format(
+        trainer.args.max_length if hasattr(trainer.args, 'max_length') else 'N/A'
+    ))
+    logger.error("   4. 다른 프로세스가 GPU를 사용 중인지 확인 (nvidia-smi)")
+    logger.error("   5. DeepSpeed ZeRO-3 CPU offload가 제대로 작동하는지 확인")
+    logger.error("   6. 이미지가 포함된 샘플이 많으면 이미지 전용 데이터셋으로 분리 고려")
+    logger.error("   7. 위의 데이터 샘플 정보를 확인하여 문제가 되는 샘플을 필터링하거나 처리 방식 변경 고려")
+    logger.error("   8. 저장된 CUDA OOM 에러 정보 JSON 파일을 확인하여 상세한 환경 정보와 데이터 정보를 분석하세요")
+    logger.error("   9. PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True 환경 변수 설정 고려")
+
+
+def handle_ram_oom(e: MemoryError, trainer, logger):
+    """
+    로컬 RAM OOM (시스템 메모리 부족) 전용 처리 함수
+    
+    Args:
+        e: MemoryError 예외 객체
+        trainer: Trainer 객체
+        logger: Logger 객체
+    """
+    error_msg = str(e)
+    logger.error("❌ MemoryError 발생! (시스템 RAM 메모리 부족)")
+    logger.error(f"   에러 메시지: {error_msg}")
+    logger.error("   상세 정보를 수집합니다...")
+    
+    # 시스템 메모리 정보 수집
+    try:
+        import psutil
+        memory = psutil.virtual_memory()
+        logger.error(f"❌ 시스템 메모리 상태:")
+        logger.error(f"  - Total RAM: {memory.total / 1024**3:.2f} GB")
+        logger.error(f"  - Available RAM: {memory.available / 1024**3:.2f} GB")
+        logger.error(f"  - Used RAM: {memory.used / 1024**3:.2f} GB")
+        logger.error(f"  - RAM Usage: {memory.percent:.1f}%")
+        
+        # 프로세스별 메모리 사용량
+        process = psutil.Process()
+        process_memory = process.memory_info()
+        logger.error(f"  - Current process RSS: {process_memory.rss / 1024**3:.2f} GB")
+        logger.error(f"  - Current process VMS: {process_memory.vms / 1024**3:.2f} GB")
+    except ImportError:
+        logger.error("  - psutil이 설치되지 않아 상세 메모리 정보를 수집할 수 없습니다.")
+    except Exception as mem_e:
+        logger.error(f"  - 메모리 정보 수집 실패: {mem_e}")
+    
+    # 환경 정보 수집
+    try:
+        env_info = collect_environment_info()
+        logger.error(f"❌ Environment at RAM OOM:")
+        logger.error(f"  - System: {env_info.get('system', {}).get('platform', 'N/A')}")
+        logger.error(f"  - CPU count: {env_info.get('system', {}).get('cpu_count', 'N/A')}")
+    except Exception as env_e:
+        logger.error(f"❌ Failed to collect environment info: {env_e}")
+    
+    # Training state 정보
+    if hasattr(trainer, 'state') and trainer.state is not None:
+        state = trainer.state
+        logger.error(f"❌ Training state at RAM OOM:")
+        logger.error(f"  - Global step: {state.global_step}")
+        logger.error(f"  - Epoch: {state.epoch:.3f}")
+    
+    # 모든 정보를 JSON 파일로 저장
+    logger.error("💾 Saving RAM OOM error information to file...")
+    try:
+        output_dir = None
+        if hasattr(trainer, 'args') and hasattr(trainer.args, 'output_dir'):
+            output_dir = trainer.args.output_dir
+        elif hasattr(trainer, 'training_args') and hasattr(trainer.training_args, 'output_dir'):
+            output_dir = trainer.training_args.output_dir
+        
+        error_file = save_oom_error_info(logger, trainer, e, batch_info=None, output_dir=output_dir)
+        if error_file:
+            logger.error(f"✅ RAM OOM 에러 정보가 저장되었습니다: {error_file}")
+    except Exception as save_e:
+        logger.error(f"❌ RAM OOM 에러 정보 저장 중 오류 발생: {save_e}")
+        logger.error(f"  Traceback: {traceback.format_exc()}")
+    
+    logger.error("💡 RAM OOM 해결 방법 제안:")
+    logger.error("   1. 데이터셋을 스트리밍 모드로 변경 (streaming=True)")
+    logger.error("   2. 데이터 로딩 방식을 변경하여 메모리 사용량 감소")
+    logger.error("   3. DeepSpeed ZeRO-3 CPU offload 활성화 (이미 활성화되어 있다면 설정 확인)")
+    logger.error("   4. 배치 크기를 줄이고 gradient accumulation을 늘리기")
+    logger.error("   5. 데이터셋 전처리를 더 가볍게 만들기")
+    logger.error("   6. 시스템의 다른 프로세스가 메모리를 많이 사용하는지 확인")
+    logger.error("   7. 스왑 메모리(swap) 사용 고려 (성능 저하 가능)")
+    logger.error("   8. 더 많은 RAM이 있는 시스템으로 이동 고려")
+
+
+def handle_training_exception(e: Exception, trainer, logger, context: str = "training"):
+    """
+    학습 중 발생하는 일반 exception을 통합 처리하는 함수
+    
+    Args:
+        e: Exception 객체
+        trainer: Trainer 객체
+        logger: Logger 객체
+        context: 에러 발생 컨텍스트 (예: "training", "training_keyboard_interrupt", "training_runtime_error")
+    """
+    error_msg = str(e)
+    error_type = type(e).__name__
+    
+    logger.error(f"❌ {error_type} during {context}: {error_msg}")
+    log_error_context(logger, e, context)
+    
+    # 특정 에러 타입별 추가 처리
+    if isinstance(e, KeyboardInterrupt):
+        logger.error("❌ 학습이 사용자에 의해 중단되었습니다.")
+    elif isinstance(e, RuntimeError):
+        # CUBLAS 메모리 할당 실패 등 RuntimeError 처리
+        if "CUBLAS_STATUS_ALLOC_FAILED" in error_msg or "cublasCreate" in error_msg:
+            logger.error("❌ CUBLAS 메모리 할당 실패 - GPU 메모리 문제일 수 있습니다.")
+            log_gpu_memory(logger, "CUBLAS_ERROR")
+        else:
+            logger.error(f"❌ RuntimeError: {error_msg}")
+    else:
+        logger.error(f"❌ Unexpected {error_type}: {error_msg}")
+
 
 def load_config(config_path: str):
     """간단한 config 로더"""
@@ -230,7 +862,7 @@ def ensure_router_parameters_trainable(model, logger, context: str = ""):
     Returns:
         tuple: (router_params_list, router_param_names_list, trainable_count)
     """
-    from models.gramspec_moe_model import GramSpecMoERouter
+    from models.spectra_model import SPECTRARouter
     
     # 실제 모델 추출 (DeepSpeed 래핑 처리)
     actual_model = model
@@ -242,9 +874,9 @@ def ensure_router_parameters_trainable(model, logger, context: str = ""):
     seen_param_ids = set()
     
     for name, module in actual_model.named_modules():
-        if isinstance(module, GramSpecMoERouter):
+        if isinstance(module, SPECTRARouter):
             if context:
-                logger.info(f"  [{context}] Found router module: {name}")
+                logger.debug(f"  [{context}] Found router module: {name}")
             
             # Router 모듈의 모든 파라미터
             for param_name, param in module.named_parameters(recurse=True):
@@ -363,10 +995,10 @@ def run_post_training_validation(
             "required": False
         },
         {
-            "name": "gramspec_validation",
-            "script": "eval/run_gramspec_validation.py",
-            "args": ["--task", "comparison", "--gramspec_model", model_path, "--eval_dataset", "dummy", "--output_dir", str(validation_output_dir)],
-            "description": "GramSpec validation (requires eval_dataset)",
+            "name": "spectra_validation",
+            "script": "eval/run_spectra_validation.py",
+            "args": ["--task", "comparison", "--spectra_model", model_path, "--eval_dataset", "dummy", "--output_dir", str(validation_output_dir)],
+            "description": "SPECTRA validation (requires eval_dataset)",
             "required": False
         },
         {
@@ -387,15 +1019,15 @@ def run_post_training_validation(
             "required": False
         },
         {
-            "name": "gramspec_moe_analysis",
-            "module": "eval.gramspec_moe_analysis",
-            "description": "GramSpec MoE analysis",
+            "name": "spectra_analysis",
+            "module": "eval.spectra_analysis",
+            "description": "SPECTRA MoE analysis",
             "required": False
         },
         {
-            "name": "gramspec_semantic_validation",
-            "module": "eval.gramspec_semantic_validation",
-            "description": "GramSpec semantic validation",
+            "name": "spectra_semantic_validation",
+            "module": "eval.spectra_semantic_validation",
+            "description": "SPECTRA semantic validation",
             "required": False
         }
     ]
@@ -425,7 +1057,7 @@ def run_post_training_validation(
                 continue
             
             # 필수 인자가 누락된 경우 스킵
-            if script_name == "gramspec_validation" and "--eval_dataset" in script_args and script_args[script_args.index("--eval_dataset") + 1] == "dummy":
+            if script_name == "spectra_validation" and "--eval_dataset" in script_args and script_args[script_args.index("--eval_dataset") + 1] == "dummy":
                 logger.info(f"⚠️ {description} requires eval_dataset - skipping")
                 validation_results[script_name] = {
                     "status": "skipped",
@@ -732,7 +1364,7 @@ def eval_with_memory_optimization(trainer, original_eval_fn, eval_dataset=None, 
 
 def setup_model_and_tokenizer(model_config: Dict[str, Any]):
     """모델과 토크나이저 설정. modules_to_save_list를 반환"""
-    """Setup GramSpecMoE model and tokenizer with detailed logging"""
+    """Setup SPECTRA model and tokenizer with detailed logging"""
     logger.info("🚀 Starting model and tokenizer setup...")
     
     # NOTE: Delay DeepSpeed env setup until AFTER model load to avoid HF ZeRO-3 init slow path
@@ -811,28 +1443,61 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
         tokenizer.convert_tokens_to_ids = tokenizer.tokenizer.convert_tokens_to_ids
 
     # Prefer config value; default to eager
-    attn_from_cfg = (model_config.get("gramspec_moe_params") or {}).get("attn_implementation")
+    attn_from_cfg = (model_config.get("spectra_params") or {}).get("attn_implementation")
     if attn_from_cfg in {"eager", "sdpa", "flash_attention_2"}:
         attn_implementation = attn_from_cfg
     else:
         attn_implementation = "eager"
 
-    # GramSpecMoE configuration parameters from config file
-    gramspec_moe_params = model_config.get("gramspec_moe_params", {})
+    # SPECTRA configuration parameters from config file
+    spectra_params = model_config.get("spectra_params", {})
     
-    # Load and configure GramSpecMoE model configuration
+    # Load and configure SPECTRA model configuration
     if initialize_from_scratch:
-        print("Initializing model from scratch with small architecture...")
+        print("Initializing model from scratch...")
+        # Load base model config from tokenizer path to get actual architecture
+        base_model_path = model_config.get("tokenizer_name_or_path") or model_config.get("model_name_or_path")
+        if base_model_path:
+            logger.info(f"📐 Loading base model architecture from: {base_model_path}")
+            try:
+                base_config = AutoConfig.from_pretrained(
+                    base_model_path,
+                    trust_remote_code=model_config["trust_remote_code"]
+                )
+                base_model_config = base_config.to_dict()
+                
+                # Handle different model config structures
+                if 'text_config' in base_model_config:
+                    text_config = base_model_config['text_config']
+                else:
+                    text_config = base_model_config
+                
+                # Get architecture parameters from base model config
+                hidden_size = text_config.get('hidden_size')
+                num_hidden_layers = text_config.get('num_hidden_layers')
+                num_attention_heads = text_config.get('num_attention_heads')
+                num_key_value_heads = text_config.get('num_key_value_heads', num_attention_heads)
+                intermediate_size = text_config.get('intermediate_size')
+                vocab_size = text_config.get('vocab_size')
+                max_position_embeddings = text_config.get('max_position_embeddings', 2048)
+                
+                logger.info(f"  ✅ Loaded architecture: layers={num_hidden_layers}, hidden_size={hidden_size}, heads={num_attention_heads}")
+            except Exception as e:
+                logger.warning(f"  ⚠️ Failed to load base model config: {e}")
+                logger.warning(f"  ⚠️ Using fallback defaults (this should not happen!)")
+                # Fallback to defaults only if config loading fails
+                hidden_size = 512
+                num_hidden_layers = 4
+                num_attention_heads = 4
+                num_key_value_heads = 2
+                intermediate_size = 2048
+                vocab_size = 256000
+                max_position_embeddings = 2048
+        else:
+            raise ValueError("Cannot initialize from scratch without tokenizer_name_or_path or model_name_or_path")
+        
         # Create a minimal config from scratch
         from transformers.models.siglip import SiglipVisionConfig
-        
-        # Get architecture parameters from config or use small defaults
-        hidden_size = gramspec_moe_params.get("hidden_size", 512)
-        num_hidden_layers = gramspec_moe_params.get("num_hidden_layers", 4)
-        num_attention_heads = gramspec_moe_params.get("num_attention_heads", 4)
-        num_key_value_heads = gramspec_moe_params.get("num_key_value_heads", 2)
-        intermediate_size = gramspec_moe_params.get("intermediate_size", 2048)
-        vocab_size = gramspec_moe_params.get("vocab_size", 256000)
         
         # Create text config from scratch
         text_config_dict = {
@@ -843,21 +1508,21 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
             "num_attention_heads": num_attention_heads,
             "num_key_value_heads": num_key_value_heads,
             "head_dim": hidden_size // num_attention_heads,
-            "n_shared_experts": gramspec_moe_params.get("n_shared_experts", 1),
-            "n_routed_experts": gramspec_moe_params.get("n_routed_experts", 8),
-            "n_group": gramspec_moe_params.get("n_group", 2),
-            "topk_group": gramspec_moe_params.get("topk_group", 2),
-            "num_experts_per_tok": gramspec_moe_params.get("num_experts_per_tok", 2),
-            "first_k_dense_replace": gramspec_moe_params.get("first_k_dense_replace", 0),
-            "router_aux_loss_coef": gramspec_moe_params.get("router_aux_loss_coef", 1e-3),
-            "router_jitter_noise": gramspec_moe_params.get("router_jitter_noise", 0.01),
-            "input_jitter_noise": gramspec_moe_params.get("input_jitter_noise", 0.0),
-            "router_dim": gramspec_moe_params.get("router_dim", 128),
-            "neftune_noise_alpha": gramspec_moe_params.get("neftune_noise_alpha", 0.0),
-            "model_type": "gramspec_moe_text",
-            "rope_scaling": gramspec_moe_params.get("rope_scaling", {"rope_type": "default", "factor": 1.0}),
+            "n_shared_experts": spectra_params.get("n_shared_experts", 1),
+            "n_routed_experts": spectra_params.get("n_routed_experts", 8),
+            "n_group": spectra_params.get("n_group", 2),
+            "topk_group": spectra_params.get("topk_group", 2),
+            "num_experts_per_tok": spectra_params.get("num_experts_per_tok", 2),
+            "first_k_dense_replace": spectra_params.get("first_k_dense_replace", 0),
+            "router_aux_loss_coef": spectra_params.get("router_aux_loss_coef", 1e-3),
+            "router_jitter_noise": spectra_params.get("router_jitter_noise", 0.01),
+            "input_jitter_noise": spectra_params.get("input_jitter_noise", 0.0),
+            "router_dim": spectra_params.get("router_dim", 128),
+            "neftune_noise_alpha": spectra_params.get("neftune_noise_alpha", 0.0),
+            "model_type": "spectra_text",
+            "rope_scaling": spectra_params.get("rope_scaling", {"rope_type": "default", "factor": 1.0}),
             "attn_implementation": attn_implementation,
-            "max_position_embeddings": gramspec_moe_params.get("max_position_embeddings", 2048),
+            "max_position_embeddings": max_position_embeddings,
             "pad_token_id": 0,
             "eos_token_id": 1,
             "bos_token_id": 2,
@@ -870,8 +1535,8 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
             num_attention_heads=6,
         )
         
-        # Create GramSpecMoE config from scratch
-        config = GramSpecMoEConfig(
+        # Create SPECTRA config from scratch
+        config = SPECTRAConfig(
             text_config=text_config_dict,
             vision_config=vision_config,
             boi_token_index=255999,
@@ -887,7 +1552,7 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
             trust_remote_code=model_config["trust_remote_code"]
         )
         
-        # Convert to dict and update with GramSpecMoE parameters
+        # Convert to dict and update with SPECTRA parameters
         base_model_config = base_config.to_dict()
         
         # Handle different model config structures (Gemma vs others)
@@ -900,28 +1565,83 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
             text_config = base_model_config
             num_attention_heads = base_model_config['num_attention_heads']
         
-        gramspec_moe_config = {
-            "n_shared_experts": gramspec_moe_params["n_shared_experts"],
-            "n_routed_experts": gramspec_moe_params["n_routed_experts"],
-            "n_group": gramspec_moe_params["n_group"],
-            "topk_group": gramspec_moe_params["topk_group"],
-            "num_experts_per_tok": gramspec_moe_params["num_experts_per_tok"],
-            "first_k_dense_replace": gramspec_moe_params["first_k_dense_replace"],
-            "router_aux_loss_coef": gramspec_moe_params["router_aux_loss_coef"],
-            "router_jitter_noise": gramspec_moe_params["router_jitter_noise"],
-            "input_jitter_noise": gramspec_moe_params["input_jitter_noise"],
-            "neftune_noise_alpha": gramspec_moe_params.get("neftune_noise_alpha", 0.0),
-            "model_type": "gramspec_moe_text",
+        spectra_config = {
+            "n_shared_experts": spectra_params["n_shared_experts"],
+            "n_routed_experts": spectra_params["n_routed_experts"],
+            "n_group": spectra_params["n_group"],
+            "topk_group": spectra_params["topk_group"],
+            "num_experts_per_tok": spectra_params["num_experts_per_tok"],
+            "first_k_dense_replace": spectra_params["first_k_dense_replace"],
+            "router_dim": spectra_params.get("router_dim", 128),
+            "router_aux_loss_coef": spectra_params["router_aux_loss_coef"],
+            "router_jitter_noise": spectra_params["router_jitter_noise"],
+            "input_jitter_noise": spectra_params["input_jitter_noise"],
+            "router_z_loss_coef": spectra_params.get("router_z_loss_coef", 1e-4),
+            "router_entropy_coef": spectra_params.get("router_entropy_coef", 1e-3),
+            "usage_uniformity_coef": spectra_params.get("usage_uniformity_coef", 1e-2),
+            "ema_alpha": spectra_params.get("ema_alpha", 0.95),
+            "balancing_strength": spectra_params.get("balancing_strength", 1e-2),
+            "neftune_noise_alpha": spectra_params.get("neftune_noise_alpha", 0.0),
+            "no_rope_layer_interval": spectra_params.get("no_rope_layer_interval", 0),
+            "use_sliding_window": spectra_params.get("use_sliding_window", False),
+            "model_type": "spectra_text",
             "rope_scaling": {
-                "rope_type": gramspec_moe_params["rope_scaling"]["rope_type"],
-                "factor": gramspec_moe_params["rope_scaling"]["factor"]
+                "rope_type": spectra_params["rope_scaling"]["rope_type"],
+                "factor": spectra_params["rope_scaling"]["factor"]
             },
             "use_bfloat16": True,
-            "attn_implementation": attn_implementation
+            "attn_implementation": attn_implementation,
+            # Expression Projector parameters
+            "expression_ortho_strength": spectra_params.get("expression_ortho_strength", 0.1),
+            "expression_init_scale": spectra_params.get("expression_init_scale", 0.1),
+            # Router parameters
+            "router_gru_num_layers": spectra_params.get("router_gru_num_layers", 3),
+            "router_logit_scale_init": spectra_params.get("router_logit_scale_init", 2.302585092994046),
+            "router_logit_scale_max": spectra_params.get("router_logit_scale_max", 100.0),
+            "router_layernorm_eps": spectra_params.get("router_layernorm_eps", 1e-5),
+            # Sinkhorn parameters
+            "sinkhorn_ortho_penalty_alpha": spectra_params.get("sinkhorn_ortho_penalty_alpha", 0.5),
+            "spechorn_sinkhorn_eps": spectra_params.get("spechorn_sinkhorn_eps", 0.05),
+            "spechorn_sinkhorn_iter": spectra_params.get("spechorn_sinkhorn_iter", 4),
+            "spechorn_bias_scale": spectra_params.get("spechorn_bias_scale", 8.0),
+            "spechorn_cap_penalty_scale": spectra_params.get("spechorn_cap_penalty_scale", 15.0),
+            "spechorn_ortho_scale": spectra_params.get("spechorn_ortho_scale", 0.4),
+            "spechorn_spec_update_every": spectra_params.get("spechorn_spec_update_every", 16),
+            "spechorn_target_cv_min": spectra_params.get("spechorn_target_cv_min", 0.03),
+            "spechorn_target_cv_max": spectra_params.get("spechorn_target_cv_max", 0.08),
+            "spechorn_cap_penalty_min": spectra_params.get("spechorn_cap_penalty_min", 5.0),
+            "spechorn_cap_penalty_max": spectra_params.get("spechorn_cap_penalty_max", 30.0),
+            "spechorn_cap_penalty_step": spectra_params.get("spechorn_cap_penalty_step", 1.0),
+            "spechorn_bias_scale_min": spectra_params.get("spechorn_bias_scale_min", 4.0),
+            "spechorn_bias_scale_max": spectra_params.get("spechorn_bias_scale_max", 12.0),
+            "spechorn_ortho_scale_min": spectra_params.get("spechorn_ortho_scale_min", 0.1),
+            "spechorn_ortho_scale_max": spectra_params.get("spechorn_ortho_scale_max", 0.6),
+            # Loss coefficients
+            "speciality_loss_coef": spectra_params.get("speciality_loss_coef", 0.0005),
+            "contrastive_loss_coef": spectra_params.get("contrastive_loss_coef", 0.0005),
+            "expression_reg_loss_coef": spectra_params.get("expression_reg_loss_coef", 1.0),
+            "cosine_similarities_loss_coef": spectra_params.get("cosine_similarities_loss_coef", 0.001),
+            "ortho_loss_coef": spectra_params.get("ortho_loss_coef", 0.003),
+            "sinkhorn_distillation_coef": spectra_params.get("sinkhorn_distillation_coef", 0.05),
+            "sinkhorn_teacher_epsilon": spectra_params.get("sinkhorn_teacher_epsilon", 0.05),
+            # Load balancing parameters
+            "lb_bias_to_hn": spectra_params.get("lb_bias_to_hn", True),
+            "lb_bias_scale": spectra_params.get("lb_bias_scale", 0.1),
+            "bias_lr": spectra_params.get("bias_lr", 1e-3),
+            "bias_decay": spectra_params.get("bias_decay", 0.95),
+            "bias_max": spectra_params.get("bias_max", 3.0),
+            "lb_bias_coef": spectra_params.get("lb_bias_coef", 1.2),
+            "gslb_coef": spectra_params.get("gslb_coef", 5e-2),
+            "lb_l2_coef": spectra_params.get("lb_l2_coef", 5e-3),
+            "lb_cv_coef": spectra_params.get("lb_cv_coef", 2e-2),
+            "lb_entropy_floor_coef": spectra_params.get("lb_entropy_floor_coef", 2e-4),
+            "lb_topk_l2_coef": spectra_params.get("lb_topk_l2_coef", 1.0),
+            "lb_topk_cv_coef": spectra_params.get("lb_topk_cv_coef", 0.9),
+            "routed_scaling_factor": spectra_params.get("routed_scaling_factor", 1.0),
         }
-        base_model_config["text_config"].update(gramspec_moe_config)
-        # Create GramSpecMoE configuration
-        config = GramSpecMoEConfig(
+        base_model_config["text_config"].update(spectra_config)
+        # Create SPECTRA configuration
+        config = SPECTRAConfig(
             text_config=base_model_config["text_config"],
             vision_config=base_model_config["vision_config"],
             boi_token_index=base_model_config["boi_token_index"],
@@ -938,7 +1658,7 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
                 ]
             }
         )
-    print("GramSpecMoE configuration created successfully")
+    print("SPECTRA configuration created successfully")
     if initialize_from_scratch:
         print(f"  - Hidden size: {hidden_size}")
         print(f"  - Num layers: {num_hidden_layers}")
@@ -960,8 +1680,8 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
         device_map = "auto"
         print(f"Using auto device mapping for {torch.cuda.device_count()} GPUs")
     
-    # Load GramSpecMoE model with the configured parameters
-    logger.info("🤖 Loading GramSpecMoE model...")
+    # Load SPECTRA model with the configured parameters
+    logger.info("🤖 Loading SPECTRA model...")
     if initialize_from_scratch:
         logger.info(f"🤖 Initializing from scratch (no pretrained model)")
     else:
@@ -977,13 +1697,10 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
         if initialize_from_scratch:
             # Initialize model from scratch with random weights
             logger.info("🔨 Initializing model from scratch (random weights)...")
-            model = GramSpecMoEForConditionalGeneration(config=config)
-            # Move to device and dtype
-            if device_map is None and torch.cuda.is_available():
-                model = model.to(torch.cuda.current_device())
-            model = model.to(torch.bfloat16)
+            model = SPECTRAForConditionalGeneration(config=config)
+            # Defer device/dtype placement to PEFT/Trainer to avoid multi-GPU OOM
         else:
-            model = GramSpecMoEForConditionalGeneration.from_pretrained(
+            model = SPECTRAForConditionalGeneration.from_pretrained(
                 model_config["model_name_or_path"],
                 config=config,
                 torch_dtype=torch.bfloat16, # Using bfloat16
@@ -997,7 +1714,7 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
                 attn_implementation=attn_implementation
             )
         load_time = time.time() - start_time
-        logger.info(f"✅ GramSpecMoE model loaded successfully in {load_time:.2f} seconds")
+        logger.info(f"✅ SPECTRA model loaded successfully in {load_time:.2f} seconds")
         logger.info(f"  - Attn implementation: {attn_implementation}")
         
         # Log memory after model loading
@@ -1013,630 +1730,56 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
             logger.info(f"  - Model device map: {model.hf_device_map}")
             
     except Exception as e:
-        logger.error(f"❌ Failed to load GramSpecMoE model: {str(e)}")
+        logger.error(f"❌ Failed to load SPECTRA model: {str(e)}")
         log_error_context(logger, e, "model_loading")
         raise e
 
+    modules_to_save_list = None
     # Setup LoRA if requested
     if model_config["use_lora"]:
-        # MoE 레이어 기반으로 router와 서브모듈 찾기
-        # 모델 구조: model.language_model.layers.{layer_idx}.moe.router
-        logger.info("🔍 Scanning model structure for trainable MoE modules...")
-        from models.gramspec_moe_model import GramSpecMoEGRINMoE, GramSpecMoERouter
-        
-        # 1. MoE 레이어 찾기 (여러 방법 시도)
-        moe_layers = []
-        
-        # 방법 1: isinstance로 찾기
-        for name, module in model.named_modules():
-            if isinstance(module, GramSpecMoEGRINMoE):
-                moe_layers.append(name)
-                logger.info(f"✓ Found MoE layer (isinstance): {name}")
-        
-        # 방법 2: 이름 패턴으로 찾기 (isinstance로 못 찾은 경우)
-        if not moe_layers:
-            logger.warning("⚠️ No MoE layers found with isinstance - trying name pattern...")
-            for name, module in model.named_modules():
-                # "moe"가 이름에 포함되고 router 속성이 있는 모듈 찾기
-                if '.moe' in name and hasattr(module, 'router'):
-                    if isinstance(module.router, GramSpecMoERouter):
-                        if name not in moe_layers:
-                            moe_layers.append(name)
-                            logger.info(f"✓ Found MoE layer (name pattern): {name}")
-        
-        # 방법 3: DecoderLayer에서 moe 속성 찾기
-        if not moe_layers:
-            logger.warning("⚠️ Still no MoE layers found - trying decoder layer structure...")
-            for name, module in model.named_modules():
-                # layers.{idx}.moe 패턴 찾기
-                if '.layers.' in name and name.endswith('.moe'):
-                    if hasattr(module, 'router'):
-                        if name not in moe_layers:
-                            moe_layers.append(name)
-                            logger.info(f"✓ Found MoE layer (decoder structure): {name}")
-        
-        # MoE 레이어를 찾지 못한 경우, router를 직접 찾기
-        if not moe_layers:
-            logger.warning("⚠️ No MoE layers found with isinstance - trying to find routers directly...")
-            # Router를 직접 찾아서 역으로 MoE 레이어 경로 추론
-            routers_found_directly = []
-            for name, module in model.named_modules():
-                if isinstance(module, GramSpecMoERouter):
-                    routers_found_directly.append(name)
-                    # router 경로에서 moe 레이어 경로 추론
-                    # 예: model.language_model.layers.0.moe.router -> model.language_model.layers.0.moe
-                    if '.moe.router' in name:
-                        moe_path = name.rsplit('.router', 1)[0]  # router 앞부분
-                        if moe_path not in moe_layers:
-                            moe_layers.append(moe_path)
-                            logger.info(f"✓ Inferred MoE layer from router: {moe_path} (router: {name})")
-                    elif name.endswith('.router'):
-                        # router만 있고 moe가 이름에 없는 경우
-                        moe_path = name.rsplit('.router', 1)[0]
-                        if moe_path not in moe_layers:
-                            moe_layers.append(moe_path)
-                            logger.info(f"✓ Inferred MoE layer from router: {moe_path} (router: {name})")
-            
-            if routers_found_directly:
-                logger.info(f"✓ Found {len(routers_found_directly)} router(s) directly")
-                # router_full_paths에 직접 추가 (나중에 사용)
-                if 'router_full_paths' not in locals():
-                    router_full_paths = []
-                for router_name in routers_found_directly:
-                    if router_name not in router_full_paths:
-                        router_full_paths.append(router_name)
-        
-        if not moe_layers:
-            logger.error("❌ No MoE layers found - router modules cannot be located")
-            logger.error("   This is a critical error! Check model structure.")
-            # 디버깅: moe 관련 모듈 모두 출력
-            logger.error("   Searching for 'moe' in module names...")
-            moe_related = []
-            for name, module in model.named_modules():
-                if 'moe' in name.lower():
-                    moe_related.append((name, type(module).__name__))
-            if moe_related:
-                logger.error(f"   Found {len(moe_related)} modules with 'moe' in name (first 20):")
-                for name, mod_type in moe_related[:20]:
-                    logger.error(f"     {name}: {mod_type}")
-            else:
-                logger.error("   No modules with 'moe' in name found!")
-            # Router 직접 찾기
-            logger.error("   Searching for routers directly...")
-            routers_found = []
-            for name, module in model.named_modules():
-                if isinstance(module, GramSpecMoERouter):
-                    routers_found.append(name)
-            if routers_found:
-                logger.error(f"   Found {len(routers_found)} router(s) directly:")
-                for router_name in routers_found[:10]:
-                    logger.error(f"     {router_name}")
-                logger.error("   Will use these router paths directly for modules_to_save")
-                # Router 경로를 직접 사용
-                for router_name in routers_found:
-                    router_full_paths.append(router_name)
-                    logger.info(f"  ✓ Using router path directly: {router_name}")
-            else:
-                logger.error("   No routers found either!")
-                logger.error("   Available modules (first 50):")
-                for i, (name, module) in enumerate(model.named_modules()):
-                    if i < 50:
-                        logger.error(f"     {name}: {type(module).__name__}")
-                    else:
-                        break
-        
-        # 2. 각 MoE 레이어의 router와 서브모듈 찾기
-        # (또는 router를 직접 찾은 경우 처리)
-        modules_to_save_list = []
-        # router_full_paths 초기화 (이미 찾은 router가 있으면 유지)
-        if 'router_full_paths' not in locals() or not router_full_paths:
-            router_full_paths = []
-        router_submodule_paths = {
-            'load_balancer': [],
-            'expression_projector': [],
-            'linear_projection': [],
-        }
-        
-        def get_module_by_path(model, path):
-            """경로로 모듈 가져오기
-            경로가 'model.'로 시작하면 제거 (named_modules()는 'model.'로 시작하지만 실제 접근은 그렇지 않음)
-            """
-            module = model
-            # 경로가 'model.'로 시작하면 제거
-            if path.startswith('model.'):
-                path = path[6:]  # 'model.' 제거
-            parts = path.split('.')
-            for part in parts:
-                if hasattr(module, part):
-                    module = getattr(module, part)
-                else:
-                    return None
-            return module
-        
-        # Router를 직접 찾은 경우 (moe_layers가 비어있고 router_full_paths가 있는 경우)
-        if not moe_layers and router_full_paths:
-            logger.info("⚠️ Using routers found directly (MoE layers not found)")
-            # Router 경로에서 서브모듈 찾기
-            for router_path in router_full_paths:
-                router_module = get_module_by_path(model, router_path)
-                if router_module and isinstance(router_module, GramSpecMoERouter):
-                    # 서브모듈들 찾기 (동일한 로직)
-                    if hasattr(router_module, 'load_balancer'):
-                        load_balancer_module = router_module.load_balancer
-                        for name, mod in model.named_modules():
-                            if mod is load_balancer_module:
-                                router_submodule_paths['load_balancer'].append(name)
-                                logger.info(f"    → Found load_balancer: {name}")
-                                break
-                        else:
-                            load_balancer_path = f"{router_path}.load_balancer"
-                            router_submodule_paths['load_balancer'].append(load_balancer_path)
-                            logger.info(f"    → Found load_balancer (constructed): {load_balancer_path}")
-                    
-                    if hasattr(router_module, 'expression_projector'):
-                        expression_projector_module = router_module.expression_projector
-                        ep_actual_path = None
-                        for name, mod in model.named_modules():
-                            if mod is expression_projector_module:
-                                ep_actual_path = name
-                                router_submodule_paths['expression_projector'].append(name)
-                                logger.info(f"    → Found expression_projector: {name}")
-                                break
-                        else:
-                            ep_actual_path = f"{router_path}.expression_projector"
-                            router_submodule_paths['expression_projector'].append(ep_actual_path)
-                            logger.info(f"    → Found expression_projector (constructed): {ep_actual_path}")
-                        
-                        if ep_actual_path and hasattr(expression_projector_module, 'linear_projection'):
-                            linear_projection_module = expression_projector_module.linear_projection
-                            for name, mod in model.named_modules():
-                                if mod is linear_projection_module:
-                                    router_submodule_paths['linear_projection'].append(name)
-                                    logger.info(f"      → Found linear_projection: {name}")
-                                    break
-                            else:
-                                linear_projection_path = f"{ep_actual_path}.linear_projection"
-                                router_submodule_paths['linear_projection'].append(linear_projection_path)
-                                logger.info(f"      → Found linear_projection (constructed): {linear_projection_path}")
-        
-        def has_trainable_params(module):
-            """학습 가능한 파라미터가 있는지 확인"""
-            if module is None:
-                return False
-            params = list(module.parameters(recurse=False))
-            return len(params) > 0 and any(p.requires_grad for p in params)
-        
-        # 각 MoE 레이어에서 router 찾기
-        # 주의: global_router가 공유되므로 named_modules()로 찾으면 하나의 경로만 나올 수 있음
-        # 따라서 각 MoE 레이어 경로를 기반으로 router 경로를 구성해야 함
-        logger.info(f"🔍 Processing {len(moe_layers)} MoE layers to find routers and submodules...")
-        logger.info(f"   MoE layers list: {moe_layers}")
-        if not moe_layers:
-            logger.error("❌ CRITICAL: moe_layers is empty! Cannot proceed with router detection.")
-        for moe_name in moe_layers:
-            logger.info(f"  Processing MoE layer: {moe_name}")
-            # MoE 모듈 가져오기
-            moe_module = get_module_by_path(model, moe_name)
-            if moe_module is None:
-                logger.error(f"  ❌ Cannot access MoE module at {moe_name}")
-                continue
-            logger.info(f"    ✓ Successfully accessed MoE module (type: {type(moe_module).__name__})")
-            
-            # router 속성 확인
-            if not hasattr(moe_module, 'router'):
-                logger.error(f"  ❌ MoE module {moe_name} has no 'router' attribute")
-                continue
-            
-            router_module = moe_module.router
-            if not isinstance(router_module, GramSpecMoERouter):
-                logger.error(f"  ❌ Router at {moe_name}.router is not GramSpecMoERouter (type: {type(router_module).__name__})")
-                continue
-            logger.info(f"    ✓ Found router (type: {type(router_module).__name__})")
-            
-            # MoE 레이어 경로를 기반으로 router 경로 구성
-            # global_router가 공유되므로 각 MoE 레이어마다 다른 경로를 가짐
-            router_actual_path = f"{moe_name}.router"
-            
-            # 실제로 해당 경로에 router가 있는지 확인
-            router_at_path = get_module_by_path(model, router_actual_path)
-            if router_at_path is router_module:
-                router_full_paths.append(router_actual_path)
-                logger.info(f"    ✓ Found router at path: {router_actual_path}")
-            else:
-                # 경로가 맞지 않으면 named_modules로 찾기 시도
-                router_found_path = None
-                for name, mod in model.named_modules():
-                    if mod is router_module and name.endswith('.router'):
-                        # 같은 router 객체이지만 다른 경로일 수 있음
-                        # MoE 레이어와 일치하는지 확인
-                        moe_base = moe_name.split('.moe')[0] if '.moe' in moe_name else moe_name
-                        if name.startswith(moe_base):
-                            router_found_path = name
-                            break
-                
-                if router_found_path:
-                    router_actual_path = router_found_path
-                    router_full_paths.append(router_found_path)
-                    logger.info(f"    ✓ Found router at path (via named_modules): {router_found_path}")
-                else:
-                    # 구성된 경로 사용
-                    router_full_paths.append(router_actual_path)
-                    logger.info(f"    ✓ Using constructed router path: {router_actual_path}")
-            
-            # router 내부 서브모듈들 찾기 (named_modules로 실제 경로 확인)
-            # load_balancer
-            if hasattr(router_module, 'load_balancer'):
-                load_balancer_module = router_module.load_balancer
-                # 실제 경로 찾기
-                for name, mod in model.named_modules():
-                    if mod is load_balancer_module:
-                        router_submodule_paths['load_balancer'].append(name)
-                        logger.info(f"    → Found load_balancer: {name}")
-                        break
-                else:
-                    # 경로를 찾지 못했으면 구성된 경로 사용
-                    load_balancer_path = f"{router_actual_path}.load_balancer"
-                    router_submodule_paths['load_balancer'].append(load_balancer_path)
-                    logger.info(f"    → Found load_balancer (using constructed path): {load_balancer_path}")
-            
-            # expression_projector
-            if hasattr(router_module, 'expression_projector'):
-                expression_projector_module = router_module.expression_projector
-                # 실제 경로 찾기
-                ep_actual_path = None
-                for name, mod in model.named_modules():
-                    if mod is expression_projector_module:
-                        ep_actual_path = name
-                        router_submodule_paths['expression_projector'].append(name)
-                        logger.info(f"    → Found expression_projector: {name}")
-                        break
-                else:
-                    # 경로를 찾지 못했으면 구성된 경로 사용
-                    ep_actual_path = f"{router_actual_path}.expression_projector"
-                    router_submodule_paths['expression_projector'].append(ep_actual_path)
-                    logger.info(f"    → Found expression_projector (using constructed path): {ep_actual_path}")
-                
-                # linear_projection (expression_projector 내부)
-                if ep_actual_path and hasattr(expression_projector_module, 'linear_projection'):
-                    linear_projection_module = expression_projector_module.linear_projection
-                    # 실제 경로 찾기
-                    for name, mod in model.named_modules():
-                        if mod is linear_projection_module:
-                            router_submodule_paths['linear_projection'].append(name)
-                            logger.info(f"      → Found linear_projection: {name}")
-                            break
-                    else:
-                        # 경로를 찾지 못했으면 구성된 경로 사용
-                        linear_projection_path = f"{ep_actual_path}.linear_projection"
-                        router_submodule_paths['linear_projection'].append(linear_projection_path)
-                        logger.info(f"      → Found linear_projection (using constructed path): {linear_projection_path}")
-        
-        # 3. PEFT modules_to_save에 추가
-        # 전체 경로를 모두 추가 (각 MoE 레이어마다 다른 경로이므로 모두 포함해야 함)
-        logger.info("=" * 80)
-        logger.info("📋 BEFORE ADDING TO modules_to_save:")
-        logger.info(f"   router_full_paths count: {len(router_full_paths)}")
-        logger.info(f"   router_full_paths: {router_full_paths}")
-        logger.info(f"   router_submodule_paths:")
-        for submodule_type, paths in router_submodule_paths.items():
-            logger.info(f"     {submodule_type}: {len(paths)} paths - {paths}")
-        logger.info("=" * 80)
-        
-        seen_paths = set()
-        
-        # router 모듈 추가 (전체 경로)
-        logger.info(f"🔍 Adding {len(router_full_paths)} router(s) to modules_to_save...")
-        for full_path in router_full_paths:
-            if full_path not in seen_paths:
-                modules_to_save_list.append(full_path)
-                seen_paths.add(full_path)
-                logger.info(f"  ✓ Added router to modules_to_save: {full_path}")
-            # else:
-            #     logger.warning(f"  ⚠️ Skipping duplicate router path: {full_path}")
-        
-        # 서브모듈들 추가 (전체 경로)
-        logger.info(f"🔍 Adding submodules to modules_to_save...")
-        for submodule_type, paths in router_submodule_paths.items():
-            logger.info(f"  Processing {submodule_type}: {len(paths)} paths")
-            for full_path in paths:
-                if full_path not in seen_paths:
-                    modules_to_save_list.append(full_path)
-                    seen_paths.add(full_path)
-                    logger.info(f"    ✓ Added {submodule_type} to modules_to_save: {full_path}")
-                # else:
-                #     logger.warning(f"    ⚠️ Skipping duplicate {submodule_type} path: {full_path}")
-        
-        # 4. expert_load_ema는 register_buffer로 등록된 버퍼이므로 modules_to_save에 포함되지 않음
-        #    router 모듈 자체를 저장하면 자동으로 포함됨
-        expert_load_ema_paths = []
-        for name, _ in model.named_buffers():
-            if 'expert_load_ema' in name:
-                expert_load_ema_paths.append(name)
-        
-        if expert_load_ema_paths:
-            logger.info(f"  → Found {len(expert_load_ema_paths)} expert_load_ema buffer(s) (will be saved with router module)")
-        
-        logger.info("=" * 80)
-        logger.info("📋 FINAL modules_to_save_list BEFORE LoraConfig:")
-        logger.info(f"   Total count: {len(modules_to_save_list)}")
-        if modules_to_save_list:
-            logger.info(f"   ✓ Found {len(modules_to_save_list)} trainable module(s) to add to modules_to_save")
-            logger.info(f"   Router paths: {len(router_full_paths)}, Submodule paths: {sum(len(v) for v in router_submodule_paths.values())}")
-            logger.info(f"   Full modules_to_save list:")
-            for i, path in enumerate(modules_to_save_list):
-                logger.info(f"     [{i}] {path}")
-            logger.info(f"   Router full paths: {router_full_paths}")
-            logger.info(f"   Load balancer paths: {router_submodule_paths['load_balancer']}")
-            logger.info(f"   Expression projector paths: {router_submodule_paths['expression_projector']}")
-            logger.info(f"   Linear projection paths: {router_submodule_paths['linear_projection']}")
-        else:
-            logger.error("❌ CRITICAL: modules_to_save_list is EMPTY!")
-            logger.error(f"   MoE layers found: {len(moe_layers)}")
-            logger.error(f"   Router paths found: {len(router_full_paths)}")
-            logger.error(f"   router_full_paths: {router_full_paths}")
-            logger.error(f"   router_submodule_paths: {router_submodule_paths}")
-        logger.info("=" * 80)
-        
-        # LoRA 설정: router를 modules_to_save에 추가하여 PEFT가 자동으로 trainable로 설정하도록 함
-        logger.info(f"🔧 Creating LoraConfig with modules_to_save={modules_to_save_list if modules_to_save_list else None}")
+        logger.info("🔍 Enabling LoRA for router components (router/balancer/projector)")
+        from models.spectra_model import SPECTRARouter
+
+        # LoRA only on supported Linear submodules (avoid wrapping custom modules)
+        lora_target_modules = [
+            # experts FFN
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+            # ManualGRUCell linears (router balancer)
+            "weight_ih_gates",
+            "weight_hh_gates",
+            "weight_ih_cand",
+            "weight_hh_cand",
+            # Dual solver projections
+            "u_proj",
+            "v_proj",
+            # Bias predictor linears (unwrapped)
+            "bias_pred_fc1",
+            "bias_pred_fc2",
+            # expression projector linear head
+            "linear_projection",
+        ]
+
         lora_config = LoraConfig(
             r=model_config["lora_r"],
             lora_alpha=model_config["lora_alpha"],
             lora_dropout=model_config["lora_dropout"],
-            target_modules=[
-                # "q_proj", "k_proj", "v_proj", "o_proj",
-                "gate_proj", "up_proj", "down_proj",
-                # "router", "routing_temperature", "global_router" 제외 - PEFT 미지원
-                "rnn.weight_ih_l0", "rnn.weight_hh_l0", 
-                "expression_projector", "load_balancer", "linear_projection"
-            ],
-            # Router 모듈을 modules_to_save에 추가 - PEFT가 자동으로 trainable로 설정하고 저장함
-            modules_to_save=modules_to_save_list if modules_to_save_list else None,
+            target_modules=lora_target_modules,
+            modules_to_save=None,
             ensure_weight_tying=True,
             bias="none",
             task_type=TaskType.CAUSAL_LM,
-            inference_mode=False,  # 훈련 모드 명시 
-            fan_in_fan_out=False,  # LoRA 호환성 향상
+            inference_mode=False,
+            fan_in_fan_out=False,
         )
-        logger.info(f"✅ LoraConfig created. modules_to_save={lora_config.modules_to_save}")
+
         model = get_peft_model(model, lora_config)
         model.enable_input_require_grads()
-        logger.info("🔍 Printing trainable parameters...")
-        logger.info(model.print_trainable_parameters())
-        for name, param in model.named_parameters():
-            if param.requires_grad and not any(
-                [keyword for keyword in ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"] 
-                if keyword in name]):
-                logger.info(f"Trainable Layer: {name} | Shape: {param.shape}")
-        # CRITICAL: print_trainable_parameters() 후 router/MoE 모듈 검증
-        logger.info("=" * 80)
-        logger.info("🔍 CRITICAL: Validating router/MoE modules after print_trainable_parameters()...")
-        logger.info("=" * 80)
-        from models.gramspec_moe_model import GramSpecMoERouter, GramSpecMoEGRINMoE
-        
-        router_modules = []
-        moe_modules = []
-        router_params = []
-        router_param_names = []
-        seen_param_ids = set()
-        
-        # Router 모듈 찾기
-        for name, module in model.named_modules():
-            if isinstance(module, GramSpecMoERouter):
-                router_modules.append((name, module))
-                # Router 파라미터 수집 - original_module.*도 포함 (PEFT가 forward에서 original_module을 사용하므로)
-                for param_name, param in module.named_parameters(recurse=True):
-                    param_id = id(param)
-                    if param_id not in seen_param_ids:
-                        router_params.append(param)
-                        router_param_names.append(f"{name}.{param_name}")
-                        seen_param_ids.add(param_id)
-            elif isinstance(module, GramSpecMoEGRINMoE):
-                moe_modules.append((name, module))
-        
-        # Router 검증
-        if not router_modules:
-            raise RuntimeError(
-                "❌ CRITICAL: No router modules found after PEFT setup. "
-                "Router must be present for training. Training aborted."
-            )
-        
-        logger.info(f"✅ Found {len(router_modules)} router module(s)")
-        logger.info(f"✅ Found {len(moe_modules)} MoE module(s)")
-        
-        # Router 파라미터 trainable 검증 (통합 함수 사용)
-        router_params, router_param_names, trainable_count = ensure_router_parameters_trainable(
-            model, logger, context="PEFT_validation"
-        )
-        
-        if not router_params:
-            raise RuntimeError(
-                "❌ CRITICAL: No router parameters found. "
-                "Router must have trainable parameters. Training aborted."
-            )
-        
-        logger.info(f"✅ All {trainable_count}/{len(router_params)} router parameters are trainable")
-        
-        if trainable_count < len(router_params):
-            remaining_non_trainable = [name for param, name in zip(router_params, router_param_names) if not param.requires_grad]
-            error_msg = (
-                f"❌ CRITICAL: Failed to set requires_grad=True for {len(remaining_non_trainable)} router parameters. "
-                f"Training aborted.\n"
-                f"Non-trainable parameters (first 10):\n"
-            )
-            for param_name in remaining_non_trainable[:10]:
-                error_msg += f"  - {param_name}\n"
-            if len(remaining_non_trainable) > 10:
-                error_msg += f"  ... and {len(remaining_non_trainable) - 10} more\n"
-            raise RuntimeError(error_msg)
-        
-        # MoE 모듈 검증 (MoE 레이어가 있어야 함)
-        if not moe_modules:
-            raise RuntimeError(
-                "❌ CRITICAL: No MoE modules found after PEFT setup. "
-                "MoE layers must be present for training. Training aborted."
-            )
-        
-        logger.info("=" * 80)
-        logger.info("✅ Router/MoE validation passed after print_trainable_parameters()")
-        logger.info("=" * 80)
-        
-        # LoRA 어댑터 설정
-        for name, module in model.named_modules():
-            if hasattr(module, 'lora_A') and hasattr(module, 'lora_B'):
-                module.lora_A.requires_grad_(True)
-                module.lora_B.requires_grad_(True)
-        
-        # CRITICAL: modules_to_save에 추가한 모듈들은 저장만 되고 자동으로 학습되지 않음
-        # 명시적으로 requires_grad=True 설정 필요
-        logger.info("🔧 Setting requires_grad=True for modules_to_save modules...")
-        if modules_to_save_list:
-            for module_path in modules_to_save_list:
-                try:
-                    module = get_module_by_path(model, module_path)
-                    if module is not None:
-                        # 모든 파라미터에 requires_grad=True 설정
-                        param_count = 0
-                        for param in module.parameters(recurse=True):
-                            if not param.requires_grad:
-                                param.requires_grad_(True)
-                                param_count += 1
-                        if param_count > 0:
-                            logger.info(f"  ✓ Enabled training for {module_path} ({param_count} params)")
-                        else:
-                            logger.debug(f"  → {module_path} already has requires_grad=True")
-                    else:
-                        logger.warning(f"  ⚠️ Cannot access module at {module_path}")
-                except Exception as e:
-                    logger.error(f"  ❌ Error setting requires_grad for {module_path}: {e}")
-        else:
-            logger.warning("⚠️ modules_to_save_list is empty - no modules to enable training")
-        
-        # PEFT가 modules_to_save에 추가한 router 모듈이 trainable인지 확인
-        # ⚠️ LoRA 적용 후 모듈 구조가 바뀌므로 named_modules()로 직접 찾아야 함
-        logger.info("🔍 Verifying trainable status of router modules after PEFT setup...")
-        verified_modules = {
-            'routers': [],
-            'load_balancers': [],
-            'expression_projectors': [],
-            'linear_projections': [],
-        }
-        
-        # LoRA 적용 후 실제 모델에서 router를 직접 찾기 (경로 기반이 아닌)
-        logger.info("  → Finding routers via named_modules() (after PEFT wrapping)...")
-        routers_found_after_peft = []
-        for name, module in model.named_modules():
-            if isinstance(module, GramSpecMoERouter):
-                routers_found_after_peft.append((name, module))
-                logger.info(f"    ✓ Found router at: {name}")
-        
-        if routers_found_after_peft:
-            logger.info(f"  → Found {len(routers_found_after_peft)} router(s) after PEFT")
-            
-            # 각 router 검증
-            for router_name, router_module in routers_found_after_peft:
-                trainable_params = sum(1 for p in router_module.parameters(recurse=True) if p.requires_grad)
-                total_params = sum(1 for p in router_module.parameters(recurse=True))
-                
-                if trainable_params > 0:
-                    verified_modules['routers'].append({
-                        'path': router_name,
-                        'trainable': trainable_params,
-                        'total': total_params
-                    })
-                    logger.info(f"  ✓ Router '{router_name}' is trainable ({trainable_params}/{total_params} params)")
-                else:
-                    logger.warning(f"  ⚠️ Router '{router_name}' has no trainable parameters")
-                
-                # load_balancer 검증
-                if hasattr(router_module, 'load_balancer'):
-                    lb_module = router_module.load_balancer
-                    lb_trainable = sum(1 for p in lb_module.parameters(recurse=True) if p.requires_grad)
-                    lb_total = sum(1 for p in lb_module.parameters(recurse=True))
-                    if lb_trainable > 0:
-                        load_balancer_path = f"{router_name}.load_balancer"
-                        verified_modules['load_balancers'].append({
-                            'path': load_balancer_path,
-                            'trainable': lb_trainable,
-                            'total': lb_total
-                        })
-                        logger.info(f"    ✓ Load balancer '{load_balancer_path}' is trainable ({lb_trainable}/{lb_total} params)")
-                
-                # expression_projector 검증
-                if hasattr(router_module, 'expression_projector'):
-                    expr_proj = router_module.expression_projector
-                    expr_trainable = sum(1 for p in expr_proj.parameters(recurse=True) if p.requires_grad)
-                    expr_total = sum(1 for p in expr_proj.parameters(recurse=True))
-                    if expr_trainable > 0:
-                        expression_projector_path = f"{router_name}.expression_projector"
-                        verified_modules['expression_projectors'].append({
-                            'path': expression_projector_path,
-                            'trainable': expr_trainable,
-                            'total': expr_total
-                        })
-                        logger.info(f"    ✓ Expression projector '{expression_projector_path}' is trainable ({expr_trainable}/{expr_total} params)")
-                        
-                        # linear_projection 검증
-                        if hasattr(expr_proj, 'linear_projection'):
-                            lin_proj = expr_proj.linear_projection
-                            lin_trainable = sum(1 for p in lin_proj.parameters(recurse=True) if p.requires_grad)
-                            lin_total = sum(1 for p in lin_proj.parameters(recurse=True))
-                            if lin_trainable > 0:
-                                linear_projection_path = f"{expression_projector_path}.linear_projection"
-                                verified_modules['linear_projections'].append({
-                                    'path': linear_projection_path,
-                                    'trainable': lin_trainable,
-                                    'total': lin_total
-                                })
-                                logger.info(f"      ✓ Linear projection '{linear_projection_path}' is trainable ({lin_trainable}/{lin_total} params)")
-        else:
-            logger.warning("  ⚠️ No routers found after PEFT - this is critical!")
-            logger.warning("     Trying to find via modules_to_save paths...")
-            
-            # Fallback: modules_to_save_list 경로로 시도
-            if modules_to_save_list:
-                for module_path in modules_to_save_list:
-                    try:
-                        module = get_module_by_path(model, module_path)
-                        if module is not None:
-                            if isinstance(module, GramSpecMoERouter):
-                                trainable_params = sum(1 for p in module.parameters(recurse=True) if p.requires_grad)
-                                total_params = sum(1 for p in module.parameters(recurse=True))
-                                if trainable_params > 0:
-                                    verified_modules['routers'].append({
-                                        'path': module_path,
-                                        'trainable': trainable_params,
-                                        'total': total_params
-                                    })
-                                    logger.info(f"  ✓ Router '{module_path}' found via modules_to_save path ({trainable_params}/{total_params} params)")
-                    except Exception as e:
-                        logger.debug(f"    Error checking {module_path}: {e}")
-        
-        # 검증 결과 요약
-        total_verified = sum(len(v) for v in verified_modules.values())
-        logger.info(f"✅ Verification complete: {total_verified} trainable module(s) found")
-        logger.info(f"   - Routers: {len(verified_modules['routers'])}")
-        logger.info(f"   - Load balancers: {len(verified_modules['load_balancers'])}")
-        logger.info(f"   - Expression projectors: {len(verified_modules['expression_projectors'])}")
-        logger.info(f"   - Linear projections: {len(verified_modules['linear_projections'])}")
-        
-        if total_verified == 0:
-            logger.error("❌ No trainable router modules found after PEFT setup! Training may fail.")
-        elif routers_found_after_peft and len(verified_modules['routers']) < len(routers_found_after_peft):
-            logger.warning(f"⚠️ Only {len(verified_modules['routers'])}/{len(routers_found_after_peft)} router modules are trainable")
-        # DDP 정적 그래프 비활성화: MoE 라우팅/LoRA로 스텝마다 활성 파라미터가 달라질 수 있으므로 동적 그래프 허용
-        if hasattr(model, '_set_static_graph'):
-            model._set_static_graph(True)
-        # Ensure all parameters incl. LoRA adapters are bfloat16 for consistency
-        try:
-            model.to(torch.bfloat16)
-            for name, param in model.named_parameters():
-                if param.requires_grad and param.dtype != torch.bfloat16:
-                    param.data = param.data.to(torch.bfloat16)
-            print("✓ Parameters cast to bfloat16")
-        except Exception as cast_e:
-            print(f"⚠️ BF16 cast warning: {cast_e}")
-        print("✓ LoRA 적용")
+
+        # Keep router params trainable with a single pass
+        ensure_router_parameters_trainable(model, logger, context="PEFT_setup")
+        logger.info("✅ LoRA ready.")
         
     # CRITICAL: LoRA 비활성화 시에도 router 파라미터를 항상 학습 가능하도록 설정
     # DeepSpeed ZeRO-3 + CPU offload 환경에서도 router가 학습되도록 보장
@@ -1880,19 +2023,19 @@ def main(
         model, tokenizer = setup_result
         modules_to_save_list = None
     
-    # Verify GramSpecMoEGRINMoE class is accessible for DeepSpeed
-    from models.gramspec_moe_model import GramSpecMoEGRINMoE
+    # Verify SPECTRAMoE class is accessible for DeepSpeed
+    from models.spectra_model import SPECTRAMoE
     moe_layers_found = []
     for name, module in model.named_modules():
-        if isinstance(module, GramSpecMoEGRINMoE):
+        if isinstance(module, SPECTRAMoE):
             moe_layers_found.append(name)
-    logger.info(f"✅ Found {len(moe_layers_found)} GramSpecMoEGRINMoE layers in model")
+    logger.info(f"✅ Found {len(moe_layers_found)} SPECTRAMoE layers in model")
     if moe_layers_found:
         logger.info(f"   All MoE layers ({len(moe_layers_found)}):")
         for i, layer_name in enumerate(moe_layers_found):
-            logger.info(f"     [{i}] {layer_name}")
+            logger.debug(f"     [{i}] {layer_name}")
     else:
-        logger.warning("⚠️ No GramSpecMoEGRINMoE layers found! DeepSpeed may fail to find MoE classes.")
+        logger.warning("⚠️ No SPECTRAMoE layers found! DeepSpeed may fail to find MoE classes.")
     
     # Setup dataset
     print("Setting up dataset...")
@@ -2010,12 +2153,12 @@ def main(
             logger.info(f"🔧 Adding {len(missing_params)} router parameters to optimizer...")
             if len(trainer.optimizer.param_groups) > 0:
                 trainer.optimizer.param_groups[0]['params'].extend(missing_params)
-                logger.info(f"  ✓ Added {len(missing_params)} parameters to optimizer param_groups[0]")
+                logger.debug(f"  ✓ Added {len(missing_params)} parameters to optimizer param_groups[0]")
                 
                 # 재확인
                 optimizer_param_ids_after = {id(p) for group in trainer.optimizer.param_groups for p in group['params']}
                 in_optimizer_after = router_param_ids & optimizer_param_ids_after
-                logger.info(f"✅ Router params in optimizer (after fix): {len(in_optimizer_after)}/{len(router_params_after_trainer)}")
+                logger.debug(f"✅ Router params in optimizer (after fix): {len(in_optimizer_after)}/{len(router_params_after_trainer)}")
             else:
                 logger.error("❌ No param_groups found in optimizer - cannot add parameters")
         else:
@@ -2037,7 +2180,7 @@ def main(
         if rank == 0 and (wandb.run is None or not wandb.run):
             # Trainer가 아직 wandb를 초기화하지 않았다면 여기서 초기화
             run = wandb.init(
-                project="gramspec_moe-sft",
+                project="spectra-sft",
                 name=training_config["run_name"],
                 config=config,
                 mode="online"  # 항상 online으로 wandb에 기록
@@ -2079,7 +2222,7 @@ def main(
     # Add MoE monitoring callback
     trainer.add_callback(
         create_moe_callback_for_transformers(
-            num_experts=model_config.get("gramspec_moe_params", {}).get("n_routed_experts", 8),
+            num_experts=model_config.get("spectra_params", {}).get("n_routed_experts", 8),
             log_every_n_steps=1,             # 매 스텝마다 로그 기록
             logger=wandb,                    # 사용할 로거 지정 (wandb)
             log_to_console=False,            # 콘솔에도 주요 메트릭 출력 (디버깅용)
@@ -2128,11 +2271,11 @@ def main(
                     if actual_model is None:
                         return control
                     
-                    from models.gramspec_moe_model import GramSpecMoERouter
+                    from models.spectra_model import SPECTRARouter
                     sync_count = 0
                     
                     for name, module in actual_model.named_modules():
-                        if isinstance(module, GramSpecMoERouter):
+                        if isinstance(module, SPECTRARouter):
                             # expression_projector의 linear_projection 동기화
                             if hasattr(module, 'expression_projector'):
                                 expr_proj = module.expression_projector
@@ -2177,11 +2320,11 @@ def main(
                 if actual_model is None:
                     return control
                 
-                from models.gramspec_moe_model import GramSpecMoERouter
+                from models.spectra_model import SPECTRARouter
                 sync_count = 0
                 
                 for name, module in actual_model.named_modules():
-                    if isinstance(module, GramSpecMoERouter):
+                    if isinstance(module, SPECTRARouter):
                         # expression_projector의 linear_projection 동기화
                         if hasattr(module, 'expression_projector'):
                             expr_proj = module.expression_projector
@@ -2226,8 +2369,8 @@ def main(
                 logger.error("❌ CRITICAL: No router parameters found in model!")
                 return
             
-            logger.info(f"✅ Found {len(router_params)} router parameters")
-            logger.info(f"✅ Router parameters trainable: {trainable_count}/{len(router_params)}")
+            logger.debug(f"✅ Found {len(router_params)} router parameters")
+            logger.debug(f"✅ Router parameters trainable: {trainable_count}/{len(router_params)}")
             
             # Optimizer 포함 여부 확인 및 추가
             if hasattr(trainer, 'deepspeed') and trainer.deepspeed is not None:
@@ -2238,24 +2381,23 @@ def main(
                         ds_param_ids = {id(p) for group in ds_optimizer.param_groups for p in group['params']}
                         router_param_ids = {id(p) for p in router_params}
                         in_ds_optimizer = router_param_ids & ds_param_ids
-                        logger.info(f"   Router params in DeepSpeed optimizer: {len(in_ds_optimizer)}/{len(router_params)}")
+                        logger.debug(f"   Router params in DeepSpeed optimizer: {len(in_ds_optimizer)}/{len(router_params)}")
             
             elif hasattr(trainer, 'optimizer') and trainer.optimizer is not None:
                 optimizer_param_ids = {id(p) for group in trainer.optimizer.param_groups for p in group['params']}
                 router_param_ids = {id(p) for p in router_params}
                 in_optimizer = router_param_ids & optimizer_param_ids
-                logger.info(f"✅ Router params in optimizer: {len(in_optimizer)}/{len(router_params)}")
+                logger.debug(f"✅ Router params in optimizer: {len(in_optimizer)}/{len(router_params)}")
                 
                 if len(in_optimizer) < len(router_params):
                     missing_params = [p for p in router_params if id(p) not in optimizer_param_ids]
                     if len(trainer.optimizer.param_groups) > 0:
                         trainer.optimizer.param_groups[0]['params'].extend(missing_params)
-                        logger.info(f"  ✓ Added {len(missing_params)} parameters to optimizer")
+                        logger.debug(f"  ✓ Added {len(missing_params)} parameters to optimizer")
             else:
                 logger.warning("⚠️ Optimizer not yet initialized - will be checked after training starts")
         
         except Exception as e:
-            import traceback
             logger.error(f"❌ Error validating router weights: {e}")
             logger.error(f"   Traceback: {traceback.format_exc()}")
     
@@ -2284,8 +2426,17 @@ def main(
             self.last_batch_step = -1
             self.trainer_ref = trainer_ref  # Trainer 참조
         
+        def on_train_batch_begin(self, args, state, control, model=None, inputs=None, **kwargs):
+            """배치 시작 시 배치 정보 저장 - 가장 확실한 방법"""
+            try:
+                if inputs is not None:
+                    trainer = kwargs.get('trainer') or self.trainer_ref
+                    self._save_batch_info(inputs, state.global_step, trainer)
+            except Exception:
+                pass  # 배치 정보 저장 실패해도 학습은 계속
+        
         def on_step_begin(self, args, state, control, **kwargs):
-            """Step 시작 시 배치 정보 저장 시도"""
+            """Step 시작 시 배치 정보 저장 시도 (fallback)"""
             try:
                 # Trainer의 내부 상태에서 배치 확인
                 trainer = kwargs.get('trainer') or self.trainer_ref
@@ -2297,7 +2448,7 @@ def main(
                 pass  # 배치 정보 저장 실패해도 학습은 계속
         
         def on_step_end(self, args, state, control, **kwargs):
-            """Step 종료 시 배치 정보 저장 시도"""
+            """Step 종료 시 배치 정보 저장 시도 (fallback)"""
             try:
                 trainer = kwargs.get('trainer') or self.trainer_ref
                 if trainer is not None:
@@ -2311,6 +2462,27 @@ def main(
             """배치 정보를 메모리 효율적으로 저장"""
             try:
                 batch_info = {}
+                
+                # Trainer 설정에서 배치 정보 가져오기
+                if trainer is not None:
+                    try:
+                        batch_info['per_device_batch_size'] = getattr(trainer, 'per_device_train_batch_size', None)
+                        batch_info['gradient_accumulation_steps'] = getattr(trainer, 'gradient_accumulation_steps', None)
+                        batch_info['num_devices'] = getattr(trainer.args, 'world_size', 1) if hasattr(trainer, 'args') else 1
+                        if batch_info['per_device_batch_size'] and batch_info['gradient_accumulation_steps']:
+                            batch_info['effective_batch_size'] = batch_info['per_device_batch_size'] * batch_info['gradient_accumulation_steps'] * batch_info['num_devices']
+                        
+                        # DataLoader에서 실제 배치 크기 확인
+                        try:
+                            train_dataloader = trainer.get_train_dataloader()
+                            if hasattr(train_dataloader, 'batch_size'):
+                                batch_info['dataloader_batch_size'] = train_dataloader.batch_size
+                            elif hasattr(train_dataloader, 'batch_sampler') and hasattr(train_dataloader.batch_sampler, 'batch_size'):
+                                batch_info['dataloader_batch_size'] = train_dataloader.batch_sampler.batch_size
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
                 
                 # Input IDs 정보
                 if 'input_ids' in batch and torch.is_tensor(batch['input_ids']):
@@ -2360,9 +2532,11 @@ def main(
                         batch_info['non_ignore_tokens'] = non_ignore
                         batch_info['ignore_tokens'] = (labels == -100).sum().item()
                 
-                # 배치 크기
+                # 실제 배치 크기 (텐서에서 직접 확인)
                 if 'input_ids' in batch and torch.is_tensor(batch['input_ids']):
-                    batch_info['batch_size'] = batch['input_ids'].shape[0] if len(batch['input_ids'].shape) > 0 else 1
+                    batch_info['actual_batch_size'] = batch['input_ids'].shape[0] if len(batch['input_ids'].shape) > 0 else 1
+                    # 기존 batch_size 필드도 유지 (하위 호환성)
+                    batch_info['batch_size'] = batch_info['actual_batch_size']
                 
                 self.last_batch_info = batch_info
                 self.last_batch_step = step
@@ -2425,19 +2599,42 @@ def main(
                     self.logger.debug(f"📊 Gradient Norm: {logs['grad_norm']:.6f}")
     
     # trainer.add_callback(DetailedTrainingCallback(logger))
-    # trainer.add_callback(
-    #     ModelEvalCallback(
-    #         trainer=trainer,  # Will be set by Trainer
-    #         enable_benchmarks=True,  # Enable benchmark evaluation
-    #         benchmarks_to_run=['mmlu', 'hellaswag', 'gsm8k', 'truthfulqa', 'arc', 'piqa'],  # Run multiple benchmarks
-    #         benchmark_eval_frequency=training_config["eval_steps"],  # Run benchmarks every 2 epochs
-    #         mme_max_samples=10,  # Limit MME samples for faster evaluation
-    #     ))
-    # trainer.add_callback(
-    #     IFEvalCallback(
-    #         eval_dataset_name="google/IFEval",
-    #         max_samples=100
-    #     ))
+
+    # ===== Benchmark evaluation callback (lightweight by default) =====
+    benchmark_eval_enabled = training_config.get("enable_benchmark_eval", True)
+    benchmark_eval_tasks = training_config.get(
+        "benchmark_eval_tasks",
+        ['mmlu', 'hellaswag', 'gsm8k', 'truthfulqa', 'arc', 'ifeval'],  # IFEval integrated
+    )
+    benchmark_eval_mode = training_config.get("benchmark_eval_mode", "step")
+    if benchmark_eval_mode not in {"step", "epoch"}:
+        benchmark_eval_mode = "step"
+
+    default_benchmark_freq = training_config.get("eval_steps", 1000)
+    benchmark_eval_frequency = int(training_config.get("benchmark_eval_frequency", default_benchmark_freq) or default_benchmark_freq)
+
+    if benchmark_eval_enabled:
+        logger.info(
+            f"✅ Enabling benchmark callback (mode={benchmark_eval_mode}, freq={benchmark_eval_frequency}, tasks={benchmark_eval_tasks})"
+        )
+        trainer.add_callback(
+            ModelEvalCallback(
+                trainer=trainer,
+                enable_benchmarks=True,
+                benchmarks_to_run=benchmark_eval_tasks,
+                benchmark_eval_frequency=benchmark_eval_frequency,
+                eval_mode=benchmark_eval_mode,
+                mme_max_samples=training_config.get("benchmark_mme_max_samples", 5),
+                benchmark_max_samples_per_task=training_config.get("benchmark_max_samples_per_task", 3),
+                benchmark_gsm8k_max_samples=training_config.get("benchmark_gsm8k_max_samples", 3),
+                benchmark_max_tasks=training_config.get("benchmark_max_tasks"),
+                benchmark_max_new_tokens=training_config.get("benchmark_max_new_tokens", 64),
+                benchmark_disable_cot=training_config.get("benchmark_disable_cot", True),
+                benchmark_ifeval_max_samples=training_config.get("benchmark_ifeval_max_samples", 5),
+            )
+        )
+    else:
+        logger.info("ℹ️ Benchmark callback disabled (enable_benchmark_eval=False)")
 
     # Print training info
     print("\n" + "="*50)
@@ -2478,6 +2675,31 @@ def main(
         logger.info(f"  - Learning rate: {training_config['learning_rate']}")
         logger.info(f"  - Max sequence length: {data_config['max_seq_length']}")
         
+        # eval 최적화를 위한 커스텀 eval 함수 설정
+        logger.info("🔧 Setting up memory-optimized evaluation...")
+        original_eval_fn = getattr(trainer, 'evaluate', None)
+        trainer.evaluate = lambda eval_dataset=None, ignore_keys=None, metric_key_prefix="eval": eval_with_memory_optimization(trainer, original_eval_fn, eval_dataset=eval_dataset, ignore_keys=ignore_keys, metric_key_prefix=metric_key_prefix)
+        
+        # 학습 시작 전 메모리 정리
+        logger.info("🧹 학습 시작 전 GPU 메모리 정리...")
+        clear_gpu_memory()
+        
+        # DataLoader 최적화 (메모리 절약)
+        if hasattr(trainer.args, 'dataloader_num_workers'):
+            if trainer.args.dataloader_num_workers is None or trainer.args.dataloader_num_workers > 0:
+                logger.info(f"🔧 DataLoader num_workers를 0으로 설정 (메모리 절약)")
+                trainer.args.dataloader_num_workers = 1
+        
+        # Log initial memory state
+        log_gpu_memory(logger, "TRAINING_START")
+        
+        # Enable checkpoint debug mode for detailed error messages
+        logger.info("🔍 Enabling gradient checkpointing debug mode...")
+        torch.utils.checkpoint.set_checkpoint_debug_enabled(True)
+        
+        # Start training with progress monitoring
+        start_time = time.time()
+        
         enable_profiler = bool(int(os.getenv("PROFILE_TRAINING", "0")))
         if enable_profiler:
             from torch.profiler import profile, record_function, ProfilerActivity
@@ -2487,302 +2709,96 @@ def main(
                 profile_memory=True,
                 with_stack=True,
             ) as prof:
-                try:
-                    
-                    trainer.train()
-                    profiler_table = prof.key_averages().table(sort_by="self_cuda_memory_usage", row_limit=10)
-                    wandb.log({"profiler_table": wandb.Table(data=[profiler_table])})
-                except Exception as e:
-                    traceback.print_exc()
-                    print(f"⚠️ Profiler error: {e}")
-        else:
-            # eval 최적화를 위한 커스텀 eval 함수 설정
-            logger.info("🔧 Setting up memory-optimized evaluation...")
-            original_eval_fn = getattr(trainer, 'evaluate', None)
-            trainer.evaluate = lambda eval_dataset=None, ignore_keys=None, metric_key_prefix="eval": eval_with_memory_optimization(trainer, original_eval_fn, eval_dataset=eval_dataset, ignore_keys=ignore_keys, metric_key_prefix=metric_key_prefix)
-            
-            # 학습 시작 전 메모리 정리
-            logger.info("🧹 학습 시작 전 GPU 메모리 정리...")
-            clear_gpu_memory()
-            
-            # DataLoader 최적화 (메모리 절약)
-            if hasattr(trainer.args, 'dataloader_num_workers'):
-                if trainer.args.dataloader_num_workers is None or trainer.args.dataloader_num_workers > 0:
-                    logger.info(f"🔧 DataLoader num_workers를 0으로 설정 (메모리 절약)")
-                    trainer.args.dataloader_num_workers = 1
-            
-            # Log initial memory state
-            log_gpu_memory(logger, "TRAINING_START")
-            
-            # Enable checkpoint debug mode for detailed error messages
-            logger.info("🔍 Enabling gradient checkpointing debug mode...")
-            torch.utils.checkpoint.set_checkpoint_debug_enabled(True)
-            
-            with torch.utils.checkpoint.set_checkpoint_debug_enabled(True):
-                # Start training with progress monitoring
-                start_time = time.time()
                 trainer.train()
-                training_time = time.time() - start_time
-            
-            logger.info(f"✅ Training completed successfully in {training_time:.2f} seconds")
+                profiler_table = prof.key_averages().table(sort_by="self_cuda_memory_usage", row_limit=10)
+                wandb.log({"profiler_table": wandb.Table(data=[profiler_table])})
+        else:
+            with torch.utils.checkpoint.set_checkpoint_debug_enabled(True):
+                trainer.train()
+        
+        training_time = time.time() - start_time
+        logger.info(f"✅ Training completed successfully in {training_time:.2f} seconds")
+        
+    except torch.OutOfMemoryError as e:
+        # CUDA OOM 전용 처리
+        handle_cuda_oom(e, trainer, logger)
+        raise e
+        
+    except MemoryError as e:
+        # 로컬 RAM OOM 전용 처리
+        handle_ram_oom(e, trainer, logger)
+        raise e
         
     except KeyboardInterrupt as e:
-        logger.error(f"❌ KeyboardInterrupt during training: {str(e)}")
-        log_error_context(logger, e, "training_keyboard_interrupt")
+        handle_training_exception(e, trainer, logger, context="training_keyboard_interrupt")
         raise e
-
+        
     except RuntimeError as e:
-        error_msg = str(e)
-        logger.error(f"❌ RuntimeError during training: {error_msg}")
-        
-        # CUBLAS 메모리 할당 실패도 메모리 부족으로 처리
-        is_memory_error = (
-            "CUDA out of memory" in error_msg or
-            "CUBLAS_STATUS_ALLOC_FAILED" in error_msg or
-            "cublasCreate" in error_msg
-        )
-        
-        if is_memory_error:
-            logger.error("❌ GPU 메모리 부족 오류 발생! (CUDA OOM 또는 CUBLAS 할당 실패)")
-            logger.error("   상세 정보를 수집합니다...")
-            
-            # Log detailed memory state at OOM
-            log_gpu_memory(logger, "OOM_ERROR")
-            
-            # Log training state at OOM
-            if hasattr(trainer, 'state') and trainer.state is not None:
-                state = trainer.state
-                logger.error(f"❌ Training state at OOM:")
-                logger.error(f"  - Global step: {state.global_step}")
-                logger.error(f"  - Epoch: {state.epoch:.3f}")
-                logger.error(f"  - Current loss: {getattr(state, 'log_history', [{}])[-1].get('train_loss', 'N/A')}")
-            
-            # Log model state
-            logger.error(f"❌ Model state at OOM:")
-            logger.error(f"  - Model device: {next(trainer.model.parameters()).device}")
-            logger.error(f"  - Model dtype: {next(trainer.model.parameters()).dtype}")
-            logger.error(f"  - Model requires_grad: {next(trainer.model.parameters()).requires_grad}")
-            
-            # Log batch information
-            if hasattr(trainer, 'train_dataloader'):
-                try:
-                    batch_size = trainer.per_device_train_batch_size
-                    grad_accum = trainer.gradient_accumulation_steps
-                    effective_batch = batch_size * grad_accum
-                    logger.error(f"❌ Batch configuration at OOM:")
-                    logger.error(f"  - Per device batch size: {batch_size}")
-                    logger.error(f"  - Gradient accumulation: {grad_accum}")
-                    logger.error(f"  - Effective batch size: {effective_batch}")
-                except Exception as batch_e:
-                    logger.error(f"❌ Could not get batch info: {batch_e}")
-            
-            # 현재 배치의 데이터 샘플 정보 수집
-            logger.error("📊 Collecting data sample information at OOM...")
-            try:
-                # 배치 추적 callback에서 저장된 정보 사용
-                batch_info = None
-                if hasattr(trainer, 'callback_handler') and trainer.callback_handler is not None:
-                    for callback in trainer.callback_handler.callbacks:
-                        if hasattr(callback, 'last_batch_info') and callback.last_batch_info is not None:
-                            batch_info = callback.last_batch_info
-                            logger.error(f"❌ Last processed batch information (step {getattr(callback, 'last_batch_step', 'unknown')}):")
-                            break
-                
-                if batch_info:
-                    # Input IDs 정보
-                    if 'input_ids_shape' in batch_info:
-                        logger.error(f"  - Input IDs shape: {batch_info['input_ids_shape']}")
-                        logger.error(f"  - Input IDs total tokens: {batch_info.get('total_tokens', 'N/A')}")
-                        if 'sample_lengths' in batch_info:
-                            logger.error(f"  - Sample lengths: {batch_info['sample_lengths']}")
-                            logger.error(f"  - Max sample length: {batch_info.get('max_length', 'N/A')}")
-                    
-                    # Attention mask 정보
-                    if 'attention_mask_shape' in batch_info:
-                        logger.error(f"  - Attention mask shape: {batch_info['attention_mask_shape']}")
-                        logger.error(f"  - Attention mask total elements: {batch_info.get('attention_mask_total', 'N/A')}")
-                    
-                    # Pixel values (이미지) 정보
-                    if 'pixel_values_shape' in batch_info:
-                        logger.error(f"  - Pixel values shape: {batch_info['pixel_values_shape']}")
-                        logger.error(f"  - Pixel values memory (MB): {batch_info.get('pixel_values_memory_mb', 'N/A'):.2f}")
-                        logger.error(f"  - Number of images in batch: {batch_info.get('num_images', 'N/A')}")
-                    
-                    # Image grid 정보
-                    if 'image_grid_thw' in batch_info:
-                        logger.error(f"  - Image grid info: {batch_info['image_grid_thw']}")
-                    
-                    # Labels 정보
-                    if 'labels_shape' in batch_info:
-                        logger.error(f"  - Labels shape: {batch_info['labels_shape']}")
-                        logger.error(f"  - Non-ignore tokens: {batch_info.get('non_ignore_tokens', 'N/A')}")
-                
-                # Trainer의 내부 상태에서 현재 배치 정보 확인 (fallback)
-                if not batch_info:
-                    if hasattr(trainer, '_current_batch') and trainer._current_batch is not None:
-                        batch = trainer._current_batch
-                        logger.error(f"❌ Current batch information (from trainer._current_batch):")
-                        logger.error(f"  - Batch keys: {list(batch.keys()) if isinstance(batch, dict) else 'N/A'}")
-                        
-                        # Input IDs 정보
-                        if 'input_ids' in batch and torch.is_tensor(batch['input_ids']):
-                            input_ids = batch['input_ids']
-                            logger.error(f"  - Input IDs shape: {input_ids.shape}")
-                            logger.error(f"  - Input IDs total tokens: {input_ids.numel()}")
-                            
-                            # 각 샘플의 길이
-                            if len(input_ids.shape) > 1:
-                                # processing_class에서 tokenizer 가져오기 (deprecated된 tokenizer 대신)
-                                processing_class = getattr(trainer, 'processing_class', None)
-                                pad_token_id = 0
-                                if processing_class is not None:
-                                    # AutoProcessor인 경우 tokenizer 속성에 접근
-                                    tokenizer = getattr(processing_class, 'tokenizer', processing_class)
-                                    pad_token_id = getattr(tokenizer, 'pad_token_id', 0) or getattr(tokenizer, 'eos_token_id', 0)
-                                sample_lengths = (input_ids != pad_token_id).sum(dim=1).cpu().tolist()
-                                logger.error(f"  - Sample lengths: {sample_lengths}")
-                                logger.error(f"  - Max sample length: {max(sample_lengths) if sample_lengths else 'N/A'}")
-                                logger.error(f"  - Min sample length: {min(sample_lengths) if sample_lengths else 'N/A'}")
-                                logger.error(f"  - Avg sample length: {sum(sample_lengths) / len(sample_lengths) if sample_lengths else 'N/A':.2f}")
-                        
-                        # Pixel values (이미지) 정보
-                        if 'pixel_values' in batch and torch.is_tensor(batch['pixel_values']):
-                            pixel_values = batch['pixel_values']
-                            logger.error(f"  - Pixel values shape: {pixel_values.shape}")
-                            logger.error(f"  - Pixel values memory (MB): {pixel_values.numel() * pixel_values.element_size() / 1024 / 1024:.2f}")
-                            logger.error(f"  - Number of images in batch: {pixel_values.shape[0] if len(pixel_values.shape) > 0 else 'N/A'}")
-                
-                # 최근 처리된 데이터셋 샘플 확인 (가능한 경우)
-                if hasattr(trainer, 'train_dataset') and trainer.train_dataset is not None:
-                    try:
-                        state = trainer.state
-                        if state and hasattr(state, 'global_step'):
-                            # 현재 step에서 처리 중인 샘플 인덱스 추정
-                            dataset_size = len(trainer.train_dataset) if hasattr(trainer.train_dataset, '__len__') else 'unknown'
-                            logger.error(f"  - Dataset size: {dataset_size}")
-                            
-                            # 샘플 몇 개 확인 (메모리 절약을 위해 최소한만)
-                            if dataset_size != 'unknown' and dataset_size > 0:
-                                sample_indices = []
-                                if hasattr(trainer, 'per_device_train_batch_size'):
-                                    batch_size = trainer.per_device_train_batch_size
-                                    if hasattr(trainer, 'gradient_accumulation_steps'):
-                                        batch_size *= trainer.gradient_accumulation_steps
-                                    
-                                    # 현재 step에서 처리 중인 샘플 범위 추정
-                                    start_idx = (state.global_step * batch_size) % dataset_size
-                                    end_idx = min(start_idx + batch_size, dataset_size)
-                                    sample_indices = list(range(start_idx, end_idx))[:5]  # 최대 5개만
-                                
-                                if sample_indices:
-                                    logger.error(f"  - Estimated sample indices at OOM: {sample_indices}")
-                                    for idx in sample_indices[:3]:  # 최대 3개만 상세 확인
-                                        try:
-                                            sample = trainer.train_dataset[idx]
-                                            sample_info = {}
-                                            
-                                            # Messages 정보
-                                            if 'messages' in sample:
-                                                messages = sample['messages']
-                                                if isinstance(messages, list):
-                                                    total_text_len = 0
-                                                    for msg in messages:
-                                                        if isinstance(msg, dict) and 'content' in msg:
-                                                            content = msg['content']
-                                                            if isinstance(content, list):
-                                                                for item in content:
-                                                                    if isinstance(item, dict) and 'text' in item:
-                                                                        total_text_len += len(str(item['text']))
-                                                            elif isinstance(content, str):
-                                                                total_text_len += len(content)
-                                                    sample_info['messages_text_length'] = total_text_len
-                                                    sample_info['num_messages'] = len(messages)
-                                            
-                                            # Images 정보
-                                            if 'images' in sample:
-                                                images = sample['images']
-                                                if isinstance(images, list):
-                                                    sample_info['num_images'] = len(images)
-                                                    if images:
-                                                        try:
-                                                            from PIL import Image
-                                                            if isinstance(images[0], Image.Image):
-                                                                sample_info['image_sizes'] = [img.size for img in images[:3]]
-                                                        except:
-                                                            pass
-                                                elif images is not None:
-                                                    sample_info['has_image'] = True
-                                            
-                                            logger.error(f"    Sample {idx}: {sample_info}")
-                                        except Exception as sample_e:
-                                            logger.error(f"    Sample {idx}: Could not inspect ({sample_e})")
-                    except Exception as dataset_e:
-                        logger.error(f"  - Could not inspect dataset: {dataset_e}")
-                
-            except Exception as data_collect_e:
-                logger.error(f"❌ Failed to collect data sample information: {data_collect_e}")
-                import traceback
-                logger.error(f"  Traceback: {traceback.format_exc()}")
-            
-            logger.error("❌ 메모리 정리 후 재시도...")
-            clear_gpu_memory()
-            logger.error("❌ GPU 메모리 정리 완료.")
-            logger.error("💡 해결 방법 제안:")
-            logger.error("   1. per_device_train_batch_size를 더 줄이기 (현재: {})".format(
-                trainer.per_device_train_batch_size if hasattr(trainer, 'per_device_train_batch_size') else 'N/A'
-            ))
-            logger.error("   2. gradient_accumulation_steps를 더 늘리기 (현재: {})".format(
-                trainer.gradient_accumulation_steps if hasattr(trainer, 'gradient_accumulation_steps') else 'N/A'
-            ))
-            logger.error("   3. max_length를 줄이기 (현재: {})".format(
-                trainer.args.max_length if hasattr(trainer.args, 'max_length') else 'N/A'
-            ))
-            logger.error("   4. 다른 프로세스가 GPU를 사용 중인지 확인 (nvidia-smi)")
-            logger.error("   5. DeepSpeed ZeRO-3 CPU offload가 제대로 작동하는지 확인")
-            logger.error("   6. 이미지가 포함된 샘플이 많으면 이미지 전용 데이터셋으로 분리 고려")
-            logger.error("   7. 위의 데이터 샘플 정보를 확인하여 문제가 되는 샘플을 필터링하거나 처리 방식 변경 고려")
-            
-        else:
-            logger.error(f"❌ Other RuntimeError: {error_msg}")
-            log_error_context(logger, e, "training_runtime_error")
-        
+        handle_training_exception(e, trainer, logger, context="training_runtime_error")
         raise e
         
     except Exception as e:
-        logger.error(f"❌ Unexpected error during training: {str(e)}")
-        log_error_context(logger, e, "training_unexpected_error")
+        handle_training_exception(e, trainer, logger, context="training")
         raise e
         
     finally:
         # 원래 eval 함수 복원
-        # Save final model
-        print("Saving final model...")
-        if config.get("deepspeed_config") is not None:
-            trainer.deepspeed.save_checkpoint(training_args.output_dir)
-        trainer.save_model()
+        # Save final model (실패해도 evaluation은 실행)
+        model_saved = False
+        try:
+            print("Saving final model...")
+            logger.info("💾 Saving final model...")
+            if config.get("deepspeed_config") is not None:
+                try:
+                    trainer.deepspeed.save_checkpoint(training_args.output_dir)
+                    logger.info("✅ DeepSpeed checkpoint saved")
+                except Exception as ds_e:
+                    logger.warning(f"⚠️ DeepSpeed checkpoint save failed: {ds_e}")
+            
+            trainer.save_model()
+            logger.info("✅ Model saved")
+            model_saved = True
+        except Exception as save_e:
+            logger.error(f"❌ Model save failed: {save_e}")
+            log_error_context(logger, save_e, "model_save")
+            # 모델 저장 실패해도 evaluation은 실행
         
-        # Save tokenizer
-        tokenizer.save_pretrained(training_args.output_dir)
+        # Save tokenizer (실패해도 evaluation은 실행)
+        try:
+            tokenizer.save_pretrained(training_args.output_dir)
+            logger.info("✅ Tokenizer saved")
+        except Exception as tokenizer_e:
+            logger.warning(f"⚠️ Tokenizer save failed: {tokenizer_e}")
+        
         print("Training End")
+        logger.info("🏁 Training End")
+        
         if original_eval_fn:
             logger.debug("🔧 Restoring original evaluation function...")
             trainer.evaluate = original_eval_fn
         
-        # 학습 종료 후 validation 실행
+        # 학습 종료 후 validation 실행 (항상 실행, 모델 저장 실패해도 실행)
         try:
             logger.info("\n" + "=" * 80)
             logger.info("🚀 Starting Post-Training Validation")
             logger.info("=" * 80)
+            logger.info("⚠️ Note: Validation will run even if training was interrupted or model save failed")
             
             model_path = training_args.output_dir
             training_config_path = config_path
             
+            # 모델이 저장되었는지 확인
+            if not model_saved:
+                logger.warning("⚠️ Model save failed, but validation will still attempt to run")
+                logger.warning("⚠️ If validation fails, check if model files exist in output directory")
+            
             # Config 파일 경로 찾기
             if training_config_path is None:
                 # 기본 경로 시도
-                default_config = "gramspec_sft/config/gramspec_small_config.json"
+                default_config = "spectra_sft/config/spectra_small_config.json"
                 if os.path.exists(default_config):
                     training_config_path = default_config
+                    logger.info(f"📄 Using default config: {default_config}")
                 else:
                     logger.warning("⚠️ Training config path not found, some validations may be skipped")
             
@@ -2799,17 +2815,19 @@ def main(
             logger.error(f"❌ Post-training validation failed: {e}")
             log_error_context(logger, e, "post_training_validation")
             # Validation 실패해도 학습은 완료된 것으로 간주
+            import traceback
+            logger.error(f"❌ Validation error traceback:\n{traceback.format_exc()}")
 
 
 if __name__ == "__main__":
     register_custom_optimizers()
     try:
         # Parse command line arguments
-        parser = argparse.ArgumentParser(description="GramSpecMoE SFT Training with Config File")
+        parser = argparse.ArgumentParser(description="SPECTRA SFT Training with Config File")
         parser.add_argument(
             "--config", 
             type=str, 
-            default="gramspec_sft/config/gramspec_small_config.json",
+            default="spectra_sft/config/spectra_small_config.json",
             help="Path to training configuration JSON file"
         )
         args = parser.parse_args()
@@ -2832,6 +2850,59 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error(f"❌ Fatal error in main: {str(e)}")
         log_error_context(logger, e, "main_function")
+        
+        # OOM 에러인 경우 상세 정보 수집 및 저장
+        error_msg = str(e)
+        is_memory_error = (
+            "CUDA out of memory" in error_msg or
+            "CUBLAS_STATUS_ALLOC_FAILED" in error_msg or
+            "cublasCreate" in error_msg
+        )
+        
+        if is_memory_error:
+            logger.error("❌ Fatal OOM error detected in main function")
+            logger.error("💾 Collecting and saving error information...")
+            try:
+                # trainer 객체가 있는지 확인 (없을 수도 있음)
+                trainer = None
+                if 'trainer' in locals():
+                    trainer = locals()['trainer']
+                elif 'trainer' in globals():
+                    trainer = globals()['trainer']
+                
+                if trainer is not None:
+                    output_dir = None
+                    if hasattr(trainer, 'args') and hasattr(trainer.args, 'output_dir'):
+                        output_dir = trainer.args.output_dir
+                    elif hasattr(trainer, 'training_args') and hasattr(trainer.training_args, 'output_dir'):
+                        output_dir = trainer.training_args.output_dir
+                    
+                    error_file = save_oom_error_info(logger, trainer, e, batch_info=None, output_dir=output_dir)
+                    if error_file:
+                        logger.error(f"✅ Fatal OOM 에러 정보가 저장되었습니다: {error_file}")
+                else:
+                    # trainer가 없는 경우에도 환경 정보만이라도 저장
+                    logger.error("⚠️ Trainer 객체를 찾을 수 없어 환경 정보만 수집합니다...")
+                    try:
+                        env_info = collect_environment_info()
+                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        error_file = f"logs/fatal_oom_error_info_{timestamp}.json"
+                        os.makedirs("logs", exist_ok=True)
+                        with open(error_file, 'w', encoding='utf-8') as f:
+                            json.dump({
+                                'timestamp': timestamp,
+                                'environment': env_info,
+                                'error': {
+                                    'error_type': type(e).__name__,
+                                    'error_message': str(e),
+                                    'error_traceback': traceback.format_exc()
+                                }
+                            }, f, indent=2, ensure_ascii=False, default=str)
+                        logger.error(f"✅ Fatal OOM 에러 정보가 저장되었습니다: {error_file}")
+                    except Exception as save_e:
+                        logger.error(f"❌ 에러 정보 저장 실패: {save_e}")
+            except Exception as collect_e:
+                logger.error(f"❌ 에러 정보 수집 실패: {collect_e}")
         
         # Log final memory state
         if torch.cuda.is_available():

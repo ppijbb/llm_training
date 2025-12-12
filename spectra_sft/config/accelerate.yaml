@@ -5,7 +5,7 @@ dynamo_backend: YES
 use_cpu: false
 downcast_bf16: 'no'
 enable_cpu_affinity: false
-num_processes: 1
+num_processes: 2
 num_machines: 1
 machine_rank: 0
 gpu_ids: all
@@ -18,10 +18,10 @@ main_training_function: main
 
 deepspeed_config:
   deepspeed_config_file: /home/conan/workspace/llm_training/sft/config/deepspeed_muon_optimizer.json
-  deepspeed_moe_layer_cls_names: GramSpecMoEGRINMoE
+  deepspeed_moe_layer_cls_names: SPECTRAMoE
   zero3_init_flag: true
 
 parallelism_config:
-  sp_size: 1 # 시퀀스 병렬화 크기를 2로 설정
-  tp_size: 1 # 텐서 병렬화 크기를 2로 설정
+  sp_size: 2 # 시퀀스 병렬화 크기를 2로 설정
+  tp_size: 2 # 텐서 병렬화 크기를 2로 설정
   dp_shard_size: 1 # 데이터 병렬화 샤드 크기 (sp_size * dp_shard_size = num_processes)

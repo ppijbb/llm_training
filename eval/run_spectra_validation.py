@@ -1,6 +1,6 @@
 # coding=utf-8
 """
-GramSpec MoE 실제 검증 스크립트
+SPECTRA MoE 실제 검증 스크립트
 
 실행 가능한 검증 실험:
 1. Expression Ablation Study
@@ -176,7 +176,7 @@ def create_ablation_model(model: torch.nn.Module, remove_expression: bool = True
 
 
 def run_information_processing_comparison(
-    gramspec_model_path: str,
+    spectra_model_path: str,
     dense_model_path: Optional[str],
     baseline_moe_model_path: Optional[str],
     eval_datasets: Dict[str, list],
@@ -186,26 +186,26 @@ def run_information_processing_comparison(
     """
     Information Processing Quality 비교
     
-    GramSpec vs Dense vs Baseline MoE
+    SPECTRA vs Dense vs Baseline MoE
     """
     print("="*60)
     print("Information Processing Quality Comparison")
     print("="*60)
     
-    tokenizer = AutoTokenizer.from_pretrained(gramspec_model_path)
+    tokenizer = AutoTokenizer.from_pretrained(spectra_model_path)
     
-    # GramSpec 모델
-    gramspec_model = AutoModelForCausalLM.from_pretrained(gramspec_model_path)
-    gramspec_model = gramspec_model.to(device)
+    # SPECTRA 모델
+    spectra_model = AutoModelForCausalLM.from_pretrained(spectra_model_path)
+    spectra_model = spectra_model.to(device)
     
-    results = {'gramspec': {}, 'dense': {}, 'baseline_moe': {}}
+    results = {'SPECTRA': {}, 'dense': {}, 'baseline_moe': {}}
     
-    # GramSpec 평가
-    print("\nEvaluating GramSpec model...")
+    # SPECTRA 평가
+    print("\nEvaluating SPECTRA model...")
     for task_name, task_data in eval_datasets.items():
         if task_name == 'language_modeling':
-            score = evaluate_model_perplexity(gramspec_model, tokenizer, task_data, device)
-            results['gramspec'][task_name] = score
+            score = evaluate_model_perplexity(spectra_model, tokenizer, task_data, device)
+            results['SPECTRA'][task_name] = score
     
     # Dense 모델 평가
     if dense_model_path:
@@ -232,38 +232,38 @@ def run_information_processing_comparison(
     # 비교 결과 계산
     comparison = {}
     if 'dense' in results and 'language_modeling' in results['dense']:
-        gramspec_ppl = results['gramspec']['language_modeling']['perplexity']
+        spectra_ppl = results['SPECTRA']['language_modeling']['perplexity']
         dense_ppl = results['dense']['language_modeling']['perplexity']
-        improvement = dense_ppl - gramspec_ppl  # 낮을수록 좋으므로
+        improvement = dense_ppl - spectra_ppl  # 낮을수록 좋으므로
         relative_improvement = (improvement / dense_ppl) * 100
         
         comparison['vs_dense'] = {
-            'gramspec_ppl': gramspec_ppl,
+            'spectra_ppl': spectra_ppl,
             'dense_ppl': dense_ppl,
             'improvement': improvement,
             'relative_improvement': relative_improvement,
         }
         
-        print(f"\nGramSpec vs Dense:")
-        print(f"  GramSpec PPL: {gramspec_ppl:.4f}")
+        print(f"\nSPECTRA vs Dense:")
+        print(f"  SPECTRA PPL: {spectra_ppl:.4f}")
         print(f"  Dense PPL:    {dense_ppl:.4f}")
         print(f"  Improvement:  {improvement:.4f} ({relative_improvement:.2f}%)")
     
     if 'baseline_moe' in results and 'language_modeling' in results['baseline_moe']:
-        gramspec_ppl = results['gramspec']['language_modeling']['perplexity']
+        spectra_ppl = results['SPECTRA']['language_modeling']['perplexity']
         baseline_ppl = results['baseline_moe']['language_modeling']['perplexity']
-        improvement = baseline_ppl - gramspec_ppl
+        improvement = baseline_ppl - spectra_ppl
         relative_improvement = (improvement / baseline_ppl) * 100
         
         comparison['vs_baseline_moe'] = {
-            'gramspec_ppl': gramspec_ppl,
+            'spectra_ppl': spectra_ppl,
             'baseline_ppl': baseline_ppl,
             'improvement': improvement,
             'relative_improvement': relative_improvement,
         }
         
-        print(f"\nGramSpec vs Baseline MoE:")
-        print(f"  GramSpec PPL:  {gramspec_ppl:.4f}")
+        print(f"\nSPECTRA vs Baseline MoE:")
+        print(f"  SPECTRA PPL:  {spectra_ppl:.4f}")
         print(f"  Baseline PPL:  {baseline_ppl:.4f}")
         print(f"  Improvement:   {improvement:.4f} ({relative_improvement:.2f}%)")
     
@@ -280,11 +280,11 @@ def run_information_processing_comparison(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="GramSpec MoE Validation Scripts")
+    parser = argparse.ArgumentParser(description="SPECTRA MoE Validation Scripts")
     parser.add_argument("--task", type=str, required=True, choices=['ablation', 'comparison', 'both'],
                        help="Validation task to run")
-    parser.add_argument("--gramspec_model", type=str, required=True,
-                       help="Path to GramSpec model")
+    parser.add_argument("--spectra_model", type=str, required=True,
+                       help="Path to SPECTRA model")
     parser.add_argument("--dense_model", type=str, default=None,
                        help="Path to dense model for comparison")
     parser.add_argument("--baseline_moe_model", type=str, default=None,
@@ -308,7 +308,7 @@ def main():
     
     if args.task in ['ablation', 'both']:
         run_expression_ablation_study(
-            model_path=args.gramspec_model,
+            model_path=args.spectra_model,
             eval_dataset=eval_dataset,
             output_dir=args.output_dir,
             device=args.device,
@@ -316,7 +316,7 @@ def main():
     
     if args.task in ['comparison', 'both']:
         run_information_processing_comparison(
-            gramspec_model_path=args.gramspec_model,
+            spectra_model_path=args.spectra_model,
             dense_model_path=args.dense_model,
             baseline_moe_model_path=args.baseline_moe_model,
             eval_datasets=eval_datasets,

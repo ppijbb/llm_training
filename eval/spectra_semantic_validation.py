@@ -1,6 +1,6 @@
 # coding=utf-8
 """
-GramSpec MoE의 실제 검증 지표
+SPECTRA MoE의 실제 검증 지표
 
 내부 메커니즘 지표가 아닌, 실제로 중요한 검증 지표들:
 1. Expression Semantic Quality: Expression이 진짜 의미있는 표현을 담고 있는지
@@ -26,9 +26,9 @@ class ExpressionAblationResult:
     relative_drop: float  # 상대적 저하 (%)
 
 
-class GramSpecSemanticValidator:
+class SPECTRASemanticValidator:
     """
-    GramSpec MoE의 실제 검증을 위한 지표 계산
+    SPECTRA MoE의 실제 검증을 위한 지표 계산
     
     핵심 질문:
     1. Expression이 실제로 의미있는 semantic representation을 담고 있는가?
@@ -155,7 +155,7 @@ class GramSpecSemanticValidator:
     
     def analyze_information_processing_quality(
         self,
-        gramspec_model: torch.nn.Module,
+        spectra_model: torch.nn.Module,
         dense_model: torch.nn.Module,
         baseline_moe_model: Optional[torch.nn.Module] = None,
         evaluation_datasets: Dict[str, Callable] = None,
@@ -164,7 +164,7 @@ class GramSpecSemanticValidator:
         """
         정보 처리 품질 분석
         
-        검증: GramSpec MoE가 정보를 더 잘 흡수/처리하는가?
+        검증: SPECTRA MoE가 정보를 더 잘 흡수/처리하는가?
         
         비교 대상:
         1. Dense 모델 (동일 파라미터 수)
@@ -184,32 +184,32 @@ class GramSpecSemanticValidator:
             'information_metrics': information_metrics or {},
         }
         
-        # GramSpec vs Dense 비교
+        # SPECTRA vs Dense 비교
         for task_name, eval_fn in evaluation_datasets.items():
-            gramspec_score = eval_fn(gramspec_model).get('score', 0.0)
+            spectra_score = eval_fn(spectra_model).get('score', 0.0)
             dense_score = eval_fn(dense_model).get('score', 0.0)
             
-            improvement = gramspec_score - dense_score
+            improvement = spectra_score - dense_score
             relative_improvement = (improvement / (dense_score + 1e-8)) * 100
             
             results['vs_dense'][task_name] = {
-                'gramspec': gramspec_score,
+                'SPECTRA': spectra_score,
                 'dense': dense_score,
                 'improvement': improvement,
                 'relative_improvement': relative_improvement,
             }
         
-        # GramSpec vs Baseline MoE 비교
+        # SPECTRA vs Baseline MoE 비교
         if baseline_moe_model is not None:
             for task_name, eval_fn in evaluation_datasets.items():
-                gramspec_score = eval_fn(gramspec_model).get('score', 0.0)
+                spectra_score = eval_fn(spectra_model).get('score', 0.0)
                 baseline_score = eval_fn(baseline_moe_model).get('score', 0.0)
                 
-                improvement = gramspec_score - baseline_score
+                improvement = spectra_score - baseline_score
                 relative_improvement = (improvement / (baseline_score + 1e-8)) * 100
                 
                 results['vs_baseline_moe'][task_name] = {
-                    'gramspec': gramspec_score,
+                    'SPECTRA': spectra_score,
                     'baseline': baseline_score,
                     'improvement': improvement,
                     'relative_improvement': relative_improvement,

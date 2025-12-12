@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Efficiency Measurement Tool for GramSpec MoE
+Efficiency Measurement Tool for SPECTRA MoE
 
 Measures:
 - tokens/s (throughput)

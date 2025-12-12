@@ -1,4 +1,4 @@
-# GramSpec MoE 실제 검증 지표
+# SPECTRA MoE 실제 검증 지표
 
 ## 핵심 철학
 
@@ -79,8 +79,8 @@
 - **Reasoning**: GSM8K, MATH accuracy
 
 ```
-GramSpec > Dense → Information processing 우수 ✅
-GramSpec > Baseline MoE → Routing method 우수 ✅
+SPECTRA > Dense → Information processing 우수 ✅
+SPECTRA > Baseline MoE → Routing method 우수 ✅
 ```
 
 #### 3.2 Representation Quality (Linear Probing)

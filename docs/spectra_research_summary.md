@@ -1,8 +1,8 @@
-# GramSpec MoE 논문 연구 요약
+# SPECTRA MoE 논문 연구 요약
 
 ## 핵심 요약
 
-GramSpec MoE는 **Gram matrix 기반 orthogonal constraint**를 활용하여 expert specialization과 diversity를 동시에 달성하는 MoE routing 방법입니다.
+SPECTRA MoE는 **Gram matrix 기반 orthogonal constraint**를 활용하여 expert specialization과 diversity를 동시에 달성하는 MoE routing 방법입니다.
 
 ## 주요 차별화 포인트
 
@@ -48,7 +48,7 @@ GramSpec MoE는 **Gram matrix 기반 orthogonal constraint**를 활용하여 exp
 
 ## 추가 지표
 
-### GramSpec 분석기에서 제공하는 지표
+### SPECTRA 분석기에서 제공하는 지표
 - `gram_matrix_orthogonality`: Gram matrix의 직교성 (0~1, 높을수록 좋음)
 - `gram_diagonal_quality`: 대각선 요소의 품질 (1에 가까울수록 좋음)
 - `gram_off_diagonal_sparsity`: 비대각선 요소의 희소성 (0에 가까울수록 좋음)

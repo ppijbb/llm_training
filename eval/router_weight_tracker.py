@@ -1,8 +1,8 @@
 # coding=utf-8
 """
-Router Weight Tracker for GramSpec MoE
+Router Weight Tracker for SPECTRA MoE
 
-이 모듈은 gramspec_moe 모델의 router 가중치를 step별로 tracking하고 분석합니다.
+이 모듈은 spectra 모델의 router 가중치를 step별로 tracking하고 분석합니다.
 Router 가중치는 다음 두 부분으로 구성됩니다:
 1. load_balancer (GRU): sequential routing을 위한 가중치
 2. expression_projector: orthogonal expression projection을 위한 가중치
@@ -23,7 +23,7 @@ def extract_router_weights(model: nn.Module, actual_weights_dict: Optional[Dict[
     모델에서 모든 router 가중치를 추출합니다.
     
     Args:
-        model: GramSpec MoE 모델
+        model: SPECTRA MoE 모델
         
     Returns:
         Dictionary with structure:
@@ -75,7 +75,7 @@ def extract_router_weights(model: nn.Module, actual_weights_dict: Optional[Dict[
         for attr_name in ['mlp', 'feed_forward', 'ffn', 'ffw', 'moe']:
             if hasattr(layer, attr_name):
                 candidate = getattr(layer, attr_name)
-                # GramSpecMoEBlock인지 확인
+                # SPECTRABlock인지 확인
                 if hasattr(candidate, 'router') and hasattr(candidate.router, 'load_balancer'):
                     moe_block = candidate
                     break
@@ -407,7 +407,7 @@ class RouterWeightTracker:
         현재 step의 router 가중치를 tracking합니다.
         
         Args:
-            model: GramSpec MoE 모델
+            model: SPECTRA MoE 모델
             step: 현재 step 번호
             global_step: 전역 step 번호 (None이면 step 사용)
             actual_weights_dict: Forward hook에서 추적한 실제 사용되는 weight 딕셔너리
@@ -526,13 +526,15 @@ class RouterWeightTracker:
         return step_stats
     
     def _save_to_disk(self, step: int):
-        """가중치 히스토리를 디스크에 저장"""
+        """가중치 히스토리를 디스크에 저장 (atomic write, empty 파일 방지)"""
         try:
             # 디렉토리 존재 확인 및 생성
             self.save_dir.mkdir(parents=True, exist_ok=True)
             
-            # 통계만 저장 (메모리 효율)
             stats_file = self.save_dir / f"router_weight_stats_step_{step}.json"
+            # Use unique tmp filename to avoid multi-process collisions
+            import uuid, time
+            tmp_file = self.save_dir / f"{stats_file.name}.tmp.{os.getpid()}.{time.time_ns()}.{uuid.uuid4().hex}"
             
             # JSON serializable 형태로 변환
             save_data = {
@@ -540,17 +542,19 @@ class RouterWeightTracker:
                 'history': self.weight_history[-self.save_every_n_steps:],  # 최근 N step만 저장
             }
             
-            # 파일 저장
-            with open(stats_file, 'w') as f:
+            # 파일을 tmp에 먼저 저장 후 rename (atomic)
+            with open(tmp_file, 'w') as f:
                 json.dump(save_data, f, indent=2, default=str)
+                f.flush()
+                os.fsync(f.fileno())
+            # Atomic replace to final path
+            os.replace(tmp_file, stats_file)
             
             # 파일이 실제로 생성되었는지 확인
             if stats_file.exists():
                 file_size = stats_file.stat().st_size
-                if file_size > 0:
-                    pass  # 성공
-                else:
-                    raise IOError(f"Saved file {stats_file} is empty")
+                if file_size <= 0:
+                    raise IOError(f"Saved file {stats_file} is empty after write")
             else:
                 raise IOError(f"Failed to create file {stats_file}")
             

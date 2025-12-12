@@ -111,7 +111,7 @@ class RouterWeightTrackingCallback(TrainerCallback):
             actual_model = model.module
         
         if actual_model is not None:
-            from models.gramspec_moe_model import GramSpecMoERouter
+            from models.spectra_model import SPECTRARouter
             try:
                 from models.g3moe_model import G3MoERouter, G3MoEGRINMoE
             except ImportError:
@@ -131,15 +131,15 @@ class RouterWeightTrackingCallback(TrainerCallback):
                     active_adapter = getattr(module, "active_adapter", "default")
                     if hasattr(module, "modules_to_save") and active_adapter in module.modules_to_save:
                         inner_module = module.modules_to_save[active_adapter]
-                        if isinstance(inner_module, GramSpecMoERouter):
+                        if isinstance(inner_module, SPECTRARouter):
                             is_router = True
                             router_module = inner_module
                         elif G3MoERouter is not None and isinstance(inner_module, G3MoERouter):
                             is_router = True
                             router_module = inner_module
                 
-                # 2. GramSpecMoERouter 체크
-                elif isinstance(module, GramSpecMoERouter):
+                # 2. SPECTRARouter 체크
+                elif isinstance(module, SPECTRARouter):
                     is_router = True
                     router_module = module
                 # 3. G3MoERouter 직접 체크
@@ -232,7 +232,7 @@ class RouterWeightTrackingCallback(TrainerCallback):
             #         actual_model = model.module
             #     
             #     if actual_model is not None:
-            #         from models.gramspec_moe_model import GramSpecMoERouter
+            #         from models.spectra_model import SPECTRARouter
             #         try:
             #             from models.g3moe_model import G3MoERouter, G3MoEGRINMoE
             #         except ImportError:
@@ -246,7 +246,7 @@ class RouterWeightTrackingCallback(TrainerCallback):
             #             is_router = False
             #             router_module = None
             #             
-            #             if isinstance(module, GramSpecMoERouter):
+            #             if isinstance(module, SPECTRARouter):
             #                 is_router = True
             #                 router_module = module
             #             elif G3MoERouter is not None and isinstance(module, G3MoERouter):
@@ -309,7 +309,7 @@ class RouterWeightTrackingCallback(TrainerCallback):
                     actual_model = model.module
                 
                 if actual_model is not None and hasattr(trainer, 'optimizer') and trainer.optimizer is not None:
-                    from models.gramspec_moe_model import GramSpecMoERouter
+                    from models.spectra_model import SPECTRARouter
                     try:
                         from models.g3moe_model import G3MoERouter, G3MoEGRINMoE
                     except ImportError:
@@ -329,15 +329,15 @@ class RouterWeightTrackingCallback(TrainerCallback):
                             active_adapter = getattr(module, "active_adapter", "default")
                             if hasattr(module, "modules_to_save") and active_adapter in module.modules_to_save:
                                 inner_module = module.modules_to_save[active_adapter]
-                                if isinstance(inner_module, GramSpecMoERouter):
+                                if isinstance(inner_module, SPECTRARouter):
                                     is_router = True
                                     router_module = inner_module
                                 elif G3MoERouter is not None and isinstance(inner_module, G3MoERouter):
                                     is_router = True
                                     router_module = inner_module
                         
-                        # 2. GramSpecMoERouter 체크
-                        elif isinstance(module, GramSpecMoERouter):
+                        # 2. SPECTRARouter 체크
+                        elif isinstance(module, SPECTRARouter):
                             is_router = True
                             router_module = module
                         # 3. G3MoERouter 직접 체크
@@ -419,7 +419,7 @@ class RouterWeightTrackingCallback(TrainerCallback):
             logger.info("✅ Router validation passed - all router parameters are trainable and in optimizer")
         logger.info("=" * 80)
         
-        # Optimizer에 등록된 파라미터 확인 및 로깅 (train_gramspec.py 형식 유지)
+        # Optimizer에 등록된 파라미터 확인 및 로깅 (train_SPECTRA.py 형식 유지)
         if trainer is not None:
             logger.info("=" * 80)
             logger.info("🔍 Checking parameters registered in optimizer...")
@@ -451,7 +451,7 @@ class RouterWeightTrackingCallback(TrainerCallback):
             if optimizer_param_ids:
                 logger.info(f"✅ Total {len(optimizer_param_ids)} parameters in optimizer (source: {optimizer_source})")
                 
-                # 모델의 모든 파라미터를 순회하면서 optimizer에 등록된 것만 로깅 (train_gramspec.py 형식)
+                # 모델의 모든 파라미터를 순회하면서 optimizer에 등록된 것만 로깅 (train_SPECTRA.py 형식)
                 actual_model = model
                 if hasattr(model, 'module'):  # DeepSpeed 래핑
                     actual_model = model.module
@@ -459,7 +459,7 @@ class RouterWeightTrackingCallback(TrainerCallback):
                 if actual_model is not None:
                     optimizer_params_logged = 0
                     for name, param in actual_model.named_parameters():
-                        # train_gramspec.py의 필터링 조건 유지
+                        # train_SPECTRA.py의 필터링 조건 유지
                         if param.requires_grad and not any([keyword for keyword in ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"] if keyword in name]):
                             # Optimizer에 등록된 파라미터만 로깅
                             if id(param) in optimizer_param_ids:
@@ -469,7 +469,7 @@ class RouterWeightTrackingCallback(TrainerCallback):
                     logger.info(f"✅ Logged {optimizer_params_logged} trainable parameters that are in optimizer (excluding q/k/v/o/gate/up/down_proj)")
                     
                     # Router 파라미터만 별도로 확인 및 검증
-                    from models.gramspec_moe_model import GramSpecMoERouter
+                    from models.spectra_model import SPECTRARouter
                     try:
                         from models.g3moe_model import G3MoERouter, G3MoEGRINMoE
                     except ImportError:
@@ -486,7 +486,7 @@ class RouterWeightTrackingCallback(TrainerCallback):
                         is_router = False
                         router_module = None
                         
-                        if isinstance(module, GramSpecMoERouter):
+                        if isinstance(module, SPECTRARouter):
                             is_router = True
                             router_module = module
                         elif G3MoERouter is not None and isinstance(module, G3MoERouter):
@@ -570,7 +570,7 @@ class RouterWeightTrackingCallback(TrainerCallback):
     
     def _register_router_forward_hooks(self, model):
         """모든 router 모듈에 forward hook을 등록하여 실제 사용 여부 및 실제 사용되는 weight 추적"""
-        from models.gramspec_moe_model import GramSpecMoERouter
+        from models.spectra_model import SPECTRARouter
         try:
             from models.g3moe_model import G3MoERouter, G3MoEGRINMoE
         except ImportError:
@@ -594,19 +594,19 @@ class RouterWeightTrackingCallback(TrainerCallback):
                     inner_module = module.modules_to_save[active_adapter]
                     
                     # 내부 모듈이 Router인지 확인
-                    if isinstance(inner_module, GramSpecMoERouter):
+                    if isinstance(inner_module, SPECTRARouter):
                         is_router = True
                         router_module = inner_module
                         wrapper_module = module  # Wrapper 자체 저장
-                        logger.info(f"✅ Found PEFT wrapped router: {name} (adapter: {active_adapter})")
+                        logger.debug(f"✅ Found PEFT wrapped router: {name} (adapter: {active_adapter})")
                     elif G3MoERouter is not None and isinstance(inner_module, G3MoERouter):
                         is_router = True
                         router_module = inner_module
                         wrapper_module = module  # Wrapper 자체 저장
-                        logger.info(f"✅ Found PEFT wrapped G3MoE router: {name} (adapter: {active_adapter})")
+                        logger.debug(f"✅ Found PEFT wrapped G3MoE router: {name} (adapter: {active_adapter})")
             
-            # 2. GramSpecMoERouter 체크
-            elif isinstance(module, GramSpecMoERouter):
+            # 2. SPECTRARouter 체크
+            elif isinstance(module, SPECTRARouter):
                 is_router = True
                 router_module = module
             # 3. G3MoERouter 직접 체크
@@ -629,7 +629,7 @@ class RouterWeightTrackingCallback(TrainerCallback):
                                 router_module = inner_module
                                 wrapper_module = potential_router  # Wrapper 자체 저장
                                 name = f"{name}.router"
-                                logger.info(f"✅ Found PEFT wrapped nested router in G3MoEGRINMoE: {name}")
+                                logger.debug(f"✅ Found PEFT wrapped nested router in G3MoEGRINMoE: {name}")
                     
                     # 일반 Router인지 확인
                     elif isinstance(potential_router, G3MoERouter):
@@ -703,7 +703,7 @@ class RouterWeightTrackingCallback(TrainerCallback):
                             if hasattr(lin_proj, "modules_to_save") and lin_proj_adapter in lin_proj.modules_to_save:
                                 lin_proj_inner = lin_proj.modules_to_save[lin_proj_adapter]
                                 lin_proj_wrapper = lin_proj
-                                logger.info(f"  ✅ Found PEFT wrapped linear_projection: {name}.expression_projector.linear_projection (adapter: {lin_proj_adapter})")
+                                logger.debug(f"  ✅ Found PEFT wrapped linear_projection: {name}.expression_projector.linear_projection (adapter: {lin_proj_adapter})")
                         
                         # Hook을 등록할 모듈 결정
                         lin_proj_hook_target = lin_proj_wrapper if lin_proj_wrapper is not None else lin_proj
@@ -830,7 +830,7 @@ class RouterWeightTrackingCallback(TrainerCallback):
                             actual_model = model.module
                         
                         if actual_model is not None:
-                            from models.gramspec_moe_model import GramSpecMoERouter
+                            from models.spectra_model import SPECTRARouter
                             try:
                                 from models.g3moe_model import G3MoERouter
                             except ImportError:
@@ -857,15 +857,15 @@ class RouterWeightTrackingCallback(TrainerCallback):
                                     active_adapter = getattr(module, "active_adapter", "default")
                                     if hasattr(module, "modules_to_save") and active_adapter in module.modules_to_save:
                                         inner_module = module.modules_to_save[active_adapter]
-                                        if isinstance(inner_module, GramSpecMoERouter):
+                                        if isinstance(inner_module, SPECTRARouter):
                                             is_router = True
                                             router_module = inner_module
                                         elif G3MoERouter is not None and isinstance(inner_module, G3MoERouter):
                                             is_router = True
                                             router_module = inner_module
                                 
-                                # 2. GramSpecMoERouter 체크
-                                elif isinstance(module, GramSpecMoERouter):
+                                # 2. SPECTRARouter 체크
+                                elif isinstance(module, SPECTRARouter):
                                     is_router = True
                                     router_module = module
                                 # 3. G3MoERouter 직접 체크
@@ -974,8 +974,8 @@ class RouterWeightTrackingCallback(TrainerCallback):
         }
         
         try:
-            from models.gramspec_moe_model import GramSpecMoERouter
-            from models.gramspec_moe_model import ExpressionProjector
+            from models.spectra_model import SPECTRARouter
+            from models.spectra_model import ExpressionProjector
             try:
                 from models.g3moe_model import G3MoERouter
             except ImportError:
@@ -1014,15 +1014,15 @@ class RouterWeightTrackingCallback(TrainerCallback):
                     active_adapter = getattr(module, "active_adapter", "default")
                     if hasattr(module, "modules_to_save") and active_adapter in module.modules_to_save:
                         inner_module = module.modules_to_save[active_adapter]
-                        if isinstance(inner_module, GramSpecMoERouter):
+                        if isinstance(inner_module, SPECTRARouter):
                             is_router = True
                             router_module = inner_module
                         elif G3MoERouter is not None and isinstance(inner_module, G3MoERouter):
                             is_router = True
                             router_module = inner_module
                             
-                # 2. GramSpecMoERouter 체크
-                elif isinstance(module, GramSpecMoERouter):
+                # 2. SPECTRARouter 체크
+                elif isinstance(module, SPECTRARouter):
                     is_router = True
                     router_module = module
                 # 3. G3MoERouter 직접 체크
@@ -1259,7 +1259,7 @@ class RouterWeightTrackingCallback(TrainerCallback):
             try:
                 actual_model = self._get_actual_model(model)
                 if actual_model is not None:
-                    from models.gramspec_moe_model import GramSpecMoERouter
+                    from models.spectra_model import SPECTRARouter
                     try:
                         from models.g3moe_model import G3MoERouter
                     except ImportError:
@@ -1275,7 +1275,7 @@ class RouterWeightTrackingCallback(TrainerCallback):
                     
                     for name, module in actual_model.named_modules():
                         router_module = None
-                        if isinstance(module, GramSpecMoERouter):
+                        if isinstance(module, SPECTRARouter):
                             router_module = module
                         elif G3MoERouter is not None and isinstance(module, G3MoERouter):
                             router_module = module
@@ -1490,14 +1490,14 @@ class RouterWeightTrackingCallback(TrainerCallback):
                             
                             # Bias balancing monitoring metrics
                             try:
-                                from models.gramspec_moe_model import GramSpecMoERouter
+                                from models.spectra_model import SPECTRARouter
                                 
                                 all_bias_magnitudes = []
                                 all_bias_changes = []
                                 total_router_count = 0
                                 
                                 for name, module in actual_model.named_modules():
-                                    if isinstance(module, GramSpecMoERouter) and hasattr(module, 'expert_bias'):
+                                    if isinstance(module, SPECTRARouter) and hasattr(module, 'expert_bias'):
                                         total_router_count += 1
                                         
                                         # Expert bias statistics
@@ -1784,7 +1784,7 @@ class RouterWeightTrackingCallback(TrainerCallback):
             # 디버깅: expression_projector 파라미터 상태 확인 및 forward에서 실제 사용되는 파라미터 추적
             logger.error("🔍 Debugging expression_projector parameters:")
             try:
-                from models.gramspec_moe_model import GramSpecMoERouter
+                from models.spectra_model import SPECTRARouter
                 
                 # 실제 모델에서 router 찾기 (전달받은 model/trainer 우선 사용)
                 actual_model = None
@@ -1819,7 +1819,7 @@ class RouterWeightTrackingCallback(TrainerCallback):
                     
                     for name, module in actual_model.named_modules():
                         router_module = None
-                        if isinstance(module, GramSpecMoERouter):
+                        if isinstance(module, SPECTRARouter):
                             router_module = module
                         elif G3MoERouter is not None and isinstance(module, G3MoERouter):
                             router_module = module

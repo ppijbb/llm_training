@@ -1,4 +1,4 @@
-# GramSpec MoE 논문 작성 가이드라인
+# SPECTRA MoE 논문 작성 가이드라인
 
 ## 1. 핵심 차별화 포인트 (Key Differentiators)
 

@@ -170,7 +170,14 @@ class LocalModel(DeepEvalBaseLLM):
     def generate(self, prompt: str, schema: Optional[Any] = None, **kwargs) -> str:
         """
         Generate text from prompt, handling DeepEval's prompt and schema parameters
+        CRITICAL: Ensure model is in eval mode to avoid gradient computation
         """
+        # CRITICAL: Ensure model is in eval mode (no gradients)
+        original_training = None
+        if hasattr(self.model, 'training'):
+            original_training = self.model.training
+            self.model.eval()
+        
         # Remove DeepEval-specific parameters that the model doesn't expect
         model_kwargs = kwargs.copy()
         _prompt = model_kwargs.get("prompt", None)
@@ -193,6 +200,10 @@ class LocalModel(DeepEvalBaseLLM):
             traceback.print_exc()
             print(f"Generation error: {e}")
             return f"Error during generation: {str(e)}"
+        finally:
+            # Restore original training state if changed
+            if original_training is not None and hasattr(self.model, 'train'):
+                self.model.train(original_training)
 
     async def a_generate(self, prompt: str) -> str:
         return self.generate(prompt)

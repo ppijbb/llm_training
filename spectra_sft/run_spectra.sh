@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# GramSpecMoE SFT Training Script with DeepSpeed Support
-# Usage: ./run_gramspec.sh [config_file] [num_gpus]
+# SPECTRA SFT Training Script with DeepSpeed Support
+# Usage: ./run_SPECTRA.sh [config_file] [num_gpus]
 
 set -e
 
@@ -13,11 +13,11 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 echo -e "${GREEN}================================================================================${NC}"
-echo -e "${GREEN}        GramSpecMoE SFT DeepSpeed Training with Small Model Configuration      ${NC}"
+echo -e "${GREEN}        SPECTRA SFT DeepSpeed Training with Small Model Configuration      ${NC}"
 echo -e "${GREEN}================================================================================${NC}"
 
 # Config file name
-CONFIG_FILE_NAME="gramspec_small_config.json"
+CONFIG_FILE_NAME="spectra_small_config.json"
 
 # Get script directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -67,7 +67,7 @@ export PYTHONPATH="$PROJECT_ROOT:$PYTHONPATH"
 if [ -z "$CUDA_VISIBLE_DEVICES" ]; then
     export CUDA_VISIBLE_DEVICES=$(seq 0 $((NUM_GPUS-1)) | paste -sd, -)
 fi
-export CUDA_VISIBLE_DEVICES=3
+export CUDA_VISIBLE_DEVICES=0,1
 export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false
 # CUDA allocator tuning to reduce fragmentation and OOM risk
@@ -167,8 +167,8 @@ cd "$PROJECT_ROOT"
 
 echo -e "${GREEN}Starting DeepSpeed training with $NUM_GPUS GPUs...${NC}"
 TRAIN_CMD="accelerate launch \
-    --config_file $SCRIPT_DIR/../gramspec_sft/config/accelerate.yaml \
-        $SCRIPT_DIR/train_gramspec.py --config $CONFIG_FILE"
+    --config_file $SCRIPT_DIR/../spectra_sft/config/accelerate.yaml \
+        $SCRIPT_DIR/train_SPECTRA.py --config $CONFIG_FILE"
 
 # Run training with error handling
 if eval "$TRAIN_CMD"; then

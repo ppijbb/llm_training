@@ -336,7 +336,9 @@ def gramspec_lb_loss(
     if attention_mask is not None:
         # Use existing masking logic from load_balancing_loss_func
         batch_size, seq_length = attention_mask.shape
-        num_hidden_layers = gate_logits.shape[0] // (batch_size * seq_length)
+        tokens = routing_weights.shape[0]
+        denom = batch_size * seq_length
+        num_hidden_layers = max(tokens // denom, 1) if denom > 0 else 1
 
         routing_per_expert_attention_mask = (
             attention_mask[None, :, :, None]
@@ -345,10 +347,13 @@ def gramspec_lb_loss(
             .to(device)
         )
 
+        # If shapes mismatch (e.g., tokens not divisible), fall back to full mask
+        if routing_per_expert_attention_mask.shape[0] != routing_weights.shape[0]:
+            routing_per_expert_attention_mask = torch.ones_like(routing_weights, device=device, dtype=dtype)
+
         # Mean per expert (masked)
-        p_bar = torch.sum(routing_weights * routing_per_expert_attention_mask, dim=0) / torch.sum(
-            routing_per_expert_attention_mask, dim=0
-        )
+        denom_mask = torch.sum(routing_per_expert_attention_mask, dim=0).clamp_min(1.0)
+        p_bar = torch.sum(routing_weights * routing_per_expert_attention_mask, dim=0) / denom_mask
     else:
         # Simple mean across batch dimension
         p_bar = routing_weights.mean(dim=0)  # [E]
@@ -750,6 +755,121 @@ class ExpressionProjector(nn.Module):
             return self.ortho_strength * ortho_loss
 
 
+class ManualGRUCell(nn.Module):
+    """
+    LoRA-friendly GRU cell implemented purely with Linear layers.
+    Gate weights are explicitly named for PEFT targeting.
+    """
+
+    def __init__(self, input_size: int, hidden_size: int):
+        super().__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+
+        self.weight_ih_gates = nn.Linear(input_size, hidden_size * 2)
+        self.weight_hh_gates = nn.Linear(hidden_size, hidden_size * 2)
+
+        self.weight_ih_cand = nn.Linear(input_size, hidden_size)
+        self.weight_hh_cand = nn.Linear(hidden_size, hidden_size)
+
+        nn.init.orthogonal_(self.weight_hh_gates.weight)
+        nn.init.orthogonal_(self.weight_hh_cand.weight)
+        nn.init.xavier_uniform_(self.weight_ih_gates.weight)
+        nn.init.xavier_uniform_(self.weight_ih_cand.weight)
+
+    def forward(self, x: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
+        gates_x = self.weight_ih_gates(x)
+        gates_h = self.weight_hh_gates(h)
+        gates = gates_x + gates_h
+
+        r_gate, z_gate = gates.chunk(2, dim=1)
+        r_gate = torch.sigmoid(r_gate)
+        z_gate = torch.sigmoid(z_gate)
+
+        cand_h = self.weight_hh_cand(h * r_gate)
+        cand_x = self.weight_ih_cand(x)
+        n = torch.tanh(cand_x + cand_h)
+
+        next_h = (1 - z_gate) * n + z_gate * h
+        return next_h
+
+
+class DualPotentialLinearSolver(nn.Module):
+    """
+    Sinkhorn-inspired dual potential optimizer using the manual GRU cell.
+    Iteratively refines logits to satisfy row/column balancing targets.
+    """
+
+    def __init__(self, num_experts: int, n_iterations: int = 3):
+        super().__init__()
+        self.num_experts = num_experts
+        self.n_iterations = n_iterations
+
+        dim = num_experts
+        self.gru_cell = ManualGRUCell(input_size=dim * 2, hidden_size=dim * 2)
+        # Separate projections: token-wise u, global v (mean across tokens)
+        self.u_proj = nn.Linear(dim * 2, 1)
+        self.v_proj = nn.Linear(dim * 2, dim)
+
+        nn.init.xavier_normal_(self.u_proj.weight)
+        nn.init.zeros_(self.u_proj.bias)
+        nn.init.xavier_normal_(self.v_proj.weight)
+        nn.init.zeros_(self.v_proj.bias)
+
+    def forward(self, logits: torch.Tensor, training: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            logits: [..., num_experts] raw logits to balance
+            training: when True, return residual constraint loss
+        Returns:
+            balanced_logits: same shape as logits
+            balance_loss: scalar residual (row/col constraint violation)
+        """
+        input_shape = logits.shape
+        logits_2d = logits.view(-1, self.num_experts)
+        batch_tokens = logits_2d.shape[0]
+        device = logits_2d.device
+        dtype = logits_2d.dtype
+
+        h = torch.zeros(batch_tokens, self.num_experts * 2, device=device, dtype=dtype)
+        target_row = torch.zeros(batch_tokens, 1, device=device, dtype=dtype)
+        target_col = torch.full((1, self.num_experts), -math.log(self.num_experts), device=device, dtype=dtype)
+
+        current_logits = logits_2d
+        final_row_error = None
+        final_col_error = None
+
+        for _ in range(self.n_iterations):
+            curr_row_sum = torch.logsumexp(current_logits, dim=-1, keepdim=True)
+            curr_col_sum = torch.logsumexp(current_logits, dim=0, keepdim=True)
+
+            row_error = curr_row_sum - target_row
+            col_error = curr_col_sum - target_col
+
+            final_row_error = row_error
+            final_col_error = col_error
+
+            error_input = torch.cat(
+                [
+                    row_error.expand(-1, self.num_experts),
+                    col_error.expand(batch_tokens, -1),
+                ],
+                dim=-1,
+            )
+
+            h = self.gru_cell(error_input, h)
+            delta_u = self.u_proj(h)  # [B,1]
+            delta_v_token = self.v_proj(h)  # [B,E]
+            delta_v = delta_v_token.mean(dim=0, keepdim=True)  # [1,E] shared across tokens
+            current_logits = current_logits + delta_u + delta_v
+
+        balance_loss = torch.tensor(0.0, device=device, dtype=dtype)
+        if training and final_row_error is not None:
+            balance_loss = (final_row_error.pow(2).mean()) + (final_col_error.pow(2).mean())
+
+        return current_logits.view(input_shape), balance_loss
+
+
 def sparsemixer(scores, top_k, jitter_eps, training):
     assert top_k == 2
 
@@ -867,6 +987,7 @@ class GramSpecMoERouter(nn.Module):
         self.hidden_size = config.hidden_size
         self.num_experts = config.n_routed_experts
         self.router_dim = config.router_dim
+        self.layernorm_eps = getattr(config, "router_layernorm_eps", 1e-5)
         
         # ===== 개선된 Loss 가중치 설정 =====
         # 1. Speciality: 너무 강하지 않게 (기존 0.02 → 0.001)
@@ -897,13 +1018,10 @@ class GramSpecMoERouter(nn.Module):
         self.sinkhorn_iterations = max(getattr(config, "sinkhorn_iterations", 3), 1)
         self.sinkhorn_inference = getattr(config, "sinkhorn_inference", False)
         
-        # GRU Load Balancer
-        self.load_balancer = nn.GRU(
-            input_size=self.hidden_size,
-            hidden_size=self.num_experts * self.router_dim,
-            num_layers=1,
-            bias=False,
-            batch_first=True,
+        # GRU Load Balancer (manual GRU for PEFT friendliness)
+        self.load_balancer = DualPotentialLinearSolver(
+            num_experts=self.num_experts,
+            n_iterations=self.sinkhorn_iterations,
         )
         
         # ===== 개선된 Expression Projector =====
@@ -919,17 +1037,24 @@ class GramSpecMoERouter(nn.Module):
         )
         self.expression_projector.ortho_strength = 0.0001  # 매우 약한 orthogonal 제약
         
-        # Bias Predictor (GRU 기반)
+        # Bias Predictor (GRU 기반) - Sequential 분리 (LoRA 대상 선형층 노출)
         self.bias_predictor_hidden_dim = getattr(config, "bias_predictor_hidden_dim", 256)
-        self.bias_predictor = nn.Sequential(
-            nn.Linear(self.num_experts * self.router_dim + self.num_experts, self.bias_predictor_hidden_dim),
-            nn.ReLU(),
-            nn.Linear(self.bias_predictor_hidden_dim, self.num_experts),
-            # [삭제] nn.Tanh() - Bias가 Logit 스케일(10.0)과 맞먹을 수 있도록 제한 해제
+        self.bias_pred_fc1 = nn.Linear(
+            self.num_experts * self.router_dim + self.num_experts, self.bias_predictor_hidden_dim
         )
+        self.bias_pred_fc2 = nn.Linear(self.bias_predictor_hidden_dim, self.num_experts)
         
         # Contrastive loss
         self.contrastive_loss = ContrastiveRouterLoss()
+
+        # Linear-only logit balancer (PEFT-friendly)
+        solver_iters = getattr(config, "sinkhorn_iter", 3)
+        self.sinkhorn_solver = DualPotentialLinearSolver(
+            num_experts=self.num_experts,
+            n_iterations=solver_iters,
+        )
+        # Alias for downstream helper code
+        self.logit_balancer = self.sinkhorn_solver
 
     def compute_adaptive_loss_weights(self, current_cv: float) -> dict:
         """CV에 따라 loss 가중치를 동적으로 조절"""
@@ -1167,7 +1292,8 @@ class GramSpecMoERouter(nn.Module):
         combined_input = torch.cat([last_hn, ema_expanded], dim=-1)
         
         # Bias 예측 (Tanh로 [-1, 1] 제한됨)
-        predicted_bias = self.bias_predictor(combined_input)
+        x = F.relu(self.bias_pred_fc1(combined_input))
+        predicted_bias = self.bias_pred_fc2(x)
         mean_bias = predicted_bias.mean(dim=0)
         
         # Zero-mean 강제
@@ -1197,10 +1323,14 @@ class GramSpecMoERouter(nn.Module):
             self.training_step += 1
         
         # GRU routing
-        routing_logits, hn = self.load_balancer(x, hn)
+        routing_output, hn = self.load_balancer(x, hn)
         
-        input_shape = routing_logits.shape[:-1]  # [batch, seq] 또는 [batch * seq]
-        hidden_shape = (*input_shape, -1, self.router_dim)  # [batch, seq, num_experts, router_dim]
+        input_shape = routing_output.shape[:-1]  # [batch, seq]
+        batch_size, seq_len = input_shape
+        # Canonical shape from expression projector output size
+        exp_total = self.num_experts * self.router_dim
+        exp_router_dim = self.router_dim
+        hidden_shape = (batch_size, seq_len, self.num_experts, exp_router_dim)
         
         # Expression projection
         # [수정] x를 flatten하여 [batch * seq, hidden_size] 형태로 만든 후 ExpressionProjector에 전달
@@ -1214,8 +1344,14 @@ class GramSpecMoERouter(nn.Module):
         if self.training:
             expression_logits = expression_logits.requires_grad_(True)
         
-        routing_logits = routing_logits.view(hidden_shape)
-        # [수정] 엡실론 추가하여 0으로 나누기 방지 (NaN 발생 방지)
+        routing_flat = routing_output.view(batch_size * seq_len, -1)
+        if routing_flat.shape[1] != exp_total:
+            if routing_flat.shape[1] < exp_total:
+                pad = exp_total - routing_flat.shape[1]
+                routing_flat = F.pad(routing_flat, (0, pad))
+            else:
+                routing_flat = routing_flat[:, :exp_total]
+        routing_logits = routing_flat.view(hidden_shape)
         routing_logits = routing_logits / (routing_logits.norm(p=2, dim=-1, keepdim=True) + 1e-6)
         
         # ===== Loss 계산 =====
@@ -1229,101 +1365,29 @@ class GramSpecMoERouter(nn.Module):
         if self.training:
             domain_orthogonality = domain_orthogonality.requires_grad_(True)
         
-        domain_scores = domain_orthogonality * 10.0
-        
-        # 3. Raw logits (순수 실력)
-        batch_size, seq_len = input_shape
-        domain_scores_flat = domain_scores.view(batch_size * seq_len, self.num_experts)
-        raw_logits = domain_scores_flat
-        
-        # ==============================================================================
-        # ⚡ [핵심] Direct Sinkhorn Routing (수학적 강제 할당)
-        # 패널티나 학습(Gradient)으로 유도하는 게 아니라, 알고리즘으로 배분해버림.
-        # Sinkhorn이 계산한 균등 확률(Q)을 그대로 선택(Selection)에 사용
-        # ==============================================================================
-        
-        sinkhorn_loss = None
-        load_balancing_loss = None
-        entropy_loss = None
-        
-        if self.training:
-            # Cost = -Logits (점수가 높을수록 비용이 낮음)
-            cost_matrix = -raw_logits
-            
-            # Sinkhorn 알고리즘으로 균등 분배 보장
-            # epsilon: 작을수록 Top-K(Hard)에 가깝고, 클수록 Uniform(Soft)
-            # 0.05 정도면 충분히 Sharp하면서도 미분 가능한 분포를 만듦
-            if not (torch.isnan(raw_logits).any() or torch.isinf(raw_logits).any()):
-                Q = self.sinkhorn_algorithm(
-                    cost_matrix,
-                    epsilon=0.05,  # Sharp하면서도 미분 가능
-                    iterations=self.sinkhorn_iterations
-                )
-                Q = Q.to(dtype=raw_logits.dtype)
-                
-                # [중요] Sinkhorn 결과(Q)는 이미 "Row Sum=1, Col Sum=1/N"이 보장됨.
-                # 즉, 이 Q를 쓰면 CV는 무조건 0에 가까워짐.
-                
-                # Q 값 자체가 '확률'이자 '선택 기준'이 됨
-                # 여기서 Top-K를 뽑으면 "균등하게 배분된 상태에서 가장 적합한 전문가"가 뽑힘
-                top_k_probs, selected_experts = torch.topk(Q, top_k, dim=-1)
-                
-                # STE (Straight-Through Estimator)
-                # Forward: Q에서 뽑은 Top-K 확률 사용
-                # Backward: Q 전체로 Gradient가 흐르게 함 (전체적인 경향 학습)
-                multiplier = top_k_probs
-                
-                # Routing probabilities는 Q 그대로 사용 (이미 균등 분배 보장됨)
-                routing_probs_full = Q
-                
-                # CV 추적 (디버깅용, Loss 계산에는 사용 안 함)
-                with torch.no_grad():
-                    load_per_expert = routing_probs_full.mean(dim=0)
-                    mean_load = load_per_expert.mean()
-                    std_load = load_per_expert.std()
-                    current_cv = (std_load / (mean_load + 1e-8)).item()
-                    
-                    # CV EMA 업데이트 (디버깅/모니터링용)
-                    self.cv_ema.mul_(self.cv_ema_alpha).add_(
-                        current_cv, alpha=1.0 - self.cv_ema_alpha
-                    )
-                
-                # Load Balancing Loss는 0 (Sinkhorn이 이미 강제했으므로 불필요)
-                load_balancing_loss = torch.tensor(0.0, device=raw_logits.device, dtype=raw_logits.dtype, requires_grad=True)
-                
-                # Entropy Loss도 0 (Sinkhorn이 이미 균등 분배 보장)
-                entropy_loss = torch.tensor(0.0, device=raw_logits.device, dtype=raw_logits.dtype, requires_grad=True)
-                
-            else:
-                # NaN/Inf 발생 시 Fallback: 기존 방식 사용
-                routing_probs_full = F.softmax(raw_logits, dim=-1)
-                top_k_logits, selected_experts = torch.topk(raw_logits, top_k, dim=-1)
-                multiplier = F.softmax(top_k_logits, dim=-1, dtype=torch.float32).type_as(raw_logits)
-                load_balancing_loss = torch.tensor(0.0, device=raw_logits.device, dtype=raw_logits.dtype, requires_grad=True)
-                entropy_loss = torch.tensor(0.0, device=raw_logits.device, dtype=raw_logits.dtype, requires_grad=True)
-        else:
-            # Inference: Sinkhorn 부담되면 그냥 Top-K (또는 Sinkhorn 유지 가능)
-            if self.enable_sinkhorn and self.sinkhorn_inference:
-                cost_matrix = -raw_logits
-                if not (torch.isnan(raw_logits).any() or torch.isinf(raw_logits).any()):
-                    Q = self.sinkhorn_algorithm(
-                        cost_matrix,
-                        epsilon=0.05,
-                        iterations=self.sinkhorn_iterations
-                    )
-                    Q = Q.to(dtype=raw_logits.dtype)
-                    top_k_probs, selected_experts = torch.topk(Q, top_k, dim=-1)
-                    multiplier = top_k_probs
-                    routing_probs_full = Q
-                else:
-                    routing_probs_full = F.softmax(raw_logits, dim=-1)
-                    top_k_logits, selected_experts = torch.topk(raw_logits, top_k, dim=-1)
-                    multiplier = F.softmax(top_k_logits, dim=-1, dtype=torch.float32).type_as(raw_logits)
-            else:
-                # Inference fallback: 일반 Top-K
-                routing_probs_full = F.softmax(raw_logits, dim=-1)
-                top_k_logits, selected_experts = torch.topk(raw_logits, top_k, dim=-1)
-                multiplier = F.softmax(top_k_logits, dim=-1, dtype=torch.float32).type_as(raw_logits)
+        # Logit standardization across experts (per token)
+        raw_logits = domain_orthogonality  # [B, S, E]
+        logit_mean = raw_logits.mean(dim=-1, keepdim=True)
+        logit_std = raw_logits.std(dim=-1, keepdim=True) + 1e-6
+        standardized_logits = (raw_logits - logit_mean) / logit_std
+        if self.training and jitter_eps > 0:
+            standardized_logits = standardized_logits + torch.randn_like(standardized_logits) * jitter_eps
+        routing_probs_full = F.softmax(standardized_logits, dim=-1)
+
+        top_k_probs, selected_experts = torch.topk(routing_probs_full, top_k, dim=-1)
+        multiplier = top_k_probs / (top_k_probs.sum(dim=-1, keepdim=True) + 1e-6)
+
+        # CV 추적 (디버깅/모니터링용)
+        with torch.no_grad():
+            load_per_expert = routing_probs_full.mean(dim=0)
+            mean_load = load_per_expert.mean()
+            std_load = load_per_expert.std()
+            current_cv = (std_load / (mean_load + 1e-8)).item()
+            self.cv_ema.mul_(self.cv_ema_alpha).add_(current_cv, alpha=1.0 - self.cv_ema_alpha)
+
+        # Aux losses (keep entropy zero; LB computed downstream using routing_probs_full)
+        load_balancing_loss = torch.tensor(0.0, device=raw_logits.device, dtype=raw_logits.dtype, requires_grad=True)
+        entropy_loss = torch.tensor(0.0, device=raw_logits.device, dtype=raw_logits.dtype, requires_grad=True)
         
         # ===== Contrastive loss (전문가 특화는 여전히 필요) =====
         routing_probs_reshaped = routing_probs_full.view(batch_size, seq_len, self.num_experts)
@@ -1359,15 +1423,6 @@ class GramSpecMoERouter(nn.Module):
             if speciality_loss is not None:
                 speciality_loss = speciality_loss * loss_weights['speciality']
             
-            # sinkhorn_loss는 더 이상 사용 안 함 (Sinkhorn이 직접 라우팅에 사용됨)
-            sinkhorn_loss = None
-            
-            # entropy_loss는 더 이상 사용 안 함 (Sinkhorn이 이미 균등 분배 보장)
-            # entropy_loss는 이미 0으로 설정됨
-            
-            # load_balancing_loss는 더 이상 사용 안 함 (Sinkhorn이 이미 균등 분배 강제)
-            # load_balancing_loss는 이미 0으로 설정됨
-            
             if contrastive_loss is not None:
                 contrastive_loss = contrastive_loss * loss_weights['contrastive']
             
@@ -1387,7 +1442,7 @@ class GramSpecMoERouter(nn.Module):
             routing_uncertainty,
             entropy_loss,
             load_balancing_loss,
-            sinkhorn_loss,
+            None,
             ortho_loss,
         )
 
@@ -1568,6 +1623,10 @@ class GramSpecMoEGRINMoE(nn.Module):
         # multiplier와 selected_experts는 이미 global router에서 sparsemixer를 통해 계산됨
         assert routing_weights.isnan().sum() == 0, f"{self.iter} layer routing_weights is nan Line: 826"
 
+        # Flatten routing outputs for per-token processing
+        routing_weights = routing_weights.view(batch_size * sequence_length, -1)  # [tokens, top_k]
+        selected_experts = selected_experts.view(batch_size * sequence_length, -1)  # [tokens, top_k]
+
         final_hidden_states = torch.zeros(
             (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
         )
@@ -1580,32 +1639,37 @@ class GramSpecMoEGRINMoE(nn.Module):
             uncertain_mask = uncertainty_flat > self.uncertainty_threshold
             # For uncertain tokens, broadcast to all experts
             if uncertain_mask.any():
-                # Create expert mask with broadcasting for uncertain tokens
-                expert_mask_base = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
-                # Expand uncertain tokens to all experts
-                uncertain_mask_2d = uncertain_mask.view(batch_size, sequence_length)
-                # Broadcast: set all experts to True for uncertain tokens
-                expert_mask = expert_mask_base.clone()
-                for expert_idx in range(self.num_experts):
-                    expert_mask[expert_idx] = expert_mask[expert_idx] | uncertain_mask_2d
+                one_hot = torch.nn.functional.one_hot(
+                    selected_experts, num_classes=self.num_experts
+                )  # [tokens, top_k, E]
+                expert_mask = one_hot.bool()
+                uncertain_token_mask = uncertain_mask.view(-1, 1).expand(-1, self.top_k)  # [tokens, top_k]
+                expert_mask[uncertain_token_mask] = True
             else:
-                expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
+                expert_mask = torch.nn.functional.one_hot(
+                    selected_experts, num_classes=self.num_experts
+                ).bool()
         else:
             # Standard routing: One hot encode the selected experts to create an expert mask
             # this will be used to easily index which expert is going to be sollicitated
-            expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
+            expert_mask = torch.nn.functional.one_hot(
+                selected_experts, num_classes=self.num_experts
+            ).bool()
+
+        # Reorder to [E, tokens, top_k] for per-expert iteration
+        expert_mask = expert_mask.permute(2, 0, 1)
 
         # Loop over all available experts in the model and perform the computation on each expert
         for expert_idx in range(self.num_experts):
             expert_layer = self.experts[expert_idx]
-            idx, top_x = torch.where(expert_mask[expert_idx])
+            token_idx, topk_idx = torch.where(expert_mask[expert_idx])
 
             # Use torch.where to handle empty tensor case in a compile-friendly way
-            has_tokens = top_x.numel() > 0
+            has_tokens = token_idx.numel() > 0
             if has_tokens:
                 # in torch it is faster to index using lists than torch tensors
-                top_x_list = top_x.tolist()
-                idx_list = idx.tolist()
+                top_x_list = token_idx.tolist()
+                idx_list = topk_idx.tolist()
 
                 # Index the correct hidden states and compute the expert hidden state for
                 # the current expert. We need to make sure to multiply the output hidden
@@ -1616,7 +1680,7 @@ class GramSpecMoEGRINMoE(nn.Module):
 
                 # However `index_add_` only support torch tensors for indexing so we'll use
                 # the `top_x` tensor here.
-                final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
+                final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(hidden_states.dtype))
                 
                 # --- Update Specialization EMA ---
                 if self.training:
@@ -3406,6 +3470,28 @@ class GramSpecMoEForConditionalGeneration(GramSpecMoEPreTrainedModel, Generation
                     # 스칼라인 경우 직접 사용
                     expr_loss = outputs.cosine_similarities * 0.001
                     loss += expr_loss
+            
+            # Router entropy / usage balancing with tuple-safe handling
+            router_probs = outputs.router_logits
+            if isinstance(router_probs, tuple):
+                router_probs = tuple(t for t in router_probs if t is not None and t.numel() > 0)
+                router_probs = torch.cat(router_probs, dim=0) if len(router_probs) > 0 else None
+            if router_probs is not None:
+                probs = router_probs
+                if probs.dim() > 2:
+                    probs = probs.view(-1, probs.size(-1))
+                probs = probs.clamp_min(1e-8)
+                expert_load = probs.mean(dim=0)
+                load_mean = expert_load.mean().clamp_min(1e-6)
+                cv_metric = expert_load.std() / load_mean
+                router_entropy = -(probs * torch.log(probs)).sum(dim=-1).mean()
+
+                entropy_coef = getattr(self.config.text_config, "router_entropy_coef", 0.0)
+                usage_coef = getattr(self.config.text_config, "usage_uniformity_coef", 0.0)
+                if usage_coef > 0:
+                    loss = loss + usage_coef * cv_metric
+                if entropy_coef > 0:
+                    loss = loss + entropy_coef * router_entropy
             
             # Disable aux_loss (Switch-style LB) to avoid conflict with gramspec_lb_loss
             # if outputs.router_logits is not None:

@@ -31,18 +31,18 @@ from transformers.models.siglip import SiglipVisionConfig
 logger = logging.get_logger(__name__)
 
 
-class GramSpecMoETextConfig(PretrainedConfig):
+class SPECTRATextConfig(PretrainedConfig):
     r"""
-    This is the configuration class to store the configuration of a [`GramSpecMoETextModel`]. It is used to instantiate an GramSpecMoEText
+    This is the configuration class to store the configuration of a [`SPECTRATextModel`]. It is used to instantiate an SPECTRAText
     model according to the specified arguments, defining the model architecture. Instantiating a configuration with the
-    defaults will yield a similar configuration to that of the GramSpecMoEText-7B.
-    e.g. [google/gramspec_moe_text-7b](https://huggingface.co/google/gramspec_moe_text-7b)
+    defaults will yield a similar configuration to that of the SPECTRAText-7B.
+    e.g. [google/spectra_text-7b](https://huggingface.co/google/spectra_text-7b)
     Configuration objects inherit from [`PretrainedConfig`] and can be used to control the model outputs. Read the
     documentation from [`PretrainedConfig`] for more information.
     Args:
         vocab_size (`int`, *optional*, defaults to 262208):
-            Vocabulary size of the GramSpecMoEText model. Defines the number of different tokens that can be represented by the
-            `inputs_ids` passed when calling [`GramSpecMoETextModel`]
+            Vocabulary size of the SPECTRAText model. Defines the number of different tokens that can be represented by the
+            `inputs_ids` passed when calling [`SPECTRATextModel`]
         hidden_size (`int`, *optional*, defaults to 2304):
             Dimension of the hidden representations.
         intermediate_size (`int`, *optional*, defaults to 9216):
@@ -162,11 +162,11 @@ class GramSpecMoETextConfig(PretrainedConfig):
             Pattern for the sliding window attention.
 
     ```python
-    >>> from transformers import GramSpecMoETextModel, GramSpecMoETextConfig
-    >>> # Initializing a GramSpecMoEText gramspec_moe_text-7b style configuration
-    >>> configuration = GramSpecMoETextConfig()
-    >>> # Initializing a model from the gramspec_moe_text-7b style configuration
-    >>> model = GramSpecMoETextModel(configuration)
+    >>> from transformers import SPECTRATextModel, SPECTRATextConfig
+    >>> # Initializing a SPECTRAText spectra_text-7b style configuration
+    >>> configuration = SPECTRATextConfig()
+    >>> # Initializing a model from the spectra_text-7b style configuration
+    >>> model = SPECTRATextModel(configuration)
     >>> # Accessing the model configuration
     >>> configuration = model.config
     ```
@@ -176,7 +176,7 @@ class GramSpecMoETextConfig(PretrainedConfig):
             Pattern for the sliding window attention.
     """
 
-    model_type = "gramspec_moe_text"
+    model_type = "spectra_text"
     keys_to_ignore_at_inference = ["past_key_values"]
     base_model_tp_plan = {
         "layers.*.self_attn.q_proj": "colwise",
@@ -397,19 +397,19 @@ class GramSpecMoETextConfig(PretrainedConfig):
     def sliding_window_pattern(self, value):
         self._sliding_window_pattern = value
 
-class GramSpecMoEConfig(PretrainedConfig):
+class SPECTRAConfig(PretrainedConfig):
     r"""
-    This is the configuration class to store the configuration of a [`GramSpecMoEForConditionalGeneration`]. It is used to instantiate an
-    GramSpecMoEForConditionalGeneration according to the specified arguments, defining the model architecture. Instantiating a configuration
+    This is the configuration class to store the configuration of a [`SPECTRAForConditionalGeneration`]. It is used to instantiate an
+    SPECTRAForConditionalGeneration according to the specified arguments, defining the model architecture. Instantiating a configuration
     with the defaults will yield a similar configuration to that of the PaliGemma-2B.
 
-    e.g. [google/gramspec_moe-4b](https://huggingface.co/google/gramspec_moe-4b)
+    e.g. [google/spectra-4b](https://huggingface.co/google/spectra-4b)
 
     Configuration objects inherit from [`PretrainedConfig`] and can be used to control the model outputs. Read the
     documentation from [`PretrainedConfig`] for more information.
 
     Args:
-        text_config (`Union[GramSpecMoETextConfig, dict]`, *optional*):
+        text_config (`Union[SPECTRATextConfig, dict]`, *optional*):
             The config object of the text backbone.
         vision_config (`Union[SiglipVisionConfig, dict]`,  *optional*):
             Custom vision config or dict.
@@ -428,38 +428,38 @@ class GramSpecMoEConfig(PretrainedConfig):
     Example:
 
     ```python
-    >>> from transformers import GramSpecMoEForConditionalGeneration, GramSpecMoEConfig, SiglipVisionConfig, GramSpecMoETextConfig
+    >>> from transformers import SPECTRAForConditionalGeneration, SPECTRAConfig, SiglipVisionConfig, SPECTRATextConfig
 
     >>> # Initializing a Siglip-like vision config
     >>> vision_config = SiglipVisionConfig()
 
-    >>> # Initializing a GramSpecMoE Text config
-    >>> text_config = GramSpecMoETextConfig()
+    >>> # Initializing a SPECTRA Text config
+    >>> text_config = SPECTRATextConfig()
 
-    >>> # Initializing a GramSpecMoE gramspec_moe-4b style configuration
-    >>> configuration = GramSpecMoEConfig(vision_config, text_config)
+    >>> # Initializing a SPECTRA spectra-4b style configuration
+    >>> configuration = SPECTRAConfig(vision_config, text_config)
 
-    >>> # Initializing a model from the gramspec_moe-4b style configuration
-    >>> model = GramSpecMoETextConfig(configuration)
+    >>> # Initializing a model from the spectra-4b style configuration
+    >>> model = SPECTRATextConfig(configuration)
 
     >>> # Accessing the model configuration
     >>> configuration = model.config
     ```"""
 
-    model_type = "gramspec_moe"
+    model_type = "spectra"
     attribute_map = {
         "image_token_id": "image_token_index",
         "boi_token_id": "boi_token_index",
         "eoi_token_id": "eoi_token_index",
     }
     sub_configs = {
-        "text_config": GramSpecMoETextConfig,
+        "text_config": SPECTRATextConfig,
         "vision_config": SiglipVisionConfig,
     }
 
     def __init__(
         self,
-        text_config: Optional[Union[GramSpecMoETextConfig, Dict[str, Any]]] = None,
+        text_config: Optional[Union[SPECTRATextConfig, Dict[str, Any]]] = None,
         vision_config: Optional[Union[SiglipVisionConfig, Dict[str, Any]]] = None,
         mm_tokens_per_image: int = 256,
         boi_token_index: int = 255_999,
@@ -469,18 +469,18 @@ class GramSpecMoEConfig(PretrainedConfig):
         **kwargs,
     ):
         if text_config is None:
-            text_config = GramSpecMoETextConfig()
-            logger.info("text_config is None, using default GramSpecMoETextConfig vision config.")
+            text_config = SPECTRATextConfig()
+            logger.info("text_config is None, using default SPECTRATextConfig vision config.")
         elif isinstance(text_config, dict):
             text_config.update(kwargs)
-            text_config = GramSpecMoETextConfig(**text_config)
+            text_config = SPECTRATextConfig(**text_config)
 
         if isinstance(vision_config, dict):
             vision_config = SiglipVisionConfig(**vision_config)
         else:
             vision_config = SiglipVisionConfig()
             logger.info(
-                "vision_config is None or incompatible with GramSpecMoEVisionConfig intialization. GramSpecMoE will be limited "
+                "vision_config is None or incompatible with SPECTRAVisionConfig intialization. SPECTRA will be limited "
                 "to text tasks."
             )
 
@@ -495,4 +495,4 @@ class GramSpecMoEConfig(PretrainedConfig):
         super().__init__(**kwargs)
 
 
-__all__ = ["GramSpecMoEConfig", "GramSpecMoETextConfig"]
+__all__ = ["SPECTRAConfig", "SPECTRATextConfig"]
