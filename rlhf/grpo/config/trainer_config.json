@@ -1,7 +1,7 @@
 {
   "model_init_kwargs": {"model_name": "unsloth/gemma-3-27b-it-unsloth-bnb-4bit"},
-  "max_prompt_length": 2048,
-  "max_completion_length": 1024,
+  "max_prompt_length": 4096,
+  "max_completion_length": 2048,
   "learning_rate": 5e-5,
   "num_generations": 2,
   "num_train_epochs": 1,

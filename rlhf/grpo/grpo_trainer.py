@@ -248,13 +248,111 @@ class CustomGRPOTrainer(GRPOTrainer):
         if not self.custom_reward_functions:
             return super().compute_rewards(completions, **kwargs)
 
-        all_rewards = [reward_func(completions, **kwargs) for reward_func in self.custom_reward_functions]
+        # completions가 리스트가 아닌 경우 리스트로 변환
+        if not isinstance(completions, list):
+            completions = [completions]
+        
+        # completion 개수 확인
+        num_completions = len(completions)
+        num_generations = getattr(self, 'num_generations', 2)
+        
+        # 디버깅 정보
+        logger.debug(
+            f"🔍 compute_rewards called: {num_completions} completions, "
+            f"num_generations={num_generations}, "
+            f"num_reward_functions={len(self.custom_reward_functions)}"
+        )
+        
+        # completion 개수가 num_generations의 배수가 아니면 경고 및 조정
+        if num_completions % num_generations != 0:
+            logger.warning(
+                f"⚠️ Completion count ({num_completions}) is not a multiple of "
+                f"num_generations ({num_generations}). Adjusting..."
+            )
+            # num_generations의 배수가 되도록 패딩 또는 잘라냄
+            target_size = ((num_completions + num_generations - 1) // num_generations) * num_generations
+            if num_completions < target_size:
+                # 부족하면 마지막 completion을 복사하여 패딩
+                padding_needed = target_size - num_completions
+                last_completion = completions[-1] if completions else ""
+                completions = completions + [last_completion] * padding_needed
+                logger.info(f"📊 Padded completions from {num_completions} to {len(completions)}")
+            else:
+                # 많으면 잘라냄
+                completions = completions[:target_size]
+                logger.info(f"📊 Trimmed completions from {num_completions} to {len(completions)}")
+            num_completions = len(completions)
+        
+        # 각 reward 함수에서 reward 계산
+        all_rewards = []
+        for reward_func in self.custom_reward_functions:
+            try:
+                rewards = reward_func(completions, **kwargs)
+                # rewards가 리스트가 아니면 리스트로 변환
+                if not isinstance(rewards, list):
+                    rewards = [rewards]
+                
+                # 길이가 completion 개수와 일치하지 않으면 조정
+                if len(rewards) != num_completions:
+                    logger.warning(
+                        f"⚠️ Reward function {reward_func} returned {len(rewards)} rewards "
+                        f"but expected {num_completions}. Adjusting..."
+                    )
+                    if len(rewards) < num_completions:
+                        # 부족하면 마지막 값으로 패딩
+                        rewards = rewards + [rewards[-1] if rewards else 0.0] * (num_completions - len(rewards))
+                    else:
+                        # 많으면 잘라냄
+                        rewards = rewards[:num_completions]
+                
+                all_rewards.append(rewards)
+            except Exception as e:
+                logger.error(f"❌ Error in reward function {reward_func}: {e}", exc_info=True)
+                # 에러 발생 시 0으로 채운 리스트 반환
+                all_rewards.append([0.0] * num_completions)
 
-        if all_rewards:
-            final_rewards = [sum(rewards) / len(all_rewards) for rewards in zip(*all_rewards)]
-            return final_rewards
-
-        return super().compute_rewards(completions, **kwargs)
+        if not all_rewards:
+            logger.warning("⚠️ No rewards computed, using default")
+            return super().compute_rewards(completions, **kwargs)
+        
+        # 모든 reward 함수의 결과를 평균
+        # 각 completion에 대해 모든 reward 함수의 평균 계산
+        final_rewards = []
+        for i in range(num_completions):
+            rewards_for_completion = [rewards[i] for rewards in all_rewards if i < len(rewards)]
+            if rewards_for_completion:
+                final_rewards.append(sum(rewards_for_completion) / len(rewards_for_completion))
+            else:
+                final_rewards.append(0.0)
+        
+        # 최종 reward 개수가 completion 개수와 일치하는지 확인
+        if len(final_rewards) != num_completions:
+            logger.error(
+                f"❌ Final rewards count ({len(final_rewards)}) doesn't match "
+                f"completion count ({num_completions})"
+            )
+            # 강제로 맞춤
+            if len(final_rewards) < num_completions:
+                final_rewards = final_rewards + [final_rewards[-1] if final_rewards else 0.0] * (num_completions - len(final_rewards))
+            else:
+                final_rewards = final_rewards[:num_completions]
+        
+        # 최종 검증: reward 개수가 num_generations의 배수인지 확인
+        if len(final_rewards) % num_generations != 0:
+            logger.error(
+                f"❌ Final rewards count ({len(final_rewards)}) is not a multiple of "
+                f"num_generations ({num_generations}). This will cause shape error!"
+            )
+            # 강제로 num_generations의 배수로 맞춤
+            target_size = ((len(final_rewards) + num_generations - 1) // num_generations) * num_generations
+            if len(final_rewards) < target_size:
+                final_rewards = final_rewards + [final_rewards[-1] if final_rewards else 0.0] * (target_size - len(final_rewards))
+            else:
+                final_rewards = final_rewards[:target_size]
+            logger.warning(f"⚠️ Adjusted rewards to {len(final_rewards)} to match num_generations")
+        
+        logger.debug(f"✅ compute_rewards returning {len(final_rewards)} rewards")
+        return final_rewards
 
     def _prepare_inputs(self, inputs):
         if not self.model.training:
@@ -302,28 +400,49 @@ class CustomGRPOTrainer(GRPOTrainer):
         if model.training:
             return super().prediction_step(model, inputs, prediction_loss_only, ignore_keys)
 
-        # Prepare inputs (may return dict, list, or other types)
-        inputs = self._prepare_inputs(inputs)
+        # Evaluation 시: TRL GRPOTrainer는 generation과 reward 계산을 수행
+        # parent의 prediction_step을 호출하면 _generate_and_score_completions가 호출됨
+        # 이 과정에서 compute_rewards가 호출되므로, 우리가 수정한 compute_rewards가 사용됨
         
-        # Check if inputs is a dict with labels
-        if not isinstance(inputs, dict):
-            # If inputs is not a dict (e.g., list), use parent implementation
-            return super().prediction_step(model, inputs, prediction_loss_only, ignore_keys)
-        
-        # If no labels, return None values
-        if 'labels' not in inputs:
-            return None, None, None
+        try:
+            # Prepare inputs (may return dict, list, or other types)
+            inputs = self._prepare_inputs(inputs)
+            
+            # Check if inputs is a dict with labels
+            if not isinstance(inputs, dict):
+                # If inputs is not a dict (e.g., list), use parent implementation
+                # TRL GRPOTrainer는 list 형태의 inputs를 처리할 수 있음
+                return super().prediction_step(model, inputs, prediction_loss_only, ignore_keys)
+            
+            # If no labels, TRL GRPOTrainer는 generation을 수행해야 함
+            # parent의 prediction_step을 호출하여 TRL의 로직 사용
+            if 'labels' not in inputs:
+                return super().prediction_step(model, inputs, prediction_loss_only, ignore_keys)
 
-        # Process dict inputs with labels
-        with torch.no_grad():
-            outputs = model(**inputs)
-            loss = outputs.get("loss")
-            logits = outputs.get("logits")
-        
-        if prediction_loss_only:
-            return (loss, None, None)
-        
-        return (loss, logits, inputs.get('labels'))
+            # Process dict inputs with labels (일반적인 loss 계산)
+            with torch.no_grad():
+                outputs = model(**inputs)
+                loss = outputs.get("loss")
+                logits = outputs.get("logits")
+            
+            if prediction_loss_only:
+                return (loss, None, None)
+            
+            return (loss, logits, inputs.get('labels'))
+            
+        except RuntimeError as e:
+            if "shape" in str(e) and "invalid for input of size" in str(e):
+                # Reward 개수 불일치 에러 처리
+                logger.error(
+                    f"❌ Reward shape mismatch error in evaluation: {e}\n"
+                    f"   This usually means the number of rewards doesn't match "
+                    f"   num_generations * num_prompts. Check compute_rewards implementation."
+                )
+                # 에러를 다시 발생시켜서 상위에서 처리하도록 함
+                raise
+            else:
+                # 다른 RuntimeError는 그대로 전파
+                raise
 
 
 class UnslothGRPOTrainWorkflow:
@@ -368,6 +487,15 @@ class UnslothGRPOTrainWorkflow:
                 load_in_4bit=True,
                 device_map="auto",
             )
+
+            # Decoder-only 모델에서 right padding은 generation 오류를 유발하므로 left padding으로 강제
+            try:
+                self.tokenizer.padding_side = "left"
+                # pad_token이 없으면 eos_token으로 설정하여 패딩 시 토큰 손실 방지
+                if self.tokenizer.pad_token is None and self.tokenizer.eos_token is not None:
+                    self.tokenizer.pad_token = self.tokenizer.eos_token
+            except Exception as e:
+                logger.warning(f"⚠️ tokenizer padding_side 설정 중 경고: {e}")
             
             self.model = FastLanguageModel.get_peft_model(
                 self.model,

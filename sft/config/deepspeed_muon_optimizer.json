@@ -19,9 +19,9 @@
     },
     "sequence_parallel_size": 1,
     "moe": {
-        "num_experts": 8,
+        "num_experts": 32,
         "ep_size": 2,
-        "k": 1,
+        "k": 4,
         "capacity_factor": 1.0,
         "eval_capacity_factor": 1.0,
         "min_capacity": 4,
@@ -68,13 +68,13 @@
     "scheduler": {
         "type": "OneCycle",
         "params": {
-            "cycle_first_step_size": 200,
-            "cycle_first_stair_count": 0,
-            "cycle_second_step_size": 200,
-            "cycle_second_stair_count": 0,
-            "decay_step_size": 200,
-            "cycle_min_lr": 1e-6,
-            "cycle_max_lr": 8e-5,
+            "cycle_first_step_size": 2000,
+            "cycle_first_stair_count": 500,
+            "cycle_second_step_size": 3000,
+            "cycle_second_stair_count": 100,
+            "decay_step_size": 1000,
+            "cycle_min_lr": 7e-6,
+            "cycle_max_lr": 1e-4,
             "decay_lr_rate": 0.001,
             "cycle_min_mom": 0.85,
             "cycle_max_mom": 0.99,
@@ -85,7 +85,7 @@
         "partition_activations": true,
         "cpu_checkpointing": true,
         "contiguous_memory_optimization": true,
-        "synchronize_checkpoint_boundary": true
+        "synchronize_checkpoint_boundary": false
    },
     "zero_optimization": {
         "stage": 3,

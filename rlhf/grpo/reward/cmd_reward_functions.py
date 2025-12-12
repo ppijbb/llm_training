@@ -7,6 +7,7 @@ import logging
 import re
 import difflib
 import os
+from collections import Counter
 import pandas as pd
 from typing import Dict, Any, List, Set, Optional
 from reward.reward_functions import RewardComponent
@@ -508,11 +509,8 @@ class CommandKeywordComponent(RewardComponent):
         # 잘못된 명령어 사용 시 매우 강한 penalty
         invalid_keywords = {'probe', 'tooth'}
         if original_kw1 in invalid_keywords or original_kw2 in invalid_keywords:
-            # "probe"나 "tooth" 같은 잘못된 명령어 사용 시 매우 낮은 점수
-            if original_kw1 in invalid_keywords and original_kw2 in invalid_keywords:
-                return 0.1  # 둘 다 잘못된 명령어면 매우 낮은 점수
-            elif original_kw1 in invalid_keywords or original_kw2 in invalid_keywords:
-                return 0.2  # 하나만 잘못된 명령어면 매우 낮은 점수
+            # "probe"나 "tooth" 같은 잘못된 명령어 사용 시 즉시 0점
+            return 0.0  # 잘못된 명령어가 포함되면 0점
         
         # 잘못된 명령어 자동 수정
         kw1 = self.invalid_command_mapping.get(kw1, kw1)
@@ -576,9 +574,9 @@ class CommandKeywordComponent(RewardComponent):
 class InstructionComplianceComponent(RewardComponent):
     """
     Instruction 준수 여부 및 환각 체크 (Reflection & Penalty)
-    가중치: 0.15
+    가중치: 0.12
     """
-    def __init__(self, weight: float = 0.15, csv_file_path: Optional[str] = None, data_csv_path: Optional[str] = None):
+    def __init__(self, weight: float = 0.12, csv_file_path: Optional[str] = None, data_csv_path: Optional[str] = None):
         super().__init__(name="instruction_compliance", weight=weight)
         
         # 명령어 정보 로더
@@ -623,19 +621,94 @@ class InstructionComplianceComponent(RewardComponent):
             if re.search(pattern, completion_lower):
                 score -= 0.3  # 금지어 사용 시 큰 감점
 
-        # 2. 잘못된 명령어 사용 체크 (매우 강한 페널티)
+        # 2. 잘못된 명령어 사용 체크 (매우 강한 페널티) - 강화
         invalid_command_penalty = 0.0
+        invalid_command_count = 0
+        
+        # 명령어 셋에 없는 명령어 체크 (probe 등)
+        commands = completion_lower.split(';')
+        for cmd in commands:
+            cmd = cmd.strip()
+            if not cmd:
+                continue
+            
+            # 각 명령어에서 실제 명령어 추출 (number 이후 부분)
+            cmd_parts = re.split(r'number\s+\d+', cmd, maxsplit=1)
+            if len(cmd_parts) > 1:
+                remaining = cmd_parts[1].strip()
+                # 쉼표로 분리하여 각 부분 확인
+                parts = [p.strip() for p in remaining.split(',') if p.strip()]
+                for part in parts:
+                    part_lower = part.lower()
+                    # 숫자만 있는 경우는 제외
+                    if re.match(r'^\d+(\s+\d+)*$', part_lower):
+                        continue
+                    # surface나 position 키워드는 제외
+                    if part_lower in self.loader.get_surface_keywords() or part_lower in self.loader.get_position_keywords():
+                        continue
+                    # 유효한 명령어인지 확인
+                    is_valid = False
+                    for valid_cmd in self.valid_commands:
+                        if part_lower == valid_cmd.lower() or part_lower in valid_cmd.lower() or valid_cmd.lower() in part_lower:
+                            is_valid = True
+                            break
+                    if not is_valid:
+                        invalid_command_count += 1
+                        # probe 같은 심각한 오류는 매우 강한 페널티
+                        if 'probe' in part_lower:
+                            invalid_command_penalty += 2.0  # probe는 매우 강한 페널티
+                        else:
+                            invalid_command_penalty += 1.0  # 다른 잘못된 명령어도 강한 페널티
+        
+        # 기존 패턴 기반 체크도 유지
         for pattern, correct_cmd in self.invalid_command_patterns.items():
             if re.search(pattern, completion_lower):
-                # 잘못된 명령어 사용 시 매우 강한 페널티
                 matches = len(re.findall(pattern, completion_lower))
                 # "tooth"나 "probe" 같은 심각한 오류는 더 강한 페널티
                 if 'tooth' in pattern or 'probe' in pattern:
-                    invalid_command_penalty += matches * 0.7  # 각 잘못된 명령어마다 0.7 감점 (0.5 -> 0.7)
+                    invalid_command_penalty += matches * 2.0  # 1.0 -> 2.0으로 강화
                 else:
-                    invalid_command_penalty += matches * 0.3  # 다른 잘못된 명령어는 0.3 감점
+                    invalid_command_penalty += matches * 1.0  # 0.3 -> 1.0으로 강화
+        
         score -= invalid_command_penalty
+        if invalid_command_penalty > 0 or invalid_command_count > 0:
+            # 잘못된 명령어가 하나라도 있으면 사실상 0점 처리 (더 강화)
+            score *= 0.001  # 0.01 -> 0.001로 더 강화
+            logger.debug(f"⚠️ Invalid command detected: {invalid_command_count} invalid commands, penalty: {invalid_command_penalty}")
 
+        # 2.5. 명령어 완성 이전에 세미콜론이나 쉼표를 찍는 경우 강력한 페널티
+        premature_separator_penalty = 0.0
+        
+        # 전체 completion에서 number 이전에 세미콜론이나 쉼표가 있는지 체크
+        # 패턴 1: "command.\nnumber 1;" 같은 경우 - number 이전에 세미콜론
+        if re.search(r'[^n][;,]+\s*number\s+\d+', completion_lower):
+            premature_separator_penalty += 2.0
+            logger.debug("⚠️ Premature separator before 'number' detected")
+        
+        # 패턴 2: ",number 1;" 같은 경우 - 쉼표로 시작
+        if re.match(r'^\s*[,;]+\s*number\s+\d+', completion_lower):
+            premature_separator_penalty += 2.0
+            logger.debug("⚠️ Completion starts with separator")
+        
+        # 패턴 3: "command.\n" 같은 메타 텍스트 후 세미콜론
+        if re.search(r'(command|output|result|answer)[.\s]*[;,]+\s*number', completion_lower):
+            premature_separator_penalty += 2.0
+            logger.debug("⚠️ Meta text followed by separator before 'number'")
+        
+        # 패턴 4: 각 명령어 내부에서 number 이전에 세미콜론/쉼표
+        lines = completion_lower.split('\n')
+        for line in lines:
+            line = line.strip()
+            # number 이전에 세미콜론이나 쉼표가 있는지 체크
+            if re.search(r'[;,]+\s*number\s+\d+', line) and not re.match(r'^\s*number\s+\d+', line):
+                premature_separator_penalty += 1.0
+                logger.debug(f"⚠️ Premature separator in line: {line[:50]}")
+        
+        score -= premature_separator_penalty
+        if premature_separator_penalty > 0:
+            # 명령어 완성 이전에 세미콜론/쉼표를 찍으면 매우 강한 페널티
+            score *= 0.01  # 99% 감점
+        
         # 3. 포맷 규칙 체크: "number N, command" 형식이어야 함 (매우 강화)
         commands = completion_lower.split(';')
         valid_format_count = 0
@@ -675,7 +748,7 @@ class InstructionComplianceComponent(RewardComponent):
             format_ratio = valid_format_count / total_commands
             # 포맷 오류가 많으면 매우 강한 페널티
             if format_ratio < 0.5:
-                score *= 0.1  # 절반 이상 형식 오류면 극심한 감점 (0.2 -> 0.1)
+                score *= 0.05  # 절반 이상 형식 오류면 극심한 감점
             elif format_ratio < 0.8:
                 score *= 0.4  # 80% 미만이면 큰 감점 (0.6 -> 0.4)
             else:
@@ -693,11 +766,13 @@ class InstructionComplianceComponent(RewardComponent):
 
         # 강한 형식 실패 시 거의 0점 처리
         if total_commands == 0 or format_ratio < 0.3 or "the following output" in completion_lower:
-            score *= 0.05
+            score *= 0.01
 
         # "command"와 같은 메타 텍스트로 시작하면 강한 페널티
         if re.search(r'^\s*command\b', completion_lower, re.MULTILINE):
-            score *= 0.05
+            score *= 0.01
+        if "the following output" in completion_lower or "based on the provided instructions" in completion_lower:
+            score *= 0.01
 
         # 4. 환각 체크 (Reflection with GT) - 매우 강화
         if ground_truth_lower:
@@ -734,9 +809,9 @@ class InstructionComplianceComponent(RewardComponent):
 class SequenceSimilarityComponent(RewardComponent):
     """
     정답과의 시퀀스 유사도 (LCS ratio + Token-level matching)
-    가중치: 0.25
+    가중치: 0.12
     """
-    def __init__(self, weight: float = 0.25):
+    def __init__(self, weight: float = 0.12):
         super().__init__(name="sequence_similarity", weight=weight)
 
     def calculate(self, completion: str, ground_truth: str = None, **kwargs) -> float:
@@ -809,9 +884,9 @@ class SequenceSimilarityComponent(RewardComponent):
 
 
 class StructuralComponent(RewardComponent):
-    """구조 정확도 (가중치: 0.05)"""
+    """구조 정확도 (가중치: 0.04)"""
     
-    def __init__(self, weight: float = 0.05):
+    def __init__(self, weight: float = 0.04):
         super().__init__(name="command_structural", weight=weight)
     
     def calculate(self, completion: str, ground_truth: str = None, **kwargs) -> float:
@@ -833,9 +908,9 @@ class StructuralComponent(RewardComponent):
 
 
 class NumericalValueComponent(RewardComponent):
-    """수치값 정확도 및 Probing 값 형식 검증 (가중치: 0.05)"""
+    """수치값 정확도 및 Probing 값 형식 검증 (가중치: 0.08)"""
     
-    def __init__(self, weight: float = 0.05, csv_file_path: Optional[str] = None, data_csv_path: Optional[str] = None):
+    def __init__(self, weight: float = 0.08, csv_file_path: Optional[str] = None, data_csv_path: Optional[str] = None):
         super().__init__(name="numerical_value", weight=weight)
         
         # 명령어 정보 로더
@@ -1051,9 +1126,9 @@ class ComponentRewardWrapper:
 class OrderPenaltyComponent(RewardComponent):
     """
     명령어 순서 오류 페널티
-    가중치: 0.15
+    가중치: 0.10
     """
-    def __init__(self, weight: float = 0.15):
+    def __init__(self, weight: float = 0.10):
         super().__init__(name="order_penalty", weight=weight)
     
     def calculate(self, completion: str, ground_truth: str = None, **kwargs) -> float:
@@ -1145,9 +1220,9 @@ class OrderPenaltyComponent(RewardComponent):
 class ExactMatchComponent(RewardComponent):
     """
     정확한 매칭 보너스 (Ground Truth와 완전 일치)
-    가중치: 0.10
+    가중치: 0.04
     """
-    def __init__(self, weight: float = 0.10):
+    def __init__(self, weight: float = 0.04):
         super().__init__(name="exact_match", weight=weight)
     
     def calculate(self, completion: str, ground_truth: str = None, **kwargs) -> float:
@@ -1295,11 +1370,11 @@ class CommandFormatComponent(RewardComponent):
             
             # 1. 쉼표 형식 검증 (매우 강한 penalty)
             if not gen_structure['has_comma_format']:
-                score *= 0.1  # 쉼표 형식이 아니면 극심한 감점 (0.3 -> 0.1)
+                score *= 0.05  # 쉼표 형식이 아니면 사실상 0점에 가깝게
             
             # 2. 명령어 추출 및 검증
             if not gen_structure['command']:
-                score *= 0.2  # 명령어가 없으면 매우 큰 감점
+                score *= 0.0  # 명령어가 없으면 즉시 0
                 format_scores.append(score)
                 continue
             
@@ -1309,7 +1384,7 @@ class CommandFormatComponent(RewardComponent):
             if cmd_info['need_surface'] or cmd_info['is_status']:
                 if not gen_structure['surface']:
                     # STATUS 명령어라도 표면이 없으면 강하게 감점 (testset 패턴 반영)
-                    score *= 0.3
+                    score *= 0.05
             else:
                 # 표면이 필요 없는데 있으면 감점하지 않음 (선택적이므로)
                 pass
@@ -1318,18 +1393,18 @@ class CommandFormatComponent(RewardComponent):
             command_lower = gen_structure['command'].lower()
             if command_lower in self.value_required_commands:
                 if not gen_structure['values']:
-                    score *= 0.3  # 값이 필요한데 없으면 큰 감점
+                    score *= 0.05  # 값이 필요한데 없으면 거의 0점
                 else:
                     # 값 형식 검증 (세 숫자여야 함)
                     for val in gen_structure['values']:
                         if not re.match(r'^\d+\s+\d+\s+\d+$', val):
-                            score *= 0.7  # 형식이 올바르지 않으면 감점
+                            score *= 0.1  # 형식이 올바르지 않으면 강하게 감점
             
             # STATUS 명령어는 확장되어야 함 (별도 Component에서 처리)
             if cmd_info['is_status']:
                 # 최소한 mesial, middle, distal 중 하나는 있어야 함
                 if not gen_structure['positions']:
-                    score *= 0.5  # 위치가 없으면 감점
+                    score *= 0.05  # 위치가 없으면 매우 강한 감점
             
             format_scores.append(score)
         
@@ -1462,7 +1537,8 @@ class StatusExpansionComponent(RewardComponent):
                     # 일부 위치가 누락됨
                     missing_positions = gt_positions - gen_positions
                     missing_ratio = len(missing_positions) / len(gt_positions)
-                    expansion_scores.append(1.0 - missing_ratio * 0.8)  # 누락된 위치마다 0.8 감점
+                    # 누락되면 거의 0에 가깝게 감점
+                    expansion_scores.append(max(0.0, 1.0 - missing_ratio * 1.2))
             else:
                 # GT에 위치가 없으면 (이상한 경우) 기본 점수
                 expansion_scores.append(0.5)
@@ -1474,10 +1550,311 @@ class StatusExpansionComponent(RewardComponent):
         avg_score = sum(expansion_scores) / len(expansion_scores)
         
         # 추가 페널티: STATUS 명령어가 전혀 확장되지 않은 경우
-        if avg_score < 0.3:
-            avg_score *= 0.5  # 매우 낮은 점수면 추가 감점
+        if avg_score < 0.7:
+            avg_score *= 0.2  # 확장이 부족하면 더 강하게 감점
         
         return max(0.0, min(1.0, avg_score))
+
+
+class SelfAuditComponent(RewardComponent):
+    """
+    Self-reward: 생성된 command 리스트만으로 스스로 형식/필수 요소를 감사하여 보상.
+    - 모든 명령이 number, [surface], command, [value] 형식인지
+    - cmd_bot.csv의 valid command인지
+    - 필요 surface/value/position이 충족되는지
+    - number-only 스팸, 잘못된 probe/tooth 등 즉시 강한 감점
+    가중치: 0.16
+    """
+    def __init__(self, weight: float = 0.16, csv_file_path: Optional[str] = None, data_csv_path: Optional[str] = None):
+        super().__init__(name="self_audit", weight=weight)
+        self.loader = CommandInfoLoader(csv_file_path=csv_file_path, data_csv_path=data_csv_path)
+        self.valid_commands = self.loader.get_all_commands()
+        self.surface_keywords = self.loader.get_surface_keywords()
+        self.position_keywords = self.loader.get_position_keywords()
+        self.value_required_commands = self.loader.get_value_required_commands()
+        self.status_commands = self.loader.get_status_commands()
+
+    def calculate(self, completion: str, ground_truth: str = None, **kwargs) -> float:
+        completion_original = str(completion)
+        completion = completion_original.lower()
+        if not completion.strip():
+            return 0.0
+
+        # 명령어 완성 이전에 세미콜론/쉼표를 찍는 경우 강력한 페널티
+        premature_separator_penalty = 0.0
+        
+        # 패턴 1: "command.\nnumber 1;" 같은 경우 - number 이전에 세미콜론/쉼표
+        if re.search(r'[^n][;,]+\s*number\s+\d+', completion):
+            premature_separator_penalty += 2.0
+            logger.debug("⚠️ Premature separator before 'number' detected in SelfAudit")
+        
+        # 패턴 2: ",number 1;" 같은 경우 - 쉼표/세미콜론으로 시작
+        if re.match(r'^\s*[,;]+\s*number\s+\d+', completion):
+            premature_separator_penalty += 2.0
+            logger.debug("⚠️ Completion starts with separator in SelfAudit")
+        
+        # 패턴 3: "command.\n" 같은 메타 텍스트 후 세미콜론/쉼표
+        if re.search(r'(command|output|result|answer)[.\s]*[;,]+\s*number', completion):
+            premature_separator_penalty += 2.0
+            logger.debug("⚠️ Meta text followed by separator before 'number' in SelfAudit")
+        
+        # 패턴 4: 각 줄에서 number 이전에 세미콜론/쉼표
+        lines = completion.split('\n')
+        for line in lines:
+            line = line.strip()
+            if re.search(r'[;,]+\s*number\s+\d+', line) and not re.match(r'^\s*number\s+\d+', line):
+                premature_separator_penalty += 1.0
+                logger.debug(f"⚠️ Premature separator in line: {line[:50]}")
+        
+        # premature_separator_penalty가 있으면 매우 강한 페널티
+        base_score_multiplier = 1.0
+        if premature_separator_penalty > 0:
+            base_score_multiplier = 0.01  # 99% 감점
+
+        gen_commands = [c.strip() for c in completion.split(';') if c.strip()]
+        if not gen_commands:
+            return 0.0
+
+        per_cmd_scores = []
+        severe_violation = False
+        number_only_count = 0
+        invalid_command_count = 0  # 잘못된 명령어 개수 추적
+
+        for cmd in gen_commands:
+            score = 1.0
+            parsed = self._parse(cmd)
+
+            if parsed.get("number_error"):
+                score = 0.0
+                severe_violation = True
+            else:
+                if parsed.get("is_number_only"):
+                    number_only_count += 1
+                if parsed.get("missing_command"):
+                    score = 0.0
+                    severe_violation = True
+
+                # invalid command - 매우 강력한 페널티
+                if parsed.get("invalid_command"):
+                    score *= 0.001  # 0.01 -> 0.001로 더 강화 (probe 같은 잘못된 명령어)
+                    severe_violation = True
+                    invalid_command_count += 1
+                    logger.debug(f"⚠️ Invalid command in: {cmd[:50]}")
+
+                # surface requirement
+                if parsed.get("need_surface_missing"):
+                    score *= 0.05
+
+                # status position missing
+                if parsed.get("status_missing_positions"):
+                    score *= 0.05
+
+                # value requirement
+                if parsed.get("need_value_missing"):
+                    score *= 0.05
+                if parsed.get("bad_value_format"):
+                    score *= 0.1
+
+            per_cmd_scores.append(score)
+
+        if not per_cmd_scores:
+            return 0.0
+
+        avg_score = sum(per_cmd_scores) / len(per_cmd_scores)
+        
+        # 명령어 완성 이전에 세미콜론/쉼표를 찍는 경우 penalty 적용
+        avg_score *= base_score_multiplier
+
+        # number-only spam
+        if number_only_count > 0:
+            ratio = number_only_count / max(1, len(gen_commands))
+            avg_score *= max(0.02, 1.0 - ratio * 2.0)
+
+        # 잘못된 명령어(probe 등)가 있으면 매우 강한 추가 penalty
+        if invalid_command_count > 0:
+            invalid_ratio = invalid_command_count / max(1, len(gen_commands))
+            avg_score *= (1.0 - invalid_ratio * 0.9)  # 잘못된 명령어 비율만큼 강하게 감점
+            logger.debug(f"⚠️ {invalid_command_count} invalid commands detected, applying strong penalty")
+
+        # severe violations crush the score
+        if severe_violation:
+            avg_score *= 0.02
+
+        # meta/template leftovers
+        if "the following output" in completion or "based on the provided instructions" in completion:
+            avg_score *= 0.05
+
+        return max(0.0, min(1.0, avg_score))
+
+    def _parse(self, cmd: str) -> Dict[str, Any]:
+        result = {
+            "number_error": False,
+            "missing_command": False,
+            "invalid_command": False,
+            "need_surface_missing": False,
+            "status_missing_positions": False,
+            "need_value_missing": False,
+            "bad_value_format": False,
+            "is_number_only": False,
+        }
+
+        m_num = re.match(r'number\s+(\d+(?:\s*,\s*\d+)*)\s*(.*)$', cmd)
+        if not m_num:
+            result["number_error"] = True
+            return result
+
+        tail = m_num.group(2).strip()
+        if not tail:
+            result["is_number_only"] = True
+            result["missing_command"] = True
+            return result
+
+        parts = [p.strip() for p in tail.split(',') if p.strip()]
+        if not parts:
+            result["missing_command"] = True
+            return result
+
+        command = None
+        surface = None
+        positions = []
+        values = []
+
+        for p in parts:
+            pl = p.lower()
+            if pl in self.surface_keywords:
+                surface = pl
+                continue
+            if pl in self.position_keywords:
+                positions.append(pl)
+                continue
+            if re.match(r'^\d+(\s+\d+){2,}$', pl):
+                values.append(pl)
+                continue
+            if command is None:
+                command = pl
+            else:
+                if re.match(r'^\d+(\s+\d+){0,2}$', pl):
+                    values.append(pl)
+                else:
+                    # 추가 토큰은 형식 평가에서 큰 가중치 부여하지 않음
+                    pass
+
+        if command is None:
+            result["missing_command"] = True
+            return result
+
+        # command validity - 강화된 체크
+        is_valid_command = False
+        # 정확한 매칭
+        if command in self.valid_commands:
+            is_valid_command = True
+        else:
+            # 부분 매칭 체크 (하지만 probe 같은 잘못된 명령어는 제외)
+            for valid_cmd in self.valid_commands:
+                if command in valid_cmd or valid_cmd in command:
+                    is_valid_command = True
+                    break
+        
+        # probe 같은 명확히 잘못된 명령어는 강력한 penalty
+        invalid_command_keywords = ['probe', 'tooth', 'teeth']  # 명령어 셋에 없는 명령어
+        if any(keyword in command for keyword in invalid_command_keywords):
+            result["invalid_command"] = True
+            logger.debug(f"⚠️ Invalid command keyword detected: {command}")
+        elif not is_valid_command:
+            result["invalid_command"] = True
+            logger.debug(f"⚠️ Invalid command detected: {command} (not in valid commands)")
+
+        cmd_info = self.loader.get_command_info(command)
+
+        # surface requirement
+        if cmd_info.get("need_surface") or cmd_info.get("is_status"):
+            if surface is None:
+                result["need_surface_missing"] = True
+
+        # status position check
+        if cmd_info.get("is_status"):
+            if not positions:
+                result["status_missing_positions"] = True
+
+        # value requirement
+        if command in self.value_required_commands:
+            if not values:
+                result["need_value_missing"] = True
+            else:
+                for v in values:
+                    if not re.match(r'^\d+\s+\d+\s+\d+$', v):
+                        result["bad_value_format"] = True
+                        break
+
+        return result
+
+
+class RepetitionPenaltyComponent(RewardComponent):
+    """
+    반복/스팸 패턴 페널티 (number만 반복, 동일 명령어 과다 반복, meta text 등)
+    가중치: 0.10
+    """
+    def __init__(self, weight: float = 0.10):
+        super().__init__(name="repetition_penalty", weight=weight)
+
+    def calculate(self, completion: str, ground_truth: str = None, **kwargs) -> float:
+        completion = str(completion).lower()
+        if not completion.strip():
+            return 0.0
+        
+        gen_commands = [c.strip() for c in completion.split(';') if c.strip()]
+        if not gen_commands:
+            return 0.0
+        
+        # 1) 동일 명령어 반복 비율
+        normalized = [self._normalize(cmd) for cmd in gen_commands]
+        unique_norm = set(normalized)
+        unique_ratio = len(unique_norm) / len(normalized) if normalized else 0.0
+        
+        score = 1.0
+        if unique_ratio < 0.5:
+            score *= 0.1  # 절반 이상이 중복이면 더 강한 감점
+        elif unique_ratio < 0.7:
+            score *= 0.5  # 다수 중복이면 감점
+        
+        # 2) number-only 패턴(행위 없는 숫자 나열) 감점
+        number_only_count = sum(1 for cmd in gen_commands if re.fullmatch(r'number\s+\d+\s*', cmd))
+        if number_only_count > 0:
+            ratio = number_only_count / max(1, len(gen_commands))
+            score *= max(0.02, 1.0 - ratio * 2.0)  # number만 반복되면 사실상 0점
+        
+        # 3) 같은 number를 여러 번 중복 생성 감점
+        numbers = []
+        for cmd in gen_commands:
+            m = re.search(r'number\s+(\d+)', cmd)
+            if m:
+                numbers.append(m.group(1))
+        if numbers:
+            from collections import Counter
+            counts = Counter(numbers)
+            over_duplicates = [n for n, cnt in counts.items() if cnt > 1]
+            if over_duplicates:
+                dup_ratio = sum(counts[n]-1 for n in over_duplicates) / len(numbers)
+                score *= max(0.1, 1.0 - dup_ratio * 1.0)
+        
+        # 4) meta text / template 남용 시 강한 감점
+        meta_patterns = [
+            r'\bthe following output\b',
+            r'\bbased on the provided instructions\b',
+            r'\bcommand\b\s*\.?$',
+            r'\boutput\b\s*\.?$'
+        ]
+        if any(re.search(p, completion) for p in meta_patterns):
+            score *= 0.02
+        
+        return max(0.0, min(1.0, score))
+    
+    def _normalize(self, cmd: str) -> str:
+        # 숫자를 토큰으로만 유지하고 나머지 공백/소문자 정규화
+        cmd = re.sub(r'\s+', ' ', cmd.strip().lower())
+        # 값 시퀀스는 축약
+        cmd = re.sub(r'\d+\s+\d+\s+\d+', '<val>', cmd)
+        return cmd
 
 
 class CommandRewardFunction:
@@ -1494,16 +1871,18 @@ class CommandRewardFunction:
             data_csv_path = config.get('data_csv_path')
         
         self.components = [
-            SequenceSimilarityComponent(weight=0.16),   # 전체 시퀀스 유사도 (GT 중심) - 감소
-            ToothNumberComponent(weight=0.16),          # 치아 번호 정확도
-            OrderPenaltyComponent(weight=0.12),        # 명령어 순서 오류 페널티
-            CommandKeywordComponent(weight=0.14, csv_file_path=csv_file_path, data_csv_path=data_csv_path),  # 명령어 키워드 매칭 (파일 기반) - 강화
-            StatusExpansionComponent(weight=0.14, csv_file_path=csv_file_path, data_csv_path=data_csv_path),  # STATUS 확장 검증 (파일 기반) - 강화
-            CommandFormatComponent(weight=0.12, csv_file_path=csv_file_path, data_csv_path=data_csv_path),  # 명령어 형식 검증 (파일 기반) - 강화
-            ExactMatchComponent(weight=0.06),          # 정확한 매칭 보너스 - 약화
-            InstructionComplianceComponent(weight=0.10, csv_file_path=csv_file_path, data_csv_path=data_csv_path),  # 지시 준수 및 환각 체크 (파일 기반) - 강화
-            StructuralComponent(weight=0.05),           # 구조적 정확도 - 소폭 강화
-            NumericalValueComponent(weight=0.05, csv_file_path=csv_file_path, data_csv_path=data_csv_path)  # 수치값 정확도 (파일 기반) - 강화
+            SequenceSimilarityComponent(weight=0.08),   # GT 시퀀스 유사도
+            ToothNumberComponent(weight=0.12),          # 치아 번호 정확도
+            OrderPenaltyComponent(weight=0.07),         # 명령어 순서 오류 페널티
+            CommandKeywordComponent(weight=0.15, csv_file_path=csv_file_path, data_csv_path=data_csv_path),  # 명령어 키워드 매칭
+            StatusExpansionComponent(weight=0.14, csv_file_path=csv_file_path, data_csv_path=data_csv_path),  # STATUS 확장 검증
+            CommandFormatComponent(weight=0.16, csv_file_path=csv_file_path, data_csv_path=data_csv_path),  # 명령어 형식 검증
+            InstructionComplianceComponent(weight=0.10, csv_file_path=csv_file_path, data_csv_path=data_csv_path),  # 지시 준수/환각
+            RepetitionPenaltyComponent(weight=0.10),    # 반복/스팸 패턴 페널티
+            SelfAuditComponent(weight=0.18, csv_file_path=csv_file_path, data_csv_path=data_csv_path),  # Self-reward 감사
+            NumericalValueComponent(weight=0.08, csv_file_path=csv_file_path, data_csv_path=data_csv_path),  # 수치값 정확도
+            StructuralComponent(weight=0.02),           # 구조적 정확도
+            ExactMatchComponent(weight=0.02),           # 정확한 매칭 보너스
         ]
         self.config = config or {}
     
