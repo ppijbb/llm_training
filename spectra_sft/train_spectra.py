@@ -1758,7 +1758,7 @@ def setup_model_and_tokenizer(model_config: Dict[str, Any]):
             "bias_pred_fc1",
             "bias_pred_fc2",
             # expression projector linear head
-            "linear_projection",
+            "projection",
         ]
 
         lora_config = LoraConfig(

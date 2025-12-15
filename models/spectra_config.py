@@ -355,6 +355,14 @@ class SPECTRATextConfig(PretrainedConfig):
         self.attn_implementation = attn_implementation
         self._attn_implementation = attn_implementation
 
+        # SOS-RMoE Parameters
+        self.log_sinkhorn_enabled = kwargs.get("log_sinkhorn_enabled", True)
+        self.srip_enabled = kwargs.get("srip_enabled", True)
+        self.so_warmup_steps = kwargs.get("so_warmup_steps", 1000)
+        self.so_lambda_max = kwargs.get("so_lambda_max", 1e-3)
+        self.adaptive_epsilon_enabled = kwargs.get("adaptive_epsilon_enabled", True)
+        self.max_vio_threshold = kwargs.get("max_vio_threshold", 0.1)
+
         # 하이브리드 positional embedding 패턴 생성 (smollm3 스타일)
         if no_rope_layers is None:
             self.no_rope_layers = [

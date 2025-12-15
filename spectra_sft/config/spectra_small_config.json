@@ -68,13 +68,13 @@
       "spechorn_bias_scale_max": 12.0,
       "spechorn_ortho_scale_min": 5e-2,
       "spechorn_ortho_scale_max": 8e-1,
-      "expression_ortho_strength": 4e-2,
-      "expression_init_scale": 1e-1,
+      "expression_ortho_strength": 4e-1,
+      "expression_init_scale": 7e-1,
       "router_gru_num_layers": 1,
       "router_logit_scale_init": 2.302585092994046,
       "router_logit_scale_max": 100.0,
       "router_layernorm_eps": 1e-4,
-      "sinkhorn_ortho_penalty_alpha": 5e-1
+      "sinkhorn_ortho_penalty_alpha": 5e-2
     }
   },
   "data_config": {

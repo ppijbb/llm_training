@@ -506,6 +506,18 @@ class TorchMoECallback:
                         if torch.is_tensor(val):
                             val = val.detach().to('cpu')
                         lightweight_entry['avg_routing_entropy'] = val
+                    # Keep top-k routing weights if present (aligned with expert_assignments)
+                    if 'routing_topk_weights' in routing_info and routing_info['routing_topk_weights'] is not None:
+                        val = routing_info['routing_topk_weights']
+                        if torch.is_tensor(val):
+                            val = val.detach().to('cpu', non_blocking=True)
+                        lightweight_entry['routing_topk_weights'] = val
+                    # Keep expert-expert similarity matrix if present (so PES != token cosine similarity)
+                    if 'expert_sim_matrix' in routing_info and routing_info['expert_sim_matrix'] is not None:
+                        val = routing_info['expert_sim_matrix']
+                        if torch.is_tensor(val):
+                            val = val.detach().to('cpu', non_blocking=True)
+                        lightweight_entry['expert_sim_matrix'] = val
                     if 'ortho_loss' in routing_info and routing_info['ortho_loss'] is not None:
                         val = routing_info['ortho_loss']
                         if torch.is_tensor(val):
@@ -516,6 +528,19 @@ class TorchMoECallback:
                         if torch.is_tensor(val):
                             val = val.detach().to('cpu')
                         lightweight_entry['aux_loss'] = val
+
+                    # Expert-choice(quota) routing debug stats (keep lightweight scalars)
+                    for k in [
+                        'last_quota_cap', 'last_quota_fallback_frac', 'last_expert_choice_enabled',
+                        'last_quota_tokens', 'last_quota_top_k', 'last_quota_num_experts', 'last_quota_capacity_factor'
+                    ]:
+                        if k in routing_info and routing_info[k] is not None:
+                            val = routing_info[k]
+                            if torch.is_tensor(val):
+                                val = val.detach().to('cpu')
+                                if val.numel() == 1:
+                                    val = val.item()
+                            lightweight_entry[k] = val
                     # G3MoE specific metrics
                     if 'speciality_loss' in routing_info and routing_info['speciality_loss'] is not None:
                         val = routing_info['speciality_loss']
@@ -611,14 +636,30 @@ class TorchMoECallback:
             if hasattr(router, 'last_routing_weights') and router.last_routing_weights is not None:
                 routing_weights = router.last_routing_weights
                 if routing_weights.dim() == 2:
-                    routing_info['routing_probs'] = routing_weights.flatten()
+                    # Top-k routing weights (aligned with last_selected_experts flatten)
+                    routing_info['routing_topk_weights'] = routing_weights.flatten()
                 else:
-                    routing_info['routing_probs'] = routing_weights.flatten() if routing_weights.dim() > 0 else routing_weights
+                    routing_info['routing_topk_weights'] = routing_weights.flatten() if routing_weights.dim() > 0 else routing_weights
             
             if hasattr(router, 'num_experts'):
                 routing_info['num_experts'] = router.num_experts
             elif hasattr(router, 'last_num_experts'):
                 routing_info['num_experts'] = router.last_num_experts
+
+            # --- Expert-choice(quota) routing debug stats (SPECTRA OSR router) ---
+            # These are lightweight scalars; safe to always extract when present.
+            for attr in [
+                'last_quota_cap', 'last_quota_fallback_frac', 'last_expert_choice_enabled',
+                'last_quota_tokens', 'last_quota_top_k', 'last_quota_num_experts', 'last_quota_capacity_factor'
+            ]:
+                if hasattr(router, attr):
+                    val = getattr(router, attr)
+                    if torch.is_tensor(val):
+                        val = val.detach().to('cpu')
+                        # scalarize if possible
+                        if val.numel() == 1:
+                            val = val.item()
+                    routing_info[attr] = val
 
         # ===== 우선순위 2: 모듈에서 직접 저장된 정보 (fallback) =====
         if 'expert_assignments' not in routing_info and hasattr(module, 'last_selected_experts'):
@@ -633,13 +674,26 @@ class TorchMoECallback:
                 if hasattr(module, 'last_routing_weights'):
                     routing_weights = module.last_routing_weights
                     if routing_weights.dim() == 2:
-                        routing_info['routing_probs'] = routing_weights.flatten()
+                        routing_info['routing_topk_weights'] = routing_weights.flatten()
                 
                 # num_experts 저장
                 if hasattr(module, 'last_num_experts'):
                     routing_info['num_experts'] = module.last_num_experts
             else:
                 routing_info['expert_assignments'] = selected_experts
+
+            # Also try module-level quota stats (in case router is not reachable through module.router)
+            for attr in [
+                'last_quota_cap', 'last_quota_fallback_frac', 'last_expert_choice_enabled',
+                'last_quota_tokens', 'last_quota_top_k', 'last_quota_num_experts', 'last_quota_capacity_factor'
+            ]:
+                if hasattr(module, attr) and attr not in routing_info:
+                    val = getattr(module, attr)
+                    if torch.is_tensor(val):
+                        val = val.detach().to('cpu')
+                        if val.numel() == 1:
+                            val = val.item()
+                    routing_info[attr] = val
         
         # ===== Router에서 Loss 메트릭 직접 추출 (치명적 버그 수정) =====
         if router is not None:
@@ -661,6 +715,20 @@ class TorchMoECallback:
                 if torch.is_tensor(val):
                     val = val.detach().to('cpu')
                 routing_info['cosine_similarities'] = val
+            
+            # Expert similarity matrix (for pairwise_expert_similarity)
+            # Check both router and module (in case router is stored differently)
+            expert_sim_matrix_source = None
+            if hasattr(router, 'last_expert_sim_matrix') and router.last_expert_sim_matrix is not None:
+                expert_sim_matrix_source = router.last_expert_sim_matrix
+            elif hasattr(module, 'last_expert_sim_matrix') and module.last_expert_sim_matrix is not None:
+                expert_sim_matrix_source = module.last_expert_sim_matrix
+            
+            if expert_sim_matrix_source is not None:
+                val = expert_sim_matrix_source
+                if torch.is_tensor(val):
+                    val = val.detach().to('cpu')
+                routing_info['expert_sim_matrix'] = val
             
             if hasattr(router, 'last_expression_reg_loss') and router.last_expression_reg_loss is not None:
                 val = router.last_expression_reg_loss
@@ -693,7 +761,7 @@ class TorchMoECallback:
                         # last_selected_experts가 없거나 이미 추출한 경우에만 사용
                         if 'expert_assignments' not in routing_info:
                             routing_info['expert_assignments'] = expert_assignments.flatten()
-                        # routing_probs는 항상 업데이트 (entropy 계산용)
+                        # routing_probs_full: full per-expert probs (for entropy/variance etc.)
                         routing_info['routing_probs'] = routing_probs_full.flatten()
                         # num_experts 정보도 추출
                         if 'num_experts' not in routing_info:
@@ -1656,6 +1724,14 @@ class TorchMoECallback:
             
             expert_assignments = routing_info.get('expert_assignments')
             routing_probs = routing_info.get('routing_probs')
+            routing_topk_weights = routing_info.get('routing_topk_weights')
+            quota_cap = routing_info.get('last_quota_cap', None)
+            quota_fallback_frac = routing_info.get('last_quota_fallback_frac', None)
+            expert_choice_enabled = routing_info.get('last_expert_choice_enabled', None)
+            quota_tokens = routing_info.get('last_quota_tokens', None)
+            quota_top_k = routing_info.get('last_quota_top_k', None)
+            quota_num_experts = routing_info.get('last_quota_num_experts', None)
+            quota_capacity_factor = routing_info.get('last_quota_capacity_factor', None)
             
             # ✅ num_experts를 데이터에서 유도 (가능한 한 데이터 기반, 최후에만 초기화 인자 사용)
             num_experts = routing_info.get('num_experts')
@@ -1727,6 +1803,68 @@ class TorchMoECallback:
                     # utilization_mean: usage_distribution의 평균 (각 expert의 평균 사용률)
                     'utilization_mean': usage_distribution.mean().item(),
                 })
+
+                # Weighted load metrics (use routing weights if aligned with expert_assignments)
+                expert_weighted_counts = None
+                try:
+                    rp = None
+                    if routing_topk_weights is not None and torch.is_tensor(routing_topk_weights):
+                        rp = routing_topk_weights
+                    elif routing_probs is not None and torch.is_tensor(routing_probs):
+                        # Fallback only if already aligned (rare)
+                        rp = routing_probs
+
+                    if rp is not None and torch.is_tensor(rp):
+                        if rp.is_cuda:
+                            rp = rp.cpu()
+                        # Ensure 1D and aligned length
+                        rp = rp.flatten()
+                        if rp.numel() == expert_assignments.numel() and rp.numel() > 0:
+                            expert_weighted_counts = torch.zeros(num_experts, dtype=torch.float32)
+                            # scatter_add using expert indices (long) and weights (float)
+                            expert_weighted_counts.scatter_add_(0, expert_assignments, rp.to(torch.float32))
+                            w_sum = expert_weighted_counts.sum().clamp_min(1e-8)
+                            w_dist = expert_weighted_counts / w_sum
+                            layer_metrics['expert_weighted_cv'] = float(w_dist.std().item() / (w_dist.mean().item() + 1e-8))
+                            # Weighted MaxVio: max deviation from mean in weighted counts
+                            mean_w = expert_weighted_counts.mean()
+                            layer_metrics['expert_weighted_maxvio'] = float((expert_weighted_counts - mean_w).abs().max().item() / (mean_w.item() + 1e-8))
+                except Exception:
+                    # Do not fail metrics due to alignment issues
+                    pass
+                # Quota routing debug metrics (if available)
+                if quota_cap is not None:
+                    try:
+                        layer_metrics['quota_cap'] = float(quota_cap)
+                    except Exception:
+                        layer_metrics['quota_cap'] = quota_cap
+                if quota_fallback_frac is not None:
+                    try:
+                        layer_metrics['quota_fallback_frac'] = float(quota_fallback_frac)
+                    except Exception:
+                        layer_metrics['quota_fallback_frac'] = quota_fallback_frac
+                if expert_choice_enabled is not None:
+                    # cast to 0/1 if bool-like
+                    if isinstance(expert_choice_enabled, bool):
+                        layer_metrics['expert_choice_enabled'] = 1.0 if expert_choice_enabled else 0.0
+                    else:
+                        try:
+                            layer_metrics['expert_choice_enabled'] = float(expert_choice_enabled)
+                        except Exception:
+                            layer_metrics['expert_choice_enabled'] = expert_choice_enabled
+
+                # Quota routing ingredients (keep the original keys to match aggregation helper)
+                if quota_tokens is not None:
+                    layer_metrics['last_quota_tokens'] = int(quota_tokens) if isinstance(quota_tokens, (int, float)) else quota_tokens
+                if quota_top_k is not None:
+                    layer_metrics['last_quota_top_k'] = int(quota_top_k) if isinstance(quota_top_k, (int, float)) else quota_top_k
+                if quota_num_experts is not None:
+                    layer_metrics['last_quota_num_experts'] = int(quota_num_experts) if isinstance(quota_num_experts, (int, float)) else quota_num_experts
+                if quota_capacity_factor is not None:
+                    try:
+                        layer_metrics['last_quota_capacity_factor'] = float(quota_capacity_factor)
+                    except Exception:
+                        layer_metrics['last_quota_capacity_factor'] = quota_capacity_factor
                 # Capacity metrics (approx): max expert load vs expected capacity
                 total_tokens = usage_counts.sum().item()
                 expected_cap = (total_tokens / float(num_experts)) * self.capacity_factor if num_experts > 0 else 0.0
@@ -1803,21 +1941,36 @@ class TorchMoECallback:
                 else:
                     layer_metrics['speciality_loss'] = float(val)
             
+            # Cosine similarities (token-expert matching similarity)
             if 'cosine_similarities' in routing_info and routing_info['cosine_similarities'] is not None:
                 val = routing_info['cosine_similarities']
                 if torch.is_tensor(val):
+                    # [B, S, E] 또는 [B*S, E] 형태의 토큰-전문가 매칭 유사도
+                    layer_metrics['cosine_similarities'] = val.mean().item()
+                else:
+                    layer_metrics['cosine_similarities'] = float(val)
+            
+            # Pairwise Expert Similarity (expert-expert similarity matrix)
+            if 'expert_sim_matrix' in routing_info and routing_info['expert_sim_matrix'] is not None:
+                val = routing_info['expert_sim_matrix']
+                if torch.is_tensor(val):
                     if val.dim() >= 2 and val.size(-1) == val.size(-2):
-                        # Off-diagonal 평균으로 Pairwise Expert Similarity 계산
+                        # [E, E] 행렬: off-diagonal 평균으로 Pairwise Expert Similarity 계산
                         diag_mask = ~torch.eye(val.size(-1), dtype=torch.bool, device=val.device)
                         pes = val.masked_select(diag_mask).mean().item()
                         layer_metrics['pairwise_expert_similarity'] = pes
-                        layer_metrics['cosine_similarities'] = val.mean().item()
                     else:
-                        mean_val = val.mean().item()
-                        layer_metrics['cosine_similarities'] = mean_val
-                        layer_metrics['pairwise_expert_similarity'] = mean_val
+                        # 1D인 경우 평균
+                        layer_metrics['pairwise_expert_similarity'] = val.mean().item()
                 else:
-                    layer_metrics['cosine_similarities'] = float(val)
+                    layer_metrics['pairwise_expert_similarity'] = float(val)
+            elif 'cosine_similarities' in routing_info and routing_info['cosine_similarities'] is not None:
+                # Fallback: expert_sim_matrix가 없으면 cosine_similarities를 사용 (하위 호환성)
+                val = routing_info['cosine_similarities']
+                if torch.is_tensor(val):
+                    mean_val = val.mean().item()
+                    layer_metrics['pairwise_expert_similarity'] = mean_val
+                else:
                     layer_metrics['pairwise_expert_similarity'] = float(val)
             
             if 'expression_loss' in routing_info and routing_info['expression_loss'] is not None:
@@ -2039,7 +2192,8 @@ class TorchMoECallback:
             for name, module in self.model.named_modules():
                 has_any = any(
                     hasattr(module, attr) for attr in (
-                        'last_selected_experts', 'last_routing_weights', 'last_num_experts'
+                        'last_selected_experts', 'last_routing_weights', 'last_num_experts',
+                        'last_quota_cap', 'last_quota_fallback_frac', 'last_expert_choice_enabled'
                     )
                 )
                 if not has_any:
@@ -2058,6 +2212,22 @@ class TorchMoECallback:
                         entry['num_experts'] = int(module.last_num_experts)
                     except Exception:
                         pass
+                # Quota routing debug stats (optional)
+                for attr in ('last_quota_cap', 'last_quota_fallback_frac', 'last_expert_choice_enabled'):
+                    if hasattr(module, attr):
+                        val = getattr(module, attr)
+                        if torch.is_tensor(val):
+                            val = val.detach().to('cpu')
+                            if val.numel() == 1:
+                                val = val.item()
+                        entry[attr] = val
+                
+                # Expert similarity matrix (for pairwise_expert_similarity)
+                if hasattr(module, 'last_expert_sim_matrix') and module.last_expert_sim_matrix is not None:
+                    val = module.last_expert_sim_matrix
+                    if torch.is_tensor(val):
+                        val = val.detach().to('cpu')
+                    entry['expert_sim_matrix'] = val
                 if entry:
                     collected[name] = entry
         except Exception as e:
@@ -2147,6 +2317,75 @@ class TorchMoECallback:
                             and m['maxvio'] is not None]
             if maxvio_values:
                 log_data['moe/avg_maxvio'] = np.mean(maxvio_values)
+
+            # Weighted CV/MaxVio aggregation (based on top-k routing weights)
+            wcv_values = [m['expert_weighted_cv']
+                          for m in metrics.values()
+                          if isinstance(m, dict) and not isinstance(m, str)
+                          and 'expert_weighted_cv' in m and m['expert_weighted_cv'] is not None]
+            if wcv_values:
+                log_data['moe/avg_expert_weighted_cv'] = float(np.mean(wcv_values))
+
+            wmv_values = [m['expert_weighted_maxvio']
+                          for m in metrics.values()
+                          if isinstance(m, dict) and not isinstance(m, str)
+                          and 'expert_weighted_maxvio' in m and m['expert_weighted_maxvio'] is not None]
+            if wmv_values:
+                log_data['moe/avg_expert_weighted_maxvio'] = float(np.mean(wmv_values))
+
+            # Quota routing debug aggregation (expert-choice routing)
+            quota_caps = [
+                m.get('quota_cap')
+                for m in metrics.values()
+                if isinstance(m, dict) and not isinstance(m, str) and m.get('quota_cap') is not None
+            ]
+            if quota_caps:
+                try:
+                    log_data['moe/quota_cap'] = float(np.mean([float(x) for x in quota_caps]))
+                except Exception:
+                    log_data['moe/quota_cap'] = quota_caps[-1]
+
+            quota_fallbacks = [
+                m.get('quota_fallback_frac')
+                for m in metrics.values()
+                if isinstance(m, dict) and not isinstance(m, str) and m.get('quota_fallback_frac') is not None
+            ]
+            if quota_fallbacks:
+                try:
+                    log_data['moe/quota_fallback_frac'] = float(np.mean([float(x) for x in quota_fallbacks]))
+                except Exception:
+                    log_data['moe/quota_fallback_frac'] = quota_fallbacks[-1]
+
+            quota_enabled = [
+                m.get('expert_choice_enabled')
+                for m in metrics.values()
+                if isinstance(m, dict) and not isinstance(m, str) and m.get('expert_choice_enabled') is not None
+            ]
+            if quota_enabled:
+                try:
+                    log_data['moe/expert_choice_enabled'] = float(np.mean([float(x) for x in quota_enabled]))
+                except Exception:
+                    log_data['moe/expert_choice_enabled'] = quota_enabled[-1]
+
+            # Also log the ingredients so quota_cap is interpretable.
+            def _mean_scalar(key: str):
+                vals = [m.get(key) for m in metrics.values() if isinstance(m, dict) and not isinstance(m, str) and m.get(key) is not None]
+                if not vals:
+                    return None
+                try:
+                    return float(np.mean([float(x) for x in vals]))
+                except Exception:
+                    return vals[-1]
+
+            for src_key, dst_key in [
+                ('last_quota_tokens', 'moe/quota_tokens'),
+                ('last_quota_top_k', 'moe/quota_top_k'),
+                ('last_quota_num_experts', 'moe/quota_num_experts'),
+                ('last_quota_capacity_factor', 'moe/quota_capacity_factor'),
+            ]:
+                v = _mean_scalar(src_key)
+                if v is not None:
+                    log_data[dst_key] = v
             
             # Capacity metrics aggregation
             cap_util_values = [m['capacity_utilization_max']
@@ -2669,7 +2908,7 @@ class TorchMoECallback:
                     ax.grid(alpha=0.3)
                     plt.tight_layout()
                     
-                    # wandb에 로깅
+                    # wandb에 로깅 (pending_heatmaps에 저장하여 on_log에서 실제 로깅)
                     try:
                         import wandb
                         if wandb.run is not None:
@@ -2677,13 +2916,23 @@ class TorchMoECallback:
                                 self.pending_heatmaps[current_step] = {}
                             self.pending_heatmaps[current_step][f'{layer_name}_tsne'] = wandb.Image(plt)
                             if self.log_to_console:
-                                self._log_debug(f"✅ Generated t-SNE visualization for {layer_name} at step {current_step}")
+                                self._log_debug(f"✅ Generated t-SNE visualization for {layer_name} at step {current_step} (stored in pending_heatmaps)")
+                        else:
+                            if self.log_to_console:
+                                self._log_debug(f"⚠️ wandb.run is None, t-SNE visualization stored but will not be logged")
+                            # wandb.run이 None이어도 pending_heatmaps에 저장 (나중에 wandb가 초기화되면 로깅 가능)
+                            if current_step not in self.pending_heatmaps:
+                                self.pending_heatmaps[current_step] = {}
+                            self.pending_heatmaps[current_step][f'{layer_name}_tsne'] = wandb.Image(plt) if wandb.run is not None else plt
                     except ImportError:
                         if self.log_to_console:
                             self._log_debug(f"⚠️ wandb not available for t-SNE visualization")
                     except Exception as e:
                         if self.log_to_console:
-                            self._log_debug(f"Warning: Failed to log t-SNE to wandb: {e}")
+                            self._log_debug(f"Warning: Failed to store t-SNE visualization: {e}")
+                        import traceback
+                        if self.log_to_console:
+                            self._log_debug(f"   Traceback: {traceback.format_exc()}")
                     
                     # 파일로 저장
                     if self.save_detailed_logs:
@@ -3051,15 +3300,38 @@ class TransformersMoECallbackWrapper(TrainerCallback):
                     # Heatmap/t-SNE는 별도 로깅 (이미지이므로)
                     if state.global_step in self.torch_callback.pending_heatmaps:
                         heatmap_data = self.torch_callback.pending_heatmaps[state.global_step]
-                        for layer_name, image in heatmap_data.items():
-                            if layer_name.endswith('_tsne'):
-                                wandb.run.log({
-                                    f'moe/{layer_name}/tsne_visualization': image
-                                }, commit=False)
-                            else:
-                                wandb.run.log({
-                                    f'moe/{layer_name}/usage_heatmap': image
-                                }, commit=False)
+                        logged_count = 0
+                        for key, image in heatmap_data.items():
+                            try:
+                                if key.endswith('_tsne'):
+                                    # t-SNE: layer_name에서 _tsne 제거하여 원래 레이어 이름 사용
+                                    original_layer_name = key[:-5]  # '_tsne' 제거
+                                    wandb_key = f'moe/{original_layer_name}/tsne_visualization'
+                                    wandb.run.log({
+                                        wandb_key: image
+                                    }, commit=False)
+                                    logged_count += 1
+                                    if self.torch_callback.log_to_console:
+                                        self.torch_callback._log_debug(f"📤 Logged t-SNE visualization for {original_layer_name} to wandb (key: {wandb_key})")
+                                else:
+                                    # Heatmap: 원래 레이어 이름 그대로 사용
+                                    wandb_key = f'moe/{key}/usage_heatmap'
+                                    wandb.run.log({
+                                        wandb_key: image
+                                    }, commit=False)
+                                    logged_count += 1
+                                    if self.torch_callback.log_to_console:
+                                        self.torch_callback._log_debug(f"📤 Logged heatmap for {key} to wandb (key: {wandb_key})")
+                            except Exception as e:
+                                if self.torch_callback.log_to_console:
+                                    self.torch_callback._log_debug(f"⚠️ Failed to log visualization {key} to wandb: {e}")
+                                    import traceback
+                                    if state.global_step % 100 == 0:  # 너무 자주 출력하지 않도록
+                                        self.torch_callback._log_debug(f"   Traceback: {traceback.format_exc()}")
+                        
+                        if self.torch_callback.log_to_console and logged_count > 0:
+                            self.torch_callback._log_debug(f"✅ Successfully logged {logged_count} visualization(s) to wandb at step {state.global_step}")
+                        
                         del self.torch_callback.pending_heatmaps[state.global_step]
                     
                     # Pending alert 로깅

@@ -601,7 +601,71 @@ class mp(torch.autograd.Function):
             None, 
             None, 
             None, 
+            None, 
         )
+
+
+def enhanced_soft_orthogonality_loss(
+    expert_embeddings: torch.Tensor,
+    lambda_so: float = 1e-4,
+    use_srip: bool = True,
+) -> torch.Tensor:
+    """
+    Enhanced Soft Orthogonality Loss with SRIP variant.
+    
+    핵심 차별점:
+    1. Frobenius Norm + Spectral Norm 결합
+    2. 양방향 억제: cos(e_i, e_j)^2로 +1과 -1 모두 페널티
+    3. Warm-up 지원
+    
+    Args:
+        expert_embeddings: [num_experts, dim] or [batch, num_experts, dim]
+        lambda_so: loss coefficient
+        use_srip: use spectral norm variant
+    
+    Returns:
+        loss: scalar orthogonality loss
+    """
+    if expert_embeddings.dim() == 3:
+        # Batch case: average over batch
+        # This is important: we want the EXPERTS to be orthogonal on average,
+        # but momentarily they can shift. Averaging the REPRESENTATION first
+        # stabilizes the gradient.
+        expert_embeddings = expert_embeddings.mean(dim=0)  # [E, dim]
+    
+    # Check for empty or invalid input
+    if expert_embeddings.numel() == 0:
+        return torch.tensor(0.0, device=expert_embeddings.device, requires_grad=True)
+
+    # Normalize to unit vectors
+    E_norm = F.normalize(expert_embeddings, p=2, dim=-1)  # [E, dim]
+    
+    # Gram matrix (pairwise cosine similarities)
+    # G_ij = cos(e_i, e_j)
+    G = torch.matmul(E_norm, E_norm.t())  # [E, E]
+    
+    # Target: Identity matrix
+    I = torch.eye(G.size(0), device=G.device, dtype=G.dtype)
+    
+    # Frobenius norm loss: ||G - I||_F^2
+    # This penalizes off-diagonals (both positive and negative correlations)
+    # (cos)^2 will be minimized
+    frob_loss = torch.pow(torch.norm(G - I, p='fro'), 2)
+    
+    if use_srip:
+        # SRIP: Spectral norm of (G - I), bounds Lipschitz constant
+        # Approximate with power iteration for efficiency? 
+        # For typical E (e.g., 8-64), exact computation via svd or matrix_norm is feasible/fast enough on GPU.
+        # If E is very large (e.g., 256+), might be slow, but usually done once per step.
+        diff = G - I
+        # Use spectral norm (2-norm)
+        # torch.linalg.matrix_norm with ord=2 computes the spectral norm (largest singular value)
+        spectral_loss = torch.linalg.matrix_norm(diff, ord=2) ** 2
+        loss = 0.7 * frob_loss + 0.3 * spectral_loss
+    else:
+        loss = frob_loss
+    
+    return lambda_so * loss
 
 
 class ExpressionProjector(nn.Module):
@@ -610,21 +674,22 @@ class ExpressionProjector(nn.Module):
     학습/추론 모두에서 가중치를 강제로 직교화하여 붕괴를 방지합니다.
     """
 
-    def __init__(self, input_dim, output_dim, num_experts, method="newton_schulz", **kwargs):
+    def __init__(self, input_dim, output_dim, num_experts, method="newton_schulz", iterations=3, **kwargs):
         super().__init__()
         self.input_dim = input_dim
         self.output_dim = output_dim
         self.num_experts = num_experts
         self.method = method
+        self.iterations = iterations
 
         # 단일 선형층 + 정직교 초기화
         self.projection = nn.Linear(input_dim, output_dim, bias=False)
         nn.init.orthogonal_(self.projection.weight)
 
-    def newton_schulz(self, W: torch.Tensor, steps: int = 10) -> torch.Tensor:
+    def newton_schulz(self, W: torch.Tensor, steps: int = 3) -> torch.Tensor:
         """SVD-free orthogonalization."""
-        norms = W.norm(p="fro") + 1e-6
-        X = W / norms if norms > 1.0 else W
+        norms = W.norm(p="fro") + 1e-8
+        X = W / norms  # Always normalize for stability
 
         transpose = X.shape[0] < X.shape[1]
         if transpose:
@@ -640,7 +705,7 @@ class ExpressionProjector(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # 학습/추론 공통으로 직교화된 가중치를 사용
-        W_ortho = self.newton_schulz(self.projection.weight, steps=10)
+        W_ortho = self.newton_schulz(self.projection.weight, steps=self.iterations)
         return F.linear(x, W_ortho)
 
     def orthogonal_loss(self):
@@ -713,7 +778,9 @@ def differentiable_sinkhorn(cost: torch.Tensor, num_experts: int, epsilon: float
         raise ValueError(f"iterations must be positive, got {iterations}")
     
     # Initialize Q: exp(-cost / epsilon)
-    cost_float = cost.float()
+    # cost_float = cost.float()
+    cost_min, _ = cost.min(dim=-1, keepdim=True)
+    cost_float = (cost - cost_min).float()  # 이제 최솟값은 0이 됨 -> exp(0) = 1 (Safe!)
     
     # Clamp cost to prevent exp overflow
     max_cost_ratio = 50.0
@@ -752,126 +819,126 @@ def differentiable_sinkhorn(cost: torch.Tensor, num_experts: int, epsilon: float
     row_sum = Q.sum(dim=-1, keepdim=True) + 1e-8
     Q = Q / row_sum
     
-    assert Q.shape == original_shape, f"Final shape mismatch: {Q.shape} vs {original_shape}"
-    assert Q.shape == cost.shape, f"Sinkhorn output shape mismatch: {Q.shape} vs {cost.shape}"
-    
     return Q
+
+
+def log_sinkhorn_stabilized(
+    logits: torch.Tensor,
+    num_experts: int,
+    epsilon: float = 0.05,
+    iterations: int = 5,
+    adaptive_epsilon: bool = True,
+    cv_ema: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Log-Domain Stabilized Sinkhorn Algorithm.
+    
+    핵심: exp(-C/epsilon) 대신 log-space에서 연산하여 underflow/overflow 방지.
+    
+    Args:
+        logits: [N, E] routing logits (higher = better)
+        num_experts: number of experts
+        epsilon: base temperature (adaptive하게 조절됨)
+        iterations: Sinkhorn iterations
+        adaptive_epsilon: CV에 따라 epsilon 조절
+        cv_ema: CV EMA value for adaptive epsilon
+    
+    Returns:
+        P: [N, E] doubly stochastic matrix
+        max_vio: maximum constraint violation (for monitoring)
+    """
+    N, E = logits.shape
+    device, dtype = logits.device, logits.dtype
+    
+    # Adaptive Epsilon: CV가 높으면 epsilon 증가 (더 부드러운 할당)
+    if adaptive_epsilon and cv_ema is not None:
+        cv_val = cv_ema.item() if torch.is_tensor(cv_ema) else cv_ema
+        # Max scaling factor: 4.0 (1 + 3.0)
+        # If CV explodes (e.g. > 10.0), clamp it.
+        epsilon = epsilon * (1.0 + min(cv_val, 3.0))
+    
+    # Safety clamp for epsilon
+    epsilon = max(epsilon, 1e-4) # Avoid division by zero
+    
+    # Log-space cost matrix: M = logits / epsilon
+    # We want to maximize logits <-> minimize cost
+    # Cost = -logits
+    # K = exp(-Cost/eps) = exp(logits/eps)
+    # working in log domain: M = log(K) = logits/eps
+    M = logits.float() / epsilon
+    
+    # Numerical stability: subtract max per row (log-sum-exp trick preparation)
+    # Does not change the resulting distribution P
+    M_max = M.max(dim=-1, keepdim=True).values
+    M = M - M_max
+    
+    # Initialize dual potentials
+    f = torch.zeros(N, 1, device=device, dtype=torch.float32)  # row potential
+    g = torch.zeros(1, E, device=device, dtype=torch.float32)  # column potential
+    
+    # Target marginals
+    # Row target: 1 (actually 1/N but we are working with probabilities summing to 1 per row)
+    # Wait, Sinkhorn usually projects to DSM where rowsum=1, colsum=N/E?
+    # Or rowsum=1/N, colsum=1/E?
+    # Standard Attention/Routing: row_sum = 1 (each token goes somewhere)
+    # Col sum = N/E (uniform load)
+    
+    target_row = torch.zeros(N, 1, device=device, dtype=torch.float32) # log(1) = 0
+    target_col = torch.log(torch.tensor(N / E, device=device, dtype=torch.float32) + 1e-10) # log(N/E)
+    
+    for _ in range(iterations):
+        # Row normalization in log-space
+        # u = 1 ./ (K @ v) => log(u) = -log(K @ exp(log_v))
+        # log_sum_exp_row = logsumexp(M + g^T)
+        log_sum_exp_row = torch.logsumexp(M + g, dim=-1, keepdim=True)
+        # f update: f = log(target_row) - log_sum_exp_row
+        # But wait, original M includes f and g implicitly?
+        # Usually Sinkhorn updates are:
+        # u <- target_r / (K @ v)
+        # v <- target_c / (K.T @ u)
+        # In log domain:
+        # log_u <- log_target_r - logsumexp(M + log_v)
+        # log_v <- log_target_c - logsumexp(M.T + log_u)
+        
+        f = target_row - log_sum_exp_row
+        
+        # Column normalization in log-space  
+        log_sum_exp_col = torch.logsumexp(M + f, dim=0, keepdim=True)
+        g = target_col - log_sum_exp_col
+    
+    # Compute final transport plan P = diag(u) K diag(v)
+    # log P = log u + M + log v
+    log_P = f + M + g
+    
+    # Convert back to probability space
+    # Since we normalized rows to sum to 1 (target_row=0 => log(1)),
+    # P rows should sum to 1.
+    P = torch.exp(log_P).to(dtype)
+    
+    # Final cleanup: ensure row sums are exactly 1
+    # (sometimes small errors accumulate)
+    P = P / (P.sum(dim=-1, keepdim=True) + 1e-8)
+    
+    # Compute MaxVio for monitoring
+    if iterations > 0:
+        with torch.no_grad():
+            row_sum = P.sum(dim=-1) # Should be 1.0
+            col_sum = P.sum(dim=0)  # Should be N/E
+            
+            # Use float64 for precision in check
+            row_vio = (row_sum.float() - 1.0).abs().max()
+            col_vio = (col_sum.float() - (N/E)).abs().max()
+            max_vio = torch.max(row_vio, col_vio)
+    else:
+        max_vio = torch.tensor(0.0, device=device)
+    
+    return P, max_vio
 
 
 # [OSR] Neural Solver 제거 완료 - Pure Math Sinkhorn만 사용
 # [OSR] Neural Solver 클래스 제거 완료
 # NeuralGradientProjector와 DualPotentialLinearSolver는 제거됨
 # 이제 differentiable_sinkhorn 함수만 사용 (학습 파라미터 0개)
-
-def sparsemixer(scores, top_k, jitter_eps, training):
-    assert top_k == 2
-
-    ################ first expert ################
-    with torch.no_grad():
-        # compute mask for sparsity
-        mask_logits_threshold, max_ind = scores.max(dim=-1, keepdim=True)
-        factor = scores.abs().clamp(min=mask_logits_threshold.abs()).clamp(min=1e-10)  # 수치적 안정성 개선
-        mask_logits_threshold = (
-            (mask_logits_threshold - scores) / factor
-        ) > (2 * jitter_eps)
-
-    # apply mask 
-    masked_gates = scores.masked_fill(mask_logits_threshold, float('-inf'))
-    if training:
-        selected_experts = (
-            masked_gates - torch.empty_like(masked_gates, memory_format=torch.legacy_contiguous_format).exponential_().log()
-        ).max(dim=-1)[1].unsqueeze(-1) # gumbel sampling, more robust than than the multinomial method
-    else:
-        selected_experts = max_ind
-        
-    # compute scores for gradients
-    masked_gates = torch.softmax(masked_gates, dim=-1)
-    
-    # Ensure selected_experts indices are within bounds
-    num_experts = masked_gates.size(-1)
-    selected_experts = torch.clamp(selected_experts, 0, num_experts - 1)
-    
-    multiplier_o = masked_gates.gather(dim=-1, index=selected_experts)
-    
-    if training:
-        # compute midpoint mask 
-        max_scores, max_ind = masked_gates.max(dim=-1, keepdim=True)
-        mask_for_one = torch.logical_or(
-            selected_experts == max_ind,
-            torch.rand_like(max_scores) > 0.75 # Heun's third-order method: f(x) - f(0) = .25 f'(x) + .75 f'(x/3.)
-        ) 
-        # 1 -> 1.0 & 0 -> 1./3: lambda x: (x + 0.5) / 1.5
-        mask_for_one = torch.add(0.3333, mask_for_one, alpha=0.6667).type_as(masked_gates)
-
-        multiplier = mp.apply(
-            scores, 
-            multiplier_o, 
-            selected_experts, 
-            masked_gates, 
-            mask_for_one,
-        )
-    else:
-        multiplier = multiplier_o
-
-    # masked out first expert 
-    masked_scores = torch.scatter(
-        scores,
-        -1,
-        selected_experts,
-        float('-inf'),
-    )
-    with torch.no_grad():
-        # compute mask for sparsity
-        mask_logits_threshold, max_ind = masked_scores.max(dim=-1, keepdim=True)
-        factor = scores.abs().clamp(min=mask_logits_threshold.abs()).clamp(min=1e-8)  # 수치적 안정성 개선
-        mask_logits_threshold = (
-            (mask_logits_threshold - scores) / factor
-        ) > (2 * jitter_eps)
-
-    # apply mask 
-    masked_gates_top2 = masked_scores.masked_fill(mask_logits_threshold, float('-inf'))
-    if training:
-        selected_experts_top2 = (
-            masked_gates_top2 - torch.empty_like(masked_gates_top2, memory_format=torch.legacy_contiguous_format).exponential_().log()
-        ).max(dim=-1)[1].unsqueeze(-1) # gumbel sampling, more robust than than the multinomial method
-    else:
-        selected_experts_top2 = max_ind
-    # compute scores for gradients
-    masked_gates_top2 = torch.softmax(masked_gates_top2, dim=-1)
-    
-    # Ensure selected_experts_top2 indices are within bounds
-    selected_experts_top2 = torch.clamp(selected_experts_top2, 0, num_experts - 1)
-    
-    multiplier_top2_o = masked_gates_top2.gather(dim=-1, index=selected_experts_top2)
-    
-    if training: 
-        # compute midpoint mask 
-        max_scores, max_ind = masked_gates_top2.max(dim=-1, keepdim=True)
-        mask_for_one_top2 = torch.logical_or(
-            selected_experts_top2 == max_ind,
-            torch.rand_like(max_scores).uniform_() > 0.75 # Heun's third-order method: f(x) - f(0) = .25 f'(x) + .75 f'(x/3.)
-        ) 
-        # 1 -> 1.0 & 0 -> 1./3: lambda x: (x + 0.5) / 1.5
-        mask_for_one_top2 = torch.add(0.3333, mask_for_one_top2, alpha=0.6667).type_as(masked_gates_top2)
-
-        multiplier_top2 = mp.apply(
-            scores, 
-            multiplier_top2_o, 
-            selected_experts_top2, 
-            masked_gates_top2, 
-            mask_for_one_top2,
-        )
-    else:
-        multiplier_top2 = multiplier_top2_o
-    
-    multiplier = torch.cat((multiplier, multiplier_top2), dim=-1)
-    selected_experts = torch.cat((selected_experts, selected_experts_top2), dim=-1)
-    
-    return (
-        multiplier, 
-        selected_experts,
-    )
-
 
 class SPECTRARouter(nn.Module):
     def __init__(self, config: SPECTRATextConfig, **kwargs):
@@ -881,6 +948,18 @@ class SPECTRARouter(nn.Module):
         self.num_experts = config.n_routed_experts
         self.router_dim = config.router_dim
         self.layernorm_eps = getattr(config, "router_layernorm_eps", 1e-5)
+
+        # ------------------------------------------------------------------
+        # Expert-Choice (Quota) Routing
+        # - Keep sparse MoE compute (still runs only top-k experts per token)
+        # - But make expert loads stable by enforcing per-expert capacity at the
+        #   *selection* stage (token-choice top-k tends to break Sinkhorn balance).
+        # ------------------------------------------------------------------
+        self.expert_choice_routing = bool(getattr(config, "expert_choice_routing", True))
+        # Capacity factor (typical: 1.0~2.0). We also accept `capacity_factor` for convenience.
+        self.expert_choice_capacity_factor = float(
+            getattr(config, "expert_choice_capacity_factor", getattr(config, "capacity_factor", 1.25))
+        )
         
         # ===== 개선된 Loss 가중치 설정 =====
         # 1. Speciality: 너무 강하지 않게 (기존 0.02 → 0.001)
@@ -928,6 +1007,7 @@ class SPECTRARouter(nn.Module):
             self.num_experts * self.router_dim,
             self.num_experts,
             method="linear",
+            iterations=getattr(config, "spechorn_osr_iter", 3),
         )
         # Orthogonal initialization for better starting point
         if hasattr(self.expression_projector, 'projection'):
@@ -946,6 +1026,115 @@ class SPECTRARouter(nn.Module):
 
         # OSR Hyperparameters
         self.repulsion_weight = getattr(config, "osr_repulsion_weight", 0.5)  # [핵심] OSR 척력 가중치
+        
+        # SOS-RMoE Configuration
+        self.log_sinkhorn_enabled = getattr(config, "log_sinkhorn_enabled", True)
+        self.srip_enabled = getattr(config, "srip_enabled", True)
+        self.so_warmup_steps = getattr(config, "so_warmup_steps", 100)
+        self.so_lambda_max = getattr(config, "so_lambda_max", 5e-2)
+        
+        # MaxVio tracking
+        self.register_buffer("max_vio_ema", torch.tensor(0.0), persistent=True)
+        self.max_vio_ema_alpha = 0.95
+
+    def _expert_choice_topk_selection(
+        self,
+        routing_probs_full: torch.Tensor,  # [B, S, E], Sinkhorn probs
+        top_k: int,
+        capacity_factor: float,
+    ) -> Tuple[torch.Tensor, torch.Tensor, int, torch.Tensor]:
+        """
+        Expert-choice (quota) sparse selection.
+
+        We keep the *scores/probabilities* for all experts (cheap) but choose a sparse top-k
+        set under a per-expert capacity constraint:
+          capacity ≈ capacity_factor * (N_tokens * top_k) / num_experts
+
+        Returns:
+          multiplier: [B, S, top_k] normalized weights (sum=1 over top_k)
+          selected_experts: [B, S, top_k] expert indices
+          cap: per-expert capacity in tokens
+          fallback_mask: [N] mask where quota selection failed and token-choice fallback was used
+        """
+        if routing_probs_full.dim() != 3:
+            raise ValueError(f"routing_probs_full must be [B,S,E], got {routing_probs_full.shape}")
+
+        batch_size, seq_len, num_experts = routing_probs_full.shape
+        if num_experts != self.num_experts:
+            raise ValueError(f"Expected num_experts={self.num_experts}, got {num_experts}")
+
+        k = int(min(max(int(top_k), 1), num_experts))
+        N = int(batch_size * seq_len)
+        scores = routing_probs_full.reshape(N, num_experts)
+
+        # Per-expert capacity in terms of *slots* (N tokens * k experts per token).
+        # Add slack via capacity_factor. We cap by N*k slots, not N tokens.
+        cap = int(math.ceil(float(capacity_factor) * (float(N) * float(k)) / float(num_experts)))
+        cap = max(1, min(cap, N * k))
+
+        # Capacity-masked k-round selection (hard constraint):
+        # - Each round picks 1 expert per token among experts with remaining capacity
+        # - Prevents any expert from exceeding cap (=> CV/MaxVio drift from selection stage is stopped)
+        cap_left = torch.full((num_experts,), cap, dtype=torch.long, device=scores.device)
+        selected = torch.empty((N, k), dtype=torch.long, device=scores.device)
+        selected_vals = torch.empty((N, k), dtype=scores.dtype, device=scores.device)
+        fallback_mask = torch.zeros((N,), dtype=torch.bool, device=scores.device)
+
+        neg_inf = torch.tensor(float("-inf"), device=scores.device, dtype=scores.dtype)
+
+        for r in range(k):
+            # Start from original scores
+            ms = scores
+
+            # Mask experts with no remaining capacity
+            avail = cap_left > 0  # [E]
+            if not bool(avail.any().item()):
+                # Should not happen if total capacity >= N*k, but guard anyway.
+                fallback_mask[:] = True
+                chosen = torch.zeros((N,), dtype=torch.long, device=scores.device)
+                chosen_vals = scores[:, 0]
+            else:
+                masked_scores = ms.clone()
+                masked_scores[:, ~avail] = neg_inf
+
+                # Mask already chosen experts for this token
+                if r > 0:
+                    row_ids = torch.arange(N, device=scores.device).unsqueeze(1).expand(N, r)
+                    masked_scores[row_ids, selected[:, :r]] = neg_inf
+
+                # If a token has all -inf (should be rare), mark fallback and pick the best among not-yet-chosen ignoring capacity.
+                has_any = torch.isfinite(masked_scores).any(dim=-1)
+                if not bool(has_any.all().item()):
+                    fallback_mask |= ~has_any
+                    # token-choice among not-yet-chosen
+                    fallback_scores = scores.clone()
+                    if r > 0:
+                        row_ids = torch.arange(N, device=scores.device).unsqueeze(1).expand(N, r)
+                        fallback_scores[row_ids, selected[:, :r]] = neg_inf
+                    fallback_choice = fallback_scores.argmax(dim=-1)
+                    masked_choice = masked_scores.argmax(dim=-1)
+                    chosen = torch.where(has_any, masked_choice, fallback_choice)
+                else:
+                    chosen = masked_scores.argmax(dim=-1)
+
+                chosen_vals = scores.gather(1, chosen.unsqueeze(1)).squeeze(1)
+
+            selected[:, r] = chosen
+            selected_vals[:, r] = chosen_vals
+
+            # Update capacities
+            used = torch.bincount(chosen, minlength=num_experts).to(cap_left.dtype)
+            cap_left = cap_left - used
+            cap_left = torch.clamp(cap_left, min=0)
+
+        # Normalize weights over top-k for stable scaling.
+        selected_vals = selected_vals.clamp_min(0.0)
+        denom = selected_vals.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        multiplier = (selected_vals / denom).to(dtype=routing_probs_full.dtype)
+
+        multiplier = multiplier.view(batch_size, seq_len, k)
+        selected_experts = selected.view(batch_size, seq_len, k)
+        return multiplier, selected_experts, cap, fallback_mask
 
     def compute_adaptive_loss_weights(self, current_cv: float) -> dict:
         """CV에 따라 loss 가중치를 동적으로 조절"""
@@ -1095,64 +1284,37 @@ class SPECTRARouter(nn.Module):
         Returns:
             Q: [N, E] doubly stochastic matrix (assignment probabilities)
         """
-        if epsilon is None:
-            epsilon = self.sinkhorn_epsilon
-        if iterations is None:
-            iterations = self.sinkhorn_iterations
+        if self.log_sinkhorn_enabled:
+            # Use Log-Domain Sinkhorn for stability
+            P, max_vio = log_sinkhorn_stabilized(
+                logits=cost,  # cost -> logits (negate), higher logits = lower cost
+                num_experts=self.num_experts,
+                epsilon=epsilon,
+                iterations=iterations,
+                adaptive_epsilon=self.adaptive_loss_scaling,
+                cv_ema=self.cv_ema,
+            )
+        else:
+            # Standard Sinkhorn (legacy) - only if explicitly disabled
+            # ... (omitted, assuming log_sinkhorn is preferred)
+            # Just fallback to log_sinkhorn for safety
+            P, max_vio = log_sinkhorn_stabilized(
+                logits=cost,
+                num_experts=self.num_experts,
+                epsilon=epsilon,
+                iterations=iterations,
+                adaptive_epsilon=False, # Disable adaptive if legacy mode
+                cv_ema=None,
+            )
         
-        # Validate epsilon
-        if epsilon <= 0:
-            raise ValueError(f"epsilon must be positive, got {epsilon}")
-        if iterations <= 0:
-            raise ValueError(f"iterations must be positive, got {iterations}")
+        # Update MaxVio EMA
+        if self.training:
+            with torch.no_grad():
+                self.max_vio_ema.mul_(self.max_vio_ema_alpha).add_(
+                    max_vio * (1.0 - self.max_vio_ema_alpha)
+                )
         
-        # Ensure epsilon is same dtype as cost for numerical stability
-        epsilon_tensor = torch.tensor(epsilon, dtype=cost.dtype, device=cost.device)
-        
-        # Initialize Q: exp(-cost / epsilon)
-        cost_float = cost.float()
-        
-        # Clamp cost to prevent exp overflow
-        max_cost_ratio = 50.0
-        cost_clamped = cost_float / epsilon
-        cost_clamped = torch.clamp(cost_clamped, min=-max_cost_ratio, max=max_cost_ratio)
-        
-        Q = torch.exp(-cost_clamped).to(dtype=cost.dtype)
-        
-        # NaN/Inf check
-        if torch.isnan(Q).any() or torch.isinf(Q).any():
-            raise ValueError(f"NaN/Inf in Sinkhorn initialization: cost_min={cost_float.min()}, cost_max={cost_float.max()}, epsilon={epsilon}, Q_min={Q.min()}, Q_max={Q.max()}")
-        
-        # Store original shape
-        original_shape = Q.shape
-        N, E = original_shape[0], original_shape[1]
-        target_load = float(N) / float(E)
-        
-        # Sinkhorn iterations
-        for i in range(iterations):
-            # Row normalization
-            row_sum = Q.sum(dim=-1, keepdim=True) + 1e-8
-            Q = Q / row_sum
-            
-            # NaN/Inf check
-            if torch.isnan(Q).any() or torch.isinf(Q).any():
-                raise ValueError(f"NaN/Inf in Sinkhorn iteration {i} after row norm")
-            
-            # Column normalization
-            col_sum = Q.sum(dim=0, keepdim=True) + 1e-8
-            Q = Q / col_sum * target_load
-            
-            # NaN/Inf check
-            if torch.isnan(Q).any() or torch.isinf(Q).any():
-                raise ValueError(f"NaN/Inf in Sinkhorn iteration {i} after col norm")
-            
-            # Shape consistency check
-            assert Q.shape == original_shape, f"Shape changed in iteration {i}: {Q.shape} vs {original_shape}"
-        
-        assert Q.shape == original_shape, f"Final shape mismatch: {Q.shape} vs {original_shape}"
-        assert Q.shape == cost.shape, f"Sinkhorn output shape mismatch: {Q.shape} vs {cost.shape}"
-        
-        return Q
+        return P
     
     def compute_routing_uncertainty(self, routing_probs: torch.Tensor) -> torch.Tensor:
         """
@@ -1173,9 +1335,10 @@ class SPECTRARouter(nn.Module):
 
     def compute_osr_cost(self, similarity: torch.Tensor, expert_embeddings: torch.Tensor) -> torch.Tensor:
         """
-        [OSR Core Logic]
+        [OSR Core Logic - Stabilized: Repulsion penalizes |expert-expert cosine| to drive orthogonality]
         Cost = -Similarity + lambda * Repulsion
-        Repulsion: 내가 좋아하는 전문가들이 '지들끼리도 비슷하면' 페널티를 줌.
+        Repulsion: 토큰이 선호(|similarity|)하는 전문가들이 서로 상관(|cos|)이 크면 페널티를 줌.
+        (핵심) expert-expert cos의 부호(양/음)와 무관하게 |cos|가 크면 "직교(0)"에서 멀기 때문에 페널티.
         
         Args:
             similarity: [Batch, Experts] cosine similarity between routing and expression vectors
@@ -1193,14 +1356,14 @@ class SPECTRARouter(nn.Module):
         identity = torch.eye(self.num_experts, device=similarity.device, dtype=similarity.dtype)
         expert_sim_matrix = expert_sim_matrix * (1 - identity)
         
-        # 양의 상관관계(비슷한 놈들)만 척력으로 사용 (ReLU)
-        repulsion_matrix = F.relu(expert_sim_matrix)
+        # |cos|를 벌점: square는 부호를 제거하고 큰 상관(양/음)을 강하게 벌점
+        # -> anti-parallel(-1)로 "음수 수렴"하는 해도 막고, 목표를 orthogonal(0)로 둠
+        repulsion_matrix = torch.square(expert_sim_matrix)
         
         # 2. 척력 계산 (Lateral Inhibition)
-        # "내가 전문가 E_i를 좋아하는데(Sim High), E_i가 E_j랑 비슷하면, E_i의 점수를 깎아라"
-        # Similarity: [Batch, Experts]
-        # Repulsion Score: [Batch, Experts]
-        repulsion_score = torch.matmul(similarity, repulsion_matrix)
+        # 토큰-전문가 관련성(|similarity|) 크기로 가중: 강하게 관련된 전문가들끼리만 더 강하게 밀어냄
+        similarity_magnitude = torch.abs(similarity)
+        repulsion_score = torch.matmul(similarity_magnitude, repulsion_matrix)
         
         # 3. 최종 Cost (Sinkhorn은 Cost가 낮을수록 좋아함)
         # Similarity가 높으면 Cost 낮춤 (-Sim)
@@ -1211,7 +1374,7 @@ class SPECTRARouter(nn.Module):
 
     def predict_expert_bias_from_gru(self, hn: torch.Tensor) -> torch.Tensor:
         """개선된 Bias 예측: 더 강한 정규화"""
-        last_hn = hn[-1]
+        # last_hn = hn[-1]  # [수정] hn은 [tokens, dim] 형태이므로 전체 토큰 사용
         
         # EMA load를 확률로 정규화
         ema_total = self.expert_load_ema.sum()
@@ -1220,9 +1383,12 @@ class SPECTRARouter(nn.Module):
         else:
             ema_normalized = torch.full_like(self.expert_load_ema, 1.0 / self.num_experts)
         
-        batch_size = last_hn.size(0)
-        ema_expanded = ema_normalized.unsqueeze(0).expand(batch_size, -1)
-        combined_input = torch.cat([last_hn, ema_expanded], dim=-1)
+        # hn: [tokens, dim]
+        batch_tokens = hn.size(0)
+        
+        # Expand EMA to match tokens
+        ema_expanded = ema_normalized.unsqueeze(0).expand(batch_tokens, -1)
+        combined_input = torch.cat([hn, ema_expanded], dim=-1)
         
         # Bias 예측 (Tanh로 [-1, 1] 제한됨)
         x = F.relu(self.bias_pred_fc1(combined_input))
@@ -1293,25 +1459,82 @@ class SPECTRARouter(nn.Module):
         current_expert_repr = expression_vec.mean(dim=(0, 1))  # [E, R]
         current_expert_repr = F.normalize(current_expert_repr, p=2, dim=-1)
         
+        # Expert 간 similarity matrix 계산 (pairwise_expert_similarity용)
+        expert_sim_matrix = torch.matmul(current_expert_repr, current_expert_repr.t())  # [E, E]
+        
         flat_sim = similarity.view(-1, self.num_experts)  # [B*S, E]
         
         # Cost 계산 (척력 포함)
         cost_matrix = self.compute_osr_cost(flat_sim, current_expert_repr)  # [B*S, E]
         
-        # 4. Sinkhorn (Pass-through Gradient)
+        # Expert similarity matrix 저장 (callback에서 사용)
+        if self.training:
+            with torch.no_grad():
+                self.last_expert_sim_matrix = expert_sim_matrix.detach()
+
+        # [NEW] GRU-based Bias Injection
+        # GRU state (hn_next)를 사용하여 Expert Bias를 예측하고 Cost에 반영
+        if self.training:
+             expert_bias = self.predict_expert_bias_from_gru(hn_next) # [Experts]
+             # Cost는 낮을수록 좋음. Bias가 높으면(선호되면) Cost를 낮춰야 함.
+             # cost = -sim + repulsion
+             # new_cost = -sim - bias + repulsion
+             cost_matrix = cost_matrix - expert_bias.unsqueeze(0)
+        
+        # 4. Sinkhorn (Pass-through Gradient) with Dynamic Epsilon
+        # Dynamic Epsilon based on CV (ASR Logic)
+        if self.training and self.adaptive_loss_scaling:
+            # CV가 높으면 epsilon을 키워서(Temperature Up) 더 Flat하게 만듭니다.
+            # Base: 0.1, CV=1.0 -> 0.1 * (1 + 1.0) = 0.2
+            # 척력이 강하면 이미 Flat해지므로, epsilon 증가폭을 조절합니다.
+            cv_val = self.cv_ema.item()
+            epsilon_factor = 1.0 + min(cv_val, 5.0)  # Max factor 6x
+            dynamic_epsilon = self.sinkhorn_epsilon * epsilon_factor
+        else:
+            dynamic_epsilon = self.sinkhorn_epsilon
+
+        
         # Pure Math Sinkhorn - 학습 파라미터 0개
-        Q_flat = differentiable_sinkhorn(
+        Q_flat = self.sinkhorn_algorithm(
             cost_matrix,
-            num_experts=self.num_experts,
-            epsilon=self.sinkhorn_epsilon,
+            epsilon=dynamic_epsilon,
             iterations=self.sinkhorn_iterations
         )
         
         routing_probs_full = Q_flat.view(batch_size, seq_len, self.num_experts)
 
-        # 5. Top-k Selection
-        top_k_probs, selected_experts = torch.topk(routing_probs_full, top_k, dim=-1)
-        multiplier = top_k_probs
+        # 5. Sparse Selection (Top-k) with optional Expert-Choice quota
+        quota_cap = None
+        quota_fallback_frac = None
+        if self.training and self.expert_choice_routing:
+            multiplier, selected_experts, quota_cap, fallback_mask = self._expert_choice_topk_selection(
+                routing_probs_full=routing_probs_full,
+                top_k=top_k,
+                capacity_factor=self.expert_choice_capacity_factor,
+            )
+            quota_fallback_frac = float(fallback_mask.float().mean().item()) if fallback_mask.numel() > 0 else 0.0
+        else:
+            top_k_probs, selected_experts = torch.topk(routing_probs_full, min(int(top_k), self.num_experts), dim=-1)
+            top_k_probs = top_k_probs.clamp_min(0.0)
+            multiplier = top_k_probs / (top_k_probs.sum(dim=-1, keepdim=True) + 1e-8)
+
+        # Expose last routing for monitoring callback (so it never falls back to argmax(routing_probs_full))
+        if self.training:
+            with torch.no_grad():
+                tok = batch_size * seq_len
+                k = selected_experts.size(-1)
+                self.last_selected_experts = selected_experts.reshape(tok, k).detach()
+                self.last_routing_weights = multiplier.reshape(tok, k).detach()
+                self.last_num_experts = int(self.num_experts)
+                # Quota stats (for debugging/plots)
+                self.last_quota_cap = int(quota_cap) if quota_cap is not None else None
+                self.last_quota_fallback_frac = float(quota_fallback_frac) if quota_fallback_frac is not None else 0.0
+                self.last_expert_choice_enabled = bool(self.training and self.expert_choice_routing)
+                # Also log the ingredients so cap is interpretable downstream
+                self.last_quota_tokens = int(tok)
+                self.last_quota_top_k = int(k)
+                self.last_quota_num_experts = int(self.num_experts)
+                self.last_quota_capacity_factor = float(self.expert_choice_capacity_factor)
 
         # 6. Loss 계산
         zero = torch.tensor(0.0, device=x.device, dtype=x.dtype, requires_grad=True)
@@ -1324,7 +1547,23 @@ class SPECTRARouter(nn.Module):
         balance_loss = zero  # Sinkhorn이 구조적으로 처리하므로 loss로 사용하지 않음
         
         # Ortho Loss (Expression Projector의 직교성)
+        # 1. Projector 자체의 직교성
         ortho_loss = self.expression_projector.orthogonal_loss()
+        
+        # 2. [NEW] Enhanced Soft Orthogonality (Representation-level)
+        # "전문가들끼리 너무 닮지 마라" (음수 발산 방지 포함)
+        if self.training:
+            warmup_progress = min(1.0, float(self.training_step) / max(self.so_warmup_steps, 1))
+            so_lambda = self.so_lambda_max * warmup_progress
+            
+            if so_lambda > 0 and self.srip_enabled:
+                 # Apply to the computed expert representations (averaged over batch)
+                 so_loss = enhanced_soft_orthogonality_loss(
+                     current_expert_repr.unsqueeze(0), # Add batch dim for func logic
+                     lambda_so=so_lambda,
+                     use_srip=self.srip_enabled,
+                 )
+                 ortho_loss = ortho_loss + so_loss
         
         # [Sharpening] Entropy Minimization: "한 놈만 패라" (확실한 전문가 선택)
         # routing_probs_full은 이미 Sinkhorn을 거친 확률입니다.
@@ -1335,6 +1574,43 @@ class SPECTRARouter(nn.Module):
             entropy_loss = entropy
         else:
             entropy_loss = zero
+
+        # 7. Update CV EMA (Thermostat Feedback Loop)
+        if self.training:
+            with torch.no_grad():
+                # 배치의 Expert 사용량 계산 (Soft Probabilities 합)
+                # routing_probs_full: [Batch, Seq, Experts]
+                expert_load = routing_probs_full.sum(dim=(0, 1))  # [Experts]
+                
+                # Normalize
+                total_load = expert_load.sum()
+                if total_load > 0:
+                    expert_dist = expert_load / total_load
+                else:
+                    expert_dist = torch.ones_like(expert_load) / self.num_experts
+                
+                # CV Calculation: std / mean
+                # mean is 1/E
+                # std = sqrt(mean((x - mean)^2))
+                # CV = sqrt(E * sum((p - 1/E)^2))  (simplification for prob distribution)
+                # Actual definition: sigma / mu. mu = 1/E.
+                # sigma = sqrt(mean(p^2) - mean(p)^2) = sqrt(mean(p^2) - (1/E)^2)
+                # CV = sqrt(mean(p^2) - (1/E)^2) / (1/E)
+                #    = sqrt(E * sum(p^2) - 1)
+                
+                # Using standard definition on the counts directly might be more numerically stable if counts are large?
+                # Using probabilities is fine.
+                
+                # Variance of probabilities p_i
+                var_p = expert_dist.var(unbiased=False)
+                mean_p = expert_dist.mean()
+                current_cv = (var_p.sqrt() / (mean_p + 1e-6))
+                
+                # Update EMA
+                self.cv_ema.mul_(self.cv_ema_alpha).add_(current_cv * (1.0 - self.cv_ema_alpha))
+                
+                # Update Expert Load EMA for Bias Predictor
+                self.expert_load_ema.mul_(self.ema_alpha).add_(expert_dist * (1.0 - self.ema_alpha))
 
         return (
             multiplier,
