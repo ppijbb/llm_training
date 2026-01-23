@@ -1,6 +1,6 @@
 {
   "model_config": {
-    "model_name_or_path": null,
+    "model_name_or_path": "google/gemma-3-4b-it",
     "tokenizer_name_or_path": "google/gemma-3-4b-it",
     "trust_remote_code": true,
     "low_cpu_mem_usage": true,

@@ -1,6 +1,6 @@
 {
   "model_config": {
-    "model_name_or_path": null,
+    "model_name_or_path": "meta-llama/Llama-4-Scout-17B-16E-Instruct",
     "tokenizer_name_or_path": "meta-llama/Llama-4-Scout-17B-16E-Instruct",
     "trust_remote_code": true,
     "low_cpu_mem_usage": true,

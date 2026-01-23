@@ -1,6 +1,6 @@
 {
   "model_config": {
-    "model_name_or_path": null,
+    "model_name_or_path": "openai/gpt-oss-120b",
     "tokenizer_name_or_path": "openai/gpt-oss-120b",
     "trust_remote_code": true,
     "low_cpu_mem_usage": true,
