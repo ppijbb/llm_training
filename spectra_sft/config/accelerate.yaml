@@ -22,6 +22,6 @@ deepspeed_config:
   zero3_init_flag: true
 
 parallelism_config:
-  sp_size: 4 # 시퀀스 병렬화 크기를 2로 설정
-  tp_size: 4 # 텐서 병렬화 크기를 2로 설정
+  sp_size: 2 # 시퀀스 병렬화 크기를 2로 설정
+  tp_size: 2 # 텐서 병렬화 크기를 2로 설정
   dp_shard_size: 1 # 데이터 병렬화 샤드 크기 (sp_size * dp_shard_size = num_processes)

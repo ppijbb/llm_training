@@ -17,7 +17,7 @@ echo -e "${GREEN}        SPECTRA SFT DeepSpeed Training with Small Model Configu
 echo -e "${GREEN}================================================================================${NC}"
 
 # Config file name
-CONFIG_FILE_NAME="spectra_small_config.json"
+CONFIG_FILE_NAME="spectra_qwen_config.json"
 
 # Get script directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -38,7 +38,7 @@ else
     fi
 fi
 
-NUM_GPUS=2 # fixed gpu count
+NUM_GPUS=4 # Test single GPU
 
 echo -e "${YELLOW}Project Root:${NC} $PROJECT_ROOT"
 echo -e "${YELLOW}Config File:${NC} $CONFIG_FILE"
@@ -67,7 +67,7 @@ export PYTHONPATH="$PROJECT_ROOT:$PYTHONPATH"
 if [ -z "$CUDA_VISIBLE_DEVICES" ]; then
     export CUDA_VISIBLE_DEVICES=$(seq 0 $((NUM_GPUS-1)) | paste -sd, -)
 fi
-export CUDA_VISIBLE_DEVICES=0,1
+export CUDA_VISIBLE_DEVICES=0,1,2,3
 export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false
 # CUDA allocator tuning to reduce fragmentation and OOM risk
@@ -168,6 +168,7 @@ cd "$PROJECT_ROOT"
 echo -e "${GREEN}Starting DeepSpeed training with $NUM_GPUS GPUs...${NC}"
 TRAIN_CMD="accelerate launch \
     --config_file $SCRIPT_DIR/../spectra_sft/config/accelerate.yaml \
+    --num_processes $NUM_GPUS \
         $SCRIPT_DIR/train_spectra.py --config $CONFIG_FILE"
 
 # Run training with error handling
