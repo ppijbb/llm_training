@@ -853,7 +853,7 @@ class ExpressionProjector(nn.Module):
         return torch.tensor(0.0, device=self.projection.weight.device)
 
 
-class ManualGRUCell(nn.Module):
+class IntentGatedContextCell(nn.Module):
     """
     LoRA-friendly GRU cell implemented purely with Linear layers.
     Gate weights are explicitly named for PEFT targeting.
@@ -1149,7 +1149,7 @@ class SPECTRARouter(nn.Module):
         self.sinkhorn_inference = getattr(config, "sinkhorn_inference", False)
         
         # Global routing GRU cell (depth-shared)
-        self.load_balancer = ManualGRUCell(
+        self.load_balancer = IntentGatedContextCell(
             input_size=self.hidden_size,
             hidden_size=self.num_experts * self.router_dim,
         )
@@ -1174,7 +1174,7 @@ class SPECTRARouter(nn.Module):
         # [LDR Phase 1] Priority Head (Divider) - Buffer 방식
         # DeepSpeed 파티셔닝 충돌 방지를 위해 register_buffer 사용
         # ========================================================================
-        intent_hidden_size = self.num_experts * self.router_dim # Actual dimension of hn_next from ManualGRUCell
+        intent_hidden_size = self.num_experts * self.router_dim # Actual dimension of hn_next from IntentGatedContextCell
         priority_input_dim = self.hidden_size + intent_hidden_size
         
         # Proper Linear Layer Initialization (compatible with ZeRO-3)
@@ -1790,7 +1790,7 @@ class SPECTRAMoE(nn.Module):
     def __init__(
         self,
         config,
-        global_router: ManualGRUCell,
+        global_router: IntentGatedContextCell,
         skip_expert_init: bool = False,  # [EXOSKELETON] Skip expert creation when injecting from base model
         **kwargs
     ):
