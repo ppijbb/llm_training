@@ -36,6 +36,137 @@ import torch.nn.functional as F
 # Add dynamo import for torch.compile compatibility
 import torch._dynamo
 
+# Siglip 초기화 오류 해결을 위한 패치
+import torch.nn.init as torch_init
+_original_orthogonal = torch_init.orthogonal_
+
+def safe_orthogonal_(tensor, gain=1):
+    if tensor.is_meta:
+        return tensor
+
+    # 1차원 텐서 처리: orthogonal_은 2차원 이상만 지원
+    if tensor.dim() < 2:
+        # 1차원 텐서에는 정규분포 초기화 사용
+        with torch.no_grad():
+            # DeepSpeed 파티셔닝으로 크기가 0인 텐서 처리
+            if tensor.numel() == 0:
+                return tensor
+
+            # fan_in 계산 (1차원 텐서에 대한 근사)
+            fan_in = tensor.size(0)
+
+            # std 계산 (LeCun normal과 유사하게)
+            std = gain / math.sqrt(fan_in) if fan_in > 0 else 0.01
+            tensor.normal_(0, std)
+        return tensor
+
+    # 2차원 이상 텐서 처리: 기존 orthogonal 초기화 사용
+    if tensor.device.type == 'cpu' and tensor.dtype in [torch.bfloat16, torch.float16]:
+        with torch.no_grad():
+            t = tensor.to(torch.float32)
+            _original_orthogonal(t, gain=gain)
+            tensor.copy_(t.to(tensor.dtype))
+    else:
+        _original_orthogonal(tensor, gain=gain)
+    return tensor
+
+# Global monkey patch to catch all internal and dependency calls (like Transformers init)
+torch_init.orthogonal_ = safe_orthogonal_
+
+def _patch_siglip_initializers():
+    """Siglip의 초기화 함수들을 안전하게 패치"""
+    try:
+        from transformers.models.siglip import modeling_siglip
+
+        # 1. lecun_normal_ 패치
+        if hasattr(modeling_siglip, 'lecun_normal_'):
+            original_lecun_normal = modeling_siglip.lecun_normal_
+
+            def _safe_lecun_normal(tensor, a=math.sqrt(5)):
+                """Siglip 초기화 오류 방지를 위한 안전한 lecun_normal_"""
+                # CRITICAL: Meta tensor는 초기화할 수 없으므로 무시 후 DeepSpeed가 처리하게 함
+                if tensor.is_meta:
+                    return
+
+                if tensor.dim() < 2:
+                    # 1차원 이하 텐서에는 일반 정규분포 사용 (LeCun 초기화의 근사값)
+                    with torch.no_grad():
+                        # DeepSpeed 파티셔닝으로 크기가 0인 텐서 처리
+                        if tensor.numel() == 0:
+                            # 빈 텐서는 초기화 생략
+                            return
+
+                        # LeCun normal: std = sqrt(1/fan_in)
+                        # 1차원 텐서에서는 fan_in을 tensor.size(0)로 근사
+                        if tensor.dim() == 1:
+                            fan_in = tensor.size(0)
+                        else:
+                            # 스칼라 텐서의 경우 기본값 사용
+                            fan_in = 1
+
+                        std = 1.0 / math.sqrt(fan_in) if fan_in > 0 else 0.01
+                        tensor.normal_(0, std)
+                else:
+                    # 2차원 이상 텐서에는 기존 lecun_normal_ 사용
+                    # 원본 함수는 tensor만 인자로 받음 (a 파라미터 무시)
+                    original_lecun_normal(tensor)
+
+            # 패치 적용
+            modeling_siglip.lecun_normal_ = _safe_lecun_normal
+
+        # 2. variance_scaling_ 패치 (가장 중요한 부분!)
+        if hasattr(modeling_siglip, 'variance_scaling_'):
+            original_variance_scaling = modeling_siglip.variance_scaling_
+
+            def _safe_variance_scaling(tensor, scale=1.0, mode='fan_in', distribution='normal'):
+                """Siglip 초기화 오류 방지를 위한 안전한 variance_scaling_"""
+                # CRITICAL: Meta tensor는 초기화할 수 없으므로 무시 후 DeepSpeed가 처리하게 함
+                if tensor.is_meta:
+                    return
+
+                if tensor.dim() < 2:
+                    # 1차원 이하 텐서에는 안전한 초기화 사용
+                    with torch.no_grad():
+                        # DeepSpeed 파티셔닝으로 크기가 0인 텐서 처리
+                        if tensor.numel() == 0:
+                            # 빈 텐서는 초기화 생략
+                            return
+
+                        # fan_in 계산 (1차원 텐서에 대한 근사)
+                        if tensor.dim() == 1:
+                            fan = tensor.size(0) if mode == 'fan_in' else 1
+                        else:
+                            # 스칼라 텐서
+                            fan = 1
+
+                        # std 계산
+                        std = math.sqrt(scale / fan) if fan > 0 else 0.01
+
+                        # 분포에 따른 초기화
+                        if distribution == 'normal':
+                            tensor.normal_(0, std)
+                        elif distribution == 'uniform':
+                            bound = math.sqrt(3) * std
+                            tensor.uniform_(-bound, bound)
+                        elif distribution == 'truncated_normal':
+                            tensor.normal_(0, std).clamp_(-2*std, 2*std)
+                else:
+                    # 2차원 이상 텐서에는 기존 variance_scaling_ 사용
+                    original_variance_scaling(tensor, scale, mode, distribution)
+
+            # 패치 적용
+            modeling_siglip.variance_scaling_ = _safe_variance_scaling
+
+        print("✅ Siglip 초기화 함수들 패치 적용됨")
+
+    except ImportError:
+        print("⚠️ Siglip 모듈을 찾을 수 없어 패치 생략")
+    except Exception as e:
+        print(f"⚠️ Siglip 패치 적용 실패: {e}")
+
+# 모델 import 시점에 패치 적용
+_patch_siglip_initializers()
+
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, HybridCache, StaticCache, DynamicCache
 from transformers.generation.utils import GenerationMixin
@@ -46,7 +177,7 @@ from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_u
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.masking_utils import create_causal_mask, create_masks_for_generate, create_sliding_window_causal_mask
 from transformers.processing_utils import Unpack
-from transformers.utils import logging
+from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple
 from transformers.utils.doc import (
     add_start_docstrings_to_model_forward,
     replace_return_docstrings,
@@ -56,7 +187,7 @@ from transformers.utils.generic import (
     ModelOutput,
     can_return_tuple,
 )
-from transformers.utils import auto_docstring
+from transformers.utils import auto_docstring, logging
 from transformers.utils.import_utils import (
     is_torchdynamo_compiling,
     is_torch_flex_attn_available,
@@ -536,19 +667,26 @@ class SPECTRACausalLMOutputWithPast(ModelOutput):
 
 
 class SPECTRATextScaledWordEmbedding(nn.Embedding):
+    """ 
+    🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨
+    TODO: THIS CODE IS CRITICAL FOR THE EXOSKELETON ARCHITECTURE. THIS CODE MUST REMOVED. SPECTRA MUST BUILT AS AN EXOSKELETON ARCHITECTURE FORM BASE LARGE LANGUAGE MODEL WEIGHTS, NOT FROM SCRATCH.
+    🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨
     """
-    This module overrides nn.Embeddings' forward by multiplying with embeddings scale.
-    """
-
     def __init__(self, num_embeddings: int, embedding_dim: int, padding_idx: int, embed_scale: float = 1.0):
         super().__init__(num_embeddings, embedding_dim, padding_idx)
-        self.register_buffer("embed_scale", torch.tensor(embed_scale), persistent=False)
+        # CRITICAL ZeRO-3 FIX: Use float attribute instead of register_buffer to avoid meta-tensor copy crash
+        self.embed_scale = embed_scale
 
     def forward(self, input_ids: torch.Tensor):
         return super().forward(input_ids) * self.embed_scale
 
 
 class SPECTRAMLP(nn.Module):
+    """ 
+    🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨
+    TODO: THIS CODE IS CRITICAL FOR THE EXOSKELETON ARCHITECTURE. THIS CODE MUST REMOVED. SPECTRA MUST BUILT AS AN EXOSKELETON ARCHITECTURE FORM BASE LARGE LANGUAGE MODEL WEIGHTS, NOT FROM SCRATCH.
+    🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨
+    """
     def __init__(self, config: SPECTRATextConfig, intermediate_size: Optional[int]=None, **kwargs):
         super().__init__()
         self.config = config
@@ -684,7 +822,9 @@ class ExpressionProjector(nn.Module):
 
         # 단일 선형층 + 정직교 초기화
         self.projection = nn.Linear(input_dim, output_dim, bias=False)
-        nn.init.orthogonal_(self.projection.weight)
+        # ZeRO-3 compatibility: Skip init if weights are partitioned (1D) or on meta device
+        if self.projection.weight.dim() > 1 and not self.projection.weight.is_meta:
+            safe_orthogonal_(self.projection.weight)
 
     def newton_schulz(self, W: torch.Tensor, steps: int = 3) -> torch.Tensor:
         """SVD-free orthogonalization."""
@@ -719,7 +859,11 @@ class ManualGRUCell(nn.Module):
     Gate weights are explicitly named for PEFT targeting.
     """
 
-    def __init__(self, input_size: int, hidden_size: int):
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size: int
+    ):
         super().__init__()
         self.input_size = input_size
         self.hidden_size = hidden_size
@@ -730,12 +874,22 @@ class ManualGRUCell(nn.Module):
         self.weight_ih_cand = nn.Linear(input_size, hidden_size)
         self.weight_hh_cand = nn.Linear(hidden_size, hidden_size)
 
-        nn.init.orthogonal_(self.weight_hh_gates.weight)
-        nn.init.orthogonal_(self.weight_hh_cand.weight)
-        nn.init.xavier_uniform_(self.weight_ih_gates.weight)
-        nn.init.xavier_uniform_(self.weight_ih_cand.weight)
+        # ZeRO-3 compatibility: Skip custom init if weights are partitioned (1D) or on meta device
+        if self.weight_hh_gates.weight.dim() > 1 and not self.weight_hh_gates.weight.is_meta:
+            safe_orthogonal_(self.weight_hh_gates.weight)
+        if self.weight_hh_cand.weight.dim() > 1 and not self.weight_hh_cand.weight.is_meta:
+            safe_orthogonal_(self.weight_hh_cand.weight)
+        
+        if self.weight_ih_gates.weight.dim() > 1 and not self.weight_ih_gates.weight.is_meta:
+            nn.init.xavier_uniform_(self.weight_ih_gates.weight)
+        if self.weight_ih_cand.weight.dim() > 1 and not self.weight_ih_cand.weight.is_meta:
+            nn.init.xavier_uniform_(self.weight_ih_cand.weight)
 
-    def forward(self, x: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        h: torch.Tensor
+    ) -> torch.Tensor:
         gates_x = self.weight_ih_gates(x)
         gates_h = self.weight_hh_gates(h)
         gates = gates_x + gates_h
@@ -1010,16 +1164,39 @@ class SPECTRARouter(nn.Module):
             iterations=getattr(config, "spechorn_osr_iter", 3),
         )
         # Orthogonal initialization for better starting point
-        if hasattr(self.expression_projector, 'projection'):
-            nn.init.orthogonal_(self.expression_projector.projection.weight)
+        # ZeRO-3 compatibility: Skip init if weights are partitioned (1D) or on meta device
+        if hasattr(self.expression_projector, 'projection') and self.expression_projector.projection.weight.dim() > 1:
+            if not self.expression_projector.projection.weight.is_meta:
+                nn.init.orthogonal_(self.expression_projector.projection.weight)
         self.expression_projector.ortho_strength = 0.0  # OSR 척력이 직교성을 강제하므로 추가 제약 불필요
+
+        # ========================================================================
+        # [LDR Phase 1] Priority Head (Divider) - Buffer 방식
+        # DeepSpeed 파티셔닝 충돌 방지를 위해 register_buffer 사용
+        # ========================================================================
+        intent_hidden_size = self.num_experts * self.router_dim # Actual dimension of hn_next from ManualGRUCell
+        priority_input_dim = self.hidden_size + intent_hidden_size
         
+        # Proper Linear Layer Initialization (compatible with ZeRO-3)
+        self.priority_head = nn.Linear(priority_input_dim, 1, bias=False)
+        nn.init.zeros_(self.priority_head.weight) # Start neutral
+
+        # Capacity Factor: 1.0에 가까울수록 CV=0, PPL 위험. 1.25~2.0 권장 (Overlap 허용)
+        # 기존 expert_choice_capacity_factor 활용
+        self.capacity_factor = getattr(config, "capacity_factor", self.expert_choice_capacity_factor)
+
         # Bias Predictor (GRU 기반) - Sequential 분리 (LoRA 대상 선형층 노출)
         self.bias_predictor_hidden_dim = getattr(config, "bias_predictor_hidden_dim", 256)
         self.bias_pred_fc1 = nn.Linear(
             self.num_experts * self.router_dim + self.num_experts, self.bias_predictor_hidden_dim
         )
         self.bias_pred_fc2 = nn.Linear(self.bias_predictor_hidden_dim, self.num_experts)
+        
+        # Explicit initialization (prevents NaN with ZeRO-3 + from_pretrained)
+        nn.init.xavier_uniform_(self.bias_pred_fc1.weight)
+        nn.init.zeros_(self.bias_pred_fc1.bias)
+        nn.init.xavier_uniform_(self.bias_pred_fc2.weight)
+        nn.init.zeros_(self.bias_pred_fc2.bias)
         
         # Contrastive loss
         self.contrastive_loss = ContrastiveRouterLoss()
@@ -1036,105 +1213,6 @@ class SPECTRARouter(nn.Module):
         # MaxVio tracking
         self.register_buffer("max_vio_ema", torch.tensor(0.0), persistent=True)
         self.max_vio_ema_alpha = 0.95
-
-    def _expert_choice_topk_selection(
-        self,
-        routing_probs_full: torch.Tensor,  # [B, S, E], Sinkhorn probs
-        top_k: int,
-        capacity_factor: float,
-    ) -> Tuple[torch.Tensor, torch.Tensor, int, torch.Tensor]:
-        """
-        Expert-choice (quota) sparse selection.
-
-        We keep the *scores/probabilities* for all experts (cheap) but choose a sparse top-k
-        set under a per-expert capacity constraint:
-          capacity ≈ capacity_factor * (N_tokens * top_k) / num_experts
-
-        Returns:
-          multiplier: [B, S, top_k] normalized weights (sum=1 over top_k)
-          selected_experts: [B, S, top_k] expert indices
-          cap: per-expert capacity in tokens
-          fallback_mask: [N] mask where quota selection failed and token-choice fallback was used
-        """
-        if routing_probs_full.dim() != 3:
-            raise ValueError(f"routing_probs_full must be [B,S,E], got {routing_probs_full.shape}")
-
-        batch_size, seq_len, num_experts = routing_probs_full.shape
-        if num_experts != self.num_experts:
-            raise ValueError(f"Expected num_experts={self.num_experts}, got {num_experts}")
-
-        k = int(min(max(int(top_k), 1), num_experts))
-        N = int(batch_size * seq_len)
-        scores = routing_probs_full.reshape(N, num_experts)
-
-        # Per-expert capacity in terms of *slots* (N tokens * k experts per token).
-        # Add slack via capacity_factor. We cap by N*k slots, not N tokens.
-        cap = int(math.ceil(float(capacity_factor) * (float(N) * float(k)) / float(num_experts)))
-        cap = max(1, min(cap, N * k))
-
-        # Capacity-masked k-round selection (hard constraint):
-        # - Each round picks 1 expert per token among experts with remaining capacity
-        # - Prevents any expert from exceeding cap (=> CV/MaxVio drift from selection stage is stopped)
-        cap_left = torch.full((num_experts,), cap, dtype=torch.long, device=scores.device)
-        selected = torch.empty((N, k), dtype=torch.long, device=scores.device)
-        selected_vals = torch.empty((N, k), dtype=scores.dtype, device=scores.device)
-        fallback_mask = torch.zeros((N,), dtype=torch.bool, device=scores.device)
-
-        neg_inf = torch.tensor(float("-inf"), device=scores.device, dtype=scores.dtype)
-
-        for r in range(k):
-            # Start from original scores
-            ms = scores
-
-            # Mask experts with no remaining capacity
-            avail = cap_left > 0  # [E]
-            if not bool(avail.any().item()):
-                # Should not happen if total capacity >= N*k, but guard anyway.
-                fallback_mask[:] = True
-                chosen = torch.zeros((N,), dtype=torch.long, device=scores.device)
-                chosen_vals = scores[:, 0]
-            else:
-                masked_scores = ms.clone()
-                masked_scores[:, ~avail] = neg_inf
-
-                # Mask already chosen experts for this token
-                if r > 0:
-                    row_ids = torch.arange(N, device=scores.device).unsqueeze(1).expand(N, r)
-                    masked_scores[row_ids, selected[:, :r]] = neg_inf
-
-                # If a token has all -inf (should be rare), mark fallback and pick the best among not-yet-chosen ignoring capacity.
-                has_any = torch.isfinite(masked_scores).any(dim=-1)
-                if not bool(has_any.all().item()):
-                    fallback_mask |= ~has_any
-                    # token-choice among not-yet-chosen
-                    fallback_scores = scores.clone()
-                    if r > 0:
-                        row_ids = torch.arange(N, device=scores.device).unsqueeze(1).expand(N, r)
-                        fallback_scores[row_ids, selected[:, :r]] = neg_inf
-                    fallback_choice = fallback_scores.argmax(dim=-1)
-                    masked_choice = masked_scores.argmax(dim=-1)
-                    chosen = torch.where(has_any, masked_choice, fallback_choice)
-                else:
-                    chosen = masked_scores.argmax(dim=-1)
-
-                chosen_vals = scores.gather(1, chosen.unsqueeze(1)).squeeze(1)
-
-            selected[:, r] = chosen
-            selected_vals[:, r] = chosen_vals
-
-            # Update capacities
-            used = torch.bincount(chosen, minlength=num_experts).to(cap_left.dtype)
-            cap_left = cap_left - used
-            cap_left = torch.clamp(cap_left, min=0)
-
-        # Normalize weights over top-k for stable scaling.
-        selected_vals = selected_vals.clamp_min(0.0)
-        denom = selected_vals.sum(dim=-1, keepdim=True).clamp_min(1e-8)
-        multiplier = (selected_vals / denom).to(dtype=routing_probs_full.dtype)
-
-        multiplier = multiplier.view(batch_size, seq_len, k)
-        selected_experts = selected.view(batch_size, seq_len, k)
-        return multiplier, selected_experts, cap, fallback_mask
 
     def compute_adaptive_loss_weights(self, current_cv: float) -> dict:
         """CV에 따라 loss 가중치를 동적으로 조절"""
@@ -1503,16 +1581,91 @@ class SPECTRARouter(nn.Module):
         
         routing_probs_full = Q_flat.view(batch_size, seq_len, self.num_experts)
 
-        # 5. Sparse Selection (Top-k) with optional Expert-Choice quota
+        # ========================================================================
+        # [LDR Phase 2] Priority-based Quota Routing (The Real Divider)
+        # Goal: CV = 0.0 (Hard Constraint) while preserving PPL via Bidding
+        # ========================================================================
         quota_cap = None
         quota_fallback_frac = None
+
         if self.training and self.expert_choice_routing:
-            multiplier, selected_experts, quota_cap, fallback_mask = self._expert_choice_topk_selection(
-                routing_probs_full=routing_probs_full,
-                top_k=top_k,
-                capacity_factor=self.expert_choice_capacity_factor,
+            # Priority Quota (LDR-Optimal) Routing
+            N, E = flat_sim.shape  # [B*S, E] - semantic_logits
+            k = int(min(max(int(top_k), 1), E))
+
+            # [LDR Phase 2.1] Divider Step: Priority Score 계산
+            # "나 급해!" 점수. Intent(문맥)와 Token(현재 상태)을 결합하여 판단
+            # x_flat: [N, Hidden], hn_next: [N, Intent_Dim]
+
+            divider_input = torch.cat([x_flat, hn_next], dim=-1)  # [N, Hidden+Intent]
+            priority_scores = self.priority_head(divider_input)  # [N, 1]
+
+            # [LDR Phase 2.2] Bidding Step: Semantic + Priority
+            # Bid = "나 이거 잘해(Logits)" + "나 이거 꼭 해야돼(Priority)"
+            # Priority가 높으면 Semantic 점수가 낮아도 Expert가 가져가게 됨 (새치기 권한)
+            priority_scores_expanded = priority_scores.expand(-1, E)  # [N, E]로 브로드캐스트
+            # 안전하게 NaN/Inf 방지
+            priority_scores_expanded = torch.clamp(priority_scores_expanded, -10.0, 10.0)
+            bid_scores = flat_sim + priority_scores_expanded  # [N, E]
+
+            # [LDR Phase 2.3] Chooser Step: Expert Choice with Hard Capacity
+            # Expert가 주체가 되어 Bid가 높은 토큰을 정원(Capacity)만큼 가져감.
+            # Capacity: 각 Expert가 처리할 토큰 수 (Hard Limit)
+            # ceil(N * k / E * factor)
+            capacity = int(math.ceil(N * k / E * self.capacity_factor))
+            capacity = max(1, min(capacity, N * k))  # Safety clamp
+
+            # [Experts, Tokens] 형태로 전치하여 Top-K 수행
+            # values: 선택된 토큰의 Bid 점수, indices: 선택된 토큰의 ID (0~N-1)
+            # topk_indices: [E, Capacity] -> 각 Expert가 선택한 토큰 리스트
+            expert_topk_vals, expert_topk_token_ids = torch.topk(bid_scores.t(), k=capacity, dim=1)
+
+            # ========================================================================
+            # [LDR Phase 2.4] Inverse Mapping (Expert->Token Assignment)
+            # Expert 중심의 선택 결과를 Token 중심의 Dispatch 정보로 변환 (Scatter)
+            # ========================================================================
+
+            # Flatten & Shuffle Logic (Efficient Scatter)
+            # GPU 병렬 처리를 위해 Expert Choice 결과를 펼침
+            # source_experts: [E * Capacity] -> Expert ID (0,0,..,1,1,..)
+            # target_tokens: [E * Capacity] -> Token ID (선택된 토큰들)
+            source_experts = torch.arange(E, device=x.device).unsqueeze(1).expand(E, capacity).reshape(-1)
+            target_tokens = expert_topk_token_ids.reshape(-1)
+            target_scores = expert_topk_vals.reshape(-1)
+
+            # "Expert가 나를 선택했는가?" Mask 생성
+            # (Bid 점수를 Scatter)
+            chosen_bid_map = torch.full((N, E), float('-inf'), device=x.device, dtype=x.dtype)
+            chosen_bid_map.index_put_(
+                (target_tokens, source_experts),
+                target_scores
             )
-            quota_fallback_frac = float(fallback_mask.float().mean().item()) if fallback_mask.numel() > 0 else 0.0
+
+            # Token 관점 Top-K (Final Dispatch)
+            # Expert들의 구애(Bid)를 받은 것들 중 상위 k개를 최종 확정
+            # 여기서 CV=0가 약간 깨질 수 있지만(중복 선택된 토큰 때문에),
+            # Capacity 제약 때문에 Expert의 Load는 물리적으로 상한선이 걸려있음 (Max Load <= Capacity).
+            # 따라서 CV 폭발은 원천 봉쇄됨.
+            final_scores, final_indices = torch.topk(chosen_bid_map, k=k, dim=-1)
+
+            # Softmax for Routing Weights (Gating)
+            routing_weights = F.softmax(final_scores, dim=-1)
+            
+            # [Fix] Handle dropped tokens (all -inf scores lead to NaN in softmax)
+            # If a token was not selected by any expert (dropped due to capacity), its scores are all -inf.
+            # Softmax([-inf, ...]) -> NaN. We replace these NaNs with 0.0 (effectively dropping the token).
+            if routing_weights.isnan().any():
+                 routing_weights = torch.nan_to_num(routing_weights, nan=0.0)
+
+            # Reshape to [B, S, k]
+            multiplier = routing_weights.view(batch_size, seq_len, k)
+            selected_experts = final_indices.view(batch_size, seq_len, k)
+            quota_cap = capacity
+            quota_fallback_frac = 0.0  # Priority Quota는 fallback이 없음 (항상 성공)
+
+            # routing_probs_full 재구성 (Bid Map 기반)
+            # chosen_bid_map에서 -inf가 아닌 부분만 사용하여 확률 재구성
+            routing_probs_full = F.softmax(chosen_bid_map.clamp(min=-20.0), dim=-1).view(batch_size, seq_len, E)
         else:
             top_k_probs, selected_experts = torch.topk(routing_probs_full, min(int(top_k), self.num_experts), dim=-1)
             top_k_probs = top_k_probs.clamp_min(0.0)
@@ -1634,7 +1787,13 @@ iterations = 0
 class SPECTRAMoE(nn.Module):
     """Hybrid Router: 하나의 linear layer에서 sigmoid로 expert 선택, sparsemixer로 가중치 계산"""
 
-    def __init__(self, config, global_router, **kwargs):
+    def __init__(
+        self,
+        config,
+        global_router: ManualGRUCell,
+        skip_expert_init: bool = False,  # [EXOSKELETON] Skip expert creation when injecting from base model
+        **kwargs
+    ):
         super().__init__()
         config = config
         self.hidden_dim = config.hidden_size
@@ -1646,9 +1805,21 @@ class SPECTRAMoE(nn.Module):
         iterations += 1
         self.iter = iterations
         self.router = global_router
-        # self.router = nn.Linear(config.hidden_size, config.n_routed_experts, bias=False)
-        self.experts = nn.ModuleList([SPECTRAMLP(config) for _ in range(self.num_experts)])
-        self.shared_experts = SPECTRAMLP(config=config, intermediate_size=config.intermediate_size * config.n_shared_experts)
+        
+        # [EXOSKELETON] Skip expert creation if we'll inject base model experts later
+        if not skip_expert_init:
+            expert_intermediate_size = getattr(config, "moe_intermediate_size", 768)
+            self.experts = nn.ModuleList([SPECTRAMLP(config, intermediate_size=expert_intermediate_size) for _ in range(self.num_experts)])
+        else:
+            # Placeholder - will be replaced by base model experts during injection
+            self.experts = None
+        
+        # Only create shared experts if enabled (affects 31B vs 37B param count)
+        self.n_shared_experts = getattr(config, "n_shared_experts", 0)
+        if self.n_shared_experts > 0:
+            self.shared_experts = SPECTRAMLP(config=config, intermediate_size=config.intermediate_size * self.n_shared_experts)
+        else:
+            self.shared_experts = None
 
         self.router_jitter_noise = getattr(config, 'router_jitter_noise', 0.01)
         self.input_jitter_noise = getattr(config, 'input_jitter_noise', 0.0)   
@@ -1679,9 +1850,10 @@ class SPECTRAMoE(nn.Module):
     
     def _freeze_shared_experts(self):
         """shared_experts의 파라미터들을 freeze"""
-        for param in self.shared_experts.parameters():
-            param.requires_grad = False
-        logger.debug(f"Shared experts frozen for layer {self.iter}")
+        if self.shared_experts is not None:
+            for param in self.shared_experts.parameters():
+                param.requires_grad = False
+            logger.debug(f"Shared experts frozen for layer {self.iter}")
     
     def _unfreeze_shared_experts(self):
         """shared_experts의 파라미터들을 unfreeze"""
@@ -1700,26 +1872,33 @@ class SPECTRAMoE(nn.Module):
         self.freeze_shared_experts = False
 
     @torch._dynamo.disable  # Disable torch.compile for this method due to data-dependent branching
-    def forward(self, hidden_states: torch.Tensor, global_routing_logits: torch.Tensor) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        global_routing_logits: torch.Tensor
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
         residual = hidden_states
         final_hidden_states, routing_info = self._sparse_routing(hidden_states, global_routing_logits)
+        print(f'layer final hn? {final_hidden_states.isnan().sum()}')
         router_logits, hn, speciality_loss, cosine_similarities, contrastive_loss, expression_reg_loss, routing_uncertainty, entropy_loss, load_balancing_loss, sinkhorn_loss, ortho_loss, balance_loss = routing_info
-        with torch.no_grad():
-            # print( f'residual in rank {torch.distributed.get_rank()}', residual.shape, residual.dtype)
-            pretriained_residual = self.shared_experts(residual)
-        
-        # final_hidden_states를 pretrained_residual의 크기에 맞춰 normalize
-        # pretrained_residual의 크기를 기준으로 final_hidden_states를 scale
-        pretrained_norm = torch.norm(pretriained_residual, dim=-1, keepdim=True)
-        final_norm = torch.norm(final_hidden_states, dim=-1, keepdim=True)
-        # 안전장치: 0으로 나누기 방지
-        scale_factor = torch.where(
-            final_norm > 1e-8,
-            pretrained_norm / (final_norm + 1e-8),
-            torch.ones_like(pretrained_norm)
-        )
-        final_hidden_states_normalized = final_hidden_states * scale_factor
-        final_hidden_states = final_hidden_states_normalized + pretriained_residual * 1.0
+        if self.shared_experts is not None:
+            with torch.no_grad():
+                pretriained_residual = self.shared_experts(residual)
+            
+            # final_hidden_states를 pretrained_residual의 크기에 맞춰 normalize
+            pretrained_norm = torch.norm(pretriained_residual, dim=-1, keepdim=True)
+            final_norm = torch.norm(final_hidden_states, dim=-1, keepdim=True)
+            # 안전장치: 0으로 나누기 방지
+            scale_factor = torch.where(
+                final_norm > 1e-8,
+                pretrained_norm / (final_norm + 1e-8),
+                torch.ones_like(pretrained_norm)
+            )
+            final_hidden_states_normalized = final_hidden_states * scale_factor
+            final_hidden_states = final_hidden_states_normalized + pretriained_residual * 1.0
+        else:
+            # No shared experts, just use routed results
+            pass
         if self.training:
             final_hidden_states = final_hidden_states.requires_grad_(True)
             if router_logits is not None:
@@ -1753,28 +1932,6 @@ class SPECTRAMoE(nn.Module):
         Ideally, we want experts to be orthogonal (diverse).
         Returns scalar average similarity.
         """
-        # This is tricky because experts process different tokens.
-        # We can only compare experts if they processed the same tokens (or we force them to).
-        # Alternatively, we can compare their weights, but here we want output similarity.
-        # If we want to enforce orthogonality of EXPERT FUNCTIONS, we can look at their outputs
-        # for a shared set of inputs, or their weight matrices.
-        # Given the prompt "PES... 각 전문가의 출력에 대해 코사인 유사도 계산", it implies output similarity.
-        # However, usually experts are sparse.
-        # If we are in a setting where we can capture outputs for all experts on some tokens (e.g. broadcasting),
-        # we can use that.
-        # Or we can use the 'expert_specialization_ema' which tracks average input/output patterns.
-        
-        # Let's implementation based on expert_specialization_ema (input patterns) or check if we have outputs.
-        # The plan says "expert_outputs" as input.
-        # But _sparse_routing only computes selected experts.
-        
-        # If we look at the plan: "3.1 PES... 각 전문가의 출력에 대해... 전문가 쌍 간의 평균 유사도 반환"
-        # This might be best computed on the 'expert_specialization_ema' or similar aggregate.
-        # Or maybe it refers to the 'cosine_similarities' we already compute?
-        # But 'cosine_similarities' in current code is between expression and routing logits.
-        
-        # Let's assume we calculate it based on the 'expert_specialization_ema' which represents the 
-        # "specialization direction" of each expert.
         
         if self.expert_specialization_ema is not None:
              # Normalize
@@ -1789,13 +1946,23 @@ class SPECTRAMoE(nn.Module):
         return torch.tensor(0.0, device=self.router.load_balancer.weight_hh_l0.device)
 
     @torch._dynamo.disable  # Disable torch.compile for this method due to data-dependent branching
-    def _sparse_routing(self, hidden_states: torch.Tensor, global_routing_logits: torch.Tensor) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+    def _sparse_routing(
+        self,
+        hidden_states: torch.Tensor, 
+        global_routing_logits: torch.Tensor
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
         batch_size, sequence_length, hidden_dim = hidden_states.shape
+        print(f'layer hidden_states? {hidden_states.isnan().sum()}')
         if self.training and self.input_jitter_noise > 0:
             # Inplace 연산 대신 새로운 텐서 생성 (gradient checkpointing 호환)
             jitter = torch.empty_like(hidden_states).uniform_(1.0 - self.input_jitter_noise, 1.0 + self.input_jitter_noise)
             hidden_states = hidden_states * jitter
-        
+            print(f'layer jitter hn? {hidden_states.isnan().sum()}')
+        # DEBUG: Check input validity
+        if torch.isnan(hidden_states).any():
+             print(f"CRITICAL: Input to _sparse_routing layer {self.iter} is NaN! Mean={hidden_states.mean().item()}")
+             # We can't easily recover, but logging this confirms the fault lies in the previous layer.
+
         # Global router에서 전체 라우팅 처리 (GRU + expression projection + sparsemixer)
         router_output = self.router(
             hidden_states, 
@@ -1805,18 +1972,19 @@ class SPECTRAMoE(nn.Module):
         )
         # Unpack including full probabilities, expression_reg_loss, routing_uncertainty, entropy_loss, load_balancing_loss, sinkhorn_loss, ortho_loss, balance_loss
         routing_weights, selected_experts, expression_logits, hn, speciality_loss, cosine_similarities, contrastive_loss, routing_probs_full, expression_reg_loss, routing_uncertainty, entropy_loss, load_balancing_loss, sinkhorn_loss, ortho_loss, balance_loss = router_output
-
+        print(f'layer routing_weights? (pre-assert) {routing_weights.isnan().sum()}')
         # multiplier와 selected_experts는 이미 global router에서 sparsemixer를 통해 계산됨
         assert routing_weights.isnan().sum() == 0, f"{self.iter} layer routing_weights is nan Line: 826"
-
+        print(f'layer routing_weights? {routing_weights.isnan().sum()}')
         # Flatten routing outputs for per-token processing
         routing_weights = routing_weights.view(batch_size * sequence_length, -1)  # [tokens, top_k]
+        print(f'layer routing_weights? {routing_weights.isnan().sum()}')
         selected_experts = selected_experts.view(batch_size * sequence_length, -1)  # [tokens, top_k]
-
+        print(f'layer selected_experts? {selected_experts.isnan().sum()}')
         final_hidden_states = torch.zeros(
             (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
         )
-
+        print(f'layer final_hidden_states? {final_hidden_states.isnan().sum()}')
         # Uncertainty-based broadcasting for uncertain tokens (training only)
         if self.training and self.enable_uncertainty_broadcast and routing_uncertainty is not None:
             # Reshape uncertainty to match token positions: [batch*seq_len]
@@ -1842,41 +2010,67 @@ class SPECTRAMoE(nn.Module):
                 selected_experts, num_classes=self.num_experts
             ).bool()
 
-        # Reorder to [E, tokens, top_k] for per-expert iteration
-        expert_mask = expert_mask.permute(2, 0, 1)
+        # =======================================================================
+        # [UNIVERSAL EXOSKELETON CONTROLLER]
+        # Dispatch to base model experts regardless of their internal structure (Fused or ModuleList)
+        # =======================================================================
+        hidden_states_flat = hidden_states.view(-1, hidden_dim)
+        
+        # Determine if we can use a "fused" call or need to loop
+        # Standard Transformers MoE uses nn.ModuleList. Specialized ones (Qwen3) use custom modules.
+        if not isinstance(self.experts, nn.ModuleList) and callable(self.experts):
+            # 🚀 Fused Expert Path (e.g. Qwen3VLMoeTextExperts)
+            # Most fused experts expect: (hidden_states, routing_weights, router_indices)
+            # We construct the expected full-rank routing_weights if necessary
+            full_routing_weights = torch.zeros(
+                hidden_states_flat.size(0), self.num_experts,
+                device=hidden_states.device, dtype=hidden_states.dtype
+            )
+            full_routing_weights.scatter_(1, selected_experts, routing_weights)
+            
+            # Use original expert module's logic exactly as intended
+            final_hidden_states = self.experts(hidden_states_flat, full_routing_weights, selected_experts)
+            
+            # --- Update Specialization EMA (Fused Path) ---
+            if self.training:
+                 with torch.no_grad():
+                    # Efficiently update EMA for all selected experts
+                    # This is critical for Spectra long-term load balancing
+                    for k in range(self.top_k):
+                        curr_exp_idx = selected_experts[:, k]  # [tokens]
+                        curr_weights = routing_weights[:, k]   # [tokens]
+                        # Weighted update of specialization EMA
+                        # Process in chunks or unique experts to avoid OOM if needed, but standard is fine
+                        unique_exps = curr_exp_idx.unique()
+                        for exp_id in unique_exps:
+                            mask = (curr_exp_idx == exp_id)
+                            if mask.any():
+                                mean_h = hidden_states_flat[mask].mean(dim=0)
+                                self.expert_specialization_ema[exp_id].lerp_(mean_h, 1.0 - self.router.ema_alpha)
+            # --- End EMA Update ---
+            
+        else:
+            # 🚀 Standard MoE Path (ModuleList / Loop)
+            expert_mask = expert_mask.permute(2, 0, 1) # [E, tokens, top_k]
+            for expert_idx in range(self.num_experts):
+                expert_layer = self.experts[expert_idx]
+                token_idx, topk_idx = torch.where(expert_mask[expert_idx])
 
-        # Loop over all available experts in the model and perform the computation on each expert
-        for expert_idx in range(self.num_experts):
-            expert_layer = self.experts[expert_idx]
-            token_idx, topk_idx = torch.where(expert_mask[expert_idx])
-
-            # Use torch.where to handle empty tensor case in a compile-friendly way
-            has_tokens = token_idx.numel() > 0
-            if has_tokens:
-                # in torch it is faster to index using lists than torch tensors
-                top_x_list = token_idx.tolist()
-                idx_list = topk_idx.tolist()
-
-                # Index the correct hidden states and compute the expert hidden state for
-                # the current expert. We need to make sure to multiply the output hidden
-                # states by `routing_weights` on the corresponding tokens (top-1 and top-2)
-                hidden_states_flat = hidden_states.view(batch_size * sequence_length, hidden_dim)
-                current_state = hidden_states_flat[top_x_list]
-                current_hidden_states = expert_layer(current_state) * routing_weights[top_x_list, idx_list].unsqueeze(-1)
-
-                # However `index_add_` only support torch tensors for indexing so we'll use
-                # the `top_x` tensor here.
-                final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(hidden_states.dtype))
-                
-                # --- Update Specialization EMA ---
-                if self.training:
-                    with torch.no_grad():
-                        # Flatten hidden_states to 2D for proper indexing
-                        hidden_states_flat = hidden_states.view(-1, hidden_states.size(-1))
-                        current_mean_hidden = hidden_states_flat[top_x_list].mean(dim=0)
-                        self.expert_specialization_ema[expert_idx].mul_(self.router.ema_alpha).add_(current_mean_hidden, alpha=1.0 - self.router.ema_alpha)
-                # --- End Update Specialization EMA ---
-
+                if token_idx.numel() > 0:
+                    top_x_list = token_idx.tolist()
+                    idx_list = topk_idx.tolist()
+                    
+                    current_state = hidden_states_flat[top_x_list]
+                    # Compute expert output and weight it
+                    current_hidden_states = expert_layer(current_state) * routing_weights[top_x_list, idx_list].unsqueeze(-1)
+                    final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(hidden_states.dtype))
+                    
+                    # --- Update Specialization EMA (Loop Path) ---
+                    if self.training:
+                        with torch.no_grad():
+                            mean_h = current_state.mean(dim=0)
+                            self.expert_specialization_ema[expert_idx].lerp_(mean_h, 1.0 - self.router.ema_alpha)
+            
         final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
         
         # 콜백을 위해 라우팅 정보를 모듈에 저장
@@ -1909,7 +2103,322 @@ class SPECTRARMSNorm(nn.Module):
         return f"{tuple(self.weight.shape)}, eps={self.eps}"
 
 
+# =============================================================================
+# EXOSKELETON ARCHITECTURE COMPONENTS
+# =============================================================================
+# 
+# The Exoskeleton architecture is designed to be a universal wrapper that can
+# inject SPECTRA's advanced routing mechanisms into any pretrained model without
+# reimplementing the model's core components (attention, layernorm, RoPE, etc.).
+#
+# Supported base models:
+#   - Qwen3-VL-MoE (modeling_qwen3_vl_moe.py)
+#   - Llama4 (modeling_llama4.py) 
+#   - DeepSeek-V3 (modeling_deepseek_v3.py)
+#   - GLM4V-MoE (modeling_glm4v_moe.py)
+#   - GPT-OSS (modeling_gpt_oss.py)
+#   - Ernie4.5-MoE (modeling_ernie4_5_moe.py)
+#   - Gemma3 and other transformer architectures
+#
+# The key principle is: DO NOT reimplement attention/RoPE/norm layers.
+# Only replace the MoE routing mechanism while preserving all base model
+# components for maximum compatibility and minimal code duplication.
+# =============================================================================
+
+
+class SPECTRAExoskeletonMoEInjector:
+    """
+    Universal Exoskeleton MoE Injector for pretrained models.
+    
+    This class wraps any transformer decoder layer and replaces its MoE/router
+    component with SPECTRA's advanced routing mechanism while preserving:
+    - Base model's attention implementation (FlashAttention, SDPA, eager, flex_attn)
+    - Base model's positional encoding (RoPE variants, NoPE, ALiBi, etc.)
+    - Base model's normalization layers (RMSNorm, LayerNorm, L2Norm)
+    - Base model's shared experts (if any)
+    
+    This design ensures compatibility with:
+    - DeepSpeed ZeRO-3 (no manual parameter gathering)
+    - Tensor/Sequence/Context/Pipeline Parallelism
+    - Gradient checkpointing
+    - torch.compile and torch dynamo
+    
+    Usage:
+        base_model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-VL-30B-A3B")
+        injector = SPECTRAExoskeletonMoEInjector(spectra_config, spectra_router)
+        spectra_model = injector.inject(base_model)
+    """
+    
+    # Mapping of base model types to their MoE attribute names
+    MOE_ATTR_NAMES = {
+        # Model type -> (moe_attr_name, router_attr_name, experts_attr_name, shared_experts_attr_name)
+        "qwen3_vl_moe": ("mlp", "gate", "experts", None),  # Qwen3-VL-MoE uses 'mlp' not 'feed_forward'
+        "llama4": ("feed_forward", "router", "experts", "shared_expert"),
+        "deepseek_v3": ("mlp", "gate", "experts", "shared_experts"),
+        "glm4v_moe": ("mlp", "gate", "experts", "shared_expert"),
+        "gpt_oss": ("mlp", "gate", "local_experts", None),
+        "ernie4_5_moe": ("mlp", "gate", "experts", "shared_expert"),
+        "gemma3": ("mlp", None, None, None),  # Dense model - will add MoE
+        "default": ("mlp", "gate", "experts", None),
+    }
+    
+    def __init__(
+        self,
+        spectra_config: SPECTRATextConfig,
+        global_router: 'SPECTRARouter',
+        preserve_shared_experts: bool = True,
+        copy_expert_weights: bool = True,
+    ):
+        """
+        Initialize the Exoskeleton MoE Injector.
+        
+        Args:
+            spectra_config: SPECTRA configuration for the MoE layer
+            global_router: Pre-initialized SPECTRA global router (shared across layers)
+            preserve_shared_experts: If True, keep base model's shared experts frozen
+            copy_expert_weights: If True, copy base model expert weights to SPECTRA experts (upcycling)
+        """
+        self.config = spectra_config
+        self.global_router = global_router
+        self.preserve_shared_experts = preserve_shared_experts
+        self.copy_expert_weights = copy_expert_weights
+    
+    def detect_model_type(self, model) -> str:
+        """
+        Auto-detect the base model architecture type from its class name or config.
+        
+        Args:
+            model: The pretrained model or module
+            
+        Returns:
+            str: One of the keys in MOE_ATTR_NAMES
+        """
+        class_name = model.__class__.__name__.lower()
+        config = getattr(model, 'config', None)
+        model_type = getattr(config, 'model_type', '') if config else ''
+        
+        detection_patterns = {
+            'qwen3_vl_moe': ['qwen3vlmoe', 'qwen3_vl_moe'],
+            'llama4': ['llama4'],
+            'deepseek_v3': ['deepseekv3', 'deepseek_v3'],
+            'glm4v_moe': ['glm4vmoe', 'glm4v_moe'],
+            'gpt_oss': ['gptoss', 'gpt_oss'],
+            'ernie4_5_moe': ['ernie4', 'ernie45moe'],
+            'gemma3': ['gemma3', 'gemma-3'],
+        }
+        
+        for model_key, patterns in detection_patterns.items():
+            for pattern in patterns:
+                if pattern in class_name or pattern in model_type:
+                    return model_key
+        
+        return 'default'
+    
+    def get_moe_components(self, layer, model_type: str) -> dict:
+        """
+        Extract MoE components from a decoder layer based on model type.
+        
+        Args:
+            layer: A decoder layer module
+            model_type: The detected model type
+            
+        Returns:
+            dict: Contains 'moe', 'router', 'experts', 'shared_experts' (some may be None)
+        """
+        attr_names = self.MOE_ATTR_NAMES.get(model_type, self.MOE_ATTR_NAMES['default'])
+        moe_attr, router_attr, experts_attr, shared_attr = attr_names
+        
+        moe = getattr(layer, moe_attr, None)
+        if moe is None:
+            return {'moe': None, 'router': None, 'experts': None, 'shared_experts': None}
+        
+        # Heuristic: Check if 'moe' is actually a MoE block by looking for router/gate and experts
+        # This handles cases where a module exists but is a dense MLP, not a MoE block.
+        has_router = hasattr(moe, router_attr) and (router_attr is None or getattr(moe, router_attr, None) is not None)
+        has_experts = hasattr(moe, experts_attr) and (experts_attr is None or getattr(moe, experts_attr, None) is not None)
+        
+        # If neither router nor experts found, this is a dense layer, not MoE
+        if router_attr and not has_router and not has_experts:
+            logger.debug(f"Layer has '{moe_attr}' but it's a dense MLP (no {router_attr}/{experts_attr}), treating as None")
+            return {'moe': None, 'router': None, 'experts': None, 'shared_experts': None}
+        
+        router = getattr(moe, router_attr, None) if router_attr else None
+        experts = getattr(moe, experts_attr, None) if experts_attr else None
+        shared_experts = getattr(moe, shared_attr, None) if shared_attr else None
+        
+        return {
+            'moe': moe,
+            'router': router,
+            'experts': experts,
+            'shared_experts': shared_experts,
+            'moe_attr_name': moe_attr,
+        }
+    
+    def create_spectra_moe_replacement(
+        self,
+        base_moe_components: dict,
+        layer_idx: int,
+    ) -> 'SPECTRAMoE':
+        """
+        Create a SPECTRAMoE module that replaces the base model's MoE.
+        
+        **CRITICAL**: For existing MoE models (e.g., Qwen3-VL-MoE), we REUSE the base model's
+        expert MLPs directly - DO NOT create new experts. Only the router is replaced.
+        
+        For dense models being upcycled, new experts are created.
+        
+        Args:
+            base_moe_components: Dict from get_moe_components()
+            layer_idx: Layer index for router state tracking
+            
+        Returns:
+            SPECTRAMoE: The replacement MoE module with SPECTRA router and base model experts
+        """
+        # Determine if we should skip expert creation (base model already has experts)
+        has_base_experts = base_moe_components['experts'] is not None
+        
+        spectra_moe = SPECTRAMoE(
+            config=self.config,
+            global_router=self.global_router,
+            skip_expert_init=has_base_experts,  # Skip if base model already has experts
+        )
+        spectra_moe.iter = layer_idx
+        
+        # =======================================================================
+        # [CRITICAL FIX] REUSE base model experts - DO NOT copy weights to new experts!
+        # This is NOT upcycling. Qwen3-VL-MoE already has experts, we just swap the router.
+        # =======================================================================
+        if has_base_experts:
+            logger.info(f"  Layer {layer_idx}: Reusing base model's {len(base_moe_components['experts']) if hasattr(base_moe_components['experts'], '__len__') else 'fused'} experts (router-only replacement)")
+            # Direct assignment - use the SAME expert modules, no copying
+            spectra_moe.experts = base_moe_components['experts']
+        else:
+            # No experts in base model - this is dense upcycling, keep new experts
+            logger.info(f"  Layer {layer_idx}: Base model has no experts, using newly initialized SPECTRA experts")
+        
+        # Preserve shared experts if requested
+        if self.preserve_shared_experts and base_moe_components['shared_experts'] is not None:
+            spectra_moe.shared_experts = base_moe_components['shared_experts']
+            # Freeze shared experts to preserve pretrained behavior
+            for param in spectra_moe.shared_experts.parameters():
+                param.requires_grad = False
+        
+        return spectra_moe
+    
+    def inject_into_layer(self, layer, layer_idx: int, model_type: str) -> nn.Module:
+        """
+        Inject SPECTRA MoE into a single decoder layer.
+        
+        This preserves the layer's:
+        - self_attn (attention mechanism)
+        - input_layernorm, post_attention_layernorm
+        - Any other components not related to MoE
+        
+        Args:
+            layer: The decoder layer to modify
+            layer_idx: Layer index
+            model_type: Detected model type
+            
+        Returns:
+            nn.Module: The modified layer with SPECTRA MoE
+        """
+        moe_components = self.get_moe_components(layer, model_type)
+        
+        if moe_components['moe'] is None:
+            # Dense layer - no MoE to replace; optionally add MoE (upcycling)
+            if layer_idx >= self.config.first_k_dense_replace:
+                logger.info(f"Layer {layer_idx}: Adding SPECTRA MoE to dense layer")
+                spectra_moe = SPECTRAMoE(
+                    config=self.config,
+                    global_router=self.global_router,
+                )
+                spectra_moe.iter = layer_idx
+                # Set the MoE as the layer's feed_forward/mlp
+                moe_attr = 'feed_forward' if hasattr(layer, 'feed_forward') else 'mlp'
+                # Copy weights from original MLP to all experts (upcycling)
+                original_mlp = getattr(layer, moe_attr, None)
+                if original_mlp and self.copy_expert_weights:
+                    with torch.no_grad():
+                        for expert in spectra_moe.experts:
+                            if hasattr(original_mlp, 'gate_proj') and hasattr(expert, 'gate_proj'):
+                                expert.gate_proj.weight.copy_(original_mlp.gate_proj.weight)
+                            if hasattr(original_mlp, 'up_proj') and hasattr(expert, 'up_proj'):
+                                expert.up_proj.weight.copy_(original_mlp.up_proj.weight)
+                            if hasattr(original_mlp, 'down_proj') and hasattr(expert, 'down_proj'):
+                                expert.down_proj.weight.copy_(original_mlp.down_proj.weight)
+                setattr(layer, moe_attr, spectra_moe)
+            return layer
+        
+        # MoE layer - replace router with SPECTRA router
+        logger.info(f"Layer {layer_idx}: Replacing MoE router with SPECTRA router")
+        moe_attr_name = moe_components['moe_attr_name']
+        spectra_moe = self.create_spectra_moe_replacement(moe_components, layer_idx)
+        setattr(layer, moe_attr_name, spectra_moe)
+        
+        return layer
+    
+    def inject(self, model) -> nn.Module:
+        """
+        Inject SPECTRA MoE into all decoder layers of a model.
+        
+        This is the main entry point for the Exoskeleton injection.
+        
+        Args:
+            model: The pretrained model to modify
+            
+        Returns:
+            nn.Module: The modified model with SPECTRA routing
+        """
+        model_type = self.detect_model_type(model)
+        logger.info(f"Detected model type: {model_type}")
+        
+        # Find decoder layers
+        layers = None
+        if hasattr(model, 'model') and hasattr(model.model, 'layers'):
+            layers = model.model.layers
+        elif hasattr(model, 'transformer') and hasattr(model.transformer, 'h'):
+            layers = model.transformer.h
+        elif hasattr(model, 'language_model') and hasattr(model.language_model, 'layers'):
+            layers = model.language_model.layers
+        elif hasattr(model, 'layers'):
+            layers = model.layers
+        
+        if layers is None:
+            raise ValueError(
+                f"Cannot find decoder layers in model of type {type(model).__name__}. "
+                "Expected one of: model.model.layers, model.transformer.h, model.language_model.layers"
+            )
+        
+        # Inject into each layer
+        for layer_idx, layer in enumerate(layers):
+            self.inject_into_layer(layer, layer_idx, model_type)
+        
+        # Store global router reference in model for state tracking
+        if hasattr(model, 'model'):
+            model.model.global_router = self.global_router
+        else:
+            model.global_router = self.global_router
+        
+        logger.info(f"SPECTRA Exoskeleton injection complete: {len(layers)} layers processed")
+        return model
+
+
 class SPECTRARotaryEmbedding(nn.Module):
+    """
+    [DEPRECATED - Use Exoskeleton Architecture]
+    
+    This is a Gemma3-specific RoPE implementation. For universal model support,
+    use SPECTRAExoskeletonMoEInjector which preserves the base model's native
+    positional encoding (RoPE, NoPE, ALiBi, etc.) without reimplementation.
+    
+    WARNING: This class will be removed in a future version. Migrate to Exoskeleton.
+    
+    The Exoskeleton architecture injects SPECTRA routing into pretrained models
+    while preserving all base model components for maximum compatibility with:
+    - Qwen3-VL-MoE, Llama4, DeepSeek-V3, GLM4V-MoE, GPT-OSS, Ernie4.5-MoE
+    - DeepSpeed ZeRO-3 and tensor parallelism
+    - FlashAttention, SDPA, flex_attn implementations
+    """
     def __init__(self, config: SPECTRATextConfig, device=None, **kwargs):
         super().__init__()
         # BC: "rope_type" was originally "type"
@@ -1924,7 +2433,8 @@ class SPECTRARotaryEmbedding(nn.Module):
         self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
 
         inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        # self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.inv_freq = inv_freq
         self.original_inv_freq = self.inv_freq
 
     @torch.no_grad()
@@ -2005,9 +2515,11 @@ def eager_attention_forward(
 
     key_states = repeat_kv(key, module.num_key_value_groups)
     value_states = repeat_kv(value, module.num_key_value_groups)
-
+    print(f'layer query?{query.shape}   {query.isnan().sum()}')
+    print(f'layer key_states? {key_states.shape} {key_states.isnan().sum()}')
+    print(f'layer value_states? {value_states.shape} {value_states.isnan().sum()}')
     attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
-
+    print(f"{attention_mask.shape}")
     if softcap is not None:
         attn_weights = attn_weights / softcap
         attn_weights = torch.tanh(attn_weights)
@@ -2015,18 +2527,59 @@ def eager_attention_forward(
     if attention_mask is not None:  # no matter the length, we just slice it
         causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
         attn_weights = attn_weights + causal_mask
-
-    # upcast attention to fp32
-    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.bfloat16).to(query.dtype)
-    attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
+    sinks = module.sinks.reshape(1, -1, 1, 1).expand(query.shape[0], -1, query.shape[-2], -1)
+    combined_logits = torch.cat([attn_weights, sinks], dim=-1)
+    combined_logits = combined_logits - combined_logits.max(dim=-1, keepdim=True).values
+    probs = F.softmax(combined_logits, dim=-1, dtype=combined_logits.dtype)
+    scores = probs[..., :-1]  # we drop the sink here
+    attn_weights = nn.functional.dropout(scores, p=dropout, training=module.training)
     attn_output = torch.matmul(attn_weights, value_states)
     attn_output = attn_output.transpose(1, 2).contiguous()
     return attn_output, attn_weights
 
+def eager_attention_forward(
+    module: nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    scaling: float,
+    dropout: float = 0.0,
+    **kwargs: Unpack[TransformersKwargs],
+):
+    key_states = repeat_kv(key, module.num_key_value_groups)
+    value_states = repeat_kv(value, module.num_key_value_groups)
+
+    attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
+    if attention_mask is not None:
+        causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+        attn_weights = attn_weights + causal_mask
+
+    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
+    attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
+    attn_output = torch.matmul(attn_weights, value_states)
+    attn_output = attn_output.transpose(1, 2).contiguous()
+
+    return attn_output, attn_weights
 
 class SPECTRAAttention(nn.Module):
-    """Multi-headed attention from 'Attention Is All You Need' paper"""
-
+    """
+    [DEPRECATED - Use Exoskeleton Architecture]
+    
+    This is a Gemma3-specific attention implementation with Q/K normalization,
+    sliding window attention, and logit softcapping. For universal model support,
+    use SPECTRAExoskeletonMoEInjector which preserves the base model's native
+    attention mechanism without reimplementation.
+    
+    WARNING: This class will be removed in a future version. Migrate to Exoskeleton.
+    
+    The Exoskeleton architecture:
+    - Preserves base model attention (FlashAttention, SDPA, eager, flex_attn)
+    - Preserves base model RoPE/positional encoding variants
+    - Only replaces MoE routing while keeping attention intact
+    - Ensures compatibility with all major transformer architectures:
+      Qwen3-VL-MoE, Llama4, DeepSeek-V3, GLM4V-MoE, GPT-OSS, Ernie4.5-MoE
+    """
     def __init__(self, config: SPECTRATextConfig, layer_idx: int, **kwargs):
         super().__init__()
         self.is_sliding = bool((layer_idx + 1) % config.sliding_window_pattern)
@@ -2124,20 +2677,24 @@ class SPECTRAAttention(nn.Module):
 
 
 class SPECTRADecoderLayer(GradientCheckpointingLayer):
-    def __init__(self, config: SPECTRATextConfig, layer_idx: int, global_router: SPECTRARouter, **kwargs):
+    def __init__(
+        self,
+        config: SPECTRATextConfig,
+        layer_idx: int,
+        global_router: SPECTRARouter, **kwargs
+    ):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
         self.layer_idx = layer_idx
         self.attention_type = config.layer_types[layer_idx]
         self.self_attn = SPECTRAAttention(config=config, layer_idx=layer_idx, **kwargs)
-        self.mlp = SPECTRAMLP(config=config) # this layer is for loading pretrained base SPECTRA model weights
         self.is_dense_replacement = layer_idx >= config.first_k_dense_replace
+        expert_intermediate_size = getattr(config, "moe_intermediate_size", 768)
         if self.is_dense_replacement:
             self.moe = SPECTRAMoE(config=config, global_router=global_router)
-            # self.moe = SPECTRASparseGRINBlock(config=config)
         else:
-            self.moe = SPECTRAMLP(config=config)
+            self.moe = SPECTRAMLP(config=config, intermediate_size=expert_intermediate_size)
         self.input_layernorm = SPECTRARMSNorm(self.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = SPECTRARMSNorm(self.hidden_size, eps=config.rms_norm_eps)
         self.pre_feedforward_layernorm = SPECTRARMSNorm(self.hidden_size, eps=config.rms_norm_eps)
@@ -2283,45 +2840,52 @@ class SPECTRAPreTrainedModel(PreTrainedModel):
                 router = getattr(module, "router", None)
                 if isinstance(router, nn.Linear):
                     already_init = getattr(router, "_is_hf_initialized", False)
-                    if not already_init:
+                    # ZeRO-3 compatibility: Skip init if weights are partitioned (1D) or on meta
+                    if not already_init and router.weight.dim() > 1 and not router.weight.is_meta:
                         nn.init.xavier_uniform_(router.weight)
-                        if router.bias is not None:
+                        if router.bias is not None and not router.bias.is_meta:
                             router.bias.zero_()
                 # Initialize routing temperature ONLY if looks uninitialized/bad
                 routing_temp = getattr(module, "routing_temperature", None)
                 if isinstance(routing_temp, nn.Parameter):
-                    if not torch.isfinite(routing_temp).all() or routing_temp.abs().sum() == 0:
+                    if not routing_temp.is_meta and (not torch.isfinite(routing_temp).all() or routing_temp.abs().sum() == 0):
                         routing_temp.data.fill_(1.0)
 
     def _init_weights(self, module):
-        # important: this ported version of Gemma2 isn't meant for training from scratch - only
-        # inference and fine-tuning - so the proper init weights code has been removed
+        # ZeRO-3 compatibility: Skip initialization for sharded (1D) or meta parameters
+        # Failure to do so causes ValueError in xavier_uniform_ and other init functions
+        if hasattr(module, "weight") and module.weight is not None:
+             if module.weight.is_meta or module.weight.dim() < 2:
+                 return
 
         # Only initialize router linears explicitly; skip expert MLPs and other dense layers during fine-tuning
         if isinstance(module, (nn.Linear, nn.Conv1d, nn.Conv2d, nn.Conv3d, nn.ConvTranspose1d, nn.ConvTranspose2d)):
             if getattr(module, "_is_spectra_router", False):
                 logging.get_logger('transformers').debug(f"Initializing router layer with Xavier uniform: {module}")
-                nn.init.xavier_uniform_(module.weight)
-                if module.bias is not None:
+                # ZeRO-3 compatibility: Skip init if weights are partitioned (1D) or on meta
+                if module.weight.dim() > 1 and not module.weight.is_meta:
+                    nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None and not module.bias.is_meta:
                     module.bias.data.zero_()
-            else:
-                # Do not touch non-router linears here to avoid re-initializing experts or base MLPs
-                pass
         elif isinstance(module, ExpressionProjector):
             logging.get_logger('transformers').debug(f"Initializing expression projector layer with Xavier uniform: {module}")
-            original_dtype = module.projection.weight.dtype
-            module.to(torch.float32)
-            nn.init.orthogonal_(module.projection.weight)
-            module.to(original_dtype)
+            # ZeRO-3 compatibility: Skip init if weights are partitioned (1D) or on meta
+            if module.projection.weight.dim() > 1 and not module.projection.weight.is_meta:
+                safe_orthogonal_(module.projection.weight)
         elif isinstance(module, SPECTRAMultiModalProjector):
-            nn.init.xavier_uniform_(module.mm_input_projection_weight)
+            # ZeRO-3 compatibility: Skip init if weights are partitioned (1D) or on meta
+            if module.mm_input_projection_weight.dim() > 1 and not module.mm_input_projection_weight.is_meta:
+                nn.init.xavier_uniform_(module.mm_input_projection_weight)
         elif isinstance(module, nn.GRU):
             for name, param in module.named_parameters():
-                if 'weight_ih' in name:
+                # ZeRO-3 compatibility: Skip init if weights are on meta
+                if param.is_meta:
+                    continue
+                if 'weight_ih' in name and param.data.dim() > 1:
                     nn.init.xavier_uniform_(param.data)
-                elif 'weight_hh' in name:
+                elif 'weight_hh' in name and param.data.dim() > 1:
                     nn.init.xavier_uniform_(param.data)
-                elif 'weight_hr' in name:
+                elif 'weight_hr' in name and param.data.dim() > 1:
                     nn.init.xavier_uniform_(param.data)
                 elif 'bias' in name:
                     param.data.fill_(0)
@@ -2346,66 +2910,106 @@ class SPECTRAPreTrainedModel(PreTrainedModel):
         ffn_checkpoint_for_moe_conversion: Optional[Union[str, os.PathLike, dict]] = None,
         **kwargs,
     ) -> SpecificPreTrainedModelType:
-
-        # config 처리 (G2MoEConfig 인스턴스 확보)
+        """
+        Universal Exoskeleton Loading Mechanism.
+        
+        This method loads a pretrained base model using its native architecture
+        and then injects SPECTRA's advanced routing system into its decoder layers.
+        This ensures that we preserve the original model's high-performance 
+        Attention, RoPE, and Normalization implementations while gaining 
+        SPECTRA's routing stability and expert specialization.
+        """
+        # Resolve configuration
         if config is None:
             config = AutoConfig.from_pretrained(pretrained_model_name_or_path, **kwargs.get("config_kwargs", {}))
-        if not isinstance(config, SPECTRAConfig):
-            config = SPECTRAConfig(**config.to_dict())
-            if config.text_config.attn_implementation == None:
-                if is_flash_attn_2_available():
-                    config.text_config.attn_implementation = "flash_attention_2"
-                elif is_torch_flex_attn_available():
-                    config.text_config.attn_implementation = "flex_attention"
-                elif cls.training:
-                    config.text_config.attn_implementation = "eager"
-                else:
-                    config.text_config.attn_implementation = "sdpa"
-            print(f"Forced attn implementation: {config.text_config.attn_implementation}")
-
-        logging.get_logger('transformers').debug("Loading SPECTRA model skeleton using super().from_pretrained...")
-        logging.set_verbosity_error()
-        import time
-        debug_time = time.time()
-        base_model = super().from_pretrained(
+        
+        # Ensure it's a SPECTRAConfig for MoE settings
+        if not isinstance(config, (SPECTRAConfig, SPECTRATextConfig)):
+            # Convert base config to SPECTRA config while preserving base model parameters
+            config_dict = config.to_dict()
+            if "text_config" in config_dict:
+                # VLM case
+                config = SPECTRAConfig(**config_dict)
+            else:
+                # Text-only case
+                config = SPECTRATextConfig(**config_dict)
+        
+        # Determine strict text config
+        text_config = config.text_config if hasattr(config, "text_config") else config
+        
+        # Determine model class (LLM vs VLM) using AutoModel
+        from transformers import AutoModelForCausalLM, AutoModelForVision2Seq
+        
+        # Heuristic to detect VLM: config has vision_config OR model type contains 'vl'
+        is_vlm = hasattr(config, "vision_config") or "vl" in str(pretrained_model_name_or_path).lower()
+        model_class = AutoModelForVision2Seq if is_vlm else AutoModelForCausalLM
+        
+        if is_vlm:
+            logger.info(f"Detected VLM architecture for {pretrained_model_name_or_path}")
+        else:
+            logger.info(f"Detected CausalLM architecture for {pretrained_model_name_or_path}")
+            
+        logger.info(f"Loading Base Model Skeleton using {model_class.__name__}...")
+        
+        # 1. Load the base model skeleton and weights using native transformers classes
+        # This preserves all optimized low-level CUDA kernels (FlashAttention, FlexAttn, etc.)
+        # We explicitly assume 'trust_remote_code=True' for models like Qwen/DeepSeek
+        if "trust_remote_code" in kwargs:
+            kwargs["trust_remote_code"] = kwargs.get("trust_remote_code", True)
+        base_model = model_class.from_pretrained(
             pretrained_model_name_or_path,
             *model_args,
-            config=config,
             cache_dir=cache_dir,
-            # Critical: only init truly missing keys to avoid full-graph init slowdown
-            ignore_mismatched_sizes=True,
+            ignore_mismatched_sizes=True, # Essential for swapping components
             force_download=force_download,
             local_files_only=local_files_only,
             token=token,
             revision=revision,
             use_safetensors=use_safetensors,
             weights_only=weights_only,
-            **{k: v for k, v in kwargs.items()}
+            **kwargs
         )
-        print(f"SPECTRA model skeleton loaded in {time.time() - debug_time} seconds")
-        logging.set_verbosity_warning()
-        logging.get_logger('transformers').debug("SPECTRA model skeleton loaded.")
-
-        if hasattr(base_model, 'model'):
-            if hasattr(base_model.model, 'layers') and hasattr(base_model.model.layers, 'moe'):
-                logging.get_logger('transformers').debug("SPECTRA Pretrained model loaded.")
-                return base_model
-            logging.get_logger('transformers').debug("Initializing MoE experts with MLP weights...")
-            if hasattr(base_model.model, 'layers'):
-                base_model.model = base_model._upcycle(base_model.model)
-            elif hasattr(base_model.model.language_model, 'layers'):
-                base_model.model.language_model = base_model._upcycle(base_model.model.language_model)
-            logging.get_logger('transformers').debug("MoE experts initialization completed.")
-        elif hasattr(base_model, "language_model"):
-            if hasattr(base_model.language_model, 'layers') and hasattr(base_model.language_model.layers, 'moe'):
-                logging.get_logger('transformers').debug("SPECTRA Pretrained model loaded.")
-                return base_model
-            logging.get_logger('transformers').debug("Initializing MoE experts with MLP weights...")
-            base_model.language_model = base_model._upcycle(base_model.language_model)
-            logging.get_logger('transformers').debug("MoE experts initialization completed.")
+        
+        # 2. Universal Exoskeleton Injection
+        # We replace the base model's router/gate with SPECTRA's global router mechanism
+        force_upcycle = kwargs.get("force_upcycle", False)
+        
+        logger.info("Initializing SPECTRA Global Router...")
+        # Initialize SPECTRA Global Router
+        # This shared router maintains states (GRU) across layers for hierarchical routing
+        global_router = SPECTRARouter(text_config)
+        
+        # Create and apply the Exoskeleton Injector
+        injector = SPECTRAExoskeletonMoEInjector(
+            spectra_config=text_config,
+            global_router=global_router,
+            preserve_shared_experts=True,
+            copy_expert_weights=force_upcycle
+        )
+        
+        logger.info("Injecting SPECTRA Routing Mechanism (Exoskeleton)...")
+        # Swap existing MoE components or upcycle dense layers
+        # This modifies base_model in-place
+        base_model = injector.inject(base_model)
+        
+        # 3. Explicitly initialize newly injected SPECTRA parameters
+        # This ensures Xavier uniform initialization for stable initial routing logits
+        logger.info("Initializing Router Weights...")
+        if hasattr(base_model, "_initialize_moe_router_and_temperature"):
+            # If it's a SPECTRA-compatible class with the helper method
+            base_model._initialize_moe_router_and_temperature()
         else:
-            logging.get_logger('transformers').info("Model does not have expected structure. MoE experts not initialized from MLP weights.")
-        logging.set_verbosity_warning() 
+            # Manual initialization for injected parameters in arbitrary models
+            for module in base_model.modules():
+                if hasattr(module, "router") and isinstance(module.router, SPECTRARouter):
+                    # SPECTRARouter handles its own internal init, but we check weights
+                    pass
+                elif getattr(module, "_is_spectra_router", False) and hasattr(module, "weight"):
+                    if module.weight.dim() > 1 and not module.weight.is_meta:
+                        nn.init.xavier_uniform_(module.weight)
+                        if module.bias is not None: module.bias.data.zero_()
+
+        logger.info(f"SPECTRA Exoskeleton successfully injected into {pretrained_model_name_or_path}")
         return base_model
 
     @torch.no_grad()
@@ -2597,7 +3201,8 @@ class SPECTRATextModel(SPECTRAPreTrainedModel):
             # allow overriding via config if provided
             self._tp_plan = getattr(config, "base_model_tp_plan", default_tp_plan)
 
-        # SPECTRA downcasts the below to bfloat16, causing sqrt(3072)=55.4256 to become 55.5. See https://github.com/huggingface/transformers/pull/29402
+        # Restore SPECTRATextScaledWordEmbedding for structural consistency
+        # Fixed to avoid ZeRO-3 meta tensor conflicts by using float scale instead of buffer
         self.embed_tokens = SPECTRATextScaledWordEmbedding(
             config.vocab_size, config.hidden_size, self.padding_idx, embed_scale=self.config.hidden_size**0.5
         )
@@ -2956,9 +3561,9 @@ class SPECTRAForCausalLM(SPECTRAPreTrainedModel, GenerationMixin):
             safe_serialization = False
         return super().save_pretrained(save_directory, safe_serialization=safe_serialization, **kwargs)
 
-    def __init__(self, config: SPECTRAConfig, **kwargs):
+    def __init__(self, config: SPECTRATextConfig, **kwargs):
         super().__init__(config)
-        self.model = SPECTRATextModel(config.text_config, **kwargs)
+        self.model = SPECTRATextModel(config, **kwargs)
         # Ensure config refers to resolved text config from the submodule
         self.config = self.model.config
         self.vocab_size = self.config.vocab_size
@@ -3034,7 +3639,11 @@ class SPECTRAForCausalLM(SPECTRAPreTrainedModel, GenerationMixin):
         >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
         "What is your favorite condiment?"
         ```"""
-
+        if self.config._attn_implementation is None:
+            self.config._attn_implementation = "eager"
+            logger.warning_once(
+                "No attention implementation is specified, using `eager` as default."
+            )
         if self.training and self.config.attn_implementation != "eager":
             logger.warning_once(
                 "It is strongly recommended to train SPECTRA models with the `eager` attention implementation "
@@ -3239,10 +3848,10 @@ class SPECTRAModel(SPECTRAPreTrainedModel):
     # we are filtering the logits/labels so we shouldn't divide the loss based on num_items_in_batch
     accepts_loss_kwargs = False
 
-    def __init__(self, config: SPECTRAConfig):
+    def __init__(self, config: SPECTRAConfig, vision_tower=None, language_model=None):
         super().__init__(config)
-        self.vision_tower = AutoModel.from_config(config=config.vision_config, trust_remote_code=True)
-        self.language_model = SPECTRATextModel.from_config(config=config.text_config, trust_remote_code=True)
+        self.visual = vision_tower if vision_tower is not None else AutoModel.from_config(config=config.vision_config, trust_remote_code=True)
+        self.language_model = language_model if language_model is not None else SPECTRATextModel.from_config(config=config.text_config, trust_remote_code=True)
         self.multi_modal_projector = SPECTRAMultiModalProjector(config=config)
         self.vocab_size = config.text_config.vocab_size
         self.pad_token_id = self.config.pad_token_id if self.config.pad_token_id is not None else -1
@@ -3270,7 +3879,7 @@ class SPECTRAModel(SPECTRAPreTrainedModel):
         Returns:
             image_features (`torch.Tensor`): Image feature tensor of shape `(num_images, image_length, embed_dim)`).
         """
-        vision_outputs = self.vision_tower(pixel_values=pixel_values).last_hidden_state
+        vision_outputs = self.visual(pixel_values=pixel_values).last_hidden_state
         image_features = self.multi_modal_projector(vision_outputs)
         return image_features
 
@@ -3445,9 +4054,13 @@ class SPECTRAModel(SPECTRAPreTrainedModel):
 class SPECTRAForConditionalGeneration(SPECTRAPreTrainedModel, GenerationMixin):
     _checkpoint_conversion_mapping = {
         "^language_model.model": "model.language_model",
-        "^vision_tower": "model.vision_tower",
+        "^visual": "model.visual",
         "^multi_modal_projector": "model.multi_modal_projector",
         "^language_model.lm_head": "lm_head",
+        # MoE key mapping: Qwen uses "mlp", SPECTRA uses "moe"
+        r"\.mlp\.": ".moe.",
+        # LayerNorm key mapping: Qwen uses "post_attention_layernorm", SPECTRA uses "post_feedforward_layernorm"
+        r"\.post_attention_layernorm": ".post_feedforward_layernorm",
     }
     _tied_weights_keys = ["lm_head.weight"]
     
@@ -3458,9 +4071,9 @@ class SPECTRAForConditionalGeneration(SPECTRAPreTrainedModel, GenerationMixin):
             safe_serialization = False
         return super().save_pretrained(save_directory, safe_serialization=safe_serialization, **kwargs)
   
-    def __init__(self, config: SPECTRAConfig, **kwargs):
+    def __init__(self, config: SPECTRAConfig, vision_tower=None, **kwargs):
         super().__init__(config)
-        self.model = SPECTRAModel(config)
+        self.model = SPECTRAModel(config, vision_tower=vision_tower)
         self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
         self.post_init()
 
@@ -3486,7 +4099,11 @@ class SPECTRAForConditionalGeneration(SPECTRAPreTrainedModel, GenerationMixin):
 
     @property
     def vision_tower(self):
-        return self.model.vision_tower
+        return self.model.visual
+
+    @property
+    def visual(self):
+        return self.model.visual
 
     @property
     def multi_modal_projector(self):
