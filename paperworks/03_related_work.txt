@@ -1,0 +1,24 @@
+=================================================================
+RELATED WORK
+=================================================================
+
+**2. Related Work**
+
+**2.1. Evolution of Mixture-of-Experts (MoE) Architectures**
+
+The concept of Mixture-of-Experts (MoE) originates from early work where multiple expert networks were trained to specialize in different regions of the input space [Jacobs et al., 1991]. This idea was successfully scaled to deep learning by Shazeer et al. [2017], leading to models like Switch Transformer [Fedus et al., 2021], GLaM [Du et al., 2021], and recent open-weights models like Mixtral [Jiang et al., 2024] and DeepSeekMoE [DeepSeek-AI, 2024]. By 2025, MoE has become the dominant architecture for frontier models, exemplified by DeepSeek-V3 [DeepSeek-AI, 2025], Qwen3 [Alibaba Cloud, 2025], and Kimi K2 [Moonshot AI, 2025]. Despite their success, the efficiency of these models remains fundamentally limited by the quality of their routing mechanisms.
+
+**2.2. The Core Challenge in MoE: Routing Mechanisms and Limitations**
+
+The prevailing routing strategy is **Top-k gating**, which selects the top `k` experts based on a router network's scores [Fedus et al., 2021]. However, this strategy is prone to 'expert collapse,' where the router favors a small subset of experts. To mitigate this, standard implementations employ an **auxiliary load-balancing loss** [Shazeer et al., 2017]. While this loss arithmetically enforces uniform traffic, it acts as a heuristic corrective rather than a structural solution. Crucially, **equal load does not imply specialization**; experts may receive balanced traffic yet fail to learn functionally distinct roles. Alternative strategies like Expert Choice routing [Zhou et al., 2022] and Hash-based routing [Roller et al., 2021] address load distribution but introduce trade-offs in adaptability or pipeline complexity.
+
+Recent work in 2024-2025 has begun to address expert specialization more directly. **Entropy-Regularized MoE (ERMoE)** [Chen et al., 2025] and **Latent Prototype Routing (LPR)** [Wang et al., 2025] attempt to sharpen routing decisions. Notably, **OMoE** [Feng et al., 2025] and **RoMA** [Ren et al., 2025] have introduced orthogonality constraints to diversify expert representations. However, these methods often rely on complex auxiliary losses or iterative optimization procedures that can be unstable or difficult to tune.
+
+Finally, most routers are stateless, processing each token in isolation. Recent **context-aware routing** approaches [Ma et al., 2024] and **Layer-Adaptive Sparse Expert Routing (LASER)** [Zhang et al., 2025] demonstrate the value of dynamic routing policies but often incur significant architectural overhead.
+
+**2.3. Orthogonality as a Regularizer in Deep Learning**
+
+The principle of orthogonality has been used successfully as a regularizer to improve training stability and reduce redundancy [Brock et al., 2017; Bansal et al., 2018]. In the context of MoE, ensuring expert representations are orthogonal is a promising direction for enforcing functional specialization.
+
+**Gap in Existing Work:**
+While recent works like OMoE [Feng et al., 2025] and RoMA [Ren et al., 2025] have begun to explore orthogonality, they typically implement it via auxiliary loss terms that compete with the main task loss. **No prior work has seamlessly integrated orthogonality directly into the routing transport mechanism itself.** SPECTRA fills this gap with OSR (Orthogonal Sinkhorn Routing), which uses a repulsive cost function to \emph{structurally} enforce expert separation via parameter-free optimal transport, replacing indirect heuristics with a principled mathematical guarantee.

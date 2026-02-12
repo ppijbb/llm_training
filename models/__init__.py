@@ -28,6 +28,7 @@ from .spectra_model import (
     SPECTRAForCausalLM,
     SPECTRAForConditionalGeneration,
     SPECTRAModel,
+    SPECTRAExoskeletonMoEInjector
 )
 from .g2moe_config import *
 from .g2moe_model import *
@@ -47,4 +48,5 @@ __all__ = [
     "SpectraForCausalLM",
     "SpectraForConditionalGeneration",
     "SpectraModel",
+    "SPECTRAExoskeletonMoEInjector"
 ]

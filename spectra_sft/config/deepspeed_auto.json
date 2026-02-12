@@ -12,7 +12,7 @@
     },
     "zero_allow_untested_optimizer": true,
     "optimizer": {
-        "type": "AdamW",
+        "type": "AdamW8bit",
         "params": {
             "lr": "auto",
             "betas": [
@@ -31,9 +31,10 @@
         "overlap_events": true
     },
     "zero_optimization": {
-        "stage": 3,
+        "stage": 2,
         "offload_optimizer": {
-            "device": "cpu",
+            "device": "nvme",
+            "nvme_path": "/mls/conan/offload",
             "pin_memory": false,
             "fast_init": true,
             "ratio": 1.0,
@@ -49,31 +50,39 @@
             "max_in_cpu": 100000.0,
             "pin_memory": false
         },
-        "memory_efficient_linear": true,
+        "memory_efficient_linear": false,
         "allgather_partitions": true,
         "overlap_comm": true,
         "contiguous_gradients": true,
-        "sub_group_size": 50000000.0,
-        "allgather_bucket_size": 50000000.0,
-        "reduce_bucket_size": 50000000.0,
-        "stage3_prefetch_bucket_size": 10000000.0,
-        "stage3_param_persistence_threshold": 100000.0,
-        "stage3_max_live_parameters": 20000000.0,
-        "stage3_max_reuse_distance": 20000000.0,
+        "sub_group_size": 200000000.0,
+        "allgather_bucket_size": 200000000.0,
+        "reduce_bucket_size": 200000000.0,
+        "stage3_prefetch_bucket_size": 100000000.0,
+        "stage3_param_persistence_threshold": 1000000.0,
+        "stage3_max_live_parameters": 100000000.0,
+        "stage3_max_reuse_distance": 100000000.0,
         "stage3_gather_16bit_weights_on_model_save": true,
         "ignore_unused_parameters": true,
         "leaf_module": {
             "classes": [
                 "Qwen2DecoderLayer",
                 "Qwen2VLDecoderLayer",
+                "Qwen3VLMoeTextDecoderLayer",
+                "Qwen3VLMoeVisionModel",
+                "Qwen3VLMoeVisionBlock",
+                "Qwen3VLMoeVisionMLP",
+                "Qwen3VLMoeVisionAttention",
                 "SiglipVisionModel",
                 "SiglipVisionTransformer",
-                "Siglip2VisionModel",
-                "Qwen3VLVisionModel",
-                "Qwen3VLMoeVisionModel",
-                "SPECTRAMLP",
-                "SPECTRAExpert",
-                "SPECTRAVisionModel"
+                "SiglipEncoder",
+                "SPECTRAMultiModalProjector",
+                "SPECTRARMSNorm",
+                "Qwen3VLMoeTextSparseMoeBlock",
+                "Qwen3VLMoeTextExperts",
+                "Qwen3VLMoeVisionPatchMerger",
+                "Qwen3VLMoeVisionPatchEmbed",
+                "SPECTRAMoE",
+                "SPECTRARouter"
             ],
             "names": [],
             "name_suffixes": []

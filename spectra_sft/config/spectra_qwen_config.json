@@ -13,7 +13,7 @@
     "bnb_4bit_compute_dtype": "bfloat16",
     "bnb_4bit_quant_type": "nf4",
     "bnb_4bit_use_double_quant": true,
-    "deepspeed_config": "/home/conan/workspace/llm_training/spectra_sft/config/deepspeed_auto.json",
+    "deepspeed_config": "/home/conan/workspace/llm_training/spectra_sft/config/deepspeed_zero3.json",
     "spectra_params": {
       "n_shared_experts": 0,
       "n_routed_experts": 128,
@@ -24,7 +24,7 @@
       "no_rope_layer_interval": 0,
       "neftune_noise_alpha": 2.0,
       "use_sliding_window": false,
-      "attn_implementation": "flash_attention_2",
+      "attn_implementation": "flash_attention_3",
       "router_entropy_coef": 0.001,
       "router_jitter_noise": 0.005,
       "input_jitter_noise": 0.005,
@@ -84,11 +84,11 @@
     "max_seq_length": 131072,
     "test_size": 0.005,
     "text_only": false,
-    "streaming": false
+    "streaming": true
   },
   "training_config": {
     "output_dir": "/mls/conan/training_logs/spectra_qwen_outputs",
-    "deepspeed": "spectra_sft/config/deepspeed_auto.json",
+    "deepspeed": "/home/conan/workspace/llm_training/spectra_sft/config/deepspeed_zero3.json",
     "num_train_epochs": 1,
     "per_device_train_batch_size": 1,
     "per_device_eval_batch_size": 1,
@@ -106,7 +106,7 @@
     "load_best_model_at_end": true,
     "metric_for_best_model": "eval_loss",
     "greater_is_better": false,
-    "dataset_num_proc": 2,
+    "dataset_num_proc": 8,
     "fp16": false,
     "bf16": true,
     "bf16_full_eval": true,
@@ -121,7 +121,7 @@
     "dataloader_drop_last": true,
     "gradient_checkpointing": true,
     "gradient_checkpointing_kwargs": {
-      "use_reentrant": false,
+      "use_reentrant": true,
       "preserve_rng_state": true
     },
     "report_to": [

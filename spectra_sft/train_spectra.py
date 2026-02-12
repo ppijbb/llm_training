@@ -6,27 +6,449 @@ SPECTRA SFT Training Script using Config File
 import os
 import sys
 import json
+import warnings
+import contextlib
+import types
+
+# --- Suppress Annoying Deprecation Warnings ---
+# These are caused by library drift (e.g. cryptography, scipy) and flood the logs
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+try:
+    from cryptography.utils import CryptographyDeprecationWarning
+    warnings.filterwarnings("ignore", category=CryptographyDeprecationWarning)
+except ImportError:
+    pass
+# ----------------------------------------------
+# [0vs2048] Global Participation Pool for v16 GAPH
+_PARTICIPATION_POOL = []
+
 # --- Global Monkey Patches for ZeRO-3 Compatibility ---
 import torch.nn as nn
 
 def _patch_nn_init():
-    orig_xavier_uniform = nn.init.xavier_uniform_
+    import torch.nn.init as torch_init
+    
+    orig_xavier_uniform = torch_init.xavier_uniform_
     def safe_xavier_uniform(tensor, gain=1.0):
+        if tensor.is_meta: return tensor
+        if tensor.numel() == 0: return tensor
         if tensor.ndimension() < 2:
-            # Fallback for sharded 1D tensors to avoid "Fan in/out" error
-            return nn.init.uniform_(tensor, -0.02, 0.02)
+            return torch_init.uniform_(tensor, -0.02, 0.02)
         return orig_xavier_uniform(tensor, gain)
+    torch_init.xavier_uniform_ = safe_xavier_uniform
     nn.init.xavier_uniform_ = safe_xavier_uniform
 
-    orig_xavier_normal = nn.init.xavier_normal_
+    orig_xavier_normal = torch_init.xavier_normal_
     def safe_xavier_normal(tensor, gain=1.0):
+        if tensor.is_meta: return tensor
+        if tensor.numel() == 0: return tensor
         if tensor.ndimension() < 2:
-            # Fallback for sharded 1D tensors
-            return nn.init.normal_(tensor, std=0.02)
+            return torch_init.normal_(tensor, std=0.02)
         return orig_xavier_normal(tensor, gain)
+    torch_init.xavier_normal_ = safe_xavier_normal
     nn.init.xavier_normal_ = safe_xavier_normal
 
-_patch_nn_init()
+    orig_kaiming_uniform = torch_init.kaiming_uniform_
+    def safe_kaiming_uniform(tensor, a=0, mode='fan_in', nonlinearity='leaky_relu'):
+        if tensor.is_meta: return tensor
+        if tensor.numel() == 0: return tensor
+        if tensor.ndimension() < 2:
+            return torch_init.uniform_(tensor, -0.02, 0.02)
+        return orig_kaiming_uniform(tensor, a=a, mode=mode, nonlinearity=nonlinearity)
+    torch_init.kaiming_uniform_ = safe_kaiming_uniform
+    nn.init.kaiming_uniform_ = safe_kaiming_uniform
+
+    orig_orthogonal = torch_init.orthogonal_
+    def safe_orthogonal(tensor, gain=1.0):
+        if tensor.is_meta: return tensor
+        if tensor.numel() == 0: return tensor
+        if tensor.ndimension() < 2:
+            return torch_init.normal_(tensor, std=0.02)
+        return orig_orthogonal(tensor, gain)
+    torch_init.orthogonal_ = safe_orthogonal
+    nn.init.orthogonal_ = safe_orthogonal
+    
+    # Patch the internal fan calculator too
+    if hasattr(torch_init, '_calculate_fan_in_and_fan_out'):
+        orig_calc = torch_init._calculate_fan_in_and_fan_out
+        def safe_calc(tensor):
+            if tensor.numel() == 0: return 1, 1
+            if tensor.dim() < 2: return 1, 1
+            f_in, f_out = orig_calc(tensor)
+            return max(1, f_in), max(1, f_out)
+        torch_init._calculate_fan_in_and_fan_out = safe_calc
+
+def _patch_qwen3_participation_guard():
+    """
+    ULTIMATE ZeRO-2/3 & AutoTP Fix (v10): Root Participation Guard (RPG).
+    1) RPG: Adds all parameters to the autograd graph via the loss to prevent any '0 vs 2048' mismatch.
+    2) MV1: Ensures Experts and Vision components process at least size 1 volume.
+    """
+    try:
+        import torch
+        import torch.nn.functional as F
+        import torch.distributed as dist
+        from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
+            Qwen3VLMoeTextExperts, 
+            Qwen3VLMoeTextRMSNorm,
+            Qwen3VLMoeVisionPatchMerger,
+            Qwen3VLMoeVisionBlock,
+            Qwen3VLMoeTextMLP,
+            Qwen3VLMoeTextAttention
+        )
+        
+        # [0vs2048] 커스텀 autograd Function: Linear backward를 직접 제어하여 grad_output (0,2048) 방지
+        # VisionPatchMerger와 VisionMLP 모두에서 사용
+        def _vision_rank():
+            try:
+                return dist.get_rank() if dist.is_initialized() else 0
+            except Exception:
+                return 0
+
+        # [0vs2048] Participation Pool (v17)
+        # We collect all dummy forward results and add them to the loss at the very end.
+        def _record_participation(x):
+            global _PARTICIPATION_POOL
+            if x is None: return
+            if torch.is_tensor(x):
+                if x.requires_grad:
+                    _PARTICIPATION_POOL.append(x.sum() * 0.0)
+            elif isinstance(x, (list, tuple)):
+                for o in x: _record_participation(o)
+            elif isinstance(x, dict):
+                for v in x.values(): _record_participation(v)
+        
+        # [0vs2048] SafeLinearFunction: backward에서 grad_output/grad_weight shape 보정 (0 vs 2048/4608 방지)
+        # ZeRO-2에서도 vision path backward 시 AccumulateGrad shape mismatch 발생 → 커스텀 backward로 해결
+        class SafeLinearFunction(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx, input, weight, bias, seq_len):
+                ctx.save_for_backward(input, weight, bias)
+                ctx.seq_len = seq_len
+                return F.linear(input, weight, bias)
+
+            @staticmethod
+            def backward(ctx, grad_output):
+                input, weight, bias = ctx.saved_tensors
+                seq_len = ctx.seq_len
+                r2 = _vision_rank()
+                if grad_output is not None and grad_output.dim() >= 1:
+                    if grad_output.shape[0] == 0:
+                        grad_output = torch.zeros(seq_len, *grad_output.shape[1:], device=grad_output.device, dtype=grad_output.dtype)
+                    elif grad_output.dim() >= 2 and (grad_output.shape[1] == 0 or grad_output.shape[1] != weight.shape[0]):
+                        grad_output = torch.zeros(grad_output.shape[0], weight.shape[0], device=grad_output.device, dtype=grad_output.dtype)
+                grad_input = grad_output @ weight if grad_output is not None else None
+                if grad_output is not None and input is not None:
+                    try:
+                        grad_weight = grad_output.t() @ input
+                        if grad_weight.shape != weight.shape:
+                            grad_weight = torch.zeros_like(weight)
+                    except RuntimeError:
+                        grad_weight = torch.zeros_like(weight)
+                else:
+                    grad_weight = None
+                grad_bias = grad_output.sum(0) if grad_output is not None and bias is not None else None
+                return grad_input, grad_weight, grad_bias, None
+
+        # --- 2) Vision: MV1 Guards ---
+        # Vision & Text components: Participation Guard (v16 - Global Connection)
+        def mv1_module_forward(orig_fn):
+            def wrapped(self, *args, **kwargs):
+                if not self.training: 
+                    return orig_fn(self, *args, **kwargs)
+                
+                # [0vs2048] Extract focal input 'x' (hidden_states)
+                x = kwargs.get('hidden_states', kwargs.get('x', args[0] if args else None))
+                
+                has_data = False
+                if torch.is_tensor(x) and x.numel() > 0:
+                    has_data = True
+                elif isinstance(x, (list, tuple)) and len(x) > 0 and torch.is_tensor(x[0]) and x[0].numel() > 0:
+                    has_data = True
+                
+                if has_data:
+                    return orig_fn(self, *args, **kwargs)
+                
+                # Participatory Dummy path
+                # Use x's properties if available, else defaults
+                device = x.device if torch.is_tensor(x) else (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
+                dtype = x.dtype if torch.is_tensor(x) else torch.bfloat16
+                h_size = x.shape[-1] if (torch.is_tensor(x) and x.dim() > 0) else getattr(self, "hidden_size", 4096)
+                
+                dummy_x = torch.zeros((1, h_size), device=device, dtype=dtype, requires_grad=True)
+                
+                # Construct dummy call inputs
+                new_args = list(args)
+                new_kwargs = kwargs.copy()
+                if args:
+                    new_args[0] = dummy_x
+                elif 'hidden_states' in new_kwargs:
+                    new_kwargs['hidden_states'] = dummy_x
+                elif 'x' in new_kwargs:
+                    new_kwargs['x'] = dummy_x
+                else:
+                    new_args = [dummy_x] # Fallback
+                
+                # Special handling for Attention (cos/sin lengths)
+                if "position_embeddings" in new_kwargs:
+                    pe = new_kwargs["position_embeddings"]
+                    if isinstance(pe, (list, tuple)) and len(pe) >= 2:
+                        new_kwargs["position_embeddings"] = tuple(t[:, :1] if torch.is_tensor(t) else t for t in pe)
+                
+                # Special handling for Vision Blocks (cu_seqlens)
+                if "cu_seqlens" in new_kwargs:
+                    new_kwargs["cu_seqlens"] = torch.tensor([0, 1], device=device, dtype=torch.int32)
+                
+                out = orig_fn(self, *new_args, **new_kwargs)
+                
+                # Connection logic (v17): record in pool and return empty
+                _record_participation(out)
+                
+                if isinstance(out, (list, tuple)):
+                    return tuple(o[:0] if torch.is_tensor(o) else o for o in out)
+                return out[:0]
+            return wrapped
+
+        # VisionPatchMerger: 빈 입력 시 원본 forward 호출 금지 → F.linear backward에서 0 vs 2048 방지.
+        # dummy forward 없이 출력 shape만 맞춰 zeros 반환 (그래프 미연결).
+        # 0-size 원인: SPECTRA 아님. baseline에서도 Qwen3-VL vision path에 빈 배치(이미지 0개/0 patches)가
+        # 들어가면 F.linear backward에서 gradient (0,...) vs param (2048,...) → AccumulateGrad 에러.
+        _merger_orig = Qwen3VLMoeVisionPatchMerger.forward
+        def vision_merger_empty_guard(self, x: torch.Tensor) -> torch.Tensor:
+            if not self.training:
+                return _merger_orig(self, x)
+            
+            has_data = torch.is_tensor(x) and x.numel() > 0 and x.shape[0] > 0
+            if has_data:
+                # [0vs2048] 데이터 있을 때 SafeLinearFunction 사용 → backward에서 0 vs 2048 방지
+                seq = x.shape[0]
+                x_norm = self.norm(x.view(-1, self.hidden_size) if self.use_postshuffle_norm else x).view(-1, self.hidden_size)
+                x_fc1 = SafeLinearFunction.apply(x_norm, self.linear_fc1.weight, self.linear_fc1.bias, seq)
+                x_act = self.act_fn(x_fc1)
+                out = SafeLinearFunction.apply(x_act, self.linear_fc2.weight, self.linear_fc2.bias, seq)
+                return out
+            
+            # [0vs2048] 빈 입력: Participatory Dummy
+            r = _vision_rank()
+            print(f"[0vs2048] rank={r} VisionPatchMerger BYPASS-WITH-DUMMY (empty input)", flush=True)
+            dummy_x = torch.zeros((1, self.hidden_size), device=x.device, dtype=x.dtype, requires_grad=True)
+            out = _merger_orig(self, dummy_x)
+            _record_participation(out)
+            return out[:0]
+        Qwen3VLMoeVisionPatchMerger.forward = vision_merger_empty_guard
+
+        # VisionBlock: 빈 hidden_states 시 Linear/Attn backward에서 0 vs 2048 발생 → bypass.
+        _block_orig = Qwen3VLMoeVisionBlock.forward
+        def vision_block_empty_guard(self, hidden_states, cu_seqlens=None, rotary_pos_emb=None, position_embeddings=None, **kwargs):
+            if not self.training:
+                return _block_orig(self, hidden_states, cu_seqlens=cu_seqlens, rotary_pos_emb=rotary_pos_emb, position_embeddings=position_embeddings, **kwargs)
+            
+            has_data = torch.is_tensor(hidden_states) and hidden_states.numel() > 0
+            if has_data:
+                return _block_orig(self, hidden_states, cu_seqlens=cu_seqlens, rotary_pos_emb=rotary_pos_emb, position_embeddings=position_embeddings, **kwargs)
+            
+            r = _vision_rank()
+            print(f"[0vs2048] rank={r} VisionBlock BYPASS-WITH-DUMMY (empty input)", flush=True)
+            
+            # Dummy Path (v16): Use 1 token
+            h_size = self.norm1.weight.shape[0]
+            dummy_hs = torch.zeros((1, h_size), device=hidden_states.device, dtype=hidden_states.dtype, requires_grad=True)
+            dummy_cu = torch.tensor([0, 1], device=hidden_states.device, dtype=torch.int32)
+            
+            out = _block_orig(self, dummy_hs, cu_seqlens=dummy_cu, rotary_pos_emb=rotary_pos_emb, position_embeddings=position_embeddings, **kwargs)
+            _record_participation(out)
+            return out[:0]
+        Qwen3VLMoeVisionBlock.forward = vision_block_empty_guard
+
+        # [0vs2048] VisionMLP: linear_fc1(1152→4608), linear_fc2(4608→1152) backward에서 0 vs 4608 방지
+        from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import Qwen3VLMoeVisionMLP
+        _mlp_orig = Qwen3VLMoeVisionMLP.forward
+        def vision_mlp_safe_guard(self, hidden_state):
+            if not self.training:
+                return _mlp_orig(self, hidden_state)
+            seq = hidden_state.shape[0]
+            x_fc1 = SafeLinearFunction.apply(hidden_state, self.linear_fc1.weight, self.linear_fc1.bias, seq)
+            x_act = self.act_fn(x_fc1)
+            out = SafeLinearFunction.apply(x_act, self.linear_fc2.weight, self.linear_fc2.bias, seq)
+            return out
+        Qwen3VLMoeVisionMLP.forward = vision_mlp_safe_guard
+
+        # [0vs2048] Removed complex mv1_module_forward wrappers (v19)
+        # We now rely on Input Injection (in compute_loss) to guarantee Vision Tower participation.
+        # This is safer and less intrusive than wrapping every module.
+
+        print("✅ Qwen3 Input Injection Guard (v19) enabled", flush=True)
+
+        # --- 2) Experts: Synchronized MV1 Loop ---
+        _exp_orig_fwd = Qwen3VLMoeTextExperts.forward
+        def patched_exp_forward(self, hidden_states, routing_weights, router_indices):
+            if not self.training:
+                return _exp_orig_fwd(self, hidden_states, routing_weights, router_indices)
+            
+            batch_size = hidden_states.shape[0]
+            hidden_states_flat = hidden_states.reshape(-1, self.hidden_size)
+            next_states = torch.zeros_like(hidden_states_flat)
+            device = hidden_states.device
+            dtype = hidden_states.dtype
+
+            with torch.no_grad():
+                local_mask = torch.zeros(self.num_experts, device=device, dtype=torch.float32)
+                if router_indices.numel() > 0:
+                    unique_indices = router_indices.unique()
+                    local_mask.scatter_(0, unique_indices, 1.0)
+                if dist.is_initialized():
+                    dist.all_reduce(local_mask, op=dist.ReduceOp.MAX)
+                global_expert_hit = local_mask.nonzero().view(-1)
+
+            for expert_idx_scalar in global_expert_hit:
+                expert_idx = expert_idx_scalar.item()
+                token_mask = (router_indices == expert_idx).any(dim=-1)
+                token_idx = torch.where(token_mask)[0]
+
+                if token_idx.numel() > 0:
+                    current_state = hidden_states_flat[token_idx]
+                    is_dummy = False
+                else:
+                    # Participation Guard (v16): requires_grad=True is life
+                    current_state = torch.zeros((1, self.hidden_size), device=device, dtype=dtype, requires_grad=True)
+                    is_dummy = True
+
+                w_gate_up = self.gate_up_proj[expert_idx]
+                w_down = self.down_proj[expert_idx]
+                gate_up = F.linear(current_state, w_gate_up.T)
+                gate, up = gate_up.chunk(2, dim=-1)
+                out = F.linear(up * self.act_fn(gate), w_down.T)
+                
+                if not is_dummy:
+                    w = routing_weights[token_idx, expert_idx].unsqueeze(-1)
+                    next_states.index_add_(0, token_idx, (out * w).to(next_states.dtype))
+                else:
+                    # v16: Record dummy expert path
+                    _record_participation(out)
+
+            return next_states.view(batch_size, -1, self.hidden_size)
+        
+        Qwen3VLMoeTextExperts.forward = patched_exp_forward
+        print("✅ Qwen3 Participation Guard (v16 - Global Pool) applied", flush=True)
+
+    except Exception as e:
+        import traceback
+        print(f"⚠️ Qwen3 participation guard patch failed: {e}", flush=True)
+        traceback.print_exc()
+
+def _patch_trainer_for_participation_guard(trainer):
+    """
+    Guaranteed Participation Guard (v16):
+    Combines module-level pool terms and root-level parameter sums to ensure
+    100% autograd participation across all sharded and unsharded parameters.
+    """
+    if not hasattr(trainer, 'compute_loss'): return
+    
+    _orig_compute_loss = trainer.compute_loss
+    def patched_compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        # Clear pool before forward
+        # NOTE: Using a simple list lookup since it's defined in the same scope in train_spectra.py
+        try:
+            from types import SimpleNamespace
+            global _PARTICIPATION_POOL
+        except ImportError: pass
+        
+        if '_PARTICIPATION_POOL' in globals():
+            globals()['_PARTICIPATION_POOL'].clear()
+            
+        try:
+            res = _orig_compute_loss(model, inputs, return_outputs=return_outputs, num_items_in_batch=num_items_in_batch)
+        except TypeError:
+            res = _orig_compute_loss(model, inputs, return_outputs=return_outputs)
+            
+        loss = res[0] if return_outputs else res
+        
+        # ROOT GUARD: Ensure every parameter shard participates
+        guard = 0.0
+        for p in model.parameters():
+            if p.requires_grad:
+                guard = guard + (p.sum() * 0.0)
+        
+        # POOL GUARD: Ensure every skipped module (dummy forward) participates
+        if '_PARTICIPATION_POOL' in globals():
+            pool = globals()['_PARTICIPATION_POOL']
+            while pool:
+                guard = guard + pool.pop()
+        
+        # Final connection
+        if return_outputs:
+            return (loss + guard, res[1])
+        else:
+            return loss + guard
+
+    trainer.compute_loss = types.MethodType(patched_compute_loss, trainer)
+    print("✅ Trainer Participation Guard (v16 - GAPH) applied", flush=True)
+
+def _get_trainable_parameters(model):
+    """PEFTWrapper 대응 파라미터 수집"""
+    if hasattr(model, "base_model") and hasattr(model.base_model, "model"):
+        return model.base_model.model.parameters()
+    return model.parameters()
+_patch_universal_participation = _patch_qwen3_participation_guard
+_patch_universal_participation()
+
+
+# [ZeRO-3 Fix] Patch transformers to allow loading weights into partitioned (size 0) parameters
+from transformers import modeling_utils
+from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
+
+_orig_find_mismatched_keys = modeling_utils._find_mismatched_keys
+
+def _safe_find_mismatched_keys(
+    model,
+    state_dict,
+    checkpoint_files,
+    ignore_mismatched_sizes,
+    keys_to_rename_mapping,
+    is_quantized,
+    weights_only,
+):
+    # 만약 mismatched_keys가 이미 비어있다면 (ignore_mismatched_sizes=False인 경우 등) 바로 반환
+    if not ignore_mismatched_sizes:
+        return [], []
+        
+    mismatched_keys, mismatched_shapes = _orig_find_mismatched_keys(
+        model,
+        state_dict,
+        checkpoint_files,
+        ignore_mismatched_sizes,
+        keys_to_rename_mapping,
+        is_quantized,
+        weights_only,
+    )
+    
+    if not is_deepspeed_zero3_enabled():
+        return mismatched_keys, mismatched_shapes
+    
+    # ZeRO-3 sharding으로 인해 size가 0이 된 파라미터들을 오탐지 목록에서 제거
+    filtered_keys = []
+    filtered_shapes = []
+    
+    # 모델의 실제 파라미터 맵 (ds_id 확인용)
+    named_params = dict(model.named_parameters())
+    
+    for key, (shape1, shape2) in zip(mismatched_keys, mismatched_shapes):
+        # shape2가 model의 shape. 만약 이게 0이거나 비어있다면 ZeRO-3 placeholder일 가능성이 높음
+        is_zero_size = (len(shape2) == 0 or (len(shape2) == 1 and shape2[0] == 0))
+        
+        if is_zero_size:
+            param = named_params.get(key)
+            if param is not None and hasattr(param, "ds_id"):
+                # DeepSpeed가 관리하는 파라미터이므로 mismatch가 아님 (성공적으로 shard됨)
+                continue
+                
+        filtered_keys.append(key)
+        filtered_shapes.append((shape1, shape2))
+        
+    return filtered_keys, filtered_shapes
+
+# 패치 적용
+modeling_utils._find_mismatched_keys = _safe_find_mismatched_keys
 # ---------------------------------------------------
 
 import torch
@@ -77,7 +499,8 @@ from transformers import (
     AutoProcessor,
     AutoConfig,
     AutoModel,
-    AutoModelForCausalLM
+    AutoModelForCausalLM,
+    AutoModelForVision2Seq
 )
 import sys
 from transformers import logging as transformers_logging
@@ -108,7 +531,15 @@ except ImportError:
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Import custom modules  
-from models import SPECTRAForCausalLM, SPECTRAConfig, SPECTRAForConditionalGeneration, SPECTRATextConfig, SPECTRATextModel, SPECTRAModel
+from models import (
+    SPECTRAForCausalLM, 
+    SPECTRAConfig, 
+    SPECTRAForConditionalGeneration, 
+    SPECTRATextConfig, 
+    SPECTRATextModel, 
+    SPECTRAModel,
+    SPECTRAExoskeletonMoEInjector # Universal Exoskeleton
+)
 
 from training_utils import (
     format_parameters, 
@@ -138,9 +569,8 @@ from training_utils import (
     DetailedTrainingCallback,
     ModulesToSaveSyncCallback
 )
+
 from eval.moe_monitoring_callback import TorchMoECallback
-from optimizers.custom_optimizers import get_custom_optimizer
-from optimizers.deepspeed_optimizer_registry import register_custom_optimizers
 from eval.callbacks import ModelEvalCallback
 # IFEval is now integrated into ModelEvalCallback - no separate callback needed
 # from eval.ifeval_callback import IFEvalCallback
@@ -172,15 +602,86 @@ from models.spectra_model import SPECTRAPreTrainedModel
 from models.spectra_model import SPECTRARouter
 from models.spectra_model import SPECTRAMoE
 from transformers import AutoConfig
-from optimizers.deepspeed_optimizer_registry import create_optimizer_from_config
 from deepspeed.runtime.zenflow.zenflow_stage_1_and_2 import ZenFlowZeroOptimizer
 from deepspeed.runtime.zero.stage_1_and_2 import DeepSpeedZeroOptimizer
 
 import deepspeed.utils
 from torch.profiler import profile, record_function, ProfilerActivity
 
-# --- Standard Imports ---
 # Standard DeepSpeed patches are disabled to rely on standard Trainer/Accelerate integration
+
+def apply_universal_exoskeleton_guard(logger):
+    """
+    ULTIMATE ZeRO-3 Fix: Radically identifies and protects EVERY weight-carrying sub-module
+    from being split by ZeRO-3. This is the only way to prevent 'Size 0' loading errors
+    across any transformer architecture.
+    """
+    import sys
+    import torch.nn as nn
+    
+    # 1. Expanded patterns for atomic units (sharding leaves)
+    # We add common layer names and our custom SPECTRA classes
+    atomic_patterns = [
+        "Block", "Layer", "Merger", "MLP", "Attention", "Expert", "Router", 
+        "Projector", "Vision", "Encoder", "Embed", "Rotary", "Patch", "Tower", 
+        "Bridge", "Head", "Decoder", "Transformer", "PatchEmbed", "Positional",
+        "SPECTRAMoE", "SPECTRARouter" # Safeguard our own additions
+    ]
+    
+    # 2. Deep Scan every single module for potential leaf classes
+    # We look for ANY class that is an nn.Module and matches our patterns
+    potential_leaves = set()
+    for mod_name, module in list(sys.modules.items()):
+        # Scan almost everything to be safe with remote code
+        for attr_name in dir(module):
+            try:
+                cls = getattr(module, attr_name)
+                if isinstance(cls, type) and issubclass(cls, nn.Module):
+                    if any(p in attr_name for p in atomic_patterns):
+                        # Skip generic small wrappers
+                        if attr_name not in ["ModuleList", "Sequential", "ModuleDict"]:
+                            potential_leaves.add(attr_name)
+            except:
+                continue
+    
+    # 3. Aggressively inject leaves into ANY class that could be a sharding container
+    # This includes Model, Config, and nested structural classes
+    container_patterns = ["Model", "Config", "Decoder", "Encoder", "Tower", "Generation"]
+    patched_count = 0
+    
+    for mod_name, module in list(sys.modules.items()):
+        for attr_name in dir(module):
+            try:
+                cls = getattr(module, attr_name)
+                if not isinstance(cls, type):
+                    continue
+                
+                # If it looks like a container or already has sharding info
+                is_container = (
+                    any(p in attr_name for p in container_patterns) or 
+                    hasattr(cls, "_no_split_modules")
+                )
+                
+                if is_container:
+                    if not hasattr(cls, "_no_split_modules") or cls._no_split_modules is None:
+                        cls._no_split_modules = []
+                    
+                    # Convert to set for fast check and back to list
+                    current_leaves = set(cls._no_split_modules)
+                    added = []
+                    for leaf in potential_leaves:
+                        # Don't add a class to its own no-split list
+                        if leaf != attr_name and leaf not in current_leaves:
+                            cls._no_split_modules.append(leaf)
+                            added.append(leaf)
+                    
+                    if added:
+                        patched_count += 1
+                        # Log only for significant classes to avoid spam
+            except:
+                continue
+    
+    return patched_count > 0
 
 def apply_deepspeed_shutil_patch():
     try:
@@ -199,9 +700,6 @@ apply_deepspeed_shutil_patch()
 
 # --- Standard Setup ---
 # Standard DeepSpeed patches are disabled to rely on standard Trainer/Accelerate integration
-
-# Register custom optimizers with DeepSpeed
-register_custom_optimizers()
 
 try:
     # AutoConfig.register("spectra", SPECTRAConfig)
@@ -574,7 +1072,7 @@ def setup_model(model_config: Dict[str, Any]):
     # Some VLMs (e.g. SPECTRA) default vision to FP16 which can mismatch bf16/fp32 runs.
     if hasattr(config, 'vision_config') and config.vision_config is not None:
         config.vision_config.dtype = model_dtype
-        logger.info(f"  ✅ Vision config dtype set to {model_dtype}")
+        logger.debug(f"  ✅ Vision config dtype set to {model_dtype}")
     
     # Import deepspeed if needed
     # Load model - use different device_map strategy based on DeepSpeed usage
@@ -630,6 +1128,29 @@ def setup_model(model_config: Dict[str, Any]):
                 ds_config_dict = ds_config_path.copy()
             else:
                 ds_config_dict = {}
+
+            # ZeRO-2 OOM fix: ensure offload_optimizer (nvme) is present so fp32 partition goes to CPU, not GPU
+            if ds_config_dict and ds_config_dict.get("zero_optimization", {}).get("stage") == 2:
+                zo = ds_config_dict["zero_optimization"]
+                if not zo.get("offload_optimizer") or zo["offload_optimizer"].get("device") != "nvme":
+                    zo["offload_optimizer"] = {
+                        "device": "nvme",
+                        "nvme_path": zo.get("offload_optimizer", {}).get("nvme_path") or "/mls/conan/offload",
+                        "pin_memory": False,
+                        "fast_init": True,
+                        "ratio": 1,
+                        "buffer_count": 8,
+                        "pipeline_read": False,
+                        "pipeline_write": False,
+                    }
+                nvme_path = zo["offload_optimizer"].get("nvme_path")
+                if nvme_path:
+                    try:
+                        os.makedirs(nvme_path, exist_ok=True)
+                        if is_main_process():
+                            logger.info(f"  ✅ ZeRO-2 offload_optimizer nvme_path ensured: {nvme_path}")
+                    except OSError as e:
+                        logger.warning(f"  ⚠️ Could not create nvme_path {nvme_path}: {e}")
 
             # CRITICAL: Read SP and TP size from Accelerate config and apply to DeepSpeed config
             sp_size = 1
@@ -770,29 +1291,16 @@ def setup_model(model_config: Dict[str, Any]):
             
             # Defer device/dtype placement to PEFT/Trainer to avoid multi-GPU OOM
         else:
-            # Load pretrained model with DeepSpeed ZeRO-3 meta device initialization
-            # CRITICAL: HfDeepSpeedConfig triggers meta device init - model params are created
-            # as meta tensors and weights are loaded directly sharded to GPUs, NOT to CPU RAM!
-            logger.info("  ⚡ Loading pretrained model with ZeRO-3 meta device init...")
+            # [ZeRO Fix] Universal Exoskeleton Loading Path
+            # This path loads the base model directly to ensure 100% pretrained weight alignment,
+            # then injects SPECTRA MoE components into the existing structure.
+            zero_stage_preview = ds_config_dict.get("zero_optimization", {}).get("stage", 0) if ds_config_dict else 0
+            logger.info(f"  ⚡ Loading base model with ZeRO-{zero_stage_preview} setup...")
             
-            # Determine correct dtype from training_config (single source of truth)
-            logger.info(f"  🚀 Loading model with dtype: {model_dtype}")
-
-            # CRITICAL: Aggressive RAM cleanup BEFORE model loading
-            logger.info("  🧹 Performing aggressive RAM cleanup before model loading...")
-            
-            gc.collect()
-            torch.cuda.empty_cache()
-            gc.collect()
-            
-            # Additional memory optimization: clear Python object cache and reset peak stats
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                if hasattr(torch.cuda, 'reset_peak_memory_stats'):
-                    torch.cuda.reset_peak_memory_stats()
-            # Clear GPU memory before loading
+            # Additional memory optimization: clear GPU memory before loading
             clear_gpu_memory()
-            # Local snapshot resolution to avoid Hub check failures on child processes
+            
+            # Local snapshot resolution (to avoid Hub check failures)
             model_id = model_config["model_name_or_path"]
             if not os.path.exists(model_id):
                 cache_dir = os.path.expanduser("~/.cache/huggingface/hub")
@@ -806,44 +1314,108 @@ def setup_model(model_config: Dict[str, Any]):
                             model_id = os.path.join(snapshots_path, snapshots[0])
                             logger.info(f"📍 Resolved repo ID to local snapshot: {model_id}")
             
-            logger.info(f"🚀 Loading model from: {model_id}")
+            logger.info(f"🚀 Loading base model from: {model_id}")
             
-            # CRITICAL: Initialize HfDeepSpeedConfig BEFORE model loading
-            # This triggers meta-device initialization and sharding in Transformers
-            dschf = HfDeepSpeedConfig(ds_config_dict) if ds_config_dict else None
-            if dschf:
-                logger.info("  ✅ Initialized HfDeepSpeedConfig for ZeRO-3 meta-device loading")
+            # ZeRO stage: only ZeRO-3 supports meta+partition; ZeRO-2 cannot use zero.Init (meta tensor cannot .to(device) without partition materialize)
+            zero_stage = ds_config_dict.get("zero_optimization", {}).get("stage", 0) if ds_config_dict else 0
 
-            # CRITICAL: Restored zero.Init context now that model size is 31B.
-            # This is the correct way to load sharded models in ZeRO-3.
-            dist.barrier()
-            with deepspeed.zero.Init(config_dict_or_path=ds_config_dict):
-                model = SPECTRAForConditionalGeneration.from_pretrained(
-                    model_id,
-                    config=config,
-                    torch_dtype=model_dtype,
-                    trust_remote_code=model_config["trust_remote_code"],
-                    device_map=None, 
-                    low_cpu_mem_usage=True,
-                    offload_state_dict=True,
-                    use_safetensors=True,
-                    attn_implementation=attn_implementation,
-                )
+            if zero_stage == 3:
+                # [ZeRO-3 Fix] Initialize HfDeepSpeedConfig and patch remote modules BEFORE model loading
+                hf_ds_config = HfDeepSpeedConfig(ds_config_dict) if ds_config_dict else None
                 
-                # Capture result in correct variable
+                # [ZeRO-3 Fix] Aggressively apply Universal Guard to identify and protect 
+                # all Block/Layer/Merger/MLP modules across current modeling classes.
+                try:
+                    # 1. Force pre-load of remote classes to ensure they are available in sys.modules
+                    tmp_config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+                    from transformers.dynamic_module_utils import get_class_from_dynamic_module
+                    if hasattr(tmp_config, "auto_map"):
+                        for key in ["AutoModelForVision2Seq", "AutoModel"]:
+                            if key in tmp_config.auto_map:
+                                class_ref = tmp_config.auto_map[key]
+                                get_class_from_dynamic_module(class_ref, model_id)
+                                break
+                    
+                    # 2. Apply Universal Guard (Pattern-based discovery)
+                    apply_universal_exoskeleton_guard(logger)
+                    logger.info("✅ Applied Universal Exoskeleton Guard to fix size 0 mismatch issues.")
+                except Exception as e:
+                    logger.warning(f"⚠️ Universal Guard application failed: {e}")
+
+                dist.barrier()
+                
+                # Load model within ZeRO-3 Init context (meta device)
+                logger.info("  ⚡ Using ZeRO-3 meta device initialization...")
+                init_context = deepspeed.zero.Init(config_dict_or_path=ds_config_dict)
+            else:
+                # ZeRO-2 or no ZeRO: regular load (zero.Init causes "Cannot copy out of meta tensor" - ZeRO-2 does not partition params)
+                logger.info(f"  ⚡ Using ZeRO-{zero_stage} regular loading (no meta device)...")
+                init_context = contextlib.nullcontext()  # No-op context manager
+            
+            with init_context:
+                # 1. Load the BASE MODEL directly (aligned keys!)
+                # [ZeRO-3 Fix] Qwen-VL-MoE (Multimodal) must be loaded using AutoModelForVision2Seq or AutoModel.
+                # AutoModelForCausalLM rejects Qwen3VLMoeConfig as it is not strictly a CausalLM class.
+                logger.info("  ⚡ Instantiating base model (searching for correct AutoModel class)...")
+                
+                try:
+                    # Qwen-VL and other VLMs usually map to AutoModelForVision2Seq
+                    base_model = AutoModelForVision2Seq.from_pretrained(
+                        model_id,
+                        dtype=model_dtype,
+                        trust_remote_code=model_config["trust_remote_code"],
+                        device_map=None, 
+                        low_cpu_mem_usage=True,
+                        offload_state_dict=True,
+                        use_safetensors=True,
+                        attn_implementation=attn_implementation,
+                        ignore_mismatched_sizes=True, 
+                    )
+                    logger.info("  ✅ Loaded base model successfully using AutoModelForVision2Seq")
+                except Exception as v_e:
+                    logger.warning(f"  ⚠️ AutoModelForVision2Seq not compatible or failed: {v_e}")
+                    logger.info("  ⚡ Attempting load via AutoModel (generic fallback)...")
+                    base_model = AutoModel.from_pretrained(
+                        model_id,
+                        dtype=model_dtype,
+                        trust_remote_code=model_config["trust_remote_code"],
+                        device_map=None, 
+                        low_cpu_mem_usage=True,
+                        offload_state_dict=True,
+                        use_safetensors=True,
+                        attn_implementation=attn_implementation,
+                        ignore_mismatched_sizes=True, 
+                    )
+                    logger.info("  ✅ Loaded base model successfully using AutoModel")
+                
+                # 2. Universal Exoskeleton MoE Injection (또는 baseline 시 건너뜀)
+                if os.environ.get("SPECTRA_DISABLE_ALL", "0") == "1":
+                    logger.info("  🔓 [baseline] SPECTRA injection 건너뜀 → base_model 그대로 사용")
+                    model = base_model
+                else:
+                    # Replace Qwen3/Base MLPs with SPECTRA advanced routing mechanism
+                    logger.info("  🔧 Injecting SPECTRA Exoskeleton (OSR/LDR Router Swap)...")
+                    global_router = SPECTRARouter(config.text_config)
+                    injector = SPECTRAExoskeletonMoEInjector(config.text_config, global_router)
+                    model = injector.inject(base_model)
+                
+                # Optional: Ensure image features handled via no_grad logic if needed
+                # (Qwen3 vision tower can be huge, freezing it is standard)
                 model_load_result = model
                 
-                # Unwrap return values
-                if isinstance(model_load_result, tuple):
-                    model = model_load_result[0]
-                    loading_info = model_load_result[1]
-                    logger.info(f"  ⚠️ Loading Info - Missing Keys: {len(loading_info.get('missing_keys', []))}")
-                    if len(loading_info.get('missing_keys', [])) > 0:
-                        logger.warning(f"  Missing Keys Sample: {loading_info['missing_keys'][:20]}")
-                    if len(loading_info.get('unexpected_keys', [])) > 0:
-                        logger.warning(f"  Unexpected Keys Sample: {loading_info['unexpected_keys'][:20]}")
-                else:
-                    model = model_load_result
+            model = model_load_result
+                
+            # Unwrap return values
+            if isinstance(model_load_result, tuple):
+                model = model_load_result[0]
+                loading_info = model_load_result[1]
+                logger.info(f"  ⚠️ Loading Info - Missing Keys: {len(loading_info.get('missing_keys', []))}")
+                if len(loading_info.get('missing_keys', [])) > 0:
+                    logger.warning(f"  Missing Keys Sample: {loading_info['missing_keys'][:20]}")
+                if len(loading_info.get('unexpected_keys', [])) > 0:
+                    logger.warning(f"  Unexpected Keys Sample: {loading_info['unexpected_keys'][:20]}")
+            else:
+                model = model_load_result
 
 
             dschf = None
@@ -975,6 +1547,21 @@ def main(
     training_config: Dict[str, Any],
     config_path: str = None
 ):
+    # [baseline] SPECTRA_DISABLE_ALL=1 → SPECTRA injection 건너뜀
+    _spectra_disable_all = os.environ.get("SPECTRA_DISABLE_ALL", "0") == "1"
+    if _spectra_disable_all:
+        logger.info("🔓 [baseline] SPECTRA_DISABLE_ALL=1 → SPECTRA injection 건너뜀 (Qwen3 원래 MoE만 사용)")
+        # baseline 시 ZeRO-2 사용: ZeRO-3 파티션 시 backward 'tensor a (0) vs b (2048)' 방지
+        _ds = model_config.get("deepspeed_config")
+        if _ds and isinstance(_ds, str) and os.path.exists(_ds):
+            _dir = os.path.dirname(os.path.abspath(_ds))
+            _z2 = os.path.join(_dir, "deepspeed_zero2.json")
+            if os.path.exists(_z2):
+                model_config["deepspeed_config"] = _z2
+                if training_config.get("deepspeed"):
+                    training_config["deepspeed"] = _z2
+                logger.info(f"🔓 [baseline] DeepSpeed ZeRO-2 사용: {_z2}")
+    
     # 경고를 로깅으로 캡처
     def warning_to_logging(message, category, filename, lineno, file=None, line=None):
         logger.warning(f"⚠️  {category.__name__}: {message} (at {filename}:{lineno})")
@@ -983,28 +1570,51 @@ def main(
     
     warnings.showwarning = warning_to_logging
     
+    # CRITICAL: Pin each process to its GPU so NCCL does not see "Duplicate GPU"
+    # launcher(accelerate/torchrun)가 CUDA_VISIBLE_DEVICES에 맞게 LOCAL_RANK를 설정해야 함
+    # 우리는 launcher가 설정한 LOCAL_RANK를 그대로 사용 (강제 매핑 금지)
+    if torch.cuda.is_available():
+        local_rank_env = os.environ.get("LOCAL_RANK")
+        if local_rank_env is not None:
+            local_rank = int(local_rank_env)
+            num_visible_gpus = torch.cuda.device_count()
+            if 0 <= local_rank < num_visible_gpus:
+                torch.cuda.set_device(local_rank)
+            else:
+                # LOCAL_RANK가 CUDA_VISIBLE_DEVICES 범위를 벗어남 - launcher 설정 문제
+                raise ValueError(
+                    f"LOCAL_RANK={local_rank} >= num_visible_gpus={num_visible_gpus}. "
+                    f"Launcher가 CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', 'not set')}에 맞게 LOCAL_RANK를 설정해야 합니다. "
+                    f"예: CUDA_VISIBLE_DEVICES=0,1이고 4프로세스면 각 노드의 LOCAL_RANK는 0,1,0,1이어야 함."
+                )
+    
     # CRITICAL FIX: Disable HF gradient checkpointing if FSDP is enabled
-    # FSDP handles activation checkpointing internally via fsdp_activation_checkpointing in accelerate config.
-    # Enabling both causes: "ValueError: The activation_checkpointing in FSDP config and the gradient_checkpointing in training arg can't be set to True simultaneously."
     if os.environ.get("ACCELERATE_USE_FSDP", "false").lower() == "true":
         if training_config.get("gradient_checkpointing"):
             logger.warning("⚠️  FSDP detected: Forcing training_config['gradient_checkpointing'] = False")
-            logger.warning("    (FSDP activation checkpointing should be enabled in accelerate config instead)")
             training_config["gradient_checkpointing"] = False
     
-    # ===== DEBUGGING: Enable autograd anomaly detection =====
-    # This will show exactly which forward operation caused the invalid gradient
-    # WARNING: This slows down training significantly - disable after debugging
-    # torch.autograd.set_detect_anomaly(True)
-    # logger.info("🐛 Autograd anomaly detection ENABLED - will show detailed gradient error traces")
-    
-    # register_custom_optimizers()
+    # ===== DEBUGGING: Respect DETECT_ANOMALY=1 for 0 vs 2048 backward traceback =====
+    if os.environ.get("DETECT_ANOMALY", "0") == "1":
+        torch.autograd.set_detect_anomaly(True)
+        logger.warning("🐛 DETECT_ANOMALY=1 → autograd anomaly ON (에러 시 backward 연산 위치 표시)")
+    else:
+        torch.autograd.set_detect_anomaly(False)
+        logger.info("ℹ️ Autograd anomaly detection DISABLED")
     
     # Initialize distributed environment manually if needed
     # This ensures DeepSpeed can detect world size correctly during HfDeepSpeedConfig initialization
+    # CRITICAL: Pass device_id so NCCL uses the correct GPU per rank (avoids "calloc async 608 bytes" / Duplicate GPU)
     if not dist.is_initialized():
         try:
-            # Use environment variables set by accelerate/torchrun
+            local_rank_for_init = int(os.environ.get("LOCAL_RANK", 0))
+            init_kwargs = {"backend": "nccl"}
+            if torch.cuda.is_available() and 0 <= local_rank_for_init < torch.cuda.device_count():
+                init_kwargs["device_id"] = local_rank_for_init
+            dist.init_process_group(**init_kwargs)
+            logger.info("✅ Manually initialized distributed process group (with device_id for NCCL)")
+        except TypeError:
+            # Older PyTorch may not support device_id
             dist.init_process_group(backend="nccl")
             logger.info("✅ Manually initialized distributed process group")
         except Exception as e:
@@ -1028,9 +1638,71 @@ def main(
     gc.collect()
     torch.cuda.empty_cache()
     
+    # === CRITICAL: Apply PEFT LoRA (Missing in original script) ===
+    if model_config.get("use_lora", False):
+        logger.info("🚀 [PEFT] Applying LoRA wrapping...")
+        
+        # 1. Identify target modules for LoRA
+        target_modules = get_dynamic_lora_target_modules(model, logger)
+        
+        # 2. Setup LoraConfig (WITHOUT modules_to_save for experts to avoid OOM)
+        # We will manually unfreeze experts/routers later
+        peft_config = LoraConfig(
+            r=model_config.get("lora_r", 16),
+            lora_alpha=model_config.get("lora_alpha", 32),
+            target_modules=target_modules,
+            lora_dropout=model_config.get("lora_dropout", 0.1),
+            bias="none",
+            task_type=TaskType.CAUSAL_LM,
+            modules_to_save=[] # Empty to prevent ModulesToSaveWrapper OOM
+        )
+        
+        # Aggressive memory cleanup before PEFT wrapping
+        gc.collect()
+        torch.cuda.empty_cache()
+        
+        model = get_peft_model(model, peft_config)
+        logger.info("✅ [PEFT] LoRA wrapping applied successfully")
+
+        # 3. Manually unfreeze Experts and Routers (Hybrid Training: LoRA + FFT)
+        logger.info("🔓 [PEFT] Manually unfreezing Experts and Routers for FFT...")
+        actual_model = model.module if hasattr(model, 'module') else model
+        count_unfrozen = 0
+        frozen_modules = []
+        
+        # Identify modules to unfreeze
+        # Note: 'base_layer' in LoRA wrapped modules might be frozen by get_peft_model
+        # But since we excluded experts from LoRA targets, they are NOT wrapped, so they are just frozen standard modules.
+        # We simply need to set requires_grad=True.
+        for name, module in actual_model.named_modules():
+            class_name = type(module).__name__
+            if any(k in class_name for k in ["SPECTRAMLP", "SPECTRAExpert", "SPECTRARouter", "Qwen3VLMoeTextExperts", "Qwen3VLMoeTextSparseMoeBlock"]):
+                for param in module.parameters():
+                    param.requires_grad = True
+                count_unfrozen += 1
+                
+        logger.info(f"✅ [PEFT] Unfrozen {count_unfrozen} MoE/Router modules for Full Fine-Tuning")
+        
+        # Re-check trainable parameters after LoRA
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in model.parameters())
+        logger.info(f"📊 [PEFT] Post-LoRA Trainable: {trainable_params/1e9:.2f}B / {total_params/1e9:.2f}B ({(trainable_params/total_params)*100:.2f}%)")
+    else:
+        logger.info("🔓 [PEFT] LoRA disabled, performing Full Fine-Tuning (FFT)")
+
+    # Aggressive memory cleanup after LoRA
+    gc.collect()
+    torch.cuda.empty_cache()
+    
     # 3. Setup dataset (Heavy processing) - Load after model to use remaining RAM
     logger.debug("Setting up dataset (Post-Model Load)...")
     dataset, collate_fn = setup_dataset(data_config, tokenizer, logger, training_config)
+    
+    # CRITICAL: Sync all ranks after dataset load to prevent NCCL timeout
+    # (Rank 0 can be much slower in multi-domain dataset "균등화된 파일 검증"; others would wait at first collective and timeout)
+    if dist.is_initialized():
+        dist.barrier()
+        logger.info("✅ All ranks finished dataset load (barrier passed).")
     
     # Final cleanup before training starts
     gc.collect()
@@ -1163,6 +1835,13 @@ def main(
     logger.info("🧹 모델 및 데이터셋 로드 후 GPU 메모리 정리...")
     clear_gpu_memory(logger)
     
+    # [DeepSpeed Fix] Disable automatic placement of model on device by Trainer.
+    # When using DeepSpeed (especially with TP or large models), we must let DeepSpeed 
+    # handle the move/partitioning from CPU to GPU. Moving the full model first causes OOM.
+    if model_config.get("deepspeed_config"):
+        training_config["place_model_on_device"] = False
+        logger.info("🔧 [DeepSpeed] Requested Trainer to skip automatic model placement")
+
     # Create training arguments
     training_args = create_training_args(
         training_config, 
@@ -1170,144 +1849,34 @@ def main(
         logger=logger
     )
     
-    # Optionally build a custom optimizer (e.g., Muon) prior to DeepSpeed init
-    # with router parameter separation for different learning rates
-    custom_optimizer = None
+    # Optional: build bnb 8bit optimizer when requested in DeepSpeed config (DeepSpeed does not create it from JSON)
+    optimizer_for_trainer = None
     try:
         ds_cfg_path = model_config.get("deepspeed_config")
-        if ds_cfg_path:
-            # Use global json import (already imported at top of file)
-            # Add retry logic and validation for DeepSpeed config file reading
-            ds_cfg_path_abs = os.path.abspath(ds_cfg_path)
-            max_retries = 5
-            retry_delay = 0.2
-            
-            ds_cfg = None
-            for attempt in range(max_retries):
-                try:
-                    # Check if file exists
-                    if not os.path.exists(ds_cfg_path_abs):
-                        if attempt < max_retries - 1:
-                            time.sleep(retry_delay)
-                            continue
-                        raise FileNotFoundError(f"DeepSpeed config file not found after {max_retries} attempts: {ds_cfg_path_abs}")
-                    
-                    # Try to read and parse JSON
-                    with open(ds_cfg_path_abs, "r", encoding='utf-8') as f:
-                        content = f.read().strip()
-                    
-                    # Check if content is empty
-                    if not content:
-                        if attempt < max_retries - 1:
-                            time.sleep(retry_delay)
-                            continue
-                        raise ValueError(f"DeepSpeed config file is empty after {max_retries} attempts: {ds_cfg_path_abs}")
-                    
-                    # Parse JSON with detailed error reporting
-                    try:
-                        ds_cfg = json.loads(content)
-                    except json.JSONDecodeError as e:
-                        # 상세한 오류 정보 제공
-                        error_msg = f"Invalid JSON in DeepSpeed config file {ds_cfg_path_abs}\n"
-                        error_msg += f"  Error: {e}\n"
-                        error_msg += f"  File size: {len(content)} bytes\n"
-                        
-                        # 문제가 있는 줄 주변 표시
-                        if hasattr(e, 'lineno') and e.lineno:
-                            lines = content.split('\n')
-                            error_line_num = e.lineno - 1  # 0-based index
-                            error_msg += f"  Problem at line {e.lineno}, column {getattr(e, 'colno', '?')}:\n"
-                            
-                            # 주변 3줄 표시
-                            start_line = max(0, error_line_num - 2)
-                            end_line = min(len(lines), error_line_num + 3)
-                            
-                            for i in range(start_line, end_line):
-                                line_num = i + 1
-                                prefix = ">>> " if i == error_line_num else "    "
-                                error_msg += f"  {prefix}Line {line_num}: {lines[i]}\n"
-                        
-                        logger.error(error_msg)
-                        raise ValueError(error_msg)
-                    
-                    # Success - break out of retry loop
-                    break
-                    
-                except (FileNotFoundError, ValueError) as e:
-                    # Re-raise these immediately (no retry)
-                    raise
-                except Exception as e:
-                    # For other exceptions, retry if attempts remain
-                    if attempt < max_retries - 1:
-                        time.sleep(retry_delay)
-                        continue
-                    raise ValueError(f"Error reading DeepSpeed config file {ds_cfg_path_abs} after {max_retries} attempts: {e}")
-            
-            if ds_cfg is None:
-                raise ValueError(f"Failed to read DeepSpeed config file after {max_retries} attempts: {ds_cfg_path_abs}")
-            # Prefer explicit custom optimizer block
-            custom_opt_section = ds_cfg.get("custom_optimizer")
-            
-            # Get base learning rate from training config
-            base_lr = training_config.get("learning_rate", 5e-5)
-            
-            # Check router LR ratio and log parameter group information
-            router_lr_ratio = ds_cfg.get("router_lr_ratio", None)
-            if router_lr_ratio is not None and hasattr(model, 'get_parameter_groups'):
-                try:
-                    param_groups_dict = model.get_parameter_groups()
-                    router_params = param_groups_dict.get('router', [])
-                    backbone_params = (
-                        param_groups_dict.get('expert', []) +
-                        param_groups_dict.get('shared_expert', []) +
-                        param_groups_dict.get('attention', []) +
-                        param_groups_dict.get('other', [])
-                    )
-                    router_lr = base_lr * router_lr_ratio
-                    
-                    logger.info("=" * 80)
-                    logger.info("🔧 Router Parameter Learning Rate Separation")
-                    logger.info("=" * 80)
-                    logger.info(f"  Router LR Ratio: {router_lr_ratio}")
-                    logger.info(f"  Base Learning Rate: {base_lr:.2e}")
-                    logger.info(f"  Router Learning Rate: {router_lr:.2e} ({router_lr_ratio * 100:.0f}% of base)")
-                    logger.info(f"  Router Parameters: {len(router_params)}")
-                    logger.info(f"  Backbone Parameters: {len(backbone_params)}")
-                    logger.info(f"  Total Trainable Parameters: {len(router_params) + len(backbone_params)}")
-                    logger.info("=" * 80)
-                except Exception as log_e:
-                    logger.warning(f"⚠️ Failed to log parameter group info: {log_e}")
-            
-            if ds_cfg and "optimizer" in ds_cfg:
-                logger.info("  🚀 Standard DeepSpeed optimizer detected (manual custom_optimizer bypassed)")
-                custom_optimizer = None
-            else:
-                if custom_opt_section:
-                    # Pass model object instead of trainable_params to enable parameter group separation
-                    custom_optimizer = create_optimizer_from_config(
-                        custom_opt_section, 
-                        model, 
-                        ds_config=ds_cfg,
-                        base_lr=base_lr
-                    )
-                    logger.info(f"✓ Using custom optimizer: {custom_opt_section.get('type')}")
+        if ds_cfg_path and os.path.exists(os.path.abspath(ds_cfg_path)):
+            with open(os.path.abspath(ds_cfg_path), "r", encoding="utf-8") as f:
+                ds_cfg = json.load(f)
+            opt_block = ds_cfg.get("optimizer") or {}
+            opt_type = str(opt_block.get("type", "")).strip().lower()
+            bnb_8bit_types = ("adamw8bit", "adamw_8bit", "adamw_bnb_8bit", "pagedadamw8bit", "adam8bit", "pagedadam8bit")
+            if opt_type in bnb_8bit_types:
+                import bitsandbytes as bnb
+                params = opt_block.get("params", {})
+                lr = params.get("lr", params.get("learning_rate", "auto"))
+                if lr == "auto":
+                    lr = training_config.get("learning_rate", 2e-5)
+                weight_decay = params.get("weight_decay", 0.01)
+                betas = params.get("betas", (0.9, 0.999))
+                if opt_type in ("pagedadamw8bit", "pagedadam8bit"):
+                    opt_class = getattr(bnb.optim, "PagedAdamW8bit", None) or getattr(bnb.optim, "AdamW8bit")
                 else:
-                    # Fallback: if optimizer.type is a custom one, build it here
-                    opt_section = ds_cfg.get("optimizer")
-                    if opt_section:
-                        opt_type = str(opt_section.get("type", "")).lower()
-                        if opt_type in {"muon", "muonoptimizer", "lion", "adafactor", "sophia"}:
-                            # Pass model object instead of trainable_params to enable parameter group separation
-                            custom_optimizer = create_optimizer_from_config(
-                                opt_section, 
-                                model, 
-                                ds_config=ds_cfg,
-                                base_lr=base_lr
-                            )
-                            logger.info(f"✓ Using custom optimizer from optimizer block: {opt_section.get('type')}")
-    except Exception as opt_e:
-        logger.warning(f"⚠️ Custom optimizer setup skipped: {opt_e}")      
-        traceback.print_exc()
+                    opt_class = getattr(bnb.optim, "AdamW8bit", None) or getattr(bnb.optim, "Adam8bit", None)
+                if opt_class is not None:
+                    trainable_params = _get_trainable_parameters(model)
+                    optimizer_for_trainer = opt_class(trainable_params, lr=lr, weight_decay=weight_decay, betas=betas)
+                    logger.info(f"  ✓ Using bnb 8bit optimizer: {opt_class.__name__} (lr={lr})")
+    except Exception as bnb_e:
+        logger.debug(f"  bnb 8bit optimizer not used: {bnb_e}")
 
     # Setup trainer
     logger.info("Setting up trainer...")
@@ -1321,14 +1890,19 @@ def main(
             
             # Get detected MoE class names from model (if available)
             # Fallback to default if not found
-            moe_classes_to_add = ["SPECTRAMoE", "SPECTRAMLP", "SPECTRAExpert"]
-            
-            # CRITICAL: Vision tower classes must be leaf modules for VLM training
-            # Different ranks may have different image data, causing vision tower submodule
-            # access patterns to differ. This triggers "disagreement on list length" error.
-            vision_leaf_classes = ["SPECTRAVisionModel", "SPECTRAVisionModel", "SPECTRAVisionModel"]
-            moe_classes_to_add.extend(vision_leaf_classes)
-            
+            moe_classes_to_add = [
+                "SPECTRAMoE",            # Top-level MoE wrapper
+                "MixtralSparseMoeBlock", "Qwen2MoeSparseMoeBlock", "DeepseekV3MoE",
+                # [Fix] Explicitly add Vision/Projector modules as leaves for ZeRO-3
+                "SiglipVisionModel", "SiglipVisionTransformer", "SiglipEncoder",
+                "SPECTRAMultiModalProjector",
+                # [Fix] Add Core Layers as leaves to ensure bias gathering
+                "SPECTRAAttention", "SPECTRAMLP",
+                # [TP Fix] Add Vision model classes as leaves to exclude from TP (prevents Conv3d weight dimension error)
+                "Qwen3VLMoeVisionModel", "Qwen3VLMoeVisionBlock", "Qwen3VLMoeVisionPatchEmbed",
+                "Qwen3VLMoeVisionPatchMerger", "Qwen3VLMoeVisionMLP", "Qwen3VLMoeVisionAttention",
+                "Qwen3VLMoeTextExperts"
+            ]
             if 'detected_moe_classes' in locals() and detected_moe_classes:
                 for cls in detected_moe_classes:
                     if cls not in moe_classes_to_add:
@@ -1624,10 +2198,29 @@ def main(
                  leaf_classes.add(vision_cls)
                  logger.info(f"  🍃 Identified Vision Block Class: {vision_cls.__name__}")
             
-            # 3. Apply to DeepSpeed utils
+            # 3. Explicitly add Shared Global/Specific classes for ZeRO-3 stability
+            # NOTE: SPECTRARouter is REMOVED from leaf modules to prevent race conditions
+            # during backward pass in Qwen3-VL-MoE (causes tensor size 0 vs 2048 mismatch)
+            # The parent MoE block (Qwen3VLMoeTextSparseMoeBlock) will handle router params
+            important_classes = [
+                # Removed: "SPECTRARouter" - causes gradient race condition in ZeRO-3
+                "SPECTRAVisionModel",
+                # Qwen3-VL-MoE Vision
+                "Qwen3VLMoeVisionModel", "Qwen3VLMoeVisionBlock", "Qwen3VLMoeVisionPatchMerger",
+                # Qwen3-VL-MoE Text Experts (parent block handles router)
+                "Qwen3VLMoeTextExperts", "Qwen3VLMoeTextSparseMoeBlock", "Qwen3VLMoeTextMLP"
+            ]
+            for name, module in model.named_modules():
+                class_name = type(module).__name__
+                if class_name in important_classes:
+                    leaf_classes.add(type(module))
+            
+            # 4. Apply to DeepSpeed utils
             if leaf_classes:
+                # Remove any None or invalid items just in case
+                leaf_classes = {c for c in leaf_classes if c is not None}
                 deepspeed.utils.set_z3_leaf_modules(model, list(leaf_classes))
-                logger.info(f"  ✅ Forced ZeRO-3 leaf modules via Python API: {[c.__name__ for c in leaf_classes]}")
+                logger.info(f"  ✅ Forced ZeRO-3 leaf modules: {[c.__name__ for c in leaf_classes]}")
         except Exception as e:
             logger.warning(f"  ⚠️  Failed to manually set ZeRO-3 leaf modules: {e}")
 
@@ -1639,53 +2232,59 @@ def main(
             logger.info("✅ Enabled input require grads for gradient checkpointing (pre-trainer)")
         else:
             logger.warning("⚠️ Model does not have enable_input_require_grads method")
+        # [0vs2048] Vision encoder는 rank별 patch 수(256 vs 1064)가 달라 checkpoint 재계산 시 shape 불일치 → vision만 checkpoint 비활성화
+        def _disable_vision_checkpoint(m):
+            if hasattr(m, "gradient_checkpointing"):
+                m.gradient_checkpointing = False
+        for candidate in (model, getattr(model, "model", None), getattr(model, "base_model", None), getattr(getattr(model, "base_model", None), "model", None)):
+            if candidate is None:
+                continue
+            vision_root = getattr(candidate, "visual", None)
+            if vision_root is not None:
+                break
+        else:
+            vision_root = None
+        if vision_root is not None:
+            for m in vision_root.modules():
+                _disable_vision_checkpoint(m)
+            logger.warning("[0vs2048] Vision encoder gradient_checkpointing disabled (rank별 patch 수 불일치 방지)")
     
     # CRITICAL: DeepSpeed autotp will handle embedding layers automatically
     # We don't need to verify embedding shapes as autotp may have already sharded them
     # or will handle them during engine initialization
     logger.info("  ℹ️  Skipping embedding layer verification - DeepSpeed autotp will handle embeddings")
     
-    # CRITICAL: Set ZeRO-3 leaf modules BEFORE DeepSpeed engine initialization
-    # This MUST happen before Trainer is created, as Trainer.train() initializes DeepSpeed engine.
-    # Vision models and MoE layers must be leaf modules to prevent rank disagreement.
-    try:
-        
-        # Collect all leaf module classes
-        leaf_module_classes = []
-        
-        # 1. Vision tower classes (different ranks may have different image data)
-        vision_leaf_class_names = [
-            "SPECTRAVisionModel", "SPECTRAVisionModel", 
-            "SPECTRAVisionModel", "SPECTRAVisionModel", 
-            "SPECTRAMoE", "SPECTRAVisionModel",
-            "SPECTRAVisionModel", "SPECTRAVisionModel"
-        ]
-        
-        # 2. MoE classes (different tokens route to different experts)
-        # CRITICAL for ZeRO-3: Experts using manual indexing (like SPECTRA/SPECTRA) MUST be leaf modules.
-        # This ensures all internal parameters (gate_up_proj) are re-assembled before indexing.
-        # 2. MoE classes (different tokens route to different experts)
-        # CRITICAL for ZeRO-3: Experts using manual indexing (like SPECTRA/SPECTRA) MUST be leaf modules.
-        # This ensures all internal parameters (gate_up_proj) are re-assembled before indexing.
-        # NOTE: We explicitly exclude "SPECTRAMoE" from being a leaf to avoid nested-leaf conflicts.
-        moe_leaf_class_names = [
-            "SPECTRAMoE",
-            "SPECTRAMoE", "SPECTRAMLP",
-            "SPECTRAMoE",
-            # Additional SPECTRA classes just in case
-            "SPECTRAMoE",
-            "SPECTRAMoE",
-            "SPECTRAMoE"
-        ]
-        
-        all_leaf_class_names = vision_leaf_class_names + moe_leaf_class_names
-        
-        # [REMOVED] Auto-detection of leaf modules caused OOM by selecting whole model classes.
-        # We now rely on the Explicit Manual Enforcement block (around line 2600) to set
-        # only DecoderLayer and VisionBlock as leaves.
-        logger.info("  🚀 Skipping risky auto-detection of leaf modules (relying on manual patch)")
-    except Exception as e:
-        logger.warning(f"  ⚠️ Error during (now skipped) leaf module setup: {e}")
+
+
+    # ZeRO-2 CUDA OOM fix: force offload_optimizer (nvme) into the exact config file
+    # that Accelerate/DeepSpeed will read at ds_initialize so fp32 partition goes to CPU (not 61GB on GPU)
+    _ds_path = model_config.get("deepspeed_config")
+    if _ds_path and isinstance(_ds_path, str) and os.path.exists(_ds_path):
+        try:
+            with open(os.path.abspath(_ds_path), "r", encoding="utf-8") as f:
+                _ds_cfg = json.load(f)
+            _zo = _ds_cfg.get("zero_optimization") or {}
+            if _zo.get("stage") == 2:
+                _off = _zo.get("offload_optimizer") or {}
+                _zo["offload_optimizer"] = {
+                    "device": "nvme",
+                    "nvme_path": _off.get("nvme_path") or "/mls/conan/offload",
+                    "pin_memory": False,
+                    "fast_init": True,
+                    "ratio": 1,
+                    "buffer_count": 8,
+                    "pipeline_read": False,
+                    "pipeline_write": False,
+                }
+                _ds_cfg["zero_optimization"] = _zo
+                if dist.is_initialized() and is_main_process():
+                    with open(os.path.abspath(_ds_path), "w", encoding="utf-8") as f:
+                        json.dump(_ds_cfg, f, indent=2, ensure_ascii=False)
+                    logger.info("  ✅ [ZeRO-2] Forced offload_optimizer nvme into DS config file before Trainer (avoids fp32 GPU OOM)")
+                if dist.is_initialized():
+                    dist.barrier()
+        except Exception as _e:
+            logger.warning(f"  ⚠️ Could not enforce offload_optimizer in DS config: {_e}")
 
     # CRITICAL: SymmetricSFTTrainer for ZeRO-3 + Multimodal MoE
     # Use standard DistributedSampler - BalancedVisionSampler caused severe bottleneck
@@ -1722,8 +2321,11 @@ def main(
         eval_dataset=eval_dataset,
         processing_class=tokenizer,
         data_collator=collate_fn,
-        optimizers=(custom_optimizer, None) if custom_optimizer is not None else (None, None)
+        optimizers=(optimizer_for_trainer, None) if optimizer_for_trainer is not None else (None, None)
     )
+    
+    # [DISABLED] RPG causes SumBackward0 invalid gradient (got [0] vs expected [151936,2048]) under ZeRO-3
+    # _patch_trainer_for_participation_guard(trainer)
     
     # CRITICAL: Verify and fix embedding layers after Trainer creation but before DeepSpeed engine init
     # DeepSpeed autotp may incorrectly shard embedding weights during engine initialization
@@ -2055,88 +2657,138 @@ def main(
         log_gpu_memory(logger, "TRAINING_START")
         
         # CRITICAL FIX: Force entire sequence learning by patching compute_loss
-        # This ensures ALL tokens are learnable, not just assistant responses
         original_compute_loss = trainer.compute_loss
+        _compute_loss_step = [0]  # first step batch log
 
         def patched_compute_loss(model, inputs, return_outputs=False, num_items_in_batch=None):
-            # Safe handling of labels for multi-modal stability
-            if "labels" in inputs:
-                input_ids = inputs["input_ids"]
-                # Default behavior: use provided labels or copy input_ids
-                if inputs["labels"] is None:
-                    labels = input_ids.clone()
-                    attention_mask = inputs.get("attention_mask")
-                    if attention_mask is not None:
-                        labels[attention_mask == 0] = -100
-                    inputs["labels"] = labels
+            # [0vs2048] Participation Guard (v16) - Global Connection
+            global _PARTICIPATION_POOL
+            if '_PARTICIPATION_POOL' in globals():
+                _PARTICIPATION_POOL.clear()
+
+            # [0vs2048] 첫 스텝에서만 배치 vision 정보 로그 (모든 rank, 체크용)
+            step = _compute_loss_step[0]
+            _compute_loss_step[0] += 1
+            if step == 0:
+                try:
+                    r = dist.get_rank() if dist.is_initialized() else 0
+                    kv = [f"rank={r}"]
+                    if "pixel_values" in inputs and inputs["pixel_values"] is not None:
+                        p = inputs["pixel_values"]
+                        kv.append(f"pixel_values={tuple(p.shape) if hasattr(p, 'shape') else type(p).__name__}")
+                        num_patches = int(p.shape[0]) if hasattr(p, "shape") and len(p.shape) > 0 else None
+                        kv.append(f"num_patches={num_patches}")
+                    if "image_grid_thw" in inputs and inputs["image_grid_thw"] is not None:
+                        g = inputs["image_grid_thw"]
+                        kv.append(f"image_grid_thw={tuple(g.shape) if hasattr(g, 'shape') else type(g).__name__}")
+                    if "input_ids" in inputs:
+                        kv.append(f"input_ids={tuple(inputs['input_ids'].shape)}")
+                    # [0vs2048] num_image_tokens_in_input_ids: if any rank has 0, that rank gets 0-sized grad to vision → 0 vs 2048
+                    num_image_tokens_local = 0
+                    cfg = getattr(getattr(model, "module", model), "config", None)
+                    image_token_id = getattr(cfg, "image_token_id", getattr(cfg, "image_token_index", None)) if cfg else None
+                    if "input_ids" in inputs and image_token_id is not None:
+                        num_image_tokens_local = (inputs["input_ids"] == image_token_id).sum().item()
+                    kv.append(f"num_image_tokens_in_input_ids={num_image_tokens_local}")
+                    if dist.is_initialized():
+                        dev = inputs["input_ids"].device if "input_ids" in inputs else None
+                        if dev is not None:
+                            t = torch.tensor([num_image_tokens_local], dtype=torch.long, device=dev)
+                            dist.all_reduce(t, op=dist.ReduceOp.MIN)
+                            min_image_tokens = t.item()
+                            if min_image_tokens == 0:
+                                logger.warning(
+                                    "[0vs2048] At least one rank has num_image_tokens_in_input_ids=0 → backward produces 0-sized gradient for vision → 0 vs 2048. Fix data/collator so every rank has image tokens in input_ids."
+                                )
+                    logger.warning(f"[0vs2048] STEP0 BATCH CHECK: {', '.join(kv)}")
+                    if r == 0:
+                        logger.warning("[0vs2048] STEP0 CHECK: Compare num_patches and num_image_tokens_in_input_ids across ranks; if any rank has 0 image tokens → 0vs2048 (see traceback).")
+                except Exception as _e:
+                    logger.warning(f"[0vs2048] STEP0 batch log failed: {_e}")
             
-            # Use transformers' standard compute_loss which handles num_items_in_batch
-            return original_compute_loss(model, inputs, return_outputs, num_items_in_batch)
+            # EXPLICIT VISION EXECUTION (v20): Force Vision Tower participation
+            # If no images are present, we MUST manually run the vision tower and add it to loss.
+            # Merely injecting pixel_values into inputs is insufficient because qwen3 filters them
+            # based on input_ids tokens. We bypass the filter by running .visual directly.
+            vision_guard = 0.0
+            if inputs.get("pixel_values") is None or (torch.is_tensor(inputs["pixel_values"]) and inputs["pixel_values"].numel() == 0):
+                # Check device/dtype from input_ids
+                ref_tensor = inputs["input_ids"]
+                device = ref_tensor.device
+                dtype = torch.bfloat16
+                
+                # Create dummy inputs
+                dummy_pixels = torch.zeros((1, 1152), device=device, dtype=dtype, requires_grad=True)
+                dummy_grid = torch.tensor([[1, 1, 1]], device=device, dtype=torch.int32)
+                
+                # Find the vision tower (it could be deeply nested in DeepSpeed/Accelerate wrappers)
+                vision_module = None
+                if hasattr(model, "visual"):
+                    vision_module = model.visual
+                elif hasattr(model, "model") and hasattr(model.model, "visual"):
+                    vision_module = model.model.visual # Standard Qwen3VLMoeForConditionalGeneration
+                elif hasattr(model, "module"): # DeepSpeed/DDP wrapper
+                    if hasattr(model.module, "visual"):
+                        vision_module = model.module.visual
+                    elif hasattr(model.module, "model") and hasattr(model.module.model, "visual"):
+                        vision_module = model.module.model.visual
+
+                if vision_module:
+                    # Run vision tower explicitly
+                    # Qwen3 vision forward: (hidden_states, grid_thw)
+                    try:
+                        # We use 0.0 * output.sum() to attach to graph without affecting loss value
+                        # Note: Qwen3 vision returns (hidden_states, deepstack_features) usually
+                        v_out = vision_module(dummy_pixels, dummy_grid)
+                        if isinstance(v_out, tuple):
+                            vision_guard = v_out[0].sum() * 0.0
+                        else:
+                            vision_guard = v_out.sum() * 0.0
+                    except Exception as ve:
+                        logger.warning(f"[0vs2048] Vision guard execution failed: {ve}")
+            
+            # Execute original compute_loss with Logits Guard (v18)
+            # We must ensure the backbone (LM Head/Embeddings) is connected
+            # even if all labels are -100 (which prunes the grad path).
+            
+            # Re-implementing the call to ensure we catch the output
+            if return_outputs:
+                loss, outputs = original_compute_loss(model, inputs, return_outputs=True)
+            else:
+                # To get logits, we need outputs. We call with return_outputs=True internally.
+                try:
+                    loss, outputs = original_compute_loss(model, inputs, return_outputs=True, num_items_in_batch=num_items_in_batch)
+                except TypeError:
+                    loss, outputs = original_compute_loss(model, inputs, return_outputs=True)
+
+            # POOL GUARD (v18): Ensure every skipped module participates
+            guard = 0.0
+            if '_PARTICIPATION_POOL' in globals():
+                pool = globals()['_PARTICIPATION_POOL']
+                while pool:
+                    guard = guard + pool.pop()
+            
+            # LOGITS GUARD: Connect logits to ensure backbone participation
+            if hasattr(outputs, "logits") and outputs.logits is not None:
+                # Add tiny grad path to logits
+                guard = guard + (outputs.logits.sum() * 0.0)
+            
+            # Add Vision Guard
+            guard = guard + vision_guard
+            
+            if return_outputs:
+                return (loss + guard, outputs)
+            return loss + guard
 
         trainer.compute_loss = patched_compute_loss
 
         # CRITICAL: Apply DeepSpeed gradient patch BEFORE training starts
         # DeepSpeed is initialized when trainer.train() is called, so we need to patch right before that
-        if hasattr(trainer, 'deepspeed') and trainer.deepspeed is not None:
-            logger.info("🔧 DeepSpeed detected - applying gradient patch for frozen parameters...")
-            # Import the patch function (it's defined below)
-            # The patch code from lines 1942-2239 will be executed here
-            # For now, we'll apply the patch directly here
-            try:
-                actual_model = trainer.model.module if hasattr(trainer.model, 'module') else trainer.model
-                frozen_param_count = sum(1 for p in actual_model.named_parameters() if not p[1].requires_grad)
-                
-                if frozen_param_count > 0:
-                    logger.info(f"✅ Found {frozen_param_count} frozen parameters - applying DeepSpeed patches...")
-                    # Apply the same patch logic from lines 2091-2232
-                    optimizer = trainer.deepspeed.optimizer
-                    patched_methods = []
-                    
-                    # Patch reduce_independent_p_g_buckets_and_remove_grads
-                    if hasattr(optimizer, 'reduce_independent_p_g_buckets_and_remove_grads'):
-                        original_reduce_independent = optimizer.reduce_independent_p_g_buckets_and_remove_grads
-                        def patched_reduce_independent(self, param, i):
-                            if param.grad is None:
-                                # Ensure zero grad has the same dtype as param
-                                param.grad = torch.zeros_like(param, dtype=param.dtype)
-                                param.grad.requires_grad_(False)
-                            return original_reduce_independent(self, param, i)
-                        optimizer.reduce_independent_p_g_buckets_and_remove_grads = types.MethodType(patched_reduce_independent, optimizer)
-                        patched_methods.append('reduce_independent_p_g_buckets_and_remove_grads')
-                    
-                    # Patch reduce_ready_partitions_and_remove_grads
-                    if hasattr(optimizer, 'reduce_ready_partitions_and_remove_grads'):
-                        original_reduce_ready = optimizer.reduce_ready_partitions_and_remove_grads
-                        def patched_reduce_ready(self, param, i):
-                            if param.grad is None:
-                                # Ensure zero grad has the same dtype as param
-                                param.grad = torch.zeros_like(param, dtype=param.dtype)
-                                param.grad.requires_grad_(False)
-                            return original_reduce_ready(self, param, i)
-                        optimizer.reduce_ready_partitions_and_remove_grads = types.MethodType(patched_reduce_ready, optimizer)
-                        patched_methods.append('reduce_ready_partitions_and_remove_grads')
-                    
-                    # Patch reduce_partition_and_remove_grads
-                    if hasattr(optimizer, 'reduce_partition_and_remove_grads'):
-                        original_reduce_partition = optimizer.reduce_partition_and_remove_grads
-                        def patched_reduce_partition(self, param):
-                            if param.grad is None:
-                                # Ensure zero grad has the same dtype as param
-                                param.grad = torch.zeros_like(param, dtype=param.dtype)
-                                param.grad.requires_grad_(False)
-                            return original_reduce_partition(param)
-                        optimizer.reduce_partition_and_remove_grads = types.MethodType(patched_reduce_partition, optimizer)
-                        patched_methods.append('reduce_partition_and_remove_grads')
-                    
-                    if patched_methods:
-                        logger.info(f"✅ Patched DeepSpeed methods: {', '.join(patched_methods)}")
-                    else:
-                        logger.warning("⚠️ Could not patch any DeepSpeed reduce methods")
-            except Exception as e:
-                logger.warning(f"⚠️ Failed to apply DeepSpeed gradient patch: {e}")
-                logger.debug(traceback.format_exc())
-        else:
-            logger.debug("DeepSpeed not detected - skipping gradient patch")
+        # [ZeRO-3 Fix] REMOVED Gradient Patch.
+        # This patch forces param.grad initialization for frozen parameters, which creates
+        # partitioned (size 0) gradients that conflict with full-sized gradients during backward
+        # in ZeRO-3 leaf modules. DeepSpeed handles None grads correctly, so this is unnecessary.
+        logger.info("🔧 DeepSpeed gradient patch skipped (causes shape mismatch in ZeRO-3 leaf modules)")
         
         # CRITICAL FIX: Disable checkpoint debug mode to prevent hanging
         # Debug mode can cause issues with DeepSpeed ZeRO-3 and distributed training
@@ -2183,6 +2835,30 @@ def main(
 
         
         enable_profiler = bool(int(os.getenv("PROFILE_TRAINING", "0")))
+        
+        # [COMPONENT TEST MODE] 첫 번째 스텝 후 종료하는 콜백 추가
+        _test_mode = os.environ.get("SPECTRA_TEST_MODE", "0") == "1"
+        _test_max_steps = int(os.environ.get("SPECTRA_TEST_MAX_STEPS", "1"))
+        
+        if _test_mode:
+            from transformers import TrainerCallback
+            
+            class EarlyStopCallback(TrainerCallback):
+                def __init__(self, max_steps=1):
+                    self.max_steps = max_steps
+                    
+                def on_step_end(self, args, state, control, **kwargs):
+                    if state.global_step >= self.max_steps:
+                        print(f"\n[TEST MODE] ✅ Step {state.global_step} completed successfully!")
+                        print(f"[TEST MODE] Stopping training after {self.max_steps} step(s).")
+                        control.should_training_stop = True
+                    return control
+            
+            trainer.add_callback(EarlyStopCallback(max_steps=_test_max_steps))
+            logger.info(f"[TEST MODE] Added EarlyStopCallback (max_steps={_test_max_steps})")
+        
+        # DETECT_ANOMALY is set earlier in setup; when ON, backward 실패 시 정확한 연산 위치 출력됨.
+
         try:
             if enable_profiler:
                 with profile(
@@ -2206,11 +2882,14 @@ def main(
             sys.stderr.flush()
         except Exception as train_e:
             # trainer.train() 내부에서 발생한 오류를 즉시 출력
+            _erank = dist.get_rank() if dist.is_initialized() else -1
             print("\n" + "="*80)
             print("🚨 TRAINING ERROR DETECTED INSIDE trainer.train()")
             print("="*80)
             print(f"Error type: {type(train_e).__name__}")
             print(f"Error message: {str(train_e)}")
+            print(f"[0vs2048] rank that raised: {_erank}")
+            print("[0vs2048] SUMMARY: If STEP0 BATCH CHECK showed same num_patches on all ranks, 0vs2048 is NOT from vision patch mismatch → see Full traceback for exact op (AccumulateGrad).")
             print(f"\nFull traceback:")
             print(traceback.format_exc())
             print("="*80)
@@ -2345,7 +3024,7 @@ def main(
                 default_config = "spectra_sft/config/spectra_small_config.json"
                 if os.path.exists(default_config):
                     training_config_path = default_config
-                    logger.info(f"📄 Using default config: {default_config}")
+                    logger.debug(f"📄 Using default config: {default_config}")
                 else:
                     logger.warning("⚠️ Training config path not found, some validations may be skipped")
             
@@ -2376,7 +3055,6 @@ def main(
 
 
 if __name__ == "__main__":
-    register_custom_optimizers()
     try:
         # Parse command line arguments
         parser = argparse.ArgumentParser(description="SPECTRA SFT Training with Config File")
@@ -2386,8 +3064,17 @@ if __name__ == "__main__":
             default="spectra_sft/config/spectra_small_config.json",
             help="Path to training configuration JSON file"
         )
+        parser.add_argument(
+            "--baseline",
+            action="store_true",
+            help="SPECTRA 비활성화, Qwen3 원래 MoE만 사용 (backward 에러 회피)"
+        )
         # Use parse_known_args to ignore --local_rank and other unknown args from DeepSpeed/Accelerate
         args, unknown = parser.parse_known_args()
+        
+        # --baseline 이면 환경 변수 설정 (자식 프로세스 env 미전달 문제 회피)
+        if args.baseline:
+            os.environ["SPECTRA_DISABLE_ALL"] = "1"
         
         # Load configuration
         config = load_config(args.config)

@@ -165,5 +165,57 @@ Contributions are welcome! Please follow these steps:
 4. Add tests if applicable
 5. Submit a pull request
 
+## Memory Management & ZeRO Optimization
+
+### ZeRO Memory Optimization (ZeRO-2/3 + ZenFlow)
+This project uses DeepSpeed ZeRO with ZenFlow for advanced memory optimization, providing the best of both worlds for large MoE models like SPECTRA.
+
+#### Supported Configurations
+- **ZeRO-2 + ZenFlow**: Official combination for maximum performance
+- **ZeRO-3 + ZenFlow**: Experimental combination (may not be officially supported)
+- **ZeRO-3 Only**: Standard ZeRO-3 partitioning without ZenFlow
+
+#### ZenFlow Features (when enabled)
+- **Asynchronous Gradient Updates**: Reduces CPU-GPU stalls during offloading
+- **Selective Gradient Updates**: Prioritizes important gradients for GPU updates
+- **Communication Overlap**: Overlaps computation with communication
+- **Up to 5x speedup** over standard ZeRO-Offload
+
+#### ZenFlow Configuration
+```json
+"zenflow": {
+  "topk_ratio": 0.05,        // Top 5% important gradients updated on GPU
+  "select_strategy": "auto",  // Adaptive selection strategy
+  "select_interval": "auto",  // Adaptive reselection frequency
+  "update_interval": 4,       // Update unimportant gradients every 4 steps
+  "overlap_step": true        // Enable computation-communication overlap
+}
+```
+
+#### ZeRO-3 Features (when stage=3)
+- **Parameter Partitioning**: 16-bit model parameters partitioned across processes
+- **Gradient Partitioning**: Gradients partitioned for memory efficiency
+- **Optimizer State Partitioning**: Optimizer states partitioned to reduce redundancy
+- **NVMe Offloading**: Parameters and optimizer states offloaded to NVMe storage
+
+#### Memory Monitoring
+- Automatic GPU and system RAM monitoring during training
+- Warnings when memory usage exceeds safe thresholds (90% GPU memory, 85% system RAM)
+- ZenFlow/ZeRO-3 specific memory usage tracking and optimization suggestions
+
+#### Environment Variables
+```bash
+# Force disable ZenFlow if RAM OOM occurs
+export DISABLE_ZENFLOW=1
+```
+
+#### Memory Optimization Tips
+1. **Choose the right ZeRO stage**: ZeRO-2 + ZenFlow for best performance, ZeRO-3 for maximum memory efficiency
+2. **Monitor memory usage** in training logs for optimization warnings
+3. **Reduce batch size** if memory issues persist (`per_device_train_batch_size`)
+4. **Enable gradient checkpointing** for additional memory savings (`gradient_checkpointing: true`)
+5. **Use NVMe offload** for maximum memory savings (already configured)
+6. **Disable ZenFlow** (`DISABLE_ZENFLOW=1`) if experiencing RAM OOM issues
+
 ## License
 This project is licensed under the MIT License.

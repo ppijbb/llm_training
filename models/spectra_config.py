@@ -216,6 +216,7 @@ class SPECTRATextConfig(PretrainedConfig):
         topk_group=4,
         n_group=8,
         num_experts_per_tok=8,
+        max_expert_capacity=8192,
         first_k_dense_replace=3,
         norm_topk_prob=True,
         router_aux_loss_coef=5e-3,
@@ -300,6 +301,7 @@ class SPECTRATextConfig(PretrainedConfig):
         self.n_group = n_group
         self.topk_group = topk_group
         self.num_experts_per_tok = num_experts_per_tok
+        self.max_expert_capacity = max_expert_capacity
         self.first_k_dense_replace = first_k_dense_replace
         self.norm_topk_prob = norm_topk_prob
         self.router_aux_loss_coef = router_aux_loss_coef
@@ -354,6 +356,9 @@ class SPECTRATextConfig(PretrainedConfig):
         self.rope_scaling = rope_scaling
         self.attn_implementation = attn_implementation
         self._attn_implementation = attn_implementation
+        if attn_implementation is None:
+            self.attn_implementation = "eager"
+            self._attn_implementation = "eager"
 
         # SOS-RMoE Parameters
         self.log_sinkhorn_enabled = kwargs.get("log_sinkhorn_enabled", True)

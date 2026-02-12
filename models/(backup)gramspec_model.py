@@ -31,6 +31,25 @@ from typing import List, Optional, Tuple, Union, Type
 from tqdm.auto import tqdm
 
 import torch
+
+import torch.nn.init as torch_init
+_original_orthogonal = torch_init.orthogonal_
+
+def safe_orthogonal_(tensor, gain=1):
+    """CPU에서 BFloat16/Float16에 대해 orthogonal_ 초기화 시 발생하는 geqrf_cpu 미지원 오류를 방지"""
+    if tensor.is_meta:
+        return tensor
+    if tensor.device.type == 'cpu' and tensor.dtype in [torch.bfloat16, torch.float16]:
+        with torch.no_grad():
+            t = tensor.to(torch.float32)
+            _original_orthogonal(t, gain=gain)
+            tensor.copy_(t.to(tensor.dtype))
+    else:
+        _original_orthogonal(tensor, gain=gain)
+    return tensor
+
+# Global monkey patch
+torch_init.orthogonal_ = safe_orthogonal_
 import torch.nn as nn
 import torch.nn.functional as F
 # Add dynamo import for torch.compile compatibility
@@ -643,7 +662,7 @@ class ExpressionProjector(nn.Module):
         """Initialize linear projection weights properly"""
         # Use PyTorch's built-in orthogonal initialization
         # This handles dtype and device compatibility automatically
-        torch.nn.init.orthogonal_(self.linear_projection.weight)
+        torch.safe_orthogonal_(self.linear_projection.weight)
         
         # Scale down the weights for better stability
         with torch.no_grad():
@@ -772,8 +791,8 @@ class ManualGRUCell(nn.Module):
         self.weight_ih_cand = nn.Linear(input_size, hidden_size)
         self.weight_hh_cand = nn.Linear(hidden_size, hidden_size)
 
-        nn.init.orthogonal_(self.weight_hh_gates.weight)
-        nn.init.orthogonal_(self.weight_hh_cand.weight)
+        safe_orthogonal_(self.weight_hh_gates.weight)
+        safe_orthogonal_(self.weight_hh_cand.weight)
         nn.init.xavier_uniform_(self.weight_ih_gates.weight)
         nn.init.xavier_uniform_(self.weight_ih_cand.weight)
 
@@ -2124,7 +2143,7 @@ class GramSpecMoEPreTrainedModel(PreTrainedModel):
             if module.method == "precomputed":
                 original_dtype = module.linear_projection.weight.dtype
                 module.to(torch.float32)
-                nn.init.orthogonal_(module.linear_projection.weight)
+                safe_orthogonal_(module.linear_projection.weight)
                 if module.linear_projection.bias is not None:
                     module.linear_projection.bias.data.zero_()
                 module.to(original_dtype)

@@ -69,16 +69,14 @@ def format_params(n: int) -> str:
 
     return f"{n:,} params ({abbrev(n)})"
 
-
+# /home/conan/workspace/llm_training/sft/config/chat_template.txt"
 def _resolve_chat_template_path() -> Optional[Path]:
     """프로젝트 내 chat_template 파일 경로 반환 (있을 경우)."""
     candidates: list[Path] = [
         Path(__file__).resolve().parent.parent
-        / "app"
-        / "src"
-        / "const"
-        / "template"
-        / "chat_template",
+        / "sft"
+        / "config"
+        / "chat_template.txt",
     ]
     env_path = os.getenv("CHAT_TEMPLATE_PATH", "").strip()
     if env_path:
@@ -257,7 +255,9 @@ def model_test(save_directory: str) -> None:
         do_sample=False,
         disable_compile=True,
     )
-    out = processor.decode(generated.cpu(), skip_special_tokens=True)
+    out = processor.batch_decode(generated.cpu(), skip_special_tokens=True)
+    if isinstance(out, list):
+        out = out[0]    
     print(generated.shape)
     print(out)
 
@@ -319,17 +319,21 @@ if __name__ == "__main__":
     MODEL_NAME = os.getenv("QUANTIZE_MODEL_NAME", "Gunulhona/Gemma-3-27B-v2")
     HF_REPO_NAME = os.getenv("QUANTIZE_HF_REPO", "Gunulhona/Gemma-3-27B-v2-w4a16")
 
-    model = quantize_gemma3(
-        model_name=MODEL_NAME,
-        save_directory=SAVE_DIR,
-        bits=4,
-        group_size=128,
-    )
+    # model = quantize_gemma3(
+    #     model_name=MODEL_NAME,
+    #     save_directory=SAVE_DIR,
+    #     bits=4,
+    #     group_size=128,
+    # )
 
-    if model is not None:
-        model_test(save_directory=SAVE_DIR)
-        token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
-        if token:
-            upload(save_directory=SAVE_DIR, hf_repo_name=HF_REPO_NAME, token=token)
-        else:
-            print("HF_TOKEN not set; skipping upload.")
+    # if model is not None:
+    #     model_test(save_directory=SAVE_DIR)
+    #     token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
+    #     if token:
+    #         upload(save_directory=SAVE_DIR, hf_repo_name=HF_REPO_NAME, token=token)
+    #     else:
+    #         print("HF_TOKEN not set; skipping upload.")
+    model_test(save_directory=SAVE_DIR)
+    token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
+    if token:
+        upload(save_directory=SAVE_DIR, hf_repo_name=HF_REPO_NAME, token=token)

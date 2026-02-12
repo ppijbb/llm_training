@@ -8,6 +8,23 @@ import logging
 from typing import Dict, Any, Optional
 from trl import SFTConfig
 
+class CustomSFTConfig(SFTConfig):
+    """
+    Custom SFTConfig that allows overriding read-only properties like place_model_on_device.
+    This is necessary for DeepSpeed TP/ZeRO-2 where we want to skip the Trainer's 
+    automatic model.to(device) call.
+    """
+    _place_model_on_device = None
+
+    @property
+    def place_model_on_device(self):
+        if self._place_model_on_device is not None:
+            return self._place_model_on_device
+        # If DeepSpeed is set, always return False to prevent OOM during Trainer initialization
+        if self.deepspeed:
+            return False
+        return True
+
 
 def create_training_args(
     training_config: Dict[str, Any], 
@@ -33,11 +50,17 @@ def create_training_args(
     training_config_copy.pop("deepspeed_config", None)
     training_config_copy.pop("deepspeed_config_file", None)
     
-    # Create SFTConfig with all parameters (without deepspeed key)
-    training_args = SFTConfig(
+    # Handle place_model_on_device logic
+    place_val = training_config_copy.pop("place_model_on_device", None)
+
+    # Create CustomSFTConfig with all parameters (without deepspeed key)
+    training_args = CustomSFTConfig(
         **training_config_copy,
         dataset_kwargs={"skip_prepare_dataset": True}
     )
+    
+    if place_val is not None:
+        training_args._place_model_on_device = place_val
     
     # Add DeepSpeed config if provided (AFTER SFTConfig creation to avoid JSON parsing during init)
     if deepspeed_config:
@@ -124,6 +147,10 @@ def create_training_args(
             off_opt = (zero.get("offload_optimizer") or {}).get("device", "none").lower()
             off_param = (zero.get("offload_param") or {}).get("device", "none").lower()
             zero_stage = zero.get("stage", 0)
+            # Param offloading 금지 (param offloading 금지)
+            if off_param != "none":
+                logger.error("❌ Param offload is forbidden (param offloading 금지). Set zero_optimization.offload_param.device to 'none' in your DeepSpeed config.")
+                raise ValueError("Param offload must be disabled (offload_param.device='none'). Param offloading 금지.")
             logger.info(f"DeepSpeed zero stage: {zero_stage}, offload_optimizer: {off_opt}, offload_param: {off_param}")
             if zero_stage == 3 and (off_opt != "none" or off_param != "none"):
                 logger.warning("⚠️ WARNING: Using ZeRO-3 with CPU offload may cause router learning issues!")

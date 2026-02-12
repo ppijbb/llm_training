@@ -1,0 +1,433 @@
+[0;32m================================================================================[0m
+[0;32m        SPECTRA SFT DeepSpeed Training with Small Model Configuration      [0m
+[0;32m================================================================================[0m
+[1;33mProject Root:[0m /home/conan/workspace/llm_training
+[1;33mConfig File:[0m /home/conan/workspace/llm_training/spectra_sft/config/spectra_qwen_config.json
+[1;33mNumber of GPUs:[0m 2
+[0;34mDeepSpeed Config:[0m /home/conan/workspace/llm_training/spectra_sft/config/deepspeed_zero3.json
+[1;33mOutput Directory:[0m /mls/conan/training_logs/spectra_qwen_outputs
+[1;33mCUDA Devices:[0m 0,1
+[0;32mStarting DeepSpeed training with 2 GPUs...[0m
+✅ Qwen3 Input Injection Guard (v19) enabled
+✅ Qwen3 Participation Guard (v16 - Global Pool) applied
+✅ Qwen3 Input Injection Guard (v19) enabled
+✅ Qwen3 Participation Guard (v16 - Global Pool) applied
+✅ [Pre-Init] Set CUDA device to 0
+   🔍 Verifying: torch.cuda.current_device() == 0
+✅ Siglip 초기화 함수들 패치 적용됨
+🚨 `vision_tower` is part of SPECTRAModel.__init__'s signature, but not documented. Make sure to add it to the docstring of the function in /home/conan/workspace/llm_training/models/spectra_model.py.
+🚨 `language_model` is part of SPECTRAModel.__init__'s signature, but not documented. Make sure to add it to the docstring of the function in /home/conan/workspace/llm_training/models/spectra_model.py.
+✅ Siglip 초기화 함수들 패치 적용됨
+🚨 `vision_tower` is part of SPECTRAModel.__init__'s signature, but not documented. Make sure to add it to the docstring of the function in /home/conan/workspace/llm_training/models/spectra_model.py.
+🚨 `language_model` is part of SPECTRAModel.__init__'s signature, but not documented. Make sure to add it to the docstring of the function in /home/conan/workspace/llm_training/models/spectra_model.py.
+✓ Config loaded from: /home/conan/workspace/llm_training/spectra_sft/config/spectra_qwen_config.json
+✓ Config loaded from: /home/conan/workspace/llm_training/spectra_sft/config/spectra_qwen_config.json
+00:34:22 | INFO     | ℹ️ Autograd anomaly detection DISABLED
+NCCL version 2.27.3+cuda12.9
+00:34:23 | INFO     | ✅ Manually initialized distributed process group (with device_id for NCCL)
+00:34:23 | INFO     | 🚀 Starting tokenizer setup...
+00:34:23 | INFO     | 🔤 Loading tokenizer from: Qwen/Qwen3-VL-30B-A3B-Instruct
+DeepSpeed environment variables set
+00:34:28 | INFO     |   ✅ AutoProcessor loaded successfully
+00:34:28 | INFO     | 🚀 Starting model setup...
+00:34:28 | INFO     | 🔧 Setting up DeepSpeed environment...
+DeepSpeed environment variables set
+00:34:28 | INFO     |   ℹ️  No rope_scaling found in config, using default
+00:34:28 | INFO     |   ✅ flash-attn-3 package detected - using flash_attention_3
+00:34:28 | INFO     | Loading base model configuration...
+00:34:28 | INFO     |   🔓 Explicitly set tie_word_embeddings = False for NVMe offloading compatibility
+00:34:28 | INFO     | SPECTRA configuration created successfully
+00:34:28 | INFO     |   Shared experts: 0, Routed experts: 128, Experts per token: 8
+00:34:28 | INFO     | Using DeepSpeed - letting DeepSpeed handle device placement
+00:34:28 | INFO     | 🤖 Loading SPECTRA model...
+00:34:28 | INFO     | 🤖 Model path: Qwen/Qwen3-VL-30B-A3B-Instruct
+00:34:28 | INFO     | 🤖 Device map: None
+00:34:28 | INFO     | 🤖 Attention implementation: flash_attention_3
+00:34:28 | INFO     | 🔧 GPU Memory [BEFORE_MODEL_LOAD] - Allocated: 0.00GB, Reserved: 0.00GB
+00:34:28 | INFO     |   🚀 Using HfDeepSpeedConfig for direct meta device initialization (no CPU load)
+00:34:28 | INFO     | ✅ Relying on JSON/Accelerate config for DeepSpeed Buffer and NVMe settings
+00:34:28 | INFO     | ⚠️  autotp_size already set in DeepSpeed config, skipping tensor_model_parallel_size from Accelerate
+00:34:28 | INFO     |   ℹ️  Will set tp_injection_policy to exclude embedding layers during DeepSpeed init
+00:34:28 | INFO     | ✅ ZeRO-3 configured to work with TP size 2
+00:34:28 | INFO     |   📊 World size for batch calculation: 2
+00:34:28 | INFO     |   🗑️  Removing train_batch_size from DeepSpeed config to bypass assertion checks
+00:34:28 | INFO     |   💾 Saved modified DeepSpeed config to temporary file: /tmp/tmpnl40739t.json
+00:34:28 | INFO     |   📤 Exported DEEPSPEED_CONFIG_FILE=/tmp/tmpnl40739t.json
+00:34:28 | INFO     |   ⚡ Loading base model with ZeRO-3 setup...
+00:34:28 | INFO     | 📍 Resolved repo ID to local snapshot: /home/conan/.cache/huggingface/hub/models--Qwen--Qwen3-VL-30B-A3B-Instruct/snapshots/9c4b90e1e4ba969fd3b5378b57d966d725f1b86c
+00:34:28 | INFO     | 🚀 Loading base model from: /home/conan/.cache/huggingface/hub/models--Qwen--Qwen3-VL-30B-A3B-Instruct/snapshots/9c4b90e1e4ba969fd3b5378b57d966d725f1b86c
+00:34:28 | WARNING  | ⚠️  FutureWarning: `torch.distributed.reduce_op` is deprecated, please use `torch.distributed.ReduceOp` instead (at /home/conan/workspace/llm_training/spectra_sft/train_spectra.py:639)
+🚨 Config not found for parakeet. You can manually add it to HARDCODED_CONFIG_FOR_MODELS in utils/auto_docstring.py
+🚨 Config not found for parakeet. You can manually add it to HARDCODED_CONFIG_FOR_MODELS in utils/auto_docstring.py
+🚨 Config not found for parakeet. You can manually add it to HARDCODED_CONFIG_FOR_MODELS in utils/auto_docstring.py
+🚨 Config not found for parakeet. You can manually add it to HARDCODED_CONFIG_FOR_MODELS in utils/auto_docstring.py
+🚨 Config not found for parakeet. You can manually add it to HARDCODED_CONFIG_FOR_MODELS in utils/auto_docstring.py
+🚨 Config not found for parakeet. You can manually add it to HARDCODED_CONFIG_FOR_MODELS in utils/auto_docstring.py
+00:34:32 | INFO     | Unable to initialize backend 'cuda': 
+00:34:32 | INFO     | Unable to initialize backend 'rocm': module 'jaxlib.xla_extension' has no attribute 'GpuAllocatorConfig'
+00:34:32 | INFO     | Unable to initialize backend 'tpu': INTERNAL: Failed to open libtpu.so: libtpu.so: cannot open shared object file: No such file or directory
+00:34:32 | WARNING  | An NVIDIA GPU may be present on this machine, but a CUDA-enabled jaxlib is not installed. Falling back to cpu.
+INFO 02-13 00:34:35 [__init__.py:216] Automatically detected platform cuda.
+00:34:35 | WARNING  | ⚠️  FutureWarning: `BestOfNSampler` is deprecated and will be removed in TRL 0.25. (at /home/conan/miniconda3/envs/llm_train/lib/python3.12/site-packages/trl/extras/best_of_n_sampler.py:24)
+00:34:35 | WARNING  | ⚠️  UserWarning: TRL currently only supports vLLM version `0.10.2`. You have version 0.11.0 installed. We recommend to install this version to avoid compatibility issues. (at /home/conan/miniconda3/envs/llm_train/lib/python3.12/site-packages/trl/import_utils.py:91)
+INFO 02-13 00:34:35 [__init__.py:216] Automatically detected platform cuda.
+00:34:36 | WARNING  | ⚠️  FutureWarning: `torch.distributed.reduce_op` is deprecated, please use `torch.distributed.ReduceOp` instead (at /home/conan/workspace/llm_training/spectra_sft/train_spectra.py:656)
+00:34:36 | INFO     | ✅ Applied Universal Exoskeleton Guard to fix size 0 mismatch issues.
+00:34:36 | INFO     |   ⚡ Using ZeRO-3 meta device initialization...
+00:34:37 | INFO     |   ⚡ Instantiating base model (searching for correct AutoModel class)...
+00:34:37 | WARNING  | ⚠️  FutureWarning: The class `AutoModelForVision2Seq` is deprecated and will be removed in v5.0. Please use `AutoModelForImageTextToText` instead. (at /home/conan/miniconda3/envs/llm_train/lib/python3.12/site-packages/transformers/models/auto/modeling_auto.py:2284)
+00:37:39 | INFO     |   ✅ Loaded base model successfully using AutoModelForVision2Seq
+00:37:39 | INFO     |   🔧 Injecting SPECTRA Exoskeleton (OSR/LDR Router Swap)...
+00:37:39 | INFO     | 💉 Injecting SPECTRA Exoskeleton (Type: qwen3_vl_moe) into base model...
+00:37:39 | INFO     | ✅ SPECTRA Exoskeleton injection complete (48 layers hijacked)
+00:37:39 | INFO     |  ✅ Model loaded.
+00:37:39 | INFO     | 🔧 Initializing Multi-Modal Projector...
+00:37:39 | INFO     | 🔧 Verifying and Initializing Router Components...
+00:37:39 | INFO     | 🔧 Initializing new LayerNorm components...
+00:37:39 | INFO     |   [setup_model] Router parameters: 13/13 trainable
+00:37:39 | INFO     | 🔧 Ensuring all experts (SPECTRAMLP) are trainable...
+00:37:39 | INFO     | ✅ Applied SliceBackward0 fix to Qwen3VLMoeTextModel
+00:37:39 | INFO     | 🚀 [PEFT] Applying LoRA wrapping...
+00:37:39 | INFO     | 🚀 Dynamically identified 10 LoRA target modules:
+00:37:39 | INFO     |    ['expression_projector', 'gate', 'gate_proj1', 'gate_proj2', 'intent_proj', 'k_proj', 'o_proj', 'priority_proj', 'q_proj', 'v_proj']
+00:37:40 | INFO     | ✅ [PEFT] LoRA wrapping applied successfully
+00:37:40 | INFO     | 🔓 [PEFT] Manually unfreezing Experts and Routers for FFT...
+00:37:40 | INFO     | ✅ [PEFT] Unfrozen 97 MoE/Router modules for Full Fine-Tuning
+00:37:40 | INFO     | 📊 [PEFT] Post-LoRA Trainable: 0.03B / 0.03B (100.00%)
+🛠️ Monkey-patching: Registering 'List' feature type as alias for 'Sequence'
+🛠️ Monkey-patching: Registering 'List' feature type as alias for 'Sequence'
+00:37:41 | INFO     | 💾 Loading Multi-Modal Dataset: HuggingFaceTB/smoltalk (Max: 100000)
+00:37:42 | INFO     | [0vs2048] Collator: pure_qwen_collate_fn | image resize 224x224 → uniform vision patch count across ranks | CHECK: COLLATOR CHECK line = first batch shape, STEP0 BATCH CHECK = per-rank step0 input
+00:37:42 | INFO     | ✅ All ranks finished dataset load (barrier passed).
+00:37:42 | INFO     | ✅ Found 48 MoE layers in model
+00:37:42 | INFO     |    All MoE layers (48):
+00:37:42 | INFO     |      [0] model.language_model.layers.0.mlp (Qwen3VLMoeTextSparseMoeBlock)
+00:37:42 | INFO     |      [1] model.language_model.layers.1.mlp (Qwen3VLMoeTextSparseMoeBlock)
+00:37:42 | INFO     |      [2] model.language_model.layers.2.mlp (Qwen3VLMoeTextSparseMoeBlock)
+00:37:42 | INFO     |      [3] model.language_model.layers.3.mlp (Qwen3VLMoeTextSparseMoeBlock)
+00:37:42 | INFO     |      [4] model.language_model.layers.4.mlp (Qwen3VLMoeTextSparseMoeBlock)
+00:37:42 | INFO     |      ... and 43 more
+00:37:42 | INFO     |    MoE class names found: {'Qwen3VLMoeTextSparseMoeBlock'}
+00:37:42 | INFO     | Dataset already setup.
+00:37:42 | INFO     | 🧹 모델 및 데이터셋 로드 후 GPU 메모리 정리...
+00:37:42 | INFO     | 🧹 Starting GPU memory cleanup...
+00:37:42 | INFO     | 🔧 GPU Memory [BEFORE_CLEANUP] - Allocated: 29.03GB, Reserved: 29.95GB
+00:37:43 | INFO     | 🔧 GPU Memory [AFTER_CLEANUP] - Allocated: 29.03GB, Reserved: 29.95GB
+00:37:43 | INFO     | 🧹 Memory cleanup completed - Freed: 0.00GB allocated, 0.00GB reserved
+00:37:43 | INFO     | 🔧 [DeepSpeed] Requested Trainer to skip automatic model placement
+
+==================================================
+TRAINING CONFIGURATION
+==================================================
+Model: Qwen/Qwen3-VL-30B-A3B-Instruct
+Model parameters: 339.03M total, 339.03M trainable
+Dataset: HuggingFaceTB/smoltalk
+Max sequence length: 131072
+Use LoRA: True
+LoRA rank: 16
+DeepSpeed config: /tmp/tmpbudxoprm.json
+Training epochs: 1
+Batch size per device: 1
+Gradient accumulation steps: 1
+Learning rate: 0.0005
+FP16: False
+BF16: True
+==================================================
+Starting training...
+00:37:43 | INFO     | DeepSpeed config set: /tmp/tmpnl40739t.json
+00:37:43 | INFO     | DeepSpeed zero stage: 3, offload_optimizer: nvme, offload_param: none
+00:37:43 | WARNING  | ⚠️ WARNING: Using ZeRO-3 with CPU offload may cause router learning issues!
+00:37:43 | INFO     | Setting up trainer...
+00:37:43 | INFO     |   🔧 Registering SPECTRAMoE with DeepSpeed...
+00:37:43 | INFO     |   📋 Using detected MoE classes from model: ['Qwen3VLMoeTextSparseMoeBlock', 'SPECTRAMoE']
+00:37:43 | INFO     |   📋 Detected Vision classes from model: {'Qwen3VLMoeVisionModel'}
+00:37:43 | INFO     |   ✅ Added MoE classes to leaf_module.classes: ['MixtralSparseMoeBlock', 'Qwen2MoeSparseMoeBlock', 'DeepseekV3MoE', 'Qwen3VLMoeTextSparseMoeBlock']
+00:37:43 | INFO     |   ✅ Updated DeepSpeed config: /tmp/tmpnl40739t.json
+00:37:43 | INFO     |      moe_leaf_modules: []
+00:37:43 | INFO     |   🔧 Patching Accelerate DeepSpeed plugin to handle missing MoE classes...
+00:37:43 | INFO     |   📋 Found actual MoE classes in model: {'Qwen3VLMoeTextSparseMoeBlock'}
+00:37:43 | INFO     |   🚀 Standard DeepSpeed initialization (manual patches bypassed)
+00:37:43 | INFO     | ✅ Dataset validation: train=1400000, eval=8360
+00:37:43 | INFO     |   🔧 Forcing idempotent patching of DeepSpeedPlugin...
+00:37:43 | INFO     |   ✅ Applied final patch to Accelerate DeepSpeedPlugin.set_moe_leaf_modules (no-op)
+00:37:43 | INFO     |   🍃 Identified Decoder Layer Class: Qwen3VLMoeTextDecoderLayer
+00:37:43 | INFO     |   🍃 Identified Vision Block Class: Qwen3VLMoeVisionBlock
+00:37:43 | INFO     |   ✅ Forced ZeRO-3 leaf modules: ['Qwen3VLMoeTextExperts', 'Qwen3VLMoeVisionModel', 'Qwen3VLMoeTextDecoderLayer', 'Qwen3VLMoeTextSparseMoeBlock', 'Qwen3VLMoeVisionBlock', 'Qwen3VLMoeVisionPatchMerger']
+00:37:43 | INFO     | ✅ Enabled input require grads for gradient checkpointing (pre-trainer)
+00:37:43 | WARNING  | [0vs2048] Vision encoder gradient_checkpointing disabled (rank별 patch 수 불일치 방지)
+00:37:43 | INFO     |   ℹ️  Skipping embedding layer verification - DeepSpeed autotp will handle embeddings
+00:37:43 | WARNING  | ⚠️  Embedding model.model.language_model.embed_tokens has empty weight
+00:37:43 | INFO     |   🔧 Reinitializing embedding model.model.language_model.embed_tokens
+00:37:43 | INFO     |   ✅ Fixed empty embedding model.model.language_model.embed_tokens
+00:37:43 | INFO     |   ✅ Verified and fixed embedding layers after Trainer creation
+00:37:43 | INFO     |   ℹ️  Vision encoder/tower is trainable (freeze_vision=False)
+00:37:43 | INFO     | ================================================================================
+
+================================================================================
+🚀 STARTING TRAINING
+================================================================================
+00:37:47 | INFO     | wandb version 0.24.2 is available!  To upgrade, please run:
+ $ pip install wandb --upgrade
+00:37:47 | INFO     | weave version 0.52.26 is available!  To upgrade, please run:
+ $ pip install weave --upgrade
+00:37:47 | INFO     | Logged in as Weights & Biases user: kevintb.
+View Weave data at https://wandb.ai/kevintb/spectra-sft/weave
+00:37:47 | INFO     | ✅ wandb initialized after Trainer creation
+00:37:47 | INFO     | ✅ MoE monitoring callback added
+00:37:47 | INFO     | ✅ ModulesToSaveSyncCallback added
+00:37:47 | INFO     | ✅ Enabling benchmark callback (mode=step, freq=1000, tasks=['mmlu', 'hellaswag', 'gsm8k', 'truthfulqa', 'arc', 'ifeval', 'mme', 'vqav2', 'textvqa'])
+00:37:47 | INFO     | ✅ All callbacks restored
+
+==================================================
+TRAINING CONFIGURATION
+==================================================
+Model: Qwen/Qwen3-VL-30B-A3B-Instruct
+Model parameters: 339.03M total, 339.03M trainable
+Dataset: HuggingFaceTB/smoltalk
+Max sequence length: 131072
+Use LoRA: True
+LoRA rank: 16
+DeepSpeed config: /tmp/tmpnl40739t.json
+Training epochs: 1
+Batch size per device: 1
+Gradient accumulation steps: 1
+Learning rate: 0.0005
+FP16: False
+BF16: True
+==================================================
+Starting training...
+00:37:47 | INFO     | 🚀 Starting training...
+00:37:47 | INFO     | 🔧 Training configuration:
+00:37:47 | INFO     |   - Epochs: 1
+00:37:47 | INFO     |   - Batch size per device: 1
+00:37:47 | INFO     |   - Gradient accumulation steps: 1
+00:37:47 | INFO     |   - Learning rate: 0.0005
+00:37:47 | INFO     |   - Max sequence length: 131072
+00:37:47 | INFO     | 🔧 Setting up memory-optimized evaluation...
+00:37:47 | INFO     | 🧹 학습 시작 전 GPU 메모리 정리...
+00:37:47 | INFO     | 🧹 Starting GPU memory cleanup...
+00:37:47 | INFO     | 🔧 GPU Memory [BEFORE_CLEANUP] - Allocated: 29.61GB, Reserved: 30.54GB
+00:37:48 | INFO     | 🔧 GPU Memory [AFTER_CLEANUP] - Allocated: 29.32GB, Reserved: 30.54GB
+00:37:48 | INFO     | 🧹 Memory cleanup completed - Freed: 0.29GB allocated, 0.00GB reserved
+00:37:48 | INFO     | 🔧 GPU Memory [TRAINING_START] - Allocated: 29.32GB, Reserved: 30.54GB
+00:37:48 | INFO     | 🔧 DeepSpeed gradient patch skipped (causes shape mismatch in ZeRO-3 leaf modules)
+00:37:48 | INFO     | 🔍 Configuring gradient checkpointing (debug mode disabled for stability)...
+
+================================================================================
+🚀 STARTING TRAINING
+================================================================================
+00:37:48 | INFO     | 🚀 Starting training...
+00:37:48 | INFO     | ✅ Rank 0: Dist initialized. World size: 2
+🔍 Rank 0: Running pre-training consistency check...
+🔍 Rank 1: Running pre-training consistency check...00:37:48 | INFO     | 🔍 Running pre-training consistency check...
+
+00:37:48 | INFO     | 🔍 Verifying model parameter consistency across ranks...
+00:37:48 | INFO     | ✅ Model parameter consistency check passed (all ranks match).
+Adam Optimizer #0 is created with AVX512 arithmetic capability.
+Config: alpha=0.000500, betas=(0.900000, 0.999000), weight_decay=0.010000, adam_w=1
+Stage 3 initialize beginning
+MA 29.29 GB         Max_MA 30.06 GB         CA 30.25 GB         Max_CA 78 GB 
+CPU Virtual Memory:  used = 31.96 GB, percent = 6.3%
+DeepSpeedZeRoOffload initialize [begin]
+MA 29.29 GB         Max_MA 29.29 GB         CA 30.25 GB         Max_CA 30 GB 
+CPU Virtual Memory:  used = 32.04 GB, percent = 6.4%
+Parameter Offload - Persistent parameters statistics: param_count = 1070, numel = 41641218
+DeepSpeedZeRoOffload initialize [end]
+MA 28.97 GB         Max_MA 29.58 GB         CA 30.52 GB         Max_CA 31 GB 
+CPU Virtual Memory:  used = 32.04 GB, percent = 6.4%
+Before creating fp16 partitions
+MA 28.97 GB         Max_MA 28.97 GB         CA 30.52 GB         Max_CA 31 GB 
+CPU Virtual Memory:  used = 32.03 GB, percent = 6.4%
+After creating fp16 partitions: 98
+MA 28.97 GB         Max_MA 28.97 GB         CA 29.93 GB         Max_CA 31 GB 
+CPU Virtual Memory:  used = 37.23 GB, percent = 7.4%
+00:38:17 | INFO     | gcc -pthread -B /home/conan/miniconda3/envs/llm_train/compiler_compat -fno-strict-overflow -Wsign-compare -DNDEBUG -O2 -Wall -fPIC -O2 -isystem /home/conan/miniconda3/envs/llm_train/include -fPIC -O2 -isystem /home/conan/miniconda3/envs/llm_train/include -fPIC -c /tmp/tmpx9imk6lr/test.c -o /tmp/tmpx9imk6lr/test.o
+00:38:17 | INFO     | gcc -pthread -B /home/conan/miniconda3/envs/llm_train/compiler_compat /tmp/tmpx9imk6lr/test.o -laio -o /tmp/tmpx9imk6lr/a.out
+Before creating fp32 partitions
+MA 28.97 GB         Max_MA 28.97 GB         CA 29.93 GB         Max_CA 30 GB 
+CPU Virtual Memory:  used = 49.29 GB, percent = 9.8%
+After creating fp32 partitions
+MA 28.97 GB         Max_MA 28.97 GB         CA 29.93 GB         Max_CA 30 GB 
+CPU Virtual Memory:  used = 42.1 GB, percent = 8.4%
+Before initializing optimizer states
+MA 28.97 GB         Max_MA 28.97 GB         CA 29.93 GB         Max_CA 30 GB 
+CPU Virtual Memory:  used = 43.04 GB, percent = 8.5%
+After initializing optimizer states
+MA 28.97 GB         Max_MA 28.97 GB         CA 29.93 GB         Max_CA 30 GB 
+CPU Virtual Memory:  used = 41.76 GB, percent = 8.3%
+[2026-02-13 02:08:04,848] [WARNING] [lr_schedules.py:690:get_lr] Attempting to get learning rate from scheduler before it has started
+[0vs2048] COLLATOR CHECK: first batch | pixel_values.shape=torch.Size([256, 1536]), image_grid_thw.shape=(1, 3) | num_patches(seq)=256 (must be same on all ranks)
+After initializing ZeRO optimizer
+MA 29.16 GB         Max_MA 29.91 GB         CA 30.85 GB         Max_CA 31 GB 
+CPU Virtual Memory:  used = 96.86 GB, percent = 19.2%
+[2026-02-13 02:08:05,532] [WARNING] [lr_schedules.py:690:get_lr] Attempting to get learning rate from scheduler before it has started
+[0vs2048] COLLATOR CHECK: first batch | pixel_values.shape=torch.Size([256, 1536]), image_grid_thw.shape=(1, 3) | num_patches(seq)=256 (must be same on all ranks)
+02:08:07 | WARNING  | [0vs2048] STEP0 BATCH CHECK: rank=0, pixel_values=(256, 1536), num_patches=256, image_grid_thw=(1, 3), input_ids=(1, 186), num_image_tokens_in_input_ids=64
+02:08:07 | WARNING  | [0vs2048] STEP0 CHECK: Compare num_patches and num_image_tokens_in_input_ids across ranks; if any rank has 0 image tokens → 0vs2048 (see traceback).
+02:08:08 | WARNING  | ⚠️  UserWarning: None of the inputs have requires_grad=True. Gradients will be None (at /home/conan/miniconda3/envs/llm_train/lib/python3.12/site-packages/torch/utils/checkpoint.py:85)
+
+================================================================================
+🚨 TRAINING ERROR DETECTED INSIDE trainer.train()
+================================================================================
+Error type: OutOfMemoryError
+Error message: CUDA out of memory. Tried to allocate 768.00 MiB. GPU 0 has a total capacity of 79.19 GiB of which 637.06 MiB is free. Including non-PyTorch memory, this process has 78.54 GiB memory in use. Of the allocated memory 75.89 GiB is allocated by PyTorch, and 1.28 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+[0vs2048] rank that raised: 0
+[0vs2048] SUMMARY: If STEP0 BATCH CHECK showed same num_patches on all ranks, 0vs2048 is NOT from vision patch mismatch → see Full traceback for exact op (AccumulateGrad).
+
+Full traceback:
+Traceback (most recent call last):
+  File "/home/conan/workspace/llm_training/spectra_sft/train_spectra.py", line 2876, in main
+    trainer.train()
+  File "/home/conan/miniconda3/envs/llm_train/lib/python3.12/site-packages/transformers/trainer.py", line 2325, in train
+    return inner_training_loop(
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/home/conan/miniconda3/envs/llm_train/lib/python3.12/site-packages/transformers/trainer.py", line 2674, in _inner_training_loop
+    tr_loss_step = self.training_step(model, inputs, num_items_in_batch)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/conan/miniconda3/envs/llm_train/lib/python3.12/site-packages/trl/trainer/sft_trainer.py", line 1185, in training_step
+    return super().training_step(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/conan/miniconda3/envs/llm_train/lib/python3.12/site-packages/transformers/trainer.py", line 4071, in training_step
+    self.accelerator.backward(loss, **kwargs)
+  File "/home/conan/miniconda3/envs/llm_train/lib/python3.12/site-packages/accelerate/accelerator.py", line 2726, in backward
+    self.deepspeed_engine_wrapped.backward(loss, sync_gradients=self.sync_gradients, **kwargs)
+  File "/home/conan/miniconda3/envs/llm_train/lib/python3.12/site-packages/accelerate/utils/deepspeed.py", line 270, in backward
+    self.engine.backward(loss, **kwargs)
+  File "/home/conan/miniconda3/envs/llm_train/lib/python3.12/site-packages/deepspeed/utils/nvtx.py", line 20, in wrapped_fn
+    ret_val = func(*args, **kwargs)
+              ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/conan/miniconda3/envs/llm_train/lib/python3.12/site-packages/deepspeed/runtime/engine.py", line 2532, in backward
+    loss.backward(**backward_kwargs)
+  File "/home/conan/miniconda3/envs/llm_train/lib/python3.12/site-packages/torch/_tensor.py", line 647, in backward
+    torch.autograd.backward(
+  File "/home/conan/miniconda3/envs/llm_train/lib/python3.12/site-packages/torch/autograd/__init__.py", line 354, in backward
+    _engine_run_backward(
+  File "/home/conan/miniconda3/envs/llm_train/lib/python3.12/site-packages/torch/autograd/graph.py", line 829, in _engine_run_backward
+    return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/conan/miniconda3/envs/llm_train/lib/python3.12/site-packages/torch/autograd/function.py", line 311, in apply
+    return user_fn(self, *args)
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/home/conan/miniconda3/envs/llm_train/lib/python3.12/site-packages/torch/utils/checkpoint.py", line 319, in backward
+    torch.autograd.backward(outputs_with_grad, args_with_grad)
+  File "/home/conan/miniconda3/envs/llm_train/lib/python3.12/site-packages/torch/autograd/__init__.py", line 354, in backward
+    _engine_run_backward(
+  File "/home/conan/miniconda3/envs/llm_train/lib/python3.12/site-packages/torch/autograd/graph.py", line 829, in _engine_run_backward
+    return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 768.00 MiB. GPU 0 has a total capacity of 79.19 GiB of which 637.06 MiB is free. Including non-PyTorch memory, this process has 78.54 GiB memory in use. Of the allocated memory 75.89 GiB is allocated by PyTorch, and 1.28 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+
+================================================================================
+03:17:06 | ERROR    | ❌ Training error inside trainer.train(): OutOfMemoryError: CUDA out of memory. Tried to allocate 768.00 MiB. GPU 0 has a total capacity of 79.19 GiB of which 637.06 MiB is free. Including non-PyTorch memory, this process has 78.54 GiB memory in use. Of the allocated memory 75.89 GiB is allocated by PyTorch, and 1.28 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+03:17:06 | ERROR    | ❌ Traceback:
+Traceback (most recent call last):
+  File "/home/conan/workspace/llm_training/spectra_sft/train_spectra.py", line 2876, in main
+    trainer.train()
+  File "/home/conan/miniconda3/envs/llm_train/lib/python3.12/site-packages/transformers/trainer.py", line 2325, in train
+    return inner_training_loop(
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/home/conan/miniconda3/envs/llm_train/lib/python3.12/site-packages/transformers/trainer.py", line 2674, in _inner_training_loop
+    tr_loss_step = self.training_step(model, inputs, num_items_in_batch)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/conan/miniconda3/envs/llm_train/lib/python3.12/site-packages/trl/trainer/sft_trainer.py", line 1185, in training_step
+    return super().training_step(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/conan/miniconda3/envs/llm_train/lib/python3.12/site-packages/transformers/trainer.py", line 4071, in training_step
+    self.accelerator.backward(loss, **kwargs)
+  File "/home/conan/miniconda3/envs/llm_train/lib/python3.12/site-packages/accelerate/accelerator.py", line 2726, in backward
+    self.deepspeed_engine_wrapped.backward(loss, sync_gradients=self.sync_gradients, **kwargs)
+  File "/home/conan/miniconda3/envs/llm_train/lib/python3.12/site-packages/accelerate/utils/deepspeed.py", line 270, in backward
+    self.engine.backward(loss, **kwargs)
+  File "/home/conan/miniconda3/envs/llm_train/lib/python3.12/site-packages/deepspeed/utils/nvtx.py", line 20, in wrapped_fn
+    ret_val = func(*args, **kwargs)
+              ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/conan/miniconda3/envs/llm_train/lib/python3.12/site-packages/deepspeed/runtime/engine.py", line 2532, in backward
+    loss.backward(**backward_kwargs)
+  File "/home/conan/miniconda3/envs/llm_train/lib/python3.12/site-packages/torch/_tensor.py", line 647, in backward
+    torch.autograd.backward(
+  File "/home/conan/miniconda3/envs/llm_train/lib/python3.12/site-packages/torch/autograd/__init__.py", line 354, in backward
+    _engine_run_backward(
+  File "/home/conan/miniconda3/envs/llm_train/lib/python3.12/site-packages/torch/autograd/graph.py", line 829, in _engine_run_backward
+    return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/conan/miniconda3/envs/llm_train/lib/python3.12/site-packages/torch/autograd/function.py", line 311, in apply
+    return user_fn(self, *args)
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/home/conan/miniconda3/envs/llm_train/lib/python3.12/site-packages/torch/utils/checkpoint.py", line 319, in backward
+    torch.autograd.backward(outputs_with_grad, args_with_grad)
+  File "/home/conan/miniconda3/envs/llm_train/lib/python3.12/site-packages/torch/autograd/__init__.py", line 354, in backward
+    _engine_run_backward(
+  File "/home/conan/miniconda3/envs/llm_train/lib/python3.12/site-packages/torch/autograd/graph.py", line 829, in _engine_run_backward
+    return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 768.00 MiB. GPU 0 has a total capacity of 79.19 GiB of which 637.06 MiB is free. Including non-PyTorch memory, this process has 78.54 GiB memory in use. Of the allocated memory 75.89 GiB is allocated by PyTorch, and 1.28 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+
+03:17:06 | ERROR    | ❌ CUDA OOM: CUDA out of memory. Tried to allocate 768.00 MiB. GPU 0 has a total capacity of 79.19 GiB of which 637.06 MiB is free. Including non-PyTorch memory, this process has 78.54 GiB memory in use. Of the allocated memory 75.89 GiB is allocated by PyTorch, and 1.28 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+03:17:06 | INFO     | 🔧 GPU Memory [OOM] - Allocated: 74.76GB, Reserved: 77.17GB
+03:17:06 | ERROR    | Step: 0, Epoch: 0.000
+03:17:56 | INFO     | 🔧 GPU Memory [OOM] - Allocated: 74.76GB, Reserved: 77.17GB
+03:17:56 | ERROR    | 💾 OOM 에러 정보 저장: /mls/conan/training_logs/spectra_qwen_outputs/oom_error_20260213_031756.json
+03:17:56 | INFO     | 🧹 Starting GPU memory cleanup...
+03:17:56 | INFO     | 🔧 GPU Memory [BEFORE_CLEANUP] - Allocated: 74.76GB, Reserved: 77.17GB
+03:17:57 | INFO     | 🔧 GPU Memory [AFTER_CLEANUP] - Allocated: 74.76GB, Reserved: 76.04GB
+03:17:57 | INFO     | 🧹 Memory cleanup completed - Freed: 0.00GB allocated, 1.13GB reserved
+03:17:57 | ERROR    | 💡 해결 방법: batch_size 감소, gradient_accumulation_steps 증가, max_length 감소
+
+================================================================================
+⚠️  FINALLY BLOCK: Exception detected during training
+================================================================================
+Exception type: OutOfMemoryError
+Exception value: CUDA out of memory. Tried to allocate 768.00 MiB. GPU 0 has a total capacity of 79.19 GiB of which 637.06 MiB is free. Including non-PyTorch memory, this process has 78.54 GiB memory in use. Of the allocated memory 75.89 GiB is allocated by PyTorch, and 1.28 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+
+Traceback:
+Traceback (most recent call last):
+  File "/home/conan/workspace/llm_training/spectra_sft/train_spectra.py", line 2908, in main
+    raise e
+  File "/home/conan/workspace/llm_training/spectra_sft/train_spectra.py", line 2903, in main
+    raise train_e
+  File "/home/conan/workspace/llm_training/spectra_sft/train_spectra.py", line 2876, in main
+    trainer.train()
+  File "/home/conan/miniconda3/envs/llm_train/lib/python3.12/site-packages/transformers/trainer.py", line 2325, in train
+    return inner_training_loop(
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/home/conan/miniconda3/envs/llm_train/lib/python3.12/site-packages/transformers/trainer.py", line 2674, in _inner_training_loop
+    tr_loss_step = self.training_step(model, inputs, num_items_in_batch)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/conan/miniconda3/envs/llm_train/lib/python3.12/site-packages/trl/trainer/sft_trainer.py", line 1185, in training_step
+    return super().training_step(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/conan/miniconda3/envs/llm_train/lib/python3.12/site-packages/transformers/trainer.py", line 4071, in training_step
+    self.accelerator.backward(loss, **kwargs)
+  File "/home/conan/miniconda3/envs/llm_train/lib/python3.12/site-packages/accelerate/accelerator.py", line 2726, in backward
+    self.deepspeed_engine_wrapped.backward(loss, sync_gradients=self.sync_gradients, **kwargs)
+  File "/home/conan/miniconda3/envs/llm_train/lib/python3.12/site-packages/accelerate/utils/deepspeed.py", line 270, in backward
+    self.engine.backward(loss, **kwargs)
+  File "/home/conan/miniconda3/envs/llm_train/lib/python3.12/site-packages/deepspeed/utils/nvtx.py", line 20, in wrapped_fn
+    ret_val = func(*args, **kwargs)
+              ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/conan/miniconda3/envs/llm_train/lib/python3.12/site-packages/deepspeed/runtime/engine.py", line 2532, in backward
+    loss.backward(**backward_kwargs)
+  File "/home/conan/miniconda3/envs/llm_train/lib/python3.12/site-packages/torch/_tensor.py", line 647, in backward
+    torch.autograd.backward(
+  File "/home/conan/miniconda3/envs/llm_train/lib/python3.12/site-packages/torch/autograd/__init__.py", line 354, in backward
+    _engine_run_backward(
+  File "/home/conan/miniconda3/envs/llm_train/lib/python3.12/site-packages/torch/autograd/graph.py", line 829, in _engine_run_backward
+    return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/conan/miniconda3/envs/llm_train/lib/python3.12/site-packages/torch/autograd/function.py", line 311, in apply
+    return user_fn(self, *args)
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/home/conan/miniconda3/envs/llm_train/lib/python3.12/site-packages/torch/utils/checkpoint.py", line 319, in backward
+    torch.autograd.backward(outputs_with_grad, args_with_grad)
+  File "/home/conan/miniconda3/envs/llm_train/lib/python3.12/site-packages/torch/autograd/__init__.py", line 354, in backward
+    _engine_run_backward(
+  File "/home/conan/miniconda3/envs/llm_train/lib/python3.12/site-packages/torch/autograd/graph.py", line 829, in _engine_run_backward
+    return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 768.00 MiB. GPU 0 has a total capacity of 79.19 GiB of which 637.06 MiB is free. Including non-PyTorch memory, this process has 78.54 GiB memory in use. Of the allocated memory 75.89 GiB is allocated by PyTorch, and 1.28 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+
+================================================================================
+03:17:57 | WARNING  | ⚠️  Exception detected in finally block: OutOfMemoryError: CUDA out of memory. Tried to allocate 768.00 MiB. GPU 0 has a total capacity of 79.19 GiB of which 637.06 MiB is free. Including non-PyTorch memory, this process has 78.54 GiB memory in use. Of the allocated memory 75.89 GiB is allocated by PyTorch, and 1.28 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+Saving final model...
+03:17:57 | INFO     | 💾 Saving final model...
+03:17:57 | INFO     | 💾 Using DeepSpeed save_checkpoint (NVMe-safe)...

@@ -396,10 +396,12 @@ def convert_sample_to_messages(sample: Dict[str, Any], dataset_name: str) -> Opt
                 img = [img] if img is not None else []
             # 중첩 리스트 평면화 및 None 값 제거
             img = validate_image_data(img)
-            # 이미지가 없으면 None 반환 (샘플 건너뜀)
+            # 이미지가 없으면 더미 이미지 생성 (Qwen3 VL MoE 호환용)
             if not img:
-                return None
-            
+                # 224x224 크기의 빈 흰색 이미지 생성
+                dummy_img = Image.new('RGB', (224, 224), color='white')
+                img = [dummy_img]
+
             # 메시지 검증 및 최적화
             messages = validate_messages(sample["messages"])
             return {"messages": messages, "images": img}
@@ -646,15 +648,50 @@ def create_memory_efficient_collate_fn(tokenizer, max_length: int = 2048):
     
     return collate_fn
 
-def create_simple_collate_fn(processor, max_length: int = 2048):
+def create_simple_collate_fn(processor, max_length: int = 2048, completion_only_loss: bool = False):
     """SFTTrainer용 커스텀 data collator - 이미지 중첩 리스트 문제 해결"""
     from trl.trainer.sft_trainer import DataCollatorForVisionLanguageModeling
-    
+
     class CustomSFTDataCollator(DataCollatorForVisionLanguageModeling):
-        def __init__(self, processor, max_length: int = 2048):
-            super().__init__(processor = processor, max_length = max_length)
+        def __init__(self, processor, max_length: int = 2048, completion_only_loss: bool = False):
+            super().__init__(processor=processor, max_length=max_length, completion_only_loss=completion_only_loss)
             self.processor = processor
             self.max_length = max_length
+            self.completion_only_loss = completion_only_loss
+            
+            # Universal Exoskeleton: Force use of SiglipImageProcessor for image inputs
+            # This ensures (B, C, H, W) format required by SiglipVisionModel, avoiding the flattened 2D output of Qwen2VLProcessor
+            from transformers import SiglipImageProcessor
+            try:
+                # Try to load from model config or default to standard Siglip
+                # Changed to 224 patch16 to match model's position embedding size (196 patches)
+                self.image_processor = SiglipImageProcessor.from_pretrained("google/siglip-base-patch16-224")
+                # Fix for Qwen3-VL standard resolution if needed (e.g. 224 or 384)
+                # self.image_processor.size = {"height": 224, "width": 224} 
+            except Exception as e:
+                print(f"⚠️ Failed to load specific SiglipImageProcessor, falling back to default: {e}")
+                self.image_processor = SiglipImageProcessor()
+
+        def torch_call(self, examples):
+            """Override to force learning entire sequence regardless of completion_only_loss setting"""
+            # Call parent method
+            batch = super().torch_call(examples)
+
+            # FORCE LEARNING ENTIRE SEQUENCE (ignore completion_only_loss)
+            # This ensures ALL tokens are learnable, not just assistant responses
+            import torch
+            if "labels" in batch:
+                input_ids = batch["input_ids"]
+                labels = input_ids.clone()  # Copy input_ids as labels
+
+                # Only mask padding tokens, keep everything else learnable
+                attention_mask = batch.get("attention_mask")
+                if attention_mask is not None:
+                    labels[attention_mask == 0] = -100
+
+                batch["labels"] = labels
+
+            return batch
             
         def __call__(self, features):
             # 이미지 데이터 검증 - 이미지가 없는 샘플은 오류 발생
@@ -678,16 +715,74 @@ def create_simple_collate_fn(processor, max_length: int = 2048):
                 feature['images'] = validate_image_data(feature['images'])
                 if not feature['images']:
                     raise ValueError(f"샘플 {i}의 이미지가 유효하지 않습니다!")
-                # batch_images.append(feature['images'])
+                batch_images.append(feature['images'])
+
             # processor를 사용하여 데이터 처리
             try:
-                return self.torch_call(
-                    examples=features
-                )
+                # CRITICAL FIX: "Universal Exoskeleton" Alignment
+                # Force exact alignment between Text Tokens (196) and Vision Features (196)
+                # by manually constructing the token sequence, bypassing Qwen's dynamic resolution logic.
+                
+                # Constants for Qwen2-VL (Exoskeleton) matching Siglip 224x224 (14x14 patches)
+                VISION_START = "<|vision_start|>"
+                VISION_END = "<|vision_end|>"
+                IMAGE_PAD = "<|image_pad|>"
+                NUM_TOKENS = 196 # 14x14 grid matches Siglip patch16@224
+                # Construct the exact token string: <|vision_start|> + 196 pads + <|vision_end|>
+                TOKEN_STRING = VISION_START + (IMAGE_PAD * NUM_TOKENS) + VISION_END
+                
+                # Create a deep copy of features for text processing
+                import copy
+                text_features = copy.deepcopy(features)
+                
+                total_images_in_batch = 0
+                
+                # Modify messages to replace images with explicit token strings
+                for feature in text_features:
+                    if 'messages' in feature:
+                        # Iterate through messages to find and replace images
+                        for msg in feature['messages']:
+                            if 'content' in msg and isinstance(msg['content'], list):
+                                for item in msg['content']:
+                                    if isinstance(item, dict) and item.get('type') == 'image':
+                                        # Replace image type with text containing the manual tokens
+                                        item['type'] = 'text'
+                                        item['text'] = TOKEN_STRING
+                                        total_images_in_batch += 1
+                    
+                    # Remove 'images' key so processor treats this as pure text
+                    # preventing it from generating its own (wrong count) image tokens or grids
+                    if 'images' in feature:
+                        del feature['images']
 
-                # return self.processor(
-                #     images=safe_flatten_images(batch_images),
-                #     text=batch_messages)
+                # Use Torch Call with the MODIFIED text-only features
+                # This will simply tokenize the TOKEN_STRING, resulting in exactly NUM_TOKENS placeholders
+                batch = self.torch_call(examples=text_features)
+                
+                # Manually process ORIGINAL images using SiglipImageProcessor to ensure 4D tensor (B, C, H, W)
+                if batch_images:
+                    # Flatten batch_images
+                    flat_images = safe_flatten_images(batch_images)
+                    
+                    # Process images with Siglip Processor (224x224 -> 196 features)
+                    image_outputs = self.image_processor(images=flat_images, return_tensors="pt")
+                    
+                    # Inject 4D pixel_values into batch
+                    if "pixel_values" in image_outputs:
+                        batch["pixel_values"] = image_outputs["pixel_values"]
+                        
+                    # Inject manually constructed image_grid_thw
+                    # Each image is 224x224 (Siglip) -> 14x14 patches (Qwen Exoskeleton View)
+                    # Shape: (Total_Images, 3) where each row is [1, 14, 14]
+                    if total_images_in_batch > 0:
+                        # Ensure we match the number of images processed
+                        # Note: batch_images len should equal total_images_in_batch if data is consistent
+                        grid_tensor = torch.tensor([[1, 14, 14]] * len(flat_images), dtype=torch.long)
+                        batch["image_grid_thw"] = grid_tensor
+
+                return batch
+                        
+                return batch
 
 
             except Exception as e:

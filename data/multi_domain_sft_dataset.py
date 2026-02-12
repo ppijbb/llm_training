@@ -1,6 +1,6 @@
 import logging
 from tqdm import tqdm
-from datasets import load_dataset, get_dataset_config_names, get_dataset_split_names, concatenate_datasets
+from datasets import load_dataset, get_dataset_config_names, get_dataset_split_names, concatenate_datasets, load_dataset_builder, Features, Sequence, Value
 from transformers import AutoProcessor
 import torch
 from typing import Dict, Any, List, Optional, Tuple
@@ -30,6 +30,18 @@ from data.simple_sft_dataset import (
     log_memory_usage
 )
 
+# ============================================================
+# Monkey Patch for datasets library compatibility
+# ============================================================
+try:
+    import datasets.features.features
+    # Check if 'List' type is missing (datasets < 4.0.0)
+    if "List" not in datasets.features.features._FEATURE_TYPES:
+        print("🛠️ Monkey-patching: Registering 'List' feature type as alias for 'Sequence'")
+        datasets.features.features._FEATURE_TYPES["List"] = datasets.features.features.Sequence
+except Exception as e:
+    print(f"⚠️ Failed to apply monkey patch for datasets library: {e}")
+
 def ensure_string(value: Any) -> str:
     """
     값을 문자열로 변환합니다. None이면 빈 문자열을 반환합니다.
@@ -37,6 +49,60 @@ def ensure_string(value: Any) -> str:
     if value is None:
         return ""
     return str(value)
+
+SFT_JSON_FEATURES = Features({
+    "messages": [
+        {
+            "role": Value("string"),
+            "content": [
+                {
+                    "type": Value("string"),
+                    "text": Value("string")
+                }
+            ]
+        }
+    ],
+    "images": [Value("string")],
+    "domain": Value("string"),
+    "source": Value("string")
+})
+
+def _preprocess_images_for_mapping(example, cache_images_dir=None):
+    """
+    Dataset.map()에서 사용할 전역 이미지 전처리 함수.
+    picklable해야 하므로 최상위 레벨에 정의합니다.
+    """
+    if 'images' in example and example['images']:
+        image_paths = example['images']
+        if isinstance(image_paths, list):
+            fixed_paths = []
+            for img_path in image_paths:
+                if isinstance(img_path, str) and img_path.strip():
+                    if not os.path.isabs(img_path) and cache_images_dir:
+                        img_path = os.path.join(cache_images_dir, os.path.basename(img_path))
+                    if os.path.exists(img_path):
+                        fixed_paths.append(img_path)
+            example['images'] = validate_image_data(fixed_paths)
+        else:
+            example['images'] = validate_image_data(example['images']) if example['images'] else []
+    elif 'images' not in example:
+        example['images'] = []
+    
+    # 텍스트 정규화 추가 (ImportError 방지를 위해 로딩 시 수행하던 로직을 여기로 이전)
+    if 'messages' in example and isinstance(example['messages'], list):
+        for message in example['messages']:
+            if not isinstance(message, dict):
+                continue
+            if 'content' in message and isinstance(message['content'], list):
+                for content_item in message['content']:
+                    if not isinstance(content_item, dict):
+                        continue
+                    if 'text' not in content_item or content_item.get('text') is None:
+                        content_item['text'] = ""
+                    if 'type' not in content_item:
+                        content_item['type'] = "text"
+    
+    return example
 
 def ensure_messages_text_strings(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
@@ -77,6 +143,111 @@ def ensure_messages_text_strings(messages: List[Dict[str, Any]]) -> List[Dict[st
     
     return result
 
+def ensure_vlm_format(sample: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    모든 샘플을 VLM 형식으로 변환합니다.
+    이미지가 있는 경우에만 이미지 placeholder를 추가합니다.
+    Qwen3-VL-MoE는 이미지 토큰과 이미지 features의 개수가 일치해야 하므로,
+    실제 이미지가 있을 때만 이미지 placeholder를 추가합니다.
+    """
+    if not isinstance(sample, dict):
+        return sample
+    
+    # messages가 없으면 변환 불가
+    if "messages" not in sample or not isinstance(sample["messages"], list):
+        return sample
+    
+    messages = sample["messages"].copy()
+    images = sample.get("images", [])
+    
+    # images가 리스트가 아니면 리스트로 변환
+    if not isinstance(images, list):
+        images = [images] if images else []
+    
+    # 이미지가 문자열 경로인지 확인 (실제 이미지 파일이 있는지)
+    has_images = False
+    for img in images:
+        if isinstance(img, str) and img.strip():
+            # 파일 경로가 존재하는지 확인
+            if os.path.exists(img):
+                has_images = True
+                break
+    
+    # 이미지가 있는 경우에만 이미지 placeholder 추가
+    if has_images:
+        first_user_msg_found = False
+        for i, msg in enumerate(messages):
+            if not isinstance(msg, dict) or msg.get("role") != "user":
+                continue
+            
+            content = msg.get("content", [])
+            if not isinstance(content, list):
+                content = [content] if content else []
+            
+            # 이미지 placeholder가 있는지 확인
+            has_image_placeholder = False
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "image":
+                    has_image_placeholder = True
+                    break
+            
+            # 첫 번째 user 메시지에 이미지 placeholder 추가 (없는 경우에만)
+            if not first_user_msg_found and not has_image_placeholder:
+                content.insert(0, {"type": "image"})
+                msg["content"] = content
+                first_user_msg_found = True
+                break
+    
+    # messages 정규화
+    messages = ensure_messages_text_strings(messages)
+    
+    result = sample.copy()
+    result["messages"] = messages
+    result["images"] = images if images else []
+    
+    return result
+
+def sanitize_sample_for_json(sample: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    샘플을 JSON 직렬화 가능한 형태로 정리합니다.
+    PIL Image 객체나 직렬화 불가능한 객체를 제거합니다.
+    """
+    if not isinstance(sample, dict):
+        return sample
+    
+    result = {}
+    for key, value in sample.items():
+        if key == "images":
+            # images는 문자열 경로 리스트만 유지
+            if isinstance(value, list):
+                sanitized_images = []
+                for img in value:
+                    if isinstance(img, str) and img.strip():
+                        sanitized_images.append(img)
+                    # PIL Image나 다른 객체는 무시 (이미 파일로 저장되어 있어야 함)
+                result[key] = sanitized_images
+            else:
+                result[key] = []
+        else:
+            # 다른 필드는 그대로 복사 (재귀적으로 처리)
+            if isinstance(value, dict):
+                result[key] = sanitize_sample_for_json(value)
+            elif isinstance(value, list):
+                result[key] = [
+                    sanitize_sample_for_json(item) if isinstance(item, dict) else item
+                    for item in value
+                ]
+            else:
+                # PIL Image나 다른 직렬화 불가능한 객체는 무시
+                try:
+                    json.dumps(value)
+                    result[key] = value
+                except (TypeError, ValueError):
+                    # 직렬화 불가능한 객체는 문자열로 변환 시도
+                    result[key] = str(value)
+    
+    return result
+
 def dataset_exists(dataset_name: str) -> bool:
     """
     주어진 데이터셋이 Hugging Face Hub에 존재하는지 간단히 확인합니다.
@@ -100,7 +271,7 @@ def process_rstar_coder(dataset, dataset_name: str, max_samples: int, log_detail
     """
     results = []
     sample_count = 0
-    failed_count = 0
+    # failed_count removed
     
     logger.debug(f"   🔧 rStar-Coder 전용 프로세서 시작 (최대 {max_samples}개 샘플)")
     
@@ -122,8 +293,7 @@ def process_rstar_coder(dataset, dataset_name: str, max_samples: int, log_detail
             # question 또는 seed_question 중 하나는 있어야 함
             user_prompt = question.strip() if question and question.strip() else (seed_question.strip() if seed_question and seed_question.strip() else "")
             if not user_prompt:
-                failed_count += 1
-                continue
+                raise RuntimeError(f"Sample processing failed")
             
             # response와 code 중 하나는 있어야 함
             assistant_content_parts = []
@@ -136,8 +306,7 @@ def process_rstar_coder(dataset, dataset_name: str, max_samples: int, log_detail
                     assistant_content_parts.append(code.strip())
             
             if not assistant_content_parts:
-                failed_count += 1
-                continue
+                raise RuntimeError(f"Sample processing failed")
             
             assistant_text = "\n".join(assistant_content_parts)
             
@@ -146,15 +315,15 @@ def process_rstar_coder(dataset, dataset_name: str, max_samples: int, log_detail
                 {"role": "assistant", "content": [{"type": "text", "text": assistant_text}]}
             ]
             
+            # Revert to text-only (no dummy image)
             results.append({"messages": messages, "images": []})
             sample_count += 1
             
         except Exception as e:
             logger.error(f"   ❌ rStar-Coder 샘플 {idx} 처리 실패: {e}")
-            failed_count += 1
-            continue
+            raise RuntimeError(f"Sample processing failed")
     
-    logger.info(f"   ✅ rStar-Coder 프로세서 완료: 성공 {sample_count}개, 실패 {failed_count}개")
+
     return results
 
 def process_metamath(dataset, dataset_name: str, max_samples: int, log_detail: bool = False) -> List[Dict[str, Any]]:
@@ -163,7 +332,7 @@ def process_metamath(dataset, dataset_name: str, max_samples: int, log_detail: b
     """
     results = []
     sample_count = 0
-    failed_count = 0
+    # failed_count removed
     
     logger.debug(f"   🔧 MetaMath 전용 프로세서 시작 (최대 {max_samples}개 샘플)")
     
@@ -176,8 +345,7 @@ def process_metamath(dataset, dataset_name: str, max_samples: int, log_detail: b
             response = sample.get("response", "")
             
             if not query or not response:
-                failed_count += 1
-                continue
+                raise RuntimeError(f"Sample processing failed")
             
             messages = [
                 {"role": "user", "content": [{"type": "text", "text": query}]},
@@ -189,10 +357,9 @@ def process_metamath(dataset, dataset_name: str, max_samples: int, log_detail: b
             
         except Exception as e:
             logger.error(f"   ❌ MetaMath 샘플 {idx} 처리 실패: {e}")
-            failed_count += 1
-            continue
+            raise RuntimeError(f"Sample processing failed")
     
-    logger.info(f"   ✅ MetaMath 프로세서 완료: 성공 {sample_count}개, 실패 {failed_count}개")
+
     return results
 
 def process_math_python_reasoning(dataset, dataset_name: str, max_samples: int, log_detail: bool = False) -> List[Dict[str, Any]]:
@@ -201,7 +368,7 @@ def process_math_python_reasoning(dataset, dataset_name: str, max_samples: int, 
     """
     results = []
     sample_count = 0
-    failed_count = 0
+    # failed_count removed
     
     logger.debug(f"   🔧 Math-Python-Reasoning 전용 프로세서 시작 (최대 {max_samples}개 샘플)")
     
@@ -221,8 +388,7 @@ def process_math_python_reasoning(dataset, dataset_name: str, max_samples: int, 
                 completion = sample.get("output", "")
             
             if not prompt or not completion:
-                failed_count += 1
-                continue
+                raise RuntimeError(f"Sample processing failed")
             
             messages = []
             
@@ -240,10 +406,9 @@ def process_math_python_reasoning(dataset, dataset_name: str, max_samples: int, 
             
         except Exception as e:
             logger.error(f"   ❌ Math-Python-Reasoning 샘플 {idx} 처리 실패: {e}")
-            failed_count += 1
-            continue
+            raise RuntimeError(f"Sample processing failed")
     
-    logger.info(f"   ✅ Math-Python-Reasoning 프로세서 완료: 성공 {sample_count}개, 실패 {failed_count}개")
+
     return results
 
 def process_llava_onevision(dataset, dataset_name: str, max_samples: int, log_detail: bool = False) -> List[Dict[str, Any]]:
@@ -252,7 +417,7 @@ def process_llava_onevision(dataset, dataset_name: str, max_samples: int, log_de
     """
     results = []
     sample_count = 0
-    failed_count = 0
+    # failed_count removed
     
     logger.debug(f"   🔧 LLaVA-OneVision 전용 프로세서 시작 (최대 {max_samples}개 샘플)")
     
@@ -266,8 +431,7 @@ def process_llava_onevision(dataset, dataset_name: str, max_samples: int, log_de
             images = sample.get("images", [])
             
             if not conversations:
-                failed_count += 1
-                continue
+                raise RuntimeError(f"Sample processing failed")
             
             messages = []
             for conv in conversations:
@@ -280,8 +444,7 @@ def process_llava_onevision(dataset, dataset_name: str, max_samples: int, log_de
                     messages.append({"role": "assistant", "content": [{"type": "text", "text": value}]})
             
             if not messages:
-                failed_count += 1
-                continue
+                raise RuntimeError(f"Sample processing failed")
             
             # 이미지 처리
             image_list = []
@@ -294,10 +457,9 @@ def process_llava_onevision(dataset, dataset_name: str, max_samples: int, log_de
             
         except Exception as e:
             logger.error(f"   ❌ LLaVA-OneVision 샘플 {idx} 처리 실패: {e}")
-            failed_count += 1
-            continue
+            raise RuntimeError(f"Sample processing failed")
     
-    logger.info(f"   ✅ LLaVA-OneVision 프로세서 완료: 성공 {sample_count}개, 실패 {failed_count}개")
+
     return results
 
 def process_olmocr(dataset, dataset_name: str, max_samples: int, log_detail: bool = False) -> List[Dict[str, Any]]:
@@ -314,7 +476,7 @@ def process_olmocr(dataset, dataset_name: str, max_samples: int, log_detail: boo
     """
     results = []
     sample_count = 0
-    failed_count = 0
+    # failed_count removed
     
     logger.debug(f"   🔧 olmOCR 전용 프로세서 시작 (최대 {max_samples}개 샘플)")
     
@@ -328,8 +490,7 @@ def process_olmocr(dataset, dataset_name: str, max_samples: int, log_detail: boo
             if not natural_text or not natural_text.strip():
                 if log_detail and idx < 5:
                     logger.warning(f"   ⚠️ olmOCR 샘플 {idx}: natural_text가 비어있음")
-                failed_count += 1
-                continue
+                raise RuntimeError(f"Sample processing failed")
             
             # 이미지 처리 (PDF 페이지 이미지)
             image_list = []
@@ -352,8 +513,7 @@ def process_olmocr(dataset, dataset_name: str, max_samples: int, log_detail: boo
             
             # 이미지가 없으면 OCR 태스크가 불가능하므로 건너뛰기
             if not image_list:
-                failed_count += 1
-                continue
+                raise RuntimeError(f"Sample processing failed")
             
             # Instruction: OCR 태스크
             instruction = "이 문서 페이지의 텍스트를 추출하세요. 이미지에서 보이는 모든 텍스트를 정확하게 읽어주세요."
@@ -378,10 +538,9 @@ def process_olmocr(dataset, dataset_name: str, max_samples: int, log_detail: boo
             
         except Exception as e:
             logger.debug(f"   ❌ olmOCR 샘플 {idx} 처리 실패: {e}")
-            failed_count += 1
-            continue
+            raise RuntimeError(f"Sample processing failed")
     
-    logger.info(f"   ✅ olmOCR 프로세서 완료: 성공 {sample_count}개, 실패 {failed_count}개")
+
     
     return results
 
@@ -397,7 +556,7 @@ def process_cord(dataset, dataset_name: str, max_samples: int, log_detail: bool 
     """
     results = []
     sample_count = 0
-    failed_count = 0
+    # failed_count removed
     
     logger.debug(f"   🔧 CORD-v2 전용 프로세서 시작 (최대 {max_samples}개 샘플)")
     
@@ -411,8 +570,7 @@ def process_cord(dataset, dataset_name: str, max_samples: int, log_detail: bool 
             if not ground_truth or not str(ground_truth).strip():
                 if log_detail and idx < 5:
                     logger.warning(f"   ⚠️ CORD-v2 샘플 {idx}: ground_truth가 비어있음")
-                failed_count += 1
-                continue
+                raise RuntimeError(f"Sample processing failed")
             
             # ground_truth가 JSON 형식일 수 있으므로 문자열로 변환
             if isinstance(ground_truth, dict):
@@ -434,8 +592,7 @@ def process_cord(dataset, dataset_name: str, max_samples: int, log_detail: bool 
             
             # 이미지가 없으면 OCR 태스크가 불가능하므로 건너뛰기
             if not image_list:
-                failed_count += 1
-                continue
+                raise RuntimeError(f"Sample processing failed")
             
             # Instruction: OCR 태스크 (영수증 특화)
             instruction = "이 영수증 이미지에서 텍스트를 추출하세요. 이미지에서 보이는 모든 텍스트를 정확하게 읽어주세요."
@@ -460,10 +617,9 @@ def process_cord(dataset, dataset_name: str, max_samples: int, log_detail: bool 
             
         except Exception as e:
             logger.debug(f"   ❌ CORD-v2 샘플 {idx} 처리 실패: {e}")
-            failed_count += 1
-            continue
+            raise RuntimeError(f"Sample processing failed")
     
-    logger.info(f"   ✅ CORD-v2 프로세서 완료: 성공 {sample_count}개, 실패 {failed_count}개")
+
     
     return results
 
@@ -481,7 +637,7 @@ def process_ask_science_qg(dataset, dataset_name: str, max_samples: int, log_det
     """
     results = []
     sample_count = 0
-    failed_count = 0
+    # failed_count removed
     
     logger.debug(f"   🔧 ask-science-qg 전용 프로세서 시작 (최대 {max_samples}개 샘플)")
     
@@ -505,8 +661,7 @@ def process_ask_science_qg(dataset, dataset_name: str, max_samples: int, log_det
             
             # title은 필수
             if not title or not str(title).strip():
-                failed_count += 1
-                continue
+                raise RuntimeError(f"Sample processing failed")
             
             # 질문 텍스트 구성
             question_parts = [str(title).strip()]
@@ -575,8 +730,7 @@ def process_ask_science_qg(dataset, dataset_name: str, max_samples: int, log_det
             
             # 답변이 비어있으면 건너뛰기
             if not answer_text:
-                failed_count += 1
-                continue
+                raise RuntimeError(f"Sample processing failed")
             
             # Messages 구성
             messages = [
@@ -595,10 +749,9 @@ def process_ask_science_qg(dataset, dataset_name: str, max_samples: int, log_det
             
         except Exception as e:
             logger.debug(f"   ❌ ask-science-qg 샘플 {idx} 처리 실패: {e}")
-            failed_count += 1
-            continue
+            raise RuntimeError(f"Sample processing failed")
     
-    logger.info(f"   ✅ ask-science-qg 프로세서 완료: 성공 {sample_count}개, 실패 {failed_count}개")
+
     
     return results
 
@@ -617,7 +770,7 @@ def process_ocr_vqa(dataset, dataset_name: str, max_samples: int, log_detail: bo
     """
     results = []
     sample_count = 0
-    failed_count = 0
+    # failed_count removed
     
     logger.debug(f"   🔧 OCR-VQA 전용 프로세서 시작 (최대 {max_samples}개 샘플)")
     
@@ -637,14 +790,12 @@ def process_ocr_vqa(dataset, dataset_name: str, max_samples: int, log_detail: bo
             # 이미지 처리
             image = sample.get("image", None)
             if image is None:
-                failed_count += 1
-                continue
+                raise RuntimeError(f"Sample processing failed")
             
             # 이미지 검증
             image_list = validate_image_data([image])
             if not image_list:
-                failed_count += 1
-                continue
+                raise RuntimeError(f"Sample processing failed")
             
             # questions와 answers 추출
             questions = sample.get("questions", None)
@@ -652,12 +803,10 @@ def process_ocr_vqa(dataset, dataset_name: str, max_samples: int, log_detail: bo
             
             # questions와 answers가 리스트인지 확인
             if not isinstance(questions, (list, tuple)) or not isinstance(answers, (list, tuple)):
-                failed_count += 1
-                continue
+                raise RuntimeError(f"Sample processing failed")
             
             if len(questions) == 0 or len(answers) == 0:
-                failed_count += 1
-                continue
+                raise RuntimeError(f"Sample processing failed")
             
             # 질문과 답변의 개수가 다를 수 있으므로, 최소 개수만큼만 처리
             num_pairs = min(len(questions), len(answers))
@@ -693,10 +842,9 @@ def process_ocr_vqa(dataset, dataset_name: str, max_samples: int, log_detail: bo
             
         except Exception as e:
             logger.debug(f"   ❌ OCR-VQA 샘플 {idx} 처리 실패: {e}")
-            failed_count += 1
-            continue
+            raise RuntimeError(f"Sample processing failed")
     
-    logger.info(f"   ✅ OCR-VQA 프로세서 완료: 성공 {sample_count}개 샘플 생성, 실패 {failed_count}개 원본 샘플")
+
     
     return results
 
@@ -706,7 +854,7 @@ def process_generic_instruction(dataset, dataset_name: str, max_samples: int, lo
     """
     results = []
     sample_count = 0
-    failed_count = 0
+    # failed_count removed
     
     logger.debug(f"   🔧 범용 Instruction 프로세서 시작 ({dataset_name}, 최대 {max_samples}개 샘플)")
     
@@ -716,12 +864,31 @@ def process_generic_instruction(dataset, dataset_name: str, max_samples: int, lo
         
         try:
             # messages 형식이 이미 있는 경우
-            if "messages" in sample:
+            if "messages" in sample and sample["messages"]:
                 messages = validate_messages(sample["messages"])
                 images = sample.get("images", [])
                 results.append({"messages": messages, "images": images if images else []})
                 sample_count += 1
                 continue
+            
+            # trajectory 형식 (UltraInteract_sft)
+            if "trajectory" in sample and sample["trajectory"]:
+                trajectory = sample["trajectory"]
+                if isinstance(trajectory, list):
+                    messages = []
+                    for turn in trajectory:
+                        if isinstance(turn, dict):
+                            role = turn.get("role", "")
+                            content = turn.get("content", "")
+                            if role and content:
+                                if role in ["user", "human"]:
+                                    messages.append({"role": "user", "content": [{"type": "text", "text": str(content)}]})
+                                elif role in ["assistant", "gpt"]:
+                                    messages.append({"role": "assistant", "content": [{"type": "text", "text": str(content)}]})
+                    if messages:
+                        results.append({"messages": messages, "images": []})
+                        sample_count += 1
+                        continue
             
             # conversations 형식
             if "conversations" in sample:
@@ -755,11 +922,74 @@ def process_generic_instruction(dataset, dataset_name: str, max_samples: int, lo
                     sample_count += 1
                     continue
             
+            # prompt-response 형식
+            if "prompt" in sample:
+                prompt = sample.get("prompt", "")
+                response = sample.get("response", sample.get("completion", sample.get("output", "")))
+                
+                if prompt and response:
+                    messages = [
+                        {"role": "user", "content": [{"type": "text", "text": str(prompt)}]},
+                        {"role": "assistant", "content": [{"type": "text", "text": str(response)}]}
+                    ]
+                    results.append({"messages": messages, "images": []})
+                    sample_count += 1
+                    continue
+            
             # question-answer 형식
             if "question" in sample:
                 question = sample.get("question", "")
                 answer = sample.get("answer", sample.get("response", ""))
                 
+                # ScienceQA 형식 지원 (choices, hint, solution 포함)
+                if "choices" in sample and "answer" in sample:
+                    choices = sample["choices"]
+                    hint = sample.get("hint", "")
+                    solution = sample.get("solution", "")
+                    
+                    # 질문 구성
+                    query_text = question
+                    if hint:
+                        query_text = f"Hint: {hint}\n{query_text}"
+                    
+                    if choices:
+                        query_text += "\nChoices:\n"
+                        for i, choice in enumerate(choices):
+                            query_text += f"({i}) {choice}\n"
+                    
+                    # 정답 구성
+                    answer_idx = sample["answer"]
+                    try:
+                        # answer가 정수 인덱스인 경우
+                        if isinstance(answer_idx, int):
+                            answer_text = choices[answer_idx]
+                        else:
+                            answer_text = str(answer_idx)
+                    except:
+                        answer_text = str(answer_idx)
+                        
+                    if solution:
+                        answer_text += f"\n\nExplanation: {solution}"
+                    
+                    messages = [
+                        {"role": "user", "content": [{"type": "text", "text": query_text}]},
+                        {"role": "assistant", "content": [{"type": "text", "text": answer_text}]}
+                    ]
+                    
+                    # 이미지 처리
+                    images = []
+                    if "image" in sample and sample["image"]:
+                         # 이미지가 1개라고 가정 (ScienceQA는 1개) <= No this is fallback code. Use Every Image in datasetss
+                         if isinstance(sample["image"], list):
+                             images = sample["image"]
+                         else:
+                             images = [sample["image"]]
+                    
+                    results.append({"messages": messages, "images": images})
+                    sample_count += 1
+                    continue
+                
+                # 일반 QA
                 if question and answer:
                     messages = [
                         {"role": "user", "content": [{"type": "text", "text": question}]},
@@ -769,15 +999,13 @@ def process_generic_instruction(dataset, dataset_name: str, max_samples: int, lo
                     sample_count += 1
                     continue
             
-            # 변환 실패
-            failed_count += 1
+            # 변환 실패 - 엔거하게 에러 발생
+            sample_keys = list(sample.keys()) if isinstance(sample, dict) else type(sample).__name__
+            raise RuntimeError(f"[{dataset_name}] 샘플 {idx} 변환 실패. 키: {sample_keys}")
             
         except Exception as e:
-            logger.warning(f"   ❌ 범용 프로세서 샘플 {idx} 처리 실패: {e}")
-            failed_count += 1
-            continue
+            raise RuntimeError(f"[{dataset_name}] 샘플 {idx} 처리 중 오류: {e}")
     
-    logger.info(f"   ✅ 범용 프로세서 완료: 성공 {sample_count}개, 실패 {failed_count}개")
     return results
 
 # 데이터셋별 프로세서 매핑
@@ -840,16 +1068,16 @@ def convert_sample_to_messages(sample: Dict[str, Any], dataset_name: str, log_fa
         
         # 디버깅: 처음 몇 개 샘플의 keys 로깅
         if log_failure:
-            logger.info(f"   🔍 rStar-Coder 샘플 keys: {sample_keys}")
-            logger.info(f"   🔍 question: {bool(question)}, seed_question: {bool(seed_question)}, response: {bool(response)}, code: {bool(code)}")
+            logger.debug(f"   🔍 rStar-Coder 샘플 keys: {sample_keys}")
+            logger.debug(f"   🔍 question: {bool(question)}, seed_question: {bool(seed_question)}, response: {bool(response)}, code: {bool(code)}")
             if question:
-                logger.info(f"   🔍 question preview: {question[:100]}")
+                logger.debug(f"   🔍 question preview: {question[:100]}")
             if seed_question:
-                logger.info(f"   🔍 seed_question preview: {seed_question[:100]}")
+                logger.debug(f"   🔍 seed_question preview: {seed_question[:100]}")
             if response:
-                logger.info(f"   🔍 response preview: {response[:100]}")
+                logger.debug(f"   🔍 response preview: {response[:100]}")
             if code:
-                logger.info(f"   🔍 code preview: {code[:100]}")
+                logger.debug(f"   🔍 code preview: {code[:100]}")
         
         # question 또는 seed_question 중 하나는 있어야 함
         user_prompt = question.strip() if question and question.strip() else (seed_question.strip() if seed_question and seed_question.strip() else "")
@@ -991,6 +1219,64 @@ def convert_sample_to_messages(sample: Dict[str, Any], dataset_name: str, log_fa
                 # 이미지가 없어도 처리
                 return {"messages": messages, "images": []}
         
+        # UltraFeedback / Binarized 처리
+        if "ultrafeedback" in dataset_name.lower():
+            # 1. messages 필드 우선 확인
+            if "messages" in sample and isinstance(sample["messages"], list):
+                try:
+                    messages = validate_messages(sample["messages"])
+                    return {"messages": messages, "images": []}
+                except:
+                    pass
+            
+            # 2. prompt/chosen 확인
+            if "prompt" in sample and "chosen" in sample:
+                prompt = sample["prompt"]
+                chosen = sample["chosen"]
+                
+                response = ""
+                if isinstance(chosen, list):
+                    # 리스트인 경우 assistant 메시지 찾기
+                    for m in chosen:
+                        if isinstance(m, dict) and m.get("role") == "assistant":
+                            # content가 리스트일 수도 문자열일 수도 있음
+                            content = m.get("content", "")
+                            if isinstance(content, list):
+                                parts = [x.get("text", "") for x in content if x.get("type") == "text"]
+                                response = "\n".join(parts)
+                            else:
+                                response = str(content)
+                            break
+                    # 못 찾았으면 마지막 항목 사용
+                    if not response and chosen:
+                        m = chosen[-1]
+                        if isinstance(m, dict):
+                            content = m.get("content", "")
+                            response = str(content) if not isinstance(content, list) else "\n".join([x.get("text","") for x in content if x.get("type")=="text"])
+                else:
+                    response = str(chosen)
+                
+                messages = [
+                    {"role": "user", "content": [{"type": "text", "text": prompt}]},
+                    {"role": "assistant", "content": [{"type": "text", "text": response}]}
+                ]
+                return {"messages": messages, "images": []}
+
+        # UltraInteract 처리
+        if "ultrainteract" in dataset_name.lower():
+            instruction = sample.get("instruction", "")
+            response = sample.get("response", "")
+            if not response and "trajectory" in sample:
+                 response = str(sample["trajectory"])
+            
+            if instruction and response:
+                messages = [
+                    {"role": "user", "content": [{"type": "text", "text": instruction}]},
+                    {"role": "assistant", "content": [{"type": "text", "text": response}]}
+                ]
+                return {"messages": messages, "images": []}
+
+        
         # messages 형식 직접 지원
         if "messages" in sample and isinstance(sample["messages"], list):
             img = sample.get("image", [])
@@ -1014,8 +1300,13 @@ def convert_sample_to_messages(sample: Dict[str, Any], dataset_name: str, log_fa
                     {"role": "assistant", "content": [{"type": "text", "text": sample["output"]}]}
                 ]
             else:
+                # Input 필드가 있는 경우 처리
+                user_text = sample["instruction"]
+                if "input" in sample and sample["input"]:
+                    user_text += f"\n\nInput:\n{sample['input']}"
+                
                 messages = [
-                    {"role": "user", "content": [{"type": "text", "text": sample["instruction"]}]},
+                    {"role": "user", "content": [{"type": "text", "text": user_text}]},
                     {"role": "assistant", "content": [{"type": "text", "text": sample["output"]}]}
                 ]
             
@@ -1584,7 +1875,7 @@ DOMAIN_DATASETS = {
     ],
     "puzzle": [
         "openbmb/UltraInteract_sft",  # UltraInteract_sft: 논리 추론 instruction 데이터셋 (학습용)
-        "HuggingFaceH4/ultrafeedback_binarized",  # UltraFeedback: 존재하지 않음, 대체 필요
+        "HuggingFaceH4/ultrafeedback_binarized",  # UltraFeedback 캐시 문제 해결 후 복원
     ],
     "vision": [
         "lmms-lab/LLaVA-OneVision-Data",  # LLaVA-OneVision-Data: 다양한 비전 태스크 (멀티모달)
@@ -1704,19 +1995,74 @@ def _process_dataset_config_split(
         try:
             logger.debug(f"   🔍 [{dataset_name}] Config {config} Train split {train_split} 로딩...")
             
-            if config == "default":
-                train_dataset = load_dataset(
-                    path=dataset_name,
-                    split=train_split,
-                    streaming=use_streaming
-                )
+
+            # Load Args 구성 (복구됨)
+            load_kwargs = {
+                "path": dataset_name,
+                "split": train_split,
+                "streaming": use_streaming,
+                "trust_remote_code": True,
+            }
+            if config != "default":
+                load_kwargs["name"] = config
+
+            # [Dynamic Load] 메타데이터 오류 우회 및 동적 Split/File 매핑
+            broken_metadata_datasets = ["lmms-lab/LLaVA-OneVision-Data", "howard-hou/OCR-VQA", "HuggingFaceH4/ultrafeedback_binarized", "HuggingFaceTB/smoltalk"]
+            
+            if any(broken in dataset_name for broken in broken_metadata_datasets):
+                logger.warning(f"   🛡️ [{dataset_name}] 메타데이터 오류 회피 -> Parquet 동적 로딩 시작")
+                try:
+                    # 1. 빌더 로드 (메타데이터 확보)
+                    builder = load_dataset_builder(dataset_name, name=config if config != "default" else None, trust_remote_code=True)
+                    
+                    # 2. 사용 가능한 Split 확인 및 동적 매핑
+                    available_splits = list(builder.info.splits.keys()) if builder.info.splits else []
+                    target_split = train_split
+                    
+                    if train_split not in available_splits:
+                        candidates = [s for s in available_splits if "train" in s]
+                        if candidates:
+                            target_split = candidates[0]
+                            logger.warning(f"   ⚠️ Split '{train_split}' 부재 -> '{target_split}' 자동 매핑")
+                        else:
+                            logger.error(f"   ❌ Split 매핑 실패. 요청: {train_split}, 가용: {available_splits}")
+                            raise ValueError(f"Split '{train_split}'을 찾을 수 없습니다.")
+                    
+                    # 3. 파일 매핑 (Split 이름 -> Parquet 파일 경로)
+                    data_files = builder.config.data_files
+                    files = None
+                    if isinstance(data_files, dict):
+                        files = data_files.get(target_split)
+                        if not files:
+                            if "train" in data_files:
+                                files = data_files["train"]
+                            else:
+                                for k in data_files.keys():
+                                    if target_split in k or k in target_split:
+                                        files = data_files.get(k)
+                                        break
+                    else:
+                        files = data_files
+                    
+                    if not files:
+                        raise ValueError(f"Files not found for split {target_split}")
+
+                    # 4. Parquet 엔진으로 로드
+                    train_dataset = load_dataset(
+                        "parquet", 
+                        data_files={target_split: files}, 
+                        split=target_split, 
+                        streaming=use_streaming
+                    )
+                    logger.debug(f"   ✅ Parquet 동적 로딩 성공: Split '{target_split}'")
+                    
+                except Exception as pq_e:
+                    logger.error(f"   ❌ Parquet 로딩 중 치명적 오류: {pq_e}")
+                    raise pq_e 
             else:
-                train_dataset = load_dataset(
-                    path=dataset_name,
-                    name=config,
-                    split=train_split,
-                    streaming=use_streaming
-                )
+                # 일반 데이터셋 로딩
+                train_dataset = load_dataset(**load_kwargs)
+
             
             # 데이터셋 정보 확인
             dataset_size = None
@@ -1787,6 +2133,12 @@ def _process_dataset_config_split(
                     converted["images"] = image_paths
                     converted["domain"] = domain
                     
+                    # VLM 형식으로 변환 (모든 데이터를 VLM 형식으로 통일)
+                    converted = ensure_vlm_format(converted)
+                    
+                    # JSON 직렬화 가능한 형태로 정리
+                    converted = sanitize_sample_for_json(converted)
+                    
                     # 파일 쓰기 (도메인별 파일에 append)
                     try:
                         json_str = json.dumps(converted, ensure_ascii=False)
@@ -1828,19 +2180,66 @@ def _process_dataset_config_split(
             try:
                 logger.debug(f"   🔍 [{dataset_name}] Config {config} Test split {test_split} 로딩...")
                 
-                if config == "default":
-                    test_dataset = load_dataset(
-                        path=dataset_name,
-                        split=test_split,
-                        streaming=use_streaming
-                    )
+                # Test Load Args 구성
+                # Test Load Args 구성
+                test_load_kwargs = {
+                    "path": dataset_name,
+                    "split": test_split,
+                    "streaming": use_streaming,
+                    "trust_remote_code": True,
+                }
+                if config != "default":
+                    test_load_kwargs["name"] = config
+                
+                # [Dynamic Load] Test Parquet 직접 로딩 (동적 매핑)
+                if any(broken in dataset_name for broken in broken_metadata_datasets):
+                    logger.warning(f"   🛡️ [{dataset_name}] (Test) 메타데이터 오류 회피 -> Parquet 동적 로딩 시작")
+                    try:
+                        builder = load_dataset_builder(dataset_name, name=config if config != "default" else None, trust_remote_code=True)
+                        
+                        # 1. Split 매핑
+                        available_splits = list(builder.info.splits.keys()) if builder.info.splits else []
+                        target_split = test_split
+                        
+                        if test_split not in available_splits:
+                            # 'test'나 'val'이 포함된 Split 검색
+                            candidates = [s for s in available_splits if "test" in s or "val" in s]
+                            if candidates:
+                                target_split = candidates[0]
+                                logger.warning(f"   ⚠️ (Test) Split '{test_split}' 부재 -> '{target_split}' 자동 매핑")
+                            else:
+                                logger.error(f"   ❌ (Test) Split 매핑 실패. 요청: {test_split}, 가용: {available_splits}")
+                                raise ValueError(f"Split '{test_split}'을 찾을 수 없습니다.")
+
+                        # 2. 파일 매핑
+                        data_files = builder.config.data_files
+                        files = None
+                        if isinstance(data_files, dict):
+                             files = data_files.get(target_split)
+                             if not files:
+                                 # 키 이름 유연 검색
+                                 for k in data_files.keys():
+                                     if target_split in k or k in target_split:
+                                         files = data_files.get(k)
+                                         break
+                        else:
+                             files = data_files
+
+                        if not files:
+                            raise ValueError(f"Files not found for split {target_split}")
+
+                        test_dataset = load_dataset(
+                            "parquet", 
+                            data_files={target_split: files}, 
+                            split=target_split, 
+                            streaming=use_streaming
+                        )
+                        logger.debug(f"   ✅ (Test) Parquet 동적 로딩 성공: Split '{target_split}'")
+                    except Exception as pq_e:
+                        logger.error(f"   ❌ Parquet 직접 로딩 실패 (Test): {pq_e}")
+                        raise pq_e # Fallback 금지
                 else:
-                    test_dataset = load_dataset(
-                        path=dataset_name,
-                        name=config,
-                        split=test_split,
-                        streaming=use_streaming
-                    )
+                    test_dataset = load_dataset(**test_load_kwargs)
                 
                 test_samples_per_config = int(samples_per_config * test_size)
                 
@@ -1878,6 +2277,12 @@ def _process_dataset_config_split(
                         # 최종 데이터 구성
                         converted["images"] = image_paths
                         converted["domain"] = domain
+                        
+                        # VLM 형식으로 변환 (모든 데이터를 VLM 형식으로 통일)
+                        converted = ensure_vlm_format(converted)
+                        
+                        # JSON 직렬화 가능한 형태로 정리
+                        converted = sanitize_sample_for_json(converted)
                         
                         # 파일 쓰기 (도메인별 파일에 append)
                         try:
@@ -1972,7 +2377,7 @@ def _process_domain_datasets(
     
     for dataset_name in dataset_names:
         try:
-            logger.info(f"   📋 {domain} 도메인 - 데이터셋: {dataset_name}")
+            logger.debug(f"   📋 {domain} 도메인 - 데이터셋: {dataset_name}")
             
             # 데이터셋 존재 확인
             if not dataset_exists(dataset_name):
@@ -2137,7 +2542,7 @@ def _process_domain_datasets(
         logger.error(error_msg)
         raise RuntimeError(error_msg)
     
-    logger.info(f"   📊 {domain} 도메인 처리 통계: 총 {domain_stats['total_processed']}개 샘플 처리 완료")
+    logger.debug(f"   📊 {domain} 도메인 처리 통계: 총 {domain_stats['total_processed']}개 샘플 처리 완료")
     
     return {
         "domain": domain,
@@ -2156,7 +2561,8 @@ def get_multi_domain_sft_dataset(
     use_streaming: bool = True,
     chunk_size: int = 1000,
     max_workers: int = 4,
-    use_cache: bool = True
+    use_cache: bool = True,
+    allow_text_only: bool = False
 ):
     """
     멀티 도메인 SFT 데이터셋을 로드합니다.
@@ -2195,17 +2601,17 @@ def get_multi_domain_sft_dataset(
     if use_cache and os.path.exists(cache_train_path) and os.path.exists(cache_test_path):
         # 파일 크기 확인 (빈 파일이 아닌지)
         if os.path.getsize(cache_train_path) > 0:
-            logger.info(f"💾 캐시된 데이터셋 발견: {cache_key}")
-            logger.info(f"   - 캐시 디렉토리: {cache_dir}")
+            logger.debug(f"💾 캐시된 데이터셋 발견: {cache_key}")
+            logger.debug(f"   - 캐시 디렉토리: {cache_dir}")
             
             # 메타데이터 확인
             if os.path.exists(cache_meta_path):
                 try:
                     with open(cache_meta_path, "r", encoding="utf-8") as f:
                         cache_meta = json.load(f)
-                        logger.info(f"   - 캐시 생성 시간: {cache_meta.get('created_at', 'N/A')}")
-                        logger.info(f"   - Train 샘플 수: {cache_meta.get('train_count', 'N/A')}")
-                        logger.info(f"   - Test 샘플 수: {cache_meta.get('test_count', 'N/A')}")
+                        logger.debug(f"   - 캐시 생성 시간: {cache_meta.get('created_at', 'N/A')}")
+                        logger.debug(f"   - Train 샘플 수: {cache_meta.get('train_count', 'N/A')}")
+                        logger.debug(f"   - Test 샘플 수: {cache_meta.get('test_count', 'N/A')}")
                 except Exception as e:
                     logger.warning(f"   ⚠️ 캐시 메타데이터 읽기 실패: {e}")
             
@@ -2221,105 +2627,43 @@ def get_multi_domain_sft_dataset(
                     logger.warning("   ⚠️ 캐시 파일이 비어있습니다. 재처리합니다.")
                     raise FileNotFoundError("Cache files are empty")
                 
-                logger.info("🧠 캐시된 JSONL 파일로부터 데이터셋 로딩...")
+                logger.debug("🧠 캐시된 JSONL 파일로부터 데이터셋 로딩 (Memory Mapping 활성화)...")
                 
-                # JSONL 파일을 읽어서 리스트로 만든 후 Dataset.from_list 사용
-                dataset_dict = DatasetDict()
-                for split_name, file_path in data_files.items():
-                    logger.info(f"   📂 {split_name} split 로딩 중...")
-                    
-                    # JSONL 파일 읽기 및 정제
-                    records = []
-                    with open(file_path, 'r', encoding='utf-8') as f:
-                        for line_num, line in enumerate(f, 1):
-                            if not line.strip():
-                                continue
-                            try:
-                                record = json.loads(line.strip())
-                                
-                                # messages 정규화
-                                if 'messages' in record and isinstance(record['messages'], list):
-                                    for message in record['messages']:
-                                        if not isinstance(message, dict):
-                                            continue
-                                        if 'content' in message and isinstance(message['content'], list):
-                                            for content_item in message['content']:
-                                                if not isinstance(content_item, dict):
-                                                    continue
-                                                # text 필드가 없거나 None이면 빈 문자열로
-                                                if 'text' not in content_item or content_item.get('text') is None:
-                                                    content_item['text'] = ""
-                                                # type 필드가 없으면 "text"로
-                                                if 'type' not in content_item:
-                                                    content_item['type'] = "text"
-                                
-                                # images 필드 정규화 (없으면 빈 리스트, 문자열 리스트로 보장)
-                                if 'images' not in record:
-                                    record['images'] = []
-                                elif record['images'] is None:
-                                    record['images'] = []
-                                elif not isinstance(record['images'], list):
-                                    record['images'] = []
-                                else:
-                                    # 이미지 경로가 문자열인지 확인
-                                    record['images'] = [str(img) if img is not None else "" for img in record['images'] if img is not None]
-                                
-                                # domain 필드 정규화 (없으면 "unknown")
-                                if 'domain' not in record or record.get('domain') is None:
-                                    record['domain'] = "unknown"
-                                else:
-                                    record['domain'] = str(record['domain'])
-                                
-                                records.append(record)
-                            except (json.JSONDecodeError, TypeError) as e:
-                                logger.debug(f"   ⚠️ {split_name} 파일 {line_num}번째 줄 JSON 파싱 실패, 건너뜀: {e}")
-                                continue
-                    
-                    # Dataset.from_list로 생성
-                    if records:
-                        dataset_dict[split_name] = Dataset.from_list(records)
-                        logger.info(f"   ✅ {split_name} split 로드 완료: {len(dataset_dict[split_name])}개 샘플")
-                    else:
-                        logger.warning(f"   ⚠️ {split_name} split에 유효한 샘플이 없습니다.")
-                        # 빈 데이터셋 생성
-                        dataset_dict[split_name] = Dataset.from_list([])
+                # Using load_dataset("json") with explicit schema for memory-mapped loading
+                from datasets import load_dataset as hf_load_dataset
+                dataset_dict = hf_load_dataset("json", data_files=data_files, features=SFT_JSON_FEATURES)
                 
-                # 이미지 경로 처리
-                logger.info("🖼️ 이미지 경로를 이미지 객체로 캐스팅 (lazy loading)...")
+                # CRITICAL RAM FIX: Slice dataset IMMEDIATELY after loading if it exceeds requested size
+                # This prevents holding 3M+ Python objects in RAM during the .map() phase
+                total_max_samples = max_samples_per_domain * len(domain_configs)
                 for split in dataset_dict:
-                    def preprocess_images(example):
-                        """이미지 데이터 전처리 - 중첩 리스트 평면화"""
-                        if 'images' in example and example['images']:
-                            # 이미지 경로를 절대 경로로 변환 (캐시 디렉토리 기준)
-                            image_paths = example['images']
-                            if isinstance(image_paths, list):
-                                # 상대 경로인 경우 절대 경로로 변환
-                                fixed_paths = []
-                                for img_path in image_paths:
-                                    if isinstance(img_path, str) and img_path.strip():
-                                        if not os.path.isabs(img_path):
-                                            img_path = os.path.join(cache_images_dir, os.path.basename(img_path))
-                                        # 파일 존재 확인
-                                        if os.path.exists(img_path):
-                                            fixed_paths.append(img_path)
-                                example['images'] = validate_image_data(fixed_paths)
-                            else:
-                                example['images'] = validate_image_data(example['images']) if example['images'] else []
-                        elif 'images' not in example:
-                            example['images'] = []
-                        return example
-                    
-                    # 이미지 전처리 적용
-                    dataset_dict[split] = dataset_dict[split].map(preprocess_images)
-                    
-                    # 이미지 필드를 DatasetImage로 캐스팅
+                    current_size = len(dataset_dict[split])
+                    if current_size > total_max_samples * 2: # Keep some headroom for filtering
+                        logger.debug(f"   ✂️  Slicing {split} dataset from {current_size} to {total_max_samples * 2} to save RAM")
+                        dataset_dict[split] = dataset_dict[split].select(range(total_max_samples * 2))
+                
+                logger.debug(f"   ✅ 데이터셋 로드 완료 (Memory Mapped): {dataset_dict}")
+                
+                # 이미지 경로 처리 및 캐스팅 (Memory Efficient)
+                logger.debug("🖼️ 이미지 경로 처리 및 DatasetImage 캐스팅 (num_proc 활용)...")
+                
+                # Setup features for casting
+                for split in dataset_dict:
                     current_features = dataset_dict[split].features
                     new_features = current_features.copy()
-                    if 'images' in new_features:
-                        new_features['images'] = Sequence(DatasetImage(decode=True))
-                        dataset_dict[split] = dataset_dict[split].cast(new_features)
+                    new_features['images'] = Sequence(DatasetImage(decode=True))
+                    
+                    # Use map with num_proc for faster execution
+                    dataset_dict[split] = dataset_dict[split].map(
+                        _preprocess_images_for_mapping,
+                        fn_kwargs={"cache_images_dir": cache_images_dir},
+                        batched=False,
+                        num_proc=min(max_workers, 8),
+                        features=new_features,
+                        desc=f"Processing {split} images"
+                    )
                 
-                logger.info("✅ 캐시된 데이터셋 로드 완료")
+                logger.debug("✅ 캐시된 데이터셋 로드 완료")
                 return dataset_dict
                 
             except Exception as e:
@@ -2328,12 +2672,12 @@ def get_multi_domain_sft_dataset(
                 # 캐시 로드 실패 시 기존 로직으로 진행
     
     # 캐시가 없거나 사용하지 않는 경우 기존 처리 로직
-    logger.info(f"📦 멀티 도메인 데이터셋 로딩 시작 (캐시 없음)")
-    logger.info(f"   - 도메인 수: {len(domain_configs)}개")
-    logger.info(f"   - 도메인당 최대 샘플: {max_samples_per_domain}개")
-    logger.info(f"   - 총 최대 샘플: {max_samples_per_domain * len(domain_configs)}개")
-    logger.info(f"   - streaming: {use_streaming}")
-    logger.info(f"   - 병렬 처리: {max_workers}개 워커")
+    logger.debug(f"📦 멀티 도메인 데이터셋 로딩 시작 (캐시 없음)")
+    logger.debug(f"   - 도메인 수: {len(domain_configs)}개")
+    logger.debug(f"   - 도메인당 최대 샘플: {max_samples_per_domain}개")
+    logger.debug(f"   - 총 최대 샘플: {max_samples_per_domain * len(domain_configs)}개")
+    logger.debug(f"   - streaming: {use_streaming}")
+    logger.debug(f"   - 병렬 처리: {max_workers}개 워커")
     
     log_memory_usage("멀티 도메인 데이터셋 로딩 시작")
     
@@ -2392,6 +2736,12 @@ def get_multi_domain_sft_dataset(
                 domain = future_to_domain[future]
                 try:
                     result = future.result()
+                    
+                    if result is None:
+                        logger.warning(f"⏩ {domain} 도메인 처리 결과가 없습니다 (Skipped).")
+                        domain_pbar.update(1)
+                        continue
+                        
                     domain_file_paths[domain] = {
                         "train": result["train_path"],
                         "test": result["test_path"]
@@ -2410,11 +2760,6 @@ def get_multi_domain_sft_dataset(
                         if not f.done():
                             f.cancel()
                     
-                    # Executor 종료 (기다리지 않고 즉시 취소)
-                    executor.shutdown(wait=False, cancel_futures=True)
-                    
-                    # 프로세스 강제 종료
-                    logger.error("💀 프로세스를 강제 종료합니다.")
                     os._exit(1)
         finally:
             # 정상 완료 시에만 정상 종료
@@ -2432,7 +2777,7 @@ def get_multi_domain_sft_dataset(
         domain_pbar.close()
         
         # 도메인별 파일을 최종 파일로 합치기
-        logger.info("🔄 도메인별 파일을 최종 파일로 합치는 중...")
+        logger.debug("🔄 도메인별 파일을 최종 파일로 합치는 중...")
         with open(train_jsonl_path, "w", encoding="utf-8") as train_f, \
              open(test_jsonl_path, "w", encoding="utf-8") as test_f:
             
@@ -2470,9 +2815,9 @@ def get_multi_domain_sft_dataset(
             logger.error(error_msg)
             raise RuntimeError(error_msg)
         
-        logger.info("📊 도메인별 샘플 통계 (균등화 전):")
+        logger.debug("📊 도메인별 샘플 통계 (균등화 전):")
         for domain, counts in domain_counts.items():
-            logger.info(f"   - {domain}: Train {counts['train']}개, Test {counts['test']}개")
+            logger.debug(f"   - {domain}: Train {counts['train']}개, Test {counts['test']}개")
         
         # 도메인별 샘플 수 균등화
         # 각 도메인에서 동일한 수의 샘플을 사용하도록 조정
@@ -2483,13 +2828,13 @@ def get_multi_domain_sft_dataset(
             min_train = min([c["train"] for c in domain_counts.values()] + [max_samples_per_domain])
             min_test = min([c["test"] for c in domain_counts.values()] + [int(max_samples_per_domain * test_size)])
             
-            logger.info(f"⚖️ 도메인별 샘플 수 균등화:")
-            logger.info(f"   - 최소 Train 샘플 수: {min_train}개")
-            logger.info(f"   - 최소 Test 샘플 수: {min_test}개")
+            logger.debug(f"⚖️ 도메인별 샘플 수 균등화:")
+            logger.debug(f"   - 최소 Train 샘플 수: {min_train}개")
+            logger.debug(f"   - 최소 Test 샘플 수: {min_test}개")
             
             # JSONL 파일을 다시 읽어서 균등화
             if min_train > 0 or min_test > 0:
-                logger.info("🔄 샘플 수 균등화를 위해 JSONL 파일 재처리...")
+                logger.debug("🔄 샘플 수 균등화를 위해 JSONL 파일 재처리...")
                 
                 # 임시 파일로 재작성
                 balanced_train_path = os.path.join(cache_dir, "train_balanced.jsonl")
@@ -2498,20 +2843,107 @@ def get_multi_domain_sft_dataset(
                 domain_train_samples = defaultdict(list)
                 domain_test_samples = defaultdict(list)
                 
-                # 기존 JSONL 파일 읽기
+                # JSON 파싱 오류 추적 (리스트 사용 - mutable)
+                json_parse_errors = {"train": [0], "test": [0]}
+                
+                # 기존 JSONL 파일 읽기 (robust한 JSON 파싱)
+                def safe_json_loads(line, line_num=None, error_counter=None):
+                    """안전한 JSON 파싱 - 오류 발생 시 None 반환"""
+                    try:
+                        # 줄바꿈 제거 및 공백 정리
+                        line = line.strip()
+                        if not line:
+                            return None
+                        
+                        # JSON 파싱 시도
+                        try:
+                            sample = json.loads(line)
+                        except json.JSONDecodeError as e:
+                            # 멀티라인 JSON 시도 (라인 끝에 불완전한 JSON이 있을 수 있음)
+                            # 마지막 불완전한 객체를 제거하고 재시도
+                            if e.pos is not None and e.pos < len(line):
+                                # 불완전한 부분을 제거하고 재시도
+                                truncated_line = line[:e.pos].rstrip()
+                                # 마지막 불완전한 객체 제거
+                                if truncated_line:
+                                    # 마지막 불완전한 객체의 시작 부분 찾기
+                                    last_brace = truncated_line.rfind('}')
+                                    last_bracket = truncated_line.rfind(']')
+                                    last_pos = max(last_brace, last_bracket)
+                                    if last_pos > 0:
+                                        truncated_line = truncated_line[:last_pos + 1]
+                                        try:
+                                            sample = json.loads(truncated_line)
+                                        except:
+                                            raise e
+                                    else:
+                                        raise e
+                                else:
+                                    raise e
+                            else:
+                                raise e
+                        
+                        # 샘플이 dict가 아니면 None 반환
+                        if not isinstance(sample, dict):
+                            return None
+                        
+                        # VLM 형식으로 변환
+                        sample = ensure_vlm_format(sample)
+                        
+                        return sample
+                    except json.JSONDecodeError as e:
+                        if error_counter is not None:
+                            error_counter[0] += 1
+                        if line_num is not None and error_counter is not None and error_counter[0] <= 10:
+                            # 처음 10개 오류만 상세 로그 출력
+                            logger.warning(f"⚠️ JSON 파싱 오류 (라인 {line_num}): {e}")
+                            logger.warning(f"   문제가 있는 라인 (처음 200자): {line[:200]}")
+                        return None
+                    except Exception as e:
+                        if error_counter is not None:
+                            error_counter[0] += 1
+                        if line_num is not None and error_counter is not None and error_counter[0] <= 10:
+                            # 처음 10개 오류만 상세 로그 출력
+                            logger.warning(f"⚠️ 예상치 못한 오류 (라인 {line_num}): {e}")
+                        return None
+                
+                # Train 파일 읽기
+                train_line_num = 0
                 with open(train_jsonl_path, "r", encoding="utf-8") as f:
                     for line in f:
-                        if line.strip():
-                            sample = json.loads(line)
+                        train_line_num += 1
+                        sample = safe_json_loads(line, train_line_num, error_counter=json_parse_errors["train"])
+                        if sample is not None:
+                            # Filter out text-only samples if allow_text_only=False
+                            if not allow_text_only:
+                                images = sample.get("images", [])
+                                if not images or len(images) == 0:
+                                    continue  # Skip text-only samples
+
                             domain = sample.get("domain", "unknown")
                             domain_train_samples[domain].append(sample)
                 
+                # Test 파일 읽기
+                test_line_num = 0
                 with open(test_jsonl_path, "r", encoding="utf-8") as f:
                     for line in f:
-                        if line.strip():
-                            sample = json.loads(line)
+                        test_line_num += 1
+                        sample = safe_json_loads(line, test_line_num, error_counter=json_parse_errors["test"])
+                        if sample is not None:
+                            # Filter out text-only samples if allow_text_only=False
+                            if not allow_text_only:
+                                images = sample.get("images", [])
+                                if not images or len(images) == 0:
+                                    continue  # Skip text-only samples
+
                             domain = sample.get("domain", "unknown")
                             domain_test_samples[domain].append(sample)
+                
+                # JSON 파싱 오류 로그 출력
+                train_parse_errors = json_parse_errors["train"][0]
+                test_parse_errors = json_parse_errors["test"][0]
+                if train_parse_errors > 0 or test_parse_errors > 0:
+                    logger.warning(f"⚠️ JSON 파싱 오류 발생: Train {train_parse_errors}개, Test {test_parse_errors}개 (건너뜀)")
                 
                 # 각 도메인별로 최소 샘플 수만큼만 사용
                 balanced_domain_counts = defaultdict(lambda: {"train": 0, "test": 0})
@@ -2527,9 +2959,18 @@ def get_multi_domain_sft_dataset(
                             train_samples = train_samples[:min_train]
                         
                         for sample in train_samples:
-                            train_f.write(json.dumps(sample) + "\n")
-                            balanced_domain_counts[domain]["train"] += 1
-                            balanced_train_count += 1
+                            try:
+                                # VLM 형식으로 변환
+                                sample = ensure_vlm_format(sample)
+                                # JSON 직렬화 가능한 형태로 정리
+                                sample = sanitize_sample_for_json(sample)
+                                # ensure_ascii=False로 특수 문자 제대로 처리
+                                train_f.write(json.dumps(sample, ensure_ascii=False) + "\n")
+                                balanced_domain_counts[domain]["train"] += 1
+                                balanced_train_count += 1
+                            except Exception as e:
+                                logger.warning(f"⚠️ Train 샘플 저장 실패 (도메인: {domain}): {e}")
+                                continue
                         
                         # Test 샘플 균등화
                         test_samples = domain_test_samples[domain]
@@ -2538,9 +2979,73 @@ def get_multi_domain_sft_dataset(
                             test_samples = test_samples[:min_test]
                         
                         for sample in test_samples:
-                            test_f.write(json.dumps(sample) + "\n")
-                            balanced_domain_counts[domain]["test"] += 1
-                            balanced_test_count += 1
+                            try:
+                                # VLM 형식으로 변환
+                                sample = ensure_vlm_format(sample)
+                                # JSON 직렬화 가능한 형태로 정리
+                                sample = sanitize_sample_for_json(sample)
+                                # ensure_ascii=False로 특수 문자 제대로 처리
+                                test_f.write(json.dumps(sample, ensure_ascii=False) + "\n")
+                                balanced_domain_counts[domain]["test"] += 1
+                                balanced_test_count += 1
+                            except Exception as e:
+                                logger.warning(f"⚠️ Test 샘플 저장 실패 (도메인: {domain}): {e}")
+                                continue
+                
+                # 균등화된 파일 검증 및 정제
+                logger.info("🔍 균등화된 파일 검증 중...")
+                
+                # Train 파일 검증
+                if os.path.exists(balanced_train_path):
+                    valid_train_lines = []
+                    with open(balanced_train_path, "r", encoding="utf-8") as f:
+                        for line_num, line in enumerate(f, 1):
+                            line = line.strip()
+                            if not line:
+                                continue
+                            try:
+                                sample = json.loads(line)
+                                sample = ensure_vlm_format(sample)
+                                sample = sanitize_sample_for_json(sample)
+                                if isinstance(sample, dict) and "messages" in sample:
+                                    valid_train_lines.append(json.dumps(sample, ensure_ascii=False))
+                            except:
+                                continue
+                    
+                    if valid_train_lines:
+                        with open(balanced_train_path, "w", encoding="utf-8") as f:
+                            for line in valid_train_lines:
+                                f.write(line + "\n")
+                        balanced_train_count = len(valid_train_lines)
+                    else:
+                        logger.warning("⚠️ 균등화된 Train 파일에 유효한 샘플이 없습니다.")
+                        balanced_train_count = 0
+                
+                # Test 파일 검증
+                if os.path.exists(balanced_test_path):
+                    valid_test_lines = []
+                    with open(balanced_test_path, "r", encoding="utf-8") as f:
+                        for line_num, line in enumerate(f, 1):
+                            line = line.strip()
+                            if not line:
+                                continue
+                            try:
+                                sample = json.loads(line)
+                                sample = ensure_vlm_format(sample)
+                                sample = sanitize_sample_for_json(sample)
+                                if isinstance(sample, dict) and "messages" in sample:
+                                    valid_test_lines.append(json.dumps(sample, ensure_ascii=False))
+                            except:
+                                continue
+                    
+                    if valid_test_lines:
+                        with open(balanced_test_path, "w", encoding="utf-8") as f:
+                            for line in valid_test_lines:
+                                f.write(line + "\n")
+                        balanced_test_count = len(valid_test_lines)
+                    else:
+                        logger.warning("⚠️ 균등화된 Test 파일에 유효한 샘플이 없습니다.")
+                        balanced_test_count = 0
                 
                 # 균등화된 파일로 교체
                 train_jsonl_path = balanced_train_path
@@ -2550,7 +3055,13 @@ def get_multi_domain_sft_dataset(
                 for domain, counts in balanced_domain_counts.items():
                     logger.info(f"   - {domain}: Train {counts['train']}개, Test {counts['test']}개")
                 
-                logger.debug(f"✅ 균등화 완료: Train {balanced_train_count}개, Test {balanced_test_count}개")
+                logger.info(f"✅ 균등화 완료: Train {balanced_train_count}개, Test {balanced_test_count}개")
+                
+                # 균등화 후 샘플이 없으면 오류 발생
+                if balanced_train_count == 0 and balanced_test_count == 0:
+                    error_msg = "❌ 균등화 후 샘플이 없습니다. JSON 파싱 오류나 필터링으로 인해 모든 샘플이 제거되었을 수 있습니다."
+                    logger.error(error_msg)
+                    raise RuntimeError(error_msg)
             else:
                 total_train = sum(c["train"] for c in domain_counts.values())
                 total_test = sum(c["test"] for c in domain_counts.values())
@@ -2562,13 +3073,16 @@ def get_multi_domain_sft_dataset(
             balanced_test_count = 0
         
         # JSONL 파일로부터 데이터셋 로드
+        original_data_files = {}
         data_files = {}
         final_train_count = balanced_train_count
         final_test_count = balanced_test_count
         
         if final_train_count > 0:
+            original_data_files["train"] = train_jsonl_path
             data_files["train"] = train_jsonl_path
         if final_test_count > 0:
+            original_data_files["test"] = test_jsonl_path
             data_files["test"] = test_jsonl_path
 
         if not data_files:
@@ -2585,42 +3099,102 @@ def get_multi_domain_sft_dataset(
         logger.info(f"   - Train 파일: {data_files.get('train', 'N/A')}")
         logger.info(f"   - Test 파일: {data_files.get('test', 'N/A')}")
         
-        # JSONL 파일 검증 (첫 몇 줄 확인)
+        # JSONL 파일 검증 및 정제 (빈 파일, 잘못된 JSON 라인 제거)
+        cleaned_data_files = {}
         for split_name, file_path in data_files.items():
             try:
-                logger.debug(f"   📋 {split_name} 파일 검증 중...")
-                with open(file_path, "r", encoding="utf-8") as f:
-                    line_count = 0
-                    for i, line in enumerate(f):
-                        if i >= 3:  # 처음 3줄만 확인
-                            break
-                        if line.strip():
-                            try:
-                                sample = json.loads(line)
-                                # 메시지 텍스트 필드 검증
-                                if "messages" in sample:
-                                    for msg in sample["messages"]:
-                                        if "content" in msg:
-                                            for content_item in msg["content"]:
-                                                if isinstance(content_item, dict) and "text" in content_item:
-                                                    text_value = content_item["text"]
-                                                    if not isinstance(text_value, str):
-                                                        logger.warning(f"   ⚠️ {split_name} 파일 {i+1}번째 줄: text 필드가 문자열이 아님 (타입: {type(text_value)}, 값: {text_value})")
-                                line_count += 1
-                            except json.JSONDecodeError as e:
-                                logger.error(f"   ❌ {split_name} 파일 {i+1}번째 줄 JSON 파싱 실패: {e}")
-                                logger.error(f"   줄 내용: {line[:200]}...")
-                            except Exception as e:
-                                logger.warning(f"   ⚠️ {split_name} 파일 {i+1}번째 줄 검증 중 오류: {e}")
+                logger.info(f"   📋 {split_name} 파일 검증 및 정제 중...")
                 
-                # 파일 크기 확인
+                # 파일 존재 및 크기 확인
+                if not os.path.exists(file_path):
+                    logger.error(f"   ❌ {split_name} 파일이 존재하지 않습니다: {file_path}")
+                    continue
+                
                 file_size = os.path.getsize(file_path)
-                logger.info(f"   ✅ {split_name} 파일 검증 완료 (크기: {file_size / 1024 / 1024:.2f} MB)")
+                if file_size == 0:
+                    logger.error(f"   ❌ {split_name} 파일이 비어있습니다: {file_path}")
+                    continue
+                
+                # 파일 읽기 및 유효한 JSON 라인만 추출
+                valid_lines = []
+                total_lines = 0
+                invalid_lines = 0
+                
+                with open(file_path, "r", encoding="utf-8") as f:
+                    for line_num, line in enumerate(f, 1):
+                        total_lines += 1
+                        line = line.strip()
+                        if not line:
+                            continue
+                        
+                        try:
+                            # JSON 파싱 시도
+                            sample = json.loads(line)
+                            
+                            # VLM 형식으로 변환
+                            sample = ensure_vlm_format(sample)
+                            
+                            # JSON 직렬화 가능한 형태로 정리
+                            sample = sanitize_sample_for_json(sample)
+                            
+                            # 유효한 샘플인지 확인 (messages 필드 필수)
+                            if not isinstance(sample, dict) or "messages" not in sample:
+                                invalid_lines += 1
+                                if invalid_lines <= 5:
+                                    logger.warning(f"   ⚠️ {split_name} 파일 {line_num}번째 줄: messages 필드가 없음")
+                                continue
+                            
+                            # 유효한 JSON 라인으로 저장
+                            valid_lines.append(json.dumps(sample, ensure_ascii=False))
+                            
+                        except json.JSONDecodeError as e:
+                            invalid_lines += 1
+                            if invalid_lines <= 5:
+                                logger.warning(f"   ⚠️ {split_name} 파일 {line_num}번째 줄 JSON 파싱 실패: {e}")
+                                logger.warning(f"      줄 내용 (처음 200자): {line[:200]}")
+                            continue
+                        except Exception as e:
+                            invalid_lines += 1
+                            if invalid_lines <= 5:
+                                logger.warning(f"   ⚠️ {split_name} 파일 {line_num}번째 줄 처리 중 오류: {e}")
+                            continue
+                
+                # 유효한 라인이 없으면 건너뛰기
+                if not valid_lines:
+                    logger.error(f"   ❌ {split_name} 파일에 유효한 JSON 라인이 없습니다 (총 {total_lines}줄, 유효하지 않은 라인 {invalid_lines}개)")
+                    continue
+                
+                # 정제된 파일로 저장
+                cleaned_file_path = file_path + ".cleaned"
+                with open(cleaned_file_path, "w", encoding="utf-8") as f:
+                    for valid_line in valid_lines:
+                        f.write(valid_line + "\n")
+                
+                logger.info(f"   ✅ {split_name} 파일 검증 완료: 총 {total_lines}줄 중 {len(valid_lines)}개 유효 (크기: {file_size / 1024 / 1024:.2f} MB)")
+                if invalid_lines > 0:
+                    logger.warning(f"   ⚠️ {invalid_lines}개 유효하지 않은 라인 제거됨")
+                
+                cleaned_data_files[split_name] = cleaned_file_path
+                
             except Exception as e:
-                logger.warning(f"   ⚠️ {split_name} 파일 검증 실패: {e}")
+                logger.error(f"   ❌ {split_name} 파일 검증 실패: {e}")
+                traceback.print_exc()
+        
+        # 정제된 파일이 없으면 오류
+        if not cleaned_data_files:
+            error_msg = "❌ 정제된 JSONL 파일이 없습니다. 모든 파일이 비어있거나 유효하지 않습니다."
+            logger.error(error_msg)
+            raise RuntimeError(error_msg)
+        
+        # 정제된 파일로 교체
+        data_files = cleaned_data_files
+        
         
         try:
-            dataset_dict = load_dataset("json", data_files=data_files)
+            # Reload from JSONL with memory mapping enabled (streaming=False but using load_dataset("json"))
+            # JSONL 형식으로 명시적으로 지정 (lines=True)
+            logger.info("📦 데이터셋 로딩 중...")
+            dataset_dict = load_dataset("json", data_files=data_files, features=SFT_JSON_FEATURES)
         except Exception as load_e:
             logger.error(f"❌ JSONL 파일 로딩 실패: {load_e}")
             logger.error(f"   - Train 파일: {data_files.get('train', 'N/A')}")
@@ -2628,7 +3202,7 @@ def get_multi_domain_sft_dataset(
             
             # 문제가 있는 샘플 찾기 (58번째 줄 주변 포함)
             for split_name, file_path in data_files.items():
-                logger.info(f"   🔍 {split_name} 파일에서 문제 샘플 검색 중...")
+                logger.debug(f"   🔍 {split_name} 파일에서 문제 샘플 검색 중...")
                 try:
                     with open(file_path, "r", encoding="utf-8") as f:
                         for line_num, line in enumerate(f, 1):
@@ -2674,6 +3248,21 @@ def get_multi_domain_sft_dataset(
             
             raise
         
+        # 정제된 파일 정리 (원본 파일로 교체)
+        logger.info("🧹 정제된 파일 정리 중...")
+        for split_name, cleaned_file_path in cleaned_data_files.items():
+            try:
+                if split_name in original_data_files:
+                    original_file_path = original_data_files[split_name]
+                    if os.path.exists(cleaned_file_path):
+                        # 정제된 파일로 원본 파일 교체
+                        if os.path.exists(original_file_path):
+                            os.remove(original_file_path)
+                        shutil.move(cleaned_file_path, original_file_path)
+                        logger.debug(f"   ✅ {split_name} 파일 정제 완료: {original_file_path}")
+            except Exception as e:
+                logger.warning(f"   ⚠️ {split_name} 파일 정리 중 오류: {e}")
+        
         logger.info("🖼️ 이미지 경로를 이미지 객체로 캐스팅 (lazy loading)...")
         for split in dataset_dict:
             current_features = dataset_dict[split].features
@@ -2695,7 +3284,7 @@ def get_multi_domain_sft_dataset(
                     new_features['images'] = Sequence(DatasetImage(decode=True))
                     dataset_dict[split] = dataset_dict[split].cast(new_features)
 
-        logger.info("✅ 멀티 도메인 데이터셋 생성 완료")
+        logger.debug("✅ 멀티 도메인 데이터셋 생성 완료")
         
         # 처리 완료 후 메타데이터 저장
         try:
@@ -2712,7 +3301,7 @@ def get_multi_domain_sft_dataset(
             }
             with open(cache_meta_path, "w", encoding="utf-8") as f:
                 json.dump(cache_meta, f, indent=2, ensure_ascii=False)
-            logger.info(f"💾 데이터셋 캐시 저장 완료: {cache_dir}")
+            logger.debug(f"💾 데이터셋 캐시 저장 완료: {cache_dir}")
         except Exception as e:
             logger.warning(f"⚠️ 캐시 메타데이터 저장 실패: {e}")
         
@@ -2728,13 +3317,10 @@ def get_multi_domain_sft_dataset(
 
 def create_simple_collate_fn(processor, max_length: int = 2048, allow_text_only: bool = True):
     """
-    SFTTrainer용 커스텀 data collator - 멀티 도메인 지원
-    
-    Args:
-        processor: AutoProcessor
-        max_length: 최대 시퀀스 길이
-        allow_text_only: True면 이미지가 없는 텍스트 전용 샘플도 허용 (multi-domain용, 기본값 True)
+    SFTTrainer용 커스텀 data collator - DeepSpeed ZeRO-3 최적화 버전
+    (모든 랭크가 동일한 모달리티 구조를 갖도록 대칭성 유지)
     """
+    import re
     from trl.trainer.sft_trainer import DataCollatorForVisionLanguageModeling
     
     class CustomSFTDataCollator(DataCollatorForVisionLanguageModeling):
@@ -2743,150 +3329,115 @@ def create_simple_collate_fn(processor, max_length: int = 2048, allow_text_only:
             self.processor = processor
             self.max_length = max_length
             self.allow_text_only = allow_text_only
-        
+            
+            # No Siglip - use native processor for Qwen3-VL-MoE compatibility
+
+            # Detect image token for Qwen3-VL/Qwen2-VL
+            self.image_token = None
+            for attr in ['image_token', 'im_start_token', 'vision_token']:
+                if hasattr(self.processor, attr):
+                    token = getattr(self.processor, attr)
+                    if isinstance(token, str): self.image_token = token; break
+            if self.image_token is None: self.image_token = '<image>'
+            
+            # Dummy image for ZeRO-3 symmetry (Compatible with Qwen3-VL-MoE)
+            # Use size divisible by patch_size(16) * spatial_merge_size(2)
+            self.dummy_image = Image.new('RGB', (64, 64), (0, 0, 0))
+
         def _collate_language_modeling(self, examples):
-            """이미지가 없는 샘플도 처리할 수 있도록 오버라이드"""
-            # messages 추출
+            """
+            Modified for Universal Exoskeleton:
+            1. Enforce specific token count (196) to match Siglip vision tower features.
+            2. Bypass Qwen dynamic token calculation by passing images=None to processor.
+            3. Manually inject Siglip-processed pixel_values and image_grid_thw.
+            """
             messages = [example["messages"] for example in examples]
             
-            # images 추출 (없을 수 있음)
+            # 1. Collect Images & Texts
             images = []
-            has_images = False
-            for example in examples:
-                if "images" in example and example["images"]:
-                    img = example["images"]
-                    # 이미지가 리스트인 경우
-                    if isinstance(img, list) and len(img) > 0:
-                        images.append(img)
-                        has_images = True
-                    elif img:  # 리스트가 아닌 단일 이미지
-                        images.append(img)
-                        has_images = True
-                    else:
-                        images.append(None)
-                else:
-                    images.append(None)
+            has_real_images = []
             
-            # processor 호출
-            if has_images:
-                # 이미지가 있는 경우 (일부 샘플만 이미지가 있어도 processor가 처리)
-                # None이 포함된 images 리스트를 전달하면 processor가 처리할 수 있는지 확인 필요
-                # 일단 processor에 전달하고, 에러가 나면 텍스트만 처리
-                try:
-                    output = self.processor(
-                        text=messages,
-                        images=images,
-                        return_tensors="pt",
-                        padding=True,
-                        truncation=True,
-                        max_length=self.max_length
-                    )
-                except (IndexError, TypeError, ValueError) as e:
-                    # processor가 None을 처리하지 못하는 경우, 텍스트만 처리
-                    if not self.allow_text_only:
-                        raise ValueError(f"이미지 처리 실패: {e}")
-                    
-                    # 텍스트만 처리
-                    if hasattr(self.processor, 'tokenizer'):
-                        tokenizer = self.processor.tokenizer
-                    else:
-                        tokenizer = self.processor
-                    
-                    # messages를 텍스트로 변환
-                    texts = []
-                    for msg in messages:
-                        try:
-                            text = tokenizer.apply_chat_template(
-                                msg,
-                                tokenize=False,
-                                add_generation_prompt=False
-                            )
-                            texts.append(text)
-                        except Exception as e2:
-                            logger.warning(f"⚠️ Chat template 적용 실패: {e2}")
-                            texts.append(str(msg))
-                    
-                    output = tokenizer(
-                        text=texts,
-                        return_tensors="pt",
-                        padding=True,
-                        truncation=True,
-                        max_length=self.max_length
-                    )
-            else:
-                # 이미지가 없는 경우 (텍스트 전용)
-                if not self.allow_text_only:
-                    raise ValueError("이미지가 없는 샘플이 있지만 allow_text_only=False입니다.")
-                
-                # 텍스트만 처리
-                if hasattr(self.processor, 'tokenizer'):
-                    tokenizer = self.processor.tokenizer
+            for example in examples:
+                img = example.get("images", None)
+                if img is not None and (isinstance(img, list) and len(img) > 0):
+                    extracted_img = img[0] if isinstance(img, list) else img
+                    images.append(extracted_img)
+                    has_real_images.append(True)
                 else:
-                    tokenizer = self.processor
+                    images.append(self.dummy_image)
+                    has_real_images.append(False)
+
+            tokenizer = self.processor.tokenizer if hasattr(self.processor, 'tokenizer') else self.processor
+            
+            texts = []
+            for i, m in enumerate(messages):
+                # Check if message has image placeholder
+                has_image_in_msg = False
+                for msg in m:
+                    if isinstance(msg.get('content'), list):
+                        for item in msg['content']:
+                            if isinstance(item, dict) and item.get('type') == 'image':
+                                has_image_in_msg = True
                 
-                # messages를 텍스트로 변환
-                texts = []
-                for msg in messages:
-                    try:
-                        text = tokenizer.apply_chat_template(
-                            msg,
-                            tokenize=False,
-                            add_generation_prompt=False
-                        )
-                        texts.append(text)
-                    except Exception as e:
-                        logger.warning(f"⚠️ Chat template 적용 실패: {e}")
-                        texts.append(str(msg))
-                
-                output = tokenizer(
+                # If no image in message but we have image, inject image placeholder
+                if not has_image_in_msg:
+                    if m and m[0]['role'] == 'user':
+                        if isinstance(m[0]['content'], str):
+                            m[0]['content'] = [{"type": "image"}, {"type": "text", "text": m[0]['content']}]
+                        elif isinstance(m[0]['content'], list):
+                            m[0]['content'].insert(0, {"type": "image"})
+
+                # CRITICAL: Use PROCESSOR.apply_chat_template, not tokenizer!
+                # Only the processor knows how to generate image tokens for Qwen3-VL-MoE
+                text = self.processor.apply_chat_template(m, tokenize=False, add_generation_prompt=False)
+                texts.append(text)
+
+            # 2. Process with NATIVE processor (text + images together)
+            # This ensures image_grid_thw is computed correctly for Qwen3-VL-MoE
+            try:
+                output = self.processor(
                     text=texts,
+                    images=images,  # Let native processor handle images
                     return_tensors="pt",
                     padding=True,
                     truncation=True,
                     max_length=self.max_length
                 )
-            
-            # labels 생성
-            labels = output["input_ids"].clone()
-            pad_token_id = self.processor.tokenizer.pad_token_id if hasattr(self.processor, 'tokenizer') else self.processor.pad_token_id
-            if pad_token_id is not None:
-                labels[labels == pad_token_id] = -100
-            
-            output["labels"] = labels
-            return output
-        
-        def __call__(self, features):
-            """features를 검증/전처리한 후 torch_call 사용"""
-            assert features is not None, "features is None"
-
-            for i, feature in enumerate(features):
-                if "messages" in feature:
-                    feature["messages"] = validate_messages(feature["messages"])
-                
-                # 이미지 처리
-                if 'images' in feature and feature['images']:
-                    # 중첩 리스트 문제 해결
-                    feature['images'] = validate_image_data(feature['images'])
-                    if not feature['images']:
-                        # 이미지가 있지만 유효하지 않은 경우
-                        if not self.allow_text_only:
-                            raise ValueError(f"샘플 {i}의 이미지가 유효하지 않습니다!")
-                        # 텍스트 전용 허용 모드면 images 필드를 제거
-                        del feature['images']
-                else:
-                    # 이미지가 없는 경우
-                    if not self.allow_text_only:
-                        raise ValueError(f"샘플 {i}에 이미지가 없습니다! 모든 샘플은 이미지를 포함해야 합니다.")
-                    # 텍스트 전용 허용 모드면 images 필드가 없으면 그대로 유지
-            
-            try:
-                # torch_call 사용 (내부적으로 _collate_language_modeling 호출)
-                return self.torch_call(examples=features)
             except Exception as e:
-                import traceback
-                traceback.print_exc()
-                logger.error(f"⚠️ Processor 처리 중 오류: {e}")
-                raise
+                print(f"⚠️ Native image processing failed: {e}. Falling back to text-only.")
+                output = self.processor(
+                    text=texts,
+                    images=None,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=self.max_length
+                )
+
+            # 5. Handle Labels (Masking)
+            input_ids = output["input_ids"]
+            if "labels" not in output or output["labels"] is None:
+                output["labels"] = input_ids.clone()
+            
+            labels = output["labels"]
+            
+            # Mask special vision tokens
+            # 151652: <|vision_start|>, 151653: <|vision_end|>, 151655: <|image_pad|>
+            special_ids = [151652, 151653, 151655]
+            for sid in special_ids:
+                labels[labels == sid] = -100
+            
+            # Mask padding
+            if tokenizer.pad_token_id is not None:
+                labels[labels == tokenizer.pad_token_id] = -100
+                
+            output["labels"] = labels
+            
+            return output
+
+        def __call__(self, features):
+             # Just pass through to our custom collator logic
+             return self.torch_call(examples=features)
     
     return CustomSFTDataCollator(processor, max_length=max_length, allow_text_only=allow_text_only)
 
@@ -2987,7 +3538,7 @@ def all_domains_dataset(tokenizer, max_samples_per_domain: int = 200, use_stream
 if __name__ == "__main__":
     from transformers import AutoTokenizer
     
-    logger.info("🚀 멀티 도메인 데이터셋 테스트 시작")
+    logger.debug("🚀 멀티 도메인 데이터셋 테스트 시작")
     log_memory_usage("프로그램 시작")
     
     tokenizer = AutoTokenizer.from_pretrained("google/gemma-2b-it")
@@ -2998,11 +3549,11 @@ if __name__ == "__main__":
     
     # 전체 도메인 데이터셋 테스트
     try:
-        logger.info("📦 전체 도메인 데이터셋 테스트")
+        logger.debug("📦 전체 도메인 데이터셋 테스트")
         dataset = all_domains_dataset(tokenizer, max_samples_per_domain=50, use_streaming=True)
         log_memory_usage("전체 도메인 데이터셋 생성 후")
         
-        logger.info(f"데이터셋 생성 완료: {dataset}")
+        logger.debug(f"데이터셋 생성 완료: {dataset}")
         
         # 도메인별 샘플 확인
         if 'train' in dataset:
@@ -3012,12 +3563,12 @@ if __name__ == "__main__":
                 domain = sample.get('domain', 'unknown')
                 train_domains[domain] = train_domains.get(domain, 0) + 1
             
-            logger.info(f"Train 세트 도메인 분포: {train_domains}")
+            logger.debug(f"Train 세트 도메인 분포: {train_domains}")
         
     except Exception as e:
         logger.error(f"전체 도메인 데이터셋 테스트 실패: {e}")
         traceback.print_exc()
     
     log_memory_usage("테스트 완료")
-    logger.info("✅ 멀티 도메인 데이터셋 테스트 완료")
+    logger.debug("✅ 멀티 도메인 데이터셋 테스트 완료")
 

@@ -1,0 +1,55 @@
+=================================================================
+REFERENCES
+=================================================================
+
+[1] Jacobs, R. A., Jordan, M. I., Nowlan, S. J., & Hinton, G. E. (1991). Adaptive mixtures of local experts. *Neural Computation*, 3(1), 79-87.
+
+[2] Gatys, L. A., Ecker, A. S., & Bethge, M. (2016). Image style transfer using convolutional neural networks. In *Proceedings of the IEEE conference on computer vision and pattern recognition* (pp. 2414-2423).
+
+[3] Huang, D., Brock, A., Andrychowicz, M., & Zaremba, W. (2017). Orthogonal Weight Normalization: Solution to Optimization over Multiple Dependent Stiefel Manifolds in Deep Neural Networks. *arXiv preprint arXiv:1709.06796*.
+
+[4] Shazeer, N., Mirhoseini, A., Maziarz, K., Davis, A., Le, Q., Hinton, G., & Dean, J. (2017). Outrageously large neural networks: The sparsely-gated mixture-of-experts layer. *arXiv preprint arXiv:1701.06538*.
+
+[5] Bansal, N., Chen, X., & Wang, Z. (2018). Can we gain more from orthogonality regularizations in training deep networks?. In *Advances in Neural Information Processing Systems*, 31.
+
+[6] Kaplan, J., McCandlish, S., Henighan, T., Brown, T. B., Chess, B., Child, R., ... & Amodei, D. (2020). Scaling laws for neural language models. *arXiv preprint arXiv:2001.08361*.
+
+[7] Brown, T., Mann, B., Ryder, N., Subbiah, M., Kaplan, J. D., Dhariwal, P., ... & Amodei, D. (2020). Language models are few-shot learners. In *Advances in neural information processing systems*, 33, 1877-1901.
+
+[8] Lepikhin, D., Lee, H., Xu, Y., Chen, D., Firat, O., Huang, Y., ... & Chen, Z. (2020). Gshard: Scaling giant models with conditional computation and automatic sharding. *arXiv preprint arXiv:2006.16668*.
+
+[9] Fedus, W., Zoph, B., & Shazeer, N. (2021). Switch transformers: Scaling to trillion parameter models with simple and efficient sparsity. *arXiv preprint arXiv:2101.03961*.
+
+[10] Roller, S., Sukhbaatar, S., Weston, J., & Szlam, A. (2021). Hash layers for large sparse models. In *Advances in Neural Information Processing Systems*, 34, 17555-17566.
+
+[11] Hazimeh, H., Zhao, Z., Chow, Y., & Ramaswamy, S. (2021). DSelect-k: Differentiable selection in the mixture of experts with applications to multi-task learning. In *Advances in Neural Information Processing Systems*, 34.
+
+[12] Du, N., Huang, Y., Dai, A. M., Gudmundsson, S., Dai, P., Lepikhin, D., ... & Le, Q. V. (2021). Glam: Efficient scaling of language models with mixture-of-experts. *arXiv preprint arXiv:2112.06905*.
+
+[13] Zhou, Y., Lei, T., Liu, H., Du, N., Huang, Y., Zhao, V., ... & Le, Q. V. (2022). Mixture-of-experts with expert choice routing. In *Advances in Neural Information Processing Systems*, 35.
+
+[14] Hoffmann, J., Borgeaud, S., Mensch, A., Buchatskaya, E., Cai, T., Rutherford, E., ... & Chang, M. W. (2022). Unified scaling laws for routed language models. In *International Conference on Machine Learning*.
+
+[15] Ma, J., Wang, H., & Ji, S. (2024). Routing Matters in MoE: Scaling Diffusion Transformers with Explicit Routing Guidance. *arXiv preprint arXiv:2403.11623*.
+
+[16] Gu, A., & Dao, T. (2023). Mamba: Linear-time sequence modeling with selective state spaces. *arXiv preprint arXiv:2312.00752*.
+
+[17] Jiang, A. Q., Sablayrolles, A., Mensch, A., Bamford, C., Chapuis, T., de las Casas, D., ... & Lample, G. (2024). Mixtral of experts. *arXiv preprint arXiv:2401.04088*.
+
+[18] DeepSeek-AI. (2024). DeepSeekMoE: Towards Ultimate Expert Specialization in Mixture-of-Experts Language Models. *arXiv preprint arXiv:2401.06066*.
+
+[19] Feng, Y., et al. (2025). OMoE: Diversifying Mixture of Low-Rank Adaptation by Orthogonal Finetuning. *arXiv preprint arXiv:2501.10062*.
+
+[20] Wang, Z., et al. (2025). LPR: Latent Prototype Routing for Mixture of Experts. *arXiv preprint arXiv:2506.21328*.
+
+[21] Chen, L., et al. (2025). ERMoE: Entropy-Regularized Mixture of Experts. *arXiv preprint arXiv:2511.10971*.
+
+[22] Zhang, H., et al. (2025). LASER: Layer-Adaptive Sparse Expert Routing. *arXiv preprint arXiv:2510.03293*.
+
+[23] Ren, S., et al. (2025). RoMA: Routing with Orthogonal Manifold Alignment. *arXiv preprint arXiv:2511.07419*.
+
+[24] Moonshot AI. (2025). Kimi K2: Scaling Efficient MoE Models. *arXiv preprint arXiv:2507.20534*.
+
+[25] Alibaba Cloud. (2025). Qwen3 Technical Report. *arXiv preprint arXiv:2505.09388*.
+
+[26] DeepSeek-AI. (2025). DeepSeek-V3 Technical Report. *arXiv preprint arXiv:2508.06471*.

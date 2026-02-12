@@ -23,6 +23,7 @@ import copy
 import os
 import inspect
 import math
+import contextlib
 from functools import partial
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -33,12 +34,20 @@ from tqdm.auto import tqdm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
 # Add dynamo import for torch.compile compatibility
 import torch._dynamo
+import types
+import logging
+import deepspeed
+logger = logging.getLogger(__name__)
 
 # Siglip 초기화 오류 해결을 위한 패치
 import torch.nn.init as torch_init
 _original_orthogonal = torch_init.orthogonal_
+_original_xavier_uniform = torch_init.xavier_uniform_
+_original_xavier_normal = torch_init.xavier_normal_
+_original_kaiming_uniform = torch_init.kaiming_uniform_
 
 def safe_orthogonal_(tensor, gain=1):
     if tensor.is_meta:
@@ -61,7 +70,9 @@ def safe_orthogonal_(tensor, gain=1):
         return tensor
 
     # 2차원 이상 텐서 처리: 기존 orthogonal 초기화 사용
-    if tensor.device.type == 'cpu' and tensor.dtype in [torch.bfloat16, torch.float16]:
+    # Fix for "geqrf_cuda" not implemented for 'BFloat16'
+    # Always cast to float32 for orthogonal_ init if low precision
+    if tensor.dtype in [torch.bfloat16, torch.float16]:
         with torch.no_grad():
             t = tensor.to(torch.float32)
             _original_orthogonal(t, gain=gain)
@@ -72,6 +83,52 @@ def safe_orthogonal_(tensor, gain=1):
 
 # Global monkey patch to catch all internal and dependency calls (like Transformers init)
 torch_init.orthogonal_ = safe_orthogonal_
+
+def safe_xavier_uniform_(tensor, gain=1.0):
+    if tensor.is_meta: return tensor
+    if tensor.numel() == 0: return tensor
+    if tensor.dim() < 2:
+        return torch_init.uniform_(tensor, -0.02, 0.02)
+    return _original_xavier_uniform(tensor, gain=gain)
+
+def safe_xavier_normal_(tensor, gain=1.0):
+    if tensor.is_meta: return tensor
+    if tensor.numel() == 0: return tensor
+    if tensor.dim() < 2:
+        return torch_init.normal_(tensor, std=0.02)
+    return _original_xavier_normal(tensor, gain=gain)
+
+def safe_kaiming_uniform_(tensor, a=0, mode='fan_in', nonlinearity='leaky_relu'):
+    if tensor.is_meta: return tensor
+    if tensor.numel() == 0: return tensor
+    if tensor.dim() < 2:
+        return torch_init.uniform_(tensor, -0.02, 0.02)
+    return _original_kaiming_uniform(tensor, a=a, mode=mode, nonlinearity=nonlinearity)
+
+torch_init.xavier_uniform_ = safe_xavier_uniform_
+torch_init.xavier_normal_ = safe_xavier_normal_
+torch_init.kaiming_uniform_ = safe_kaiming_uniform_
+
+# Ensure nn.init also points to patched versions
+if hasattr(nn, 'init'):
+    nn.init.xavier_uniform_ = safe_xavier_uniform_
+    nn.init.xavier_normal_ = safe_xavier_normal_
+    nn.init.kaiming_uniform_ = safe_kaiming_uniform_
+
+# Ultimate catch-all: patch the internal fan_in/out calculator
+_orig_calc_fan = torch_init._calculate_fan_in_and_fan_out
+def safe_calc_fan(tensor):
+    if tensor.numel() == 0:
+        return 1, 1
+    if tensor.dim() < 2:
+        return 1, 1
+    f_in, f_out = _orig_calc_fan(tensor)
+    return max(1, f_in), max(1, f_out)
+torch_init._calculate_fan_in_and_fan_out = safe_calc_fan
+if hasattr(nn.init, '_calculate_fan_in_and_fan_out'):
+    nn.init._calculate_fan_in_and_fan_out = safe_calc_fan
+if hasattr(torch.nn.init, '_calculate_fan_in_and_fan_out'):
+    torch.nn.init._calculate_fan_in_and_fan_out = safe_calc_fan
 
 def _patch_siglip_initializers():
     """Siglip의 초기화 함수들을 안전하게 패치"""
@@ -207,10 +264,39 @@ if is_torch_flex_attn_available():
     from torch.nn.attention.flex_attention import BlockMask
     from transformers.integrations.flex_attention import make_flex_block_causal_mask
 
-    
+
 logger = logging.get_logger(__name__)
 _CONFIG_FOR_DOC = "SPECTRAConfig"
 
+
+
+class DifferentiableAllReduce(torch.autograd.Function):
+    """
+    [ZeRO-3 Fix] Synchronize gradients correctly for shared collectives.
+    Standard all_reduce is in-place and risky in complex autograd graphs.
+    """
+    @staticmethod
+    def forward(ctx, tensor, op=dist.ReduceOp.SUM):
+        if not dist.is_initialized(): return tensor
+        output = tensor.detach().clone()
+        dist.all_reduce(output, op=op)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        if not dist.is_initialized(): return grad_output, None
+        # Gradients for SUM all_reduce are identity across ranks for this activation
+        # Crucial for autograd: must return a gradient for EACH input to forward.
+        # forward(tensor, op) -> 2 inputs. We return (grad_tensor, grad_op).
+        # grad_op is None because 'op' is not a tensor.
+        return grad_output, None
+
+def safe_distributed_sync(tensor, op=dist.ReduceOp.SUM, average=True):
+    if not dist.is_initialized(): return tensor
+    synced = DifferentiableAllReduce.apply(tensor, op)
+    if average:
+        synced = synced / dist.get_world_size()
+    return synced
 
 def calculate_ortho_loss_for_experts(expert_weights: List[torch.Tensor]) -> torch.Tensor:
     """
@@ -228,35 +314,35 @@ def calculate_ortho_loss_for_experts(expert_weights: List[torch.Tensor]) -> torc
     # Normalize rows to be unit vectors, preventing weights from collapsing to zero
     # [수정] 엡실론 추가하여 0으로 나누기 방지
     V = V / (V.norm(p=2, dim=1, keepdim=True) + 1e-6)
-    
+
     # Gram matrix: V @ V.T
     gram_matrix = torch.matmul(V, V.t())
-    
+
     # Target: identity matrix
     identity = torch.eye(gram_matrix.size(0), device=gram_matrix.device, dtype=gram_matrix.dtype)
-    
+
     # Loss: squared Frobenius norm of (VV' - I)
     ortho_loss = torch.pow(torch.norm(gram_matrix - identity, p='fro'), 2)
     return ortho_loss
 
 
 def _orthogonal_constraint_loss(
-    num_experts: int, 
+    num_experts: int,
     gate_logits: torch.Tensor
 ) -> torch.Tensor:
         """라우터 출력값들의 직교성 제약 손실"""
         # router_outputs: [batch*seq, num_experts]
-        
+
         # 각 토큰별로 expert 방향이 직교하도록
         # [수정] 엡실론 추가하여 0으로 나누기 방지
         normalized_outputs = gate_logits / (gate_logits.norm(p=2, dim=-1, keepdim=True) + 1e-6)
-        
+
         # Gram matrix: [num_experts, num_experts]
         gram_matrix = torch.matmul(normalized_outputs.T, normalized_outputs)
-        
+
         # Target: identity matrix
         identity = torch.eye(num_experts, device=gate_logits.device, dtype=gate_logits.dtype)
-        
+
         # Loss: squared Frobenius norm of (GG' - I)
         constraint_loss = torch.pow(torch.norm(gram_matrix - identity, p='fro'), 2)
         return constraint_loss
@@ -280,28 +366,28 @@ class ContrastiveRouterLoss(nn.Module):
         # Flatten: [batch, seq, hidden] -> [N, hidden], [batch*seq, experts] -> [N, experts]
         flattened_states = hidden_states.reshape(-1, hidden_states.size(-1))
         flattened_weights = routing_weights.reshape(-1, routing_weights.size(-1))
-        
+
         # Ensure dtype consistency for matmul
         flattened_weights = flattened_weights.to(dtype=flattened_states.dtype)
-        
+
         # Calculate weighted centroids for each expert
         # [experts, N] @ [N, hidden] -> [experts, hidden]
         expert_centroids = torch.matmul(flattened_weights.t(), flattened_states)
-        
+
         # Normalize by total weight assigned to expert
         expert_weight_sums = flattened_weights.sum(dim=0) + self.epsilon
         expert_centroids = expert_centroids / expert_weight_sums.unsqueeze(-1)
-        
+
         # Cosine similarity between centroids
         # [수정] 엡실론 추가하여 0으로 나누기 방지
         normalized_centroids = expert_centroids / (expert_centroids.norm(p=2, dim=1, keepdim=True) + 1e-6)
         similarity = torch.matmul(normalized_centroids, normalized_centroids.t())
-        
+
         # Minimize off-diagonal similarity (contrastive)
         num_experts = similarity.size(0)
         mask = torch.eye(num_experts, device=similarity.device).bool()
         contrastive_loss = similarity[~mask].mean()
-        
+
         return contrastive_loss
 
 def load_balancing_loss_func(
@@ -568,7 +654,7 @@ def _get_unpad_data(attention_mask):
         cu_seqlens,
         max_seqlen_in_batch,
     )
-    
+
 @dataclass
 class SPECTRAModelOutputWithPast(BaseModelOutputWithPast):
     """
@@ -667,7 +753,7 @@ class SPECTRACausalLMOutputWithPast(ModelOutput):
 
 
 class SPECTRATextScaledWordEmbedding(nn.Embedding):
-    """ 
+    """
     🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨
     TODO: THIS CODE IS CRITICAL FOR THE EXOSKELETON ARCHITECTURE. THIS CODE MUST REMOVED. SPECTRA MUST BUILT AS AN EXOSKELETON ARCHITECTURE FORM BASE LARGE LANGUAGE MODEL WEIGHTS, NOT FROM SCRATCH.
     🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨
@@ -682,7 +768,7 @@ class SPECTRATextScaledWordEmbedding(nn.Embedding):
 
 
 class SPECTRAMLP(nn.Module):
-    """ 
+    """
     🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨
     TODO: THIS CODE IS CRITICAL FOR THE EXOSKELETON ARCHITECTURE. THIS CODE MUST REMOVED. SPECTRA MUST BUILT AS AN EXOSKELETON ARCHITECTURE FORM BASE LARGE LANGUAGE MODEL WEIGHTS, NOT FROM SCRATCH.
     🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨
@@ -707,39 +793,39 @@ class SPECTRAMLP(nn.Module):
 class mp(torch.autograd.Function):
     @staticmethod
     def forward(
-        ctx, 
-        scores: torch.Tensor, 
-        multiplier: torch.Tensor, 
+        ctx,
+        scores: torch.Tensor,
+        multiplier: torch.Tensor,
         selected_experts: torch.Tensor,
         masked_gates: torch.Tensor,
         mask_for_one: torch.Tensor,
     ):
         ctx.save_for_backward(multiplier, selected_experts, masked_gates)
         return multiplier * mask_for_one
-        
+
     @staticmethod
     def backward(
-        ctx, 
-        grad_at_output: torch.Tensor, 
+        ctx,
+        grad_at_output: torch.Tensor,
     ):
         multiplier, selected_experts, masked_gates = ctx.saved_tensors
-        
+
         grad_at_output = grad_at_output * multiplier
-        
+
         grad_at_scores_expaned = masked_gates * grad_at_output.mul(-1)
         grad_at_scores_expaned.scatter_add_(
             dim=-1,
             index=selected_experts,
             src=grad_at_output,
         )
-        
+
         return (
-            grad_at_scores_expaned, 
-            None, 
-            None, 
-            None, 
-            None, 
-            None, 
+            grad_at_scores_expaned,
+            None,
+            None,
+            None,
+            None,
+            None,
         )
 
 
@@ -750,17 +836,17 @@ def enhanced_soft_orthogonality_loss(
 ) -> torch.Tensor:
     """
     Enhanced Soft Orthogonality Loss with SRIP variant.
-    
+
     핵심 차별점:
     1. Frobenius Norm + Spectral Norm 결합
     2. 양방향 억제: cos(e_i, e_j)^2로 +1과 -1 모두 페널티
     3. Warm-up 지원
-    
+
     Args:
         expert_embeddings: [num_experts, dim] or [batch, num_experts, dim]
         lambda_so: loss coefficient
         use_srip: use spectral norm variant
-    
+
     Returns:
         loss: scalar orthogonality loss
     """
@@ -770,39 +856,40 @@ def enhanced_soft_orthogonality_loss(
         # but momentarily they can shift. Averaging the REPRESENTATION first
         # stabilizes the gradient.
         expert_embeddings = expert_embeddings.mean(dim=0)  # [E, dim]
-    
+
     # Check for empty or invalid input
     if expert_embeddings.numel() == 0:
-        return torch.tensor(0.0, device=expert_embeddings.device, requires_grad=True)
+        return torch.tensor(0.0, device=expert_embeddings.device, requires_grad=False)
 
     # Normalize to unit vectors
     E_norm = F.normalize(expert_embeddings, p=2, dim=-1)  # [E, dim]
-    
+
     # Gram matrix (pairwise cosine similarities)
     # G_ij = cos(e_i, e_j)
     G = torch.matmul(E_norm, E_norm.t())  # [E, E]
-    
+
     # Target: Identity matrix
     I = torch.eye(G.size(0), device=G.device, dtype=G.dtype)
-    
+
     # Frobenius norm loss: ||G - I||_F^2
     # This penalizes off-diagonals (both positive and negative correlations)
     # (cos)^2 will be minimized
-    frob_loss = torch.pow(torch.norm(G - I, p='fro'), 2)
-    
+    diff = (G - I).float()
+    frob_loss = torch.pow(torch.norm(diff, p='fro'), 2)
+
     if use_srip:
         # SRIP: Spectral norm of (G - I), bounds Lipschitz constant
-        # Approximate with power iteration for efficiency? 
+        # Approximate with power iteration for efficiency?
         # For typical E (e.g., 8-64), exact computation via svd or matrix_norm is feasible/fast enough on GPU.
         # If E is very large (e.g., 256+), might be slow, but usually done once per step.
-        diff = G - I
         # Use spectral norm (2-norm)
         # torch.linalg.matrix_norm with ord=2 computes the spectral norm (largest singular value)
+        # ord=2 (spectral norm) requires float32 or higher
         spectral_loss = torch.linalg.matrix_norm(diff, ord=2) ** 2
         loss = 0.7 * frob_loss + 0.3 * spectral_loss
     else:
         loss = frob_loss
-    
+
     return lambda_so * loss
 
 
@@ -844,9 +931,12 @@ class ExpressionProjector(nn.Module):
         return X
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # 학습/추론 공통으로 직교화된 가중치를 사용
-        W_ortho = self.newton_schulz(self.projection.weight, steps=self.iterations)
-        return F.linear(x, W_ortho)
+        # [ZeRO-3 Fix] Always use self.projection (nn.Linear) which handles ZeRO-3 gathering correctly.
+        # Direct access to self.projection.weight (partitioned) causes shape mismatch (0 vs 4608).
+        if x.numel() == 0:
+            # Handle empty input manually to avoid DeepSpeed/Linear issues with empty inputs
+            return torch.zeros(x.shape[0], self.output_dim, device=x.device, dtype=x.dtype)
+        return self.projection(x)
 
     def orthogonal_loss(self):
         # 강제 직교화 경로이므로 별도 손실 불필요
@@ -855,244 +945,53 @@ class ExpressionProjector(nn.Module):
 
 class IntentGatedContextCell(nn.Module):
     """
-    LoRA-friendly GRU cell implemented purely with Linear layers.
-    Gate weights are explicitly named for PEFT targeting.
+    Agentic Intent Cell (Memory-Efficient).
+    Extracts global intent via gated mean-pooling instead of sequential GRU loop.
+    This avoids the OOM bottleneck of 64-step GRU × 48 layers = 3072 GRUCell calls.
     """
-
-    def __init__(
-        self,
-        input_size: int,
-        hidden_size: int
-    ):
+    def __init__(self, hidden_size):
         super().__init__()
-        self.input_size = input_size
         self.hidden_size = hidden_size
-
-        self.weight_ih_gates = nn.Linear(input_size, hidden_size * 2)
-        self.weight_hh_gates = nn.Linear(hidden_size, hidden_size * 2)
-
-        self.weight_ih_cand = nn.Linear(input_size, hidden_size)
-        self.weight_hh_cand = nn.Linear(hidden_size, hidden_size)
-
-        # ZeRO-3 compatibility: Skip custom init if weights are partitioned (1D) or on meta device
-        if self.weight_hh_gates.weight.dim() > 1 and not self.weight_hh_gates.weight.is_meta:
-            safe_orthogonal_(self.weight_hh_gates.weight)
-        if self.weight_hh_cand.weight.dim() > 1 and not self.weight_hh_cand.weight.is_meta:
-            safe_orthogonal_(self.weight_hh_cand.weight)
         
-        if self.weight_ih_gates.weight.dim() > 1 and not self.weight_ih_gates.weight.is_meta:
-            nn.init.xavier_uniform_(self.weight_ih_gates.weight)
-        if self.weight_ih_cand.weight.dim() > 1 and not self.weight_ih_cand.weight.is_meta:
-            nn.init.xavier_uniform_(self.weight_ih_cand.weight)
+        # Gating Network (Lightweight: determines how much of global context to use)
+        self.gate_proj1 = nn.Linear(hidden_size, hidden_size // 2)
+        self.gate_norm = nn.LayerNorm(hidden_size // 2)
+        self.gate_act = nn.ReLU()
+        self.gate_proj2 = nn.Linear(hidden_size // 2, 1)
+        self.gate_sigmoid = nn.Sigmoid()
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        h: torch.Tensor
-    ) -> torch.Tensor:
-        gates_x = self.weight_ih_gates(x)
-        gates_h = self.weight_hh_gates(h)
-        gates = gates_x + gates_h
+        # Intent Projection (replaces GRU: single matmul instead of 64 sequential steps)
+        self.intent_proj = nn.Linear(hidden_size, hidden_size)
+        nn.init.orthogonal_(self.intent_proj.weight)
 
-        r_gate, z_gate = gates.chunk(2, dim=1)
-        r_gate = torch.sigmoid(r_gate)
-        z_gate = torch.sigmoid(z_gate)
+        # Expression Projector for compatibility with legacy code calling conventions
+        self.expression_projector = nn.Linear(hidden_size, hidden_size)
 
-        cand_h = self.weight_hh_cand(h * r_gate)
-        cand_x = self.weight_ih_cand(x)
-        n = torch.tanh(cand_x + cand_h)
-
-        next_h = (1 - z_gate) * n + z_gate * h
-        return next_h
-
-
-def differentiable_sinkhorn(cost: torch.Tensor, num_experts: int, epsilon: float = 0.05, iterations: int = 3) -> torch.Tensor:
-    """
-    [Pure Math Sinkhorn - No Learning, Just Computing]
-    Differentiable Sinkhorn algorithm for optimal transport.
-    학습 파라미터가 0개이므로 망가지고 싶어도 망가질 수 없습니다.
-    
-    Args:
-        cost: [Batch, Experts] cost matrix (lower is better)
-        num_experts: number of experts
-        epsilon: temperature parameter
-        iterations: number of Sinkhorn iterations
-    
-    Returns:
-        Q: [Batch, Experts] doubly stochastic matrix (assignment probabilities)
-    """
-    batch_tokens = cost.shape[0]
-    device = cost.device
-    dtype = cost.dtype
-    
-    # Validate epsilon
-    if epsilon <= 0:
-        raise ValueError(f"epsilon must be positive, got {epsilon}")
-    if iterations <= 0:
-        raise ValueError(f"iterations must be positive, got {iterations}")
-    
-    # Initialize Q: exp(-cost / epsilon)
-    # cost_float = cost.float()
-    cost_min, _ = cost.min(dim=-1, keepdim=True)
-    cost_float = (cost - cost_min).float()  # 이제 최솟값은 0이 됨 -> exp(0) = 1 (Safe!)
-    
-    # Clamp cost to prevent exp overflow
-    max_cost_ratio = 50.0
-    cost_clamped = cost_float / epsilon
-    cost_clamped = torch.clamp(cost_clamped, min=-max_cost_ratio, max=max_cost_ratio)
-    
-    Q = torch.exp(-cost_clamped).to(dtype=dtype)
-    
-    # Store original shape
-    original_shape = Q.shape
-    N, E = original_shape[0], original_shape[1]
-    target_load = float(N) / float(E)
-    
-    # Sinkhorn iterations (standard Sinkhorn-Knopp)
-    for i in range(iterations):
-        # Row normalization: 각 토큰의 확률 합 = 1
-        row_sum = Q.sum(dim=-1, keepdim=True) + 1e-8
-        Q = Q / row_sum
+    def forward(self, x, h=None):
+        """
+        Single-step intent extraction.
+        x: [batch, hidden] or [batch, seq, hidden]
+        Returns: [batch, hidden] intent vector
+        """
+        # Handle both 2D and 3D input
+        if x.dim() == 3:
+            # Mean pool across sequence dimension -> [batch, hidden]
+            x_pooled = x.mean(dim=1)
+        else:
+            x_pooled = x
         
-        # NaN/Inf check
-        if torch.isnan(Q).any() or torch.isinf(Q).any():
-            raise ValueError(f"NaN/Inf in Sinkhorn iteration {i} after row norm")
+        # Gating: how much global context to inject
+        global_ctx = x_pooled  # Already batch-level
+        g = self.gate_proj1(global_ctx)
+        g = self.gate_norm(g)
+        g = self.gate_act(g)
+        g = self.gate_proj2(g)
+        gate_val = self.gate_sigmoid(g)  # [batch, 1]
         
-        # Column normalization: 각 전문가의 기대 토큰 수 = N/E
-        col_sum = Q.sum(dim=0, keepdim=True) + 1e-8
-        Q = Q / col_sum * target_load
+        # Gated projection (replaces sequential GRU)
+        intent = self.intent_proj(x_pooled * gate_val)
         
-        # NaN/Inf check
-        if torch.isnan(Q).any() or torch.isinf(Q).any():
-            raise ValueError(f"NaN/Inf in Sinkhorn iteration {i} after col norm")
-        
-        # Shape consistency check
-        assert Q.shape == original_shape, f"Shape changed in iteration {i}: {Q.shape} vs {original_shape}"
-    
-    # Final row normalization to ensure row sums = 1.0
-    row_sum = Q.sum(dim=-1, keepdim=True) + 1e-8
-    Q = Q / row_sum
-    
-    return Q
-
-
-def log_sinkhorn_stabilized(
-    logits: torch.Tensor,
-    num_experts: int,
-    epsilon: float = 0.05,
-    iterations: int = 5,
-    adaptive_epsilon: bool = True,
-    cv_ema: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Log-Domain Stabilized Sinkhorn Algorithm.
-    
-    핵심: exp(-C/epsilon) 대신 log-space에서 연산하여 underflow/overflow 방지.
-    
-    Args:
-        logits: [N, E] routing logits (higher = better)
-        num_experts: number of experts
-        epsilon: base temperature (adaptive하게 조절됨)
-        iterations: Sinkhorn iterations
-        adaptive_epsilon: CV에 따라 epsilon 조절
-        cv_ema: CV EMA value for adaptive epsilon
-    
-    Returns:
-        P: [N, E] doubly stochastic matrix
-        max_vio: maximum constraint violation (for monitoring)
-    """
-    N, E = logits.shape
-    device, dtype = logits.device, logits.dtype
-    
-    # Adaptive Epsilon: CV가 높으면 epsilon 증가 (더 부드러운 할당)
-    if adaptive_epsilon and cv_ema is not None:
-        cv_val = cv_ema.item() if torch.is_tensor(cv_ema) else cv_ema
-        # Max scaling factor: 4.0 (1 + 3.0)
-        # If CV explodes (e.g. > 10.0), clamp it.
-        epsilon = epsilon * (1.0 + min(cv_val, 3.0))
-    
-    # Safety clamp for epsilon
-    epsilon = max(epsilon, 1e-4) # Avoid division by zero
-    
-    # Log-space cost matrix: M = logits / epsilon
-    # We want to maximize logits <-> minimize cost
-    # Cost = -logits
-    # K = exp(-Cost/eps) = exp(logits/eps)
-    # working in log domain: M = log(K) = logits/eps
-    M = logits.float() / epsilon
-    
-    # Numerical stability: subtract max per row (log-sum-exp trick preparation)
-    # Does not change the resulting distribution P
-    M_max = M.max(dim=-1, keepdim=True).values
-    M = M - M_max
-    
-    # Initialize dual potentials
-    f = torch.zeros(N, 1, device=device, dtype=torch.float32)  # row potential
-    g = torch.zeros(1, E, device=device, dtype=torch.float32)  # column potential
-    
-    # Target marginals
-    # Row target: 1 (actually 1/N but we are working with probabilities summing to 1 per row)
-    # Wait, Sinkhorn usually projects to DSM where rowsum=1, colsum=N/E?
-    # Or rowsum=1/N, colsum=1/E?
-    # Standard Attention/Routing: row_sum = 1 (each token goes somewhere)
-    # Col sum = N/E (uniform load)
-    
-    target_row = torch.zeros(N, 1, device=device, dtype=torch.float32) # log(1) = 0
-    target_col = torch.log(torch.tensor(N / E, device=device, dtype=torch.float32) + 1e-10) # log(N/E)
-    
-    for _ in range(iterations):
-        # Row normalization in log-space
-        # u = 1 ./ (K @ v) => log(u) = -log(K @ exp(log_v))
-        # log_sum_exp_row = logsumexp(M + g^T)
-        log_sum_exp_row = torch.logsumexp(M + g, dim=-1, keepdim=True)
-        # f update: f = log(target_row) - log_sum_exp_row
-        # But wait, original M includes f and g implicitly?
-        # Usually Sinkhorn updates are:
-        # u <- target_r / (K @ v)
-        # v <- target_c / (K.T @ u)
-        # In log domain:
-        # log_u <- log_target_r - logsumexp(M + log_v)
-        # log_v <- log_target_c - logsumexp(M.T + log_u)
-        
-        f = target_row - log_sum_exp_row
-        
-        # Column normalization in log-space  
-        log_sum_exp_col = torch.logsumexp(M + f, dim=0, keepdim=True)
-        g = target_col - log_sum_exp_col
-    
-    # Compute final transport plan P = diag(u) K diag(v)
-    # log P = log u + M + log v
-    log_P = f + M + g
-    
-    # Convert back to probability space
-    # Since we normalized rows to sum to 1 (target_row=0 => log(1)),
-    # P rows should sum to 1.
-    P = torch.exp(log_P).to(dtype)
-    
-    # Final cleanup: ensure row sums are exactly 1
-    # (sometimes small errors accumulate)
-    P = P / (P.sum(dim=-1, keepdim=True) + 1e-8)
-    
-    # Compute MaxVio for monitoring
-    if iterations > 0:
-        with torch.no_grad():
-            row_sum = P.sum(dim=-1) # Should be 1.0
-            col_sum = P.sum(dim=0)  # Should be N/E
-            
-            # Use float64 for precision in check
-            row_vio = (row_sum.float() - 1.0).abs().max()
-            col_vio = (col_sum.float() - (N/E)).abs().max()
-            max_vio = torch.max(row_vio, col_vio)
-    else:
-        max_vio = torch.tensor(0.0, device=device)
-    
-    return P, max_vio
-
-
-# [OSR] Neural Solver 제거 완료 - Pure Math Sinkhorn만 사용
-# [OSR] Neural Solver 클래스 제거 완료
-# NeuralGradientProjector와 DualPotentialLinearSolver는 제거됨
-# 이제 differentiable_sinkhorn 함수만 사용 (학습 파라미터 0개)
+        return intent.detach()  # Detach to prevent BPTT
 
 class SPECTRARouter(nn.Module):
     def __init__(self, config: SPECTRATextConfig, **kwargs):
@@ -1100,689 +999,186 @@ class SPECTRARouter(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.num_experts = config.n_routed_experts
+        self.top_k = config.num_experts_per_tok
         self.router_dim = config.router_dim
-        self.layernorm_eps = getattr(config, "router_layernorm_eps", 1e-5)
+        
+        # [1] Intent Exoskeleton (Global Context)
+        self.context_cell = IntentGatedContextCell(self.hidden_size)
+        
+        # Priority Projector (Semantic Routability)
+        self.priority_proj = nn.Linear(self.hidden_size, self.num_experts, bias=False)
+        nn.init.zeros_(self.priority_proj.weight)
+        
+        # [2] Orthogonalized Speciality Gate (Codebook)
+        self.expert_codebook = nn.Parameter(torch.randn(self.num_experts, self.hidden_size, dtype=torch.float32))
+        nn.init.orthogonal_(self.expert_codebook)
+        
+        # [3] Agentic Load Balancing (DeepSeek ALF + GLN)
+        # Persistent Bias Buffer
+        self.register_buffer("expert_bias", torch.zeros(self.num_experts))
+        
+        # GLN Parameters (Gate Logit Normalization)
+        self.lambda_gln = nn.Parameter(torch.tensor(10.0)) # Learnable scale, init high for sharpness
+        
+        # Update Hypers
+        self.bias_update_rate = 0.001 
+        self.temperature = 0.1
 
-        # ------------------------------------------------------------------
-        # Expert-Choice (Quota) Routing
-        # - Keep sparse MoE compute (still runs only top-k experts per token)
-        # - But make expert loads stable by enforcing per-expert capacity at the
-        #   *selection* stage (token-choice top-k tends to break Sinkhorn balance).
-        # ------------------------------------------------------------------
-        self.expert_choice_routing = bool(getattr(config, "expert_choice_routing", True))
-        # Capacity factor (typical: 1.0~2.0). We also accept `capacity_factor` for convenience.
-        self.expert_choice_capacity_factor = float(
-            getattr(config, "expert_choice_capacity_factor", getattr(config, "capacity_factor", 1.25))
-        )
-        
-        # ===== 개선된 Loss 가중치 설정 =====
-        # 1. Speciality: 너무 강하지 않게 (기존 0.02 → 0.001)
-        self.speciality_strength = getattr(config, "speciality_strength", 0.001)
-        
-        # 2. Sinkhorn: Teacher 강도 조절 (기존 0.1 → 0.05)
-        self.sinkhorn_distillation_coef = getattr(config, "sinkhorn_distillation_coef", 0.05)
-        
-        # [전략 1] Balance Loss 가중치: CV를 0으로 만들기 위한 "가중치 폭탄"
-        # GRU Solver의 balance_loss에 강한 가중치를 줘서 밸런싱을 최우선으로 만듦
-        self.balance_loss_coef = getattr(config, "balance_loss_coef", 2.0)  # 기본값 2.0 (1.0 ~ 5.0 권장)
-        
-        # 3. Adaptive weighting: CV에 따라 loss 가중치 자동 조절
-        self.adaptive_loss_scaling = getattr(config, "adaptive_loss_scaling", True)
-        
-        # 4. Curriculum learning: 초반에는 load balancing 강하게, 후반에는 speciality 강하게
-        self.curriculum_steps = getattr(config, "curriculum_steps", 10000)
-        self.register_buffer("training_step", torch.tensor(0, dtype=torch.long))
-        
-        # EMA 설정
-        self.balancing_strength = getattr(config, "balancing_strength", 0.01)
-        self.ema_alpha = getattr(config, "ema_alpha", 0.99)
-        self.register_buffer("expert_load_ema", torch.zeros(self.num_experts), persistent=True)
-        
-        # CV 추적
-        self.register_buffer("cv_ema", torch.tensor(1.0), persistent=True)
-        self.cv_ema_alpha = 0.95
-        
-        # Sinkhorn 설정
-        self.enable_sinkhorn = getattr(config, "enable_sinkhorn", True)
-        self.sinkhorn_epsilon = max(getattr(config, "sinkhorn_epsilon", 0.1), 1e-6)
-        self.sinkhorn_iterations = max(getattr(config, "sinkhorn_iterations", 3), 1)
-        self.sinkhorn_inference = getattr(config, "sinkhorn_inference", False)
-        
-        # Global routing GRU cell (depth-shared)
-        self.load_balancer = IntentGatedContextCell(
-            input_size=self.hidden_size,
-            hidden_size=self.num_experts * self.router_dim,
-        )
-        
-        # ===== Expression Projector (Linear + Ortho Init) =====
-        # 복잡한 Newton-Schulz도 일단 뺍시다. OSR 척력이면 충분합니다.
-        self.expression_projector = ExpressionProjector(
-            self.hidden_size,
-            self.num_experts * self.router_dim,
-            self.num_experts,
-            method="linear",
-            iterations=getattr(config, "spechorn_osr_iter", 3),
-        )
-        # Orthogonal initialization for better starting point
-        # ZeRO-3 compatibility: Skip init if weights are partitioned (1D) or on meta device
-        if hasattr(self.expression_projector, 'projection') and self.expression_projector.projection.weight.dim() > 1:
-            if not self.expression_projector.projection.weight.is_meta:
-                nn.init.orthogonal_(self.expression_projector.projection.weight)
-        self.expression_projector.ortho_strength = 0.0  # OSR 척력이 직교성을 강제하므로 추가 제약 불필요
+        # [Gradient Checkpointing] Deferred bias updates
+        self._bias_delta_acc = None 
 
-        # ========================================================================
-        # [LDR Phase 1] Priority Head (Divider) - Buffer 방식
-        # DeepSpeed 파티셔닝 충돌 방지를 위해 register_buffer 사용
-        # ========================================================================
-        intent_hidden_size = self.num_experts * self.router_dim # Actual dimension of hn_next from IntentGatedContextCell
-        priority_input_dim = self.hidden_size + intent_hidden_size
-        
-        # Proper Linear Layer Initialization (compatible with ZeRO-3)
-        self.priority_head = nn.Linear(priority_input_dim, 1, bias=False)
-        nn.init.zeros_(self.priority_head.weight) # Start neutral
-
-        # Capacity Factor: 1.0에 가까울수록 CV=0, PPL 위험. 1.25~2.0 권장 (Overlap 허용)
-        # 기존 expert_choice_capacity_factor 활용
-        self.capacity_factor = getattr(config, "capacity_factor", self.expert_choice_capacity_factor)
-
-        # Bias Predictor (GRU 기반) - Sequential 분리 (LoRA 대상 선형층 노출)
-        self.bias_predictor_hidden_dim = getattr(config, "bias_predictor_hidden_dim", 256)
-        self.bias_pred_fc1 = nn.Linear(
-            self.num_experts * self.router_dim + self.num_experts, self.bias_predictor_hidden_dim
-        )
-        self.bias_pred_fc2 = nn.Linear(self.bias_predictor_hidden_dim, self.num_experts)
-        
-        # Explicit initialization (prevents NaN with ZeRO-3 + from_pretrained)
-        nn.init.xavier_uniform_(self.bias_pred_fc1.weight)
-        nn.init.zeros_(self.bias_pred_fc1.bias)
-        nn.init.xavier_uniform_(self.bias_pred_fc2.weight)
-        nn.init.zeros_(self.bias_pred_fc2.bias)
-        
-        # Contrastive loss
-        self.contrastive_loss = ContrastiveRouterLoss()
-
-        # OSR Hyperparameters
-        self.repulsion_weight = getattr(config, "osr_repulsion_weight", 0.5)  # [핵심] OSR 척력 가중치
-        
-        # SOS-RMoE Configuration
-        self.log_sinkhorn_enabled = getattr(config, "log_sinkhorn_enabled", True)
-        self.srip_enabled = getattr(config, "srip_enabled", True)
-        self.so_warmup_steps = getattr(config, "so_warmup_steps", 100)
-        self.so_lambda_max = getattr(config, "so_lambda_max", 5e-2)
-        
-        # MaxVio tracking
-        self.register_buffer("max_vio_ema", torch.tensor(0.0), persistent=True)
-        self.max_vio_ema_alpha = 0.95
-
-    def compute_adaptive_loss_weights(self, current_cv: float) -> dict:
-        """CV에 따라 loss 가중치를 동적으로 조절"""
-        # CV가 높을수록 load balancing에 집중, 낮을수록 speciality에 집중
-        cv_factor = float(torch.clamp(torch.tensor(current_cv), 0.1, 2.0).item())  # float로 변환
-        
-        # Curriculum learning: 초반에는 LB 강하게
-        progress = min(1.0, float(self.training_step) / self.curriculum_steps)
-        curriculum_factor = 1.0 - 0.5 * progress  # 1.0 → 0.5
-        
-        weights = {
-            # [수정] 계수 대폭 상향 - CV가 높을 때 Loss가 '유의미한 크기(0.1~1.0)'가 되어야 라우터가 반응합니다
-            # Load balancing: CV 높으면 강하게
-            'sinkhorn': 0.5 * cv_factor * curriculum_factor,      # 기존 0.05 -> 0.5 (10배)
-            'entropy': 0.1 * cv_factor * curriculum_factor,       # 기존 0.01 -> 0.1 (10배)
-            'lb_direct': 1.0 * cv_factor * curriculum_factor,     # 기존 0.01 -> 1.0 (100배! 가장 중요)
-            
-            # [전략 1] Balance Loss: GRU Solver의 constraint violation loss에 강한 가중치
-            # CV가 높을수록 더 강하게 적용하여 밸런싱을 최우선으로 만듦
-            'balance_loss': self.balance_loss_coef * cv_factor * curriculum_factor,
-            
-            # Specialization: CV 낮으면 강하게 (progress에 따라 증가)
-            'speciality': 0.0005 * (1.0 / cv_factor) * progress,
-            'contrastive': 0.005 * (1.0 / cv_factor) * progress,
-            'expression_reg': 0.0001,
-        }
-        return weights
-
-    def compute_improved_speciality_loss(
-        self, 
-        routing_logits: torch.Tensor,
-        expression_logits: torch.Tensor
-    ) -> torch.Tensor:
-        """개선된 Speciality Loss: Soft orthogonality + Diversity"""
-        batch_size, seq_len, num_experts, router_dim = routing_logits.shape
-        
-        # 1. Routing space의 soft orthogonality (기존보다 약하게)
-        # [수정] 엡실론 추가하여 0으로 나누기 방지
-        routing_normalized = routing_logits / (routing_logits.norm(p=2, dim=-1, keepdim=True) + 1e-6)
-        gram = torch.matmul(
-            routing_normalized.view(-1, num_experts, router_dim),
-            routing_normalized.view(-1, num_experts, router_dim).transpose(-2, -1)
-        )
-        identity = torch.eye(num_experts, device=gram.device)
-        
-        # Off-diagonal만 페널티 (diagonal은 1이어도 됨)
-        mask = ~torch.eye(num_experts, dtype=torch.bool, device=gram.device)
-        off_diag_loss = (gram[:, mask] ** 2).mean()
-        
-        # 2. Expression space의 diversity (전체 배치에서 다양성)
-        # expression_logits의 shape을 routing_logits와 맞춤
-        # [수정] 엡실론 추가하여 0으로 나누기 방지
-        expr_normalized = expression_logits / (expression_logits.norm(p=2, dim=-1, keepdim=True) + 1e-6)
-        
-        # expression_logits의 shape 확인 및 변환
-        if expr_normalized.shape == routing_logits.shape:
-            # 이미 올바른 shape: [batch_size, seq_len, num_experts, router_dim]
-            expr_flat = expr_normalized.view(-1, num_experts, router_dim)
-        else:
-            # shape이 다르면 변환 시도
-            # expression_logits: [batch_size, seq_len, num_experts, router_dim] 또는 다른 형태
-            expr_total_elements = expr_normalized.numel()
-            expected_elements = batch_size * seq_len * num_experts * router_dim
-            
-            if expr_total_elements == expected_elements:
-                # 전체 요소 수가 같으면 reshape만 하면 됨
-                expr_flat = expr_normalized.view(batch_size, seq_len, num_experts, router_dim).view(-1, num_experts, router_dim)
-            else:
-                # 요소 수가 다르면 마지막 router_dim 차원을 기준으로 처리
-                # expr_normalized를 [..., router_dim] 형태로 가정
-                if expr_normalized.dim() >= 2 and expr_normalized.size(-1) == router_dim:
-                    # 마지막 차원이 router_dim이면, 앞부분을 flatten
-                    expr_flat_all = expr_normalized.view(-1, router_dim)
-                    # 필요한 개수만큼만 사용
-                    needed_count = batch_size * seq_len * num_experts
-                    if expr_flat_all.size(0) >= needed_count:
-                        expr_flat = expr_flat_all[:needed_count].view(-1, num_experts, router_dim)
-                    else:
-                        # 부족하면 반복
-                        repeat_times = (needed_count + expr_flat_all.size(0) - 1) // expr_flat_all.size(0)
-                        expr_flat = expr_flat_all.repeat(repeat_times, 1)[:needed_count].view(-1, num_experts, router_dim)
-                else:
-                    # shape이 맞지 않으면 routing_logits만 사용
-                    return off_diag_loss
-        
-        # Expert별 평균 방향
-        expert_directions = expr_flat.mean(dim=0)  # [num_experts, router_dim]
-        # [수정] 엡실론 추가하여 0으로 나누기 방지
-        expert_directions = expert_directions / (expert_directions.norm(p=2, dim=-1, keepdim=True) + 1e-6)
-        
-        # Expert간 cosine similarity의 분산 최소화 (더 uniform하게)
-        similarity_matrix = torch.matmul(expert_directions, expert_directions.T)
-        target_similarity = torch.ones_like(similarity_matrix) * (1.0 / num_experts)
-        target_similarity.diagonal().fill_(1.0)
-        diversity_loss = F.mse_loss(similarity_matrix, target_similarity)
-        
-        return off_diag_loss * 0.5 + diversity_loss * 0.5
-
-    def compute_improved_sinkhorn_loss(
-        self,
-        raw_logits: torch.Tensor,
-        balanced_logits: torch.Tensor,
-        Q_target: Optional[torch.Tensor]
-    ) -> torch.Tensor:
-        """개선된 Sinkhorn Distillation: Soft target + Curriculum"""
-        if Q_target is None:
-            return torch.tensor(0.0, device=raw_logits.device, requires_grad=True)
-        
-        # Student distribution (GRU가 예측한 것)
-        P_student = F.softmax(balanced_logits, dim=-1)
-        
-        # Soft target: Q_target와 uniform의 혼합
-        uniform = torch.ones_like(Q_target) / self.num_experts
-        progress = min(1.0, float(self.training_step) / self.curriculum_steps)
-        
-        # 초반: uniform 비중 높음, 후반: Sinkhorn 비중 높음
-        Q_soft = (1 - progress) * uniform + progress * Q_target
-        
-        # KL Divergence (더 안정적)
-        # 양방향 KL의 가중 평균
-        kl_forward = F.kl_div(
-            P_student.log().clamp(min=-10),
-            Q_soft,
-            reduction='batchmean',
-            log_target=False
-        )
-        kl_reverse = F.kl_div(
-            Q_soft.log().clamp(min=-10),
-            P_student,
-            reduction='batchmean',
-            log_target=False
-        )
-        
-        return 0.7 * kl_forward + 0.3 * kl_reverse
-
-    @torch._dynamo.disable  # Disable torch.compile for gradient checkpointing compatibility
-    def sinkhorn_algorithm(self, cost: torch.Tensor, epsilon: float = None, iterations: int = None) -> torch.Tensor:
-        """
-        Sinkhorn-Knopp algorithm for Optimal Transport.
-        Computes a doubly stochastic matrix Q that ensures uniform expert load distribution.
-        
-        Args:
-            cost: [N, E] cost matrix (negative logits, higher score = lower cost)
-            epsilon: Temperature parameter (default: self.sinkhorn_epsilon)
-            iterations: Number of Sinkhorn iterations (default: self.sinkhorn_iterations)
-        
-        Returns:
-            Q: [N, E] doubly stochastic matrix (assignment probabilities)
-        """
-        if self.log_sinkhorn_enabled:
-            # Use Log-Domain Sinkhorn for stability
-            P, max_vio = log_sinkhorn_stabilized(
-                logits=cost,  # cost -> logits (negate), higher logits = lower cost
-                num_experts=self.num_experts,
-                epsilon=epsilon,
-                iterations=iterations,
-                adaptive_epsilon=self.adaptive_loss_scaling,
-                cv_ema=self.cv_ema,
-            )
-        else:
-            # Standard Sinkhorn (legacy) - only if explicitly disabled
-            # ... (omitted, assuming log_sinkhorn is preferred)
-            # Just fallback to log_sinkhorn for safety
-            P, max_vio = log_sinkhorn_stabilized(
-                logits=cost,
-                num_experts=self.num_experts,
-                epsilon=epsilon,
-                iterations=iterations,
-                adaptive_epsilon=False, # Disable adaptive if legacy mode
-                cv_ema=None,
-            )
-        
-        # Update MaxVio EMA
-        if self.training:
+    def flush_bias_updates(self):
+        """Apply accumulated bias delta (Sign-based) once."""
+        acc = getattr(self, "_bias_delta_acc", None)
+        if acc is not None:
             with torch.no_grad():
-                self.max_vio_ema.mul_(self.max_vio_ema_alpha).add_(
-                    max_vio * (1.0 - self.max_vio_ema_alpha)
-                )
-        
-        return P
-    
-    def compute_routing_uncertainty(self, routing_probs: torch.Tensor) -> torch.Tensor:
-        """
-        Compute normalized entropy of routing probabilities as uncertainty measure.
-        Returns: [batch, seq_len] or [batch * seq_len] depending on input
-        """
-        # routing_probs: [..., num_experts]
-        probs = routing_probs + 1e-8
-        
-        # Entropy: -sum(p * log(p))
-        entropy = -torch.sum(probs * torch.log(probs), dim=-1)
-        
-        # Normalize by max entropy (log(num_experts))
-        max_entropy = torch.log(torch.tensor(self.num_experts, device=probs.device, dtype=probs.dtype))
-        normalized_entropy = entropy / max_entropy
-        
-        return normalized_entropy
+                # Sign-based update: acc contains sum of signs or errors
+                # Here we just add the accumulated delta directly
+                self.expert_bias.add_(acc)
+                # Safety Clamp
+                self.expert_bias.clamp_(min=-20.0, max=20.0)
+            acc.zero_()
 
-    def compute_osr_cost(self, similarity: torch.Tensor, expert_embeddings: torch.Tensor) -> torch.Tensor:
-        """
-        [OSR Core Logic - Stabilized: Repulsion penalizes |expert-expert cosine| to drive orthogonality]
-        Cost = -Similarity + lambda * Repulsion
-        Repulsion: 토큰이 선호(|similarity|)하는 전문가들이 서로 상관(|cos|)이 크면 페널티를 줌.
-        (핵심) expert-expert cos의 부호(양/음)와 무관하게 |cos|가 크면 "직교(0)"에서 멀기 때문에 페널티.
-        
-        Args:
-            similarity: [Batch, Experts] cosine similarity between routing and expression vectors
-            expert_embeddings: [Experts, Dim] expert representation vectors
-        
-        Returns:
-            cost: [Batch, Experts] cost matrix (lower is better for Sinkhorn)
-        """
-        # 1. 전문가 간 유사도 (Gram Matrix)
-        # expert_embeddings: [Experts, Dim]
-        # G: [Experts, Experts]
-        expert_sim_matrix = torch.matmul(expert_embeddings, expert_embeddings.t())
-        
-        # 자기 자신과의 유사도(대각선)는 0으로 만듦 (자기 자신을 밀어내면 안 되니까)
-        identity = torch.eye(self.num_experts, device=similarity.device, dtype=similarity.dtype)
-        expert_sim_matrix = expert_sim_matrix * (1 - identity)
-        
-        # |cos|를 벌점: square는 부호를 제거하고 큰 상관(양/음)을 강하게 벌점
-        # -> anti-parallel(-1)로 "음수 수렴"하는 해도 막고, 목표를 orthogonal(0)로 둠
-        repulsion_matrix = torch.square(expert_sim_matrix)
-        
-        # 2. 척력 계산 (Lateral Inhibition)
-        # 토큰-전문가 관련성(|similarity|) 크기로 가중: 강하게 관련된 전문가들끼리만 더 강하게 밀어냄
-        similarity_magnitude = torch.abs(similarity)
-        repulsion_score = torch.matmul(similarity_magnitude, repulsion_matrix)
-        
-        # 3. 최종 Cost (Sinkhorn은 Cost가 낮을수록 좋아함)
-        # Similarity가 높으면 Cost 낮춤 (-Sim)
-        # Repulsion이 높으면 Cost 높임 (+Rep)
-        cost = -similarity + self.repulsion_weight * repulsion_score
-        
-        return cost
+    def compute_affinity_loss(self):
+        # Orthogonality of Expert Codes
+        codes = F.normalize(self.expert_codebook.float(), p=2, dim=1)
+        gram = torch.matmul(codes, codes.t())
+        identity = torch.eye(self.num_experts, device=gram.device)
+        return ((gram - identity) ** 2).mean()
 
-    def predict_expert_bias_from_gru(self, hn: torch.Tensor) -> torch.Tensor:
-        """개선된 Bias 예측: 더 강한 정규화"""
-        # last_hn = hn[-1]  # [수정] hn은 [tokens, dim] 형태이므로 전체 토큰 사용
-        
-        # EMA load를 확률로 정규화
-        ema_total = self.expert_load_ema.sum()
-        if ema_total > 0:
-            ema_normalized = self.expert_load_ema / ema_total
-        else:
-            ema_normalized = torch.full_like(self.expert_load_ema, 1.0 / self.num_experts)
-        
-        # hn: [tokens, dim]
-        batch_tokens = hn.size(0)
-        
-        # Expand EMA to match tokens
-        ema_expanded = ema_normalized.unsqueeze(0).expand(batch_tokens, -1)
-        combined_input = torch.cat([hn, ema_expanded], dim=-1)
-        
-        # Bias 예측 (Tanh로 [-1, 1] 제한됨)
-        x = F.relu(self.bias_pred_fc1(combined_input))
-        predicted_bias = self.bias_pred_fc2(x)
-        mean_bias = predicted_bias.mean(dim=0)
-        
-        # Zero-mean 강제
-        mean_bias = mean_bias - mean_bias.mean()
-        
-        # [수정] Bias 제한 완전 해제 - Logit(10.0)을 이겨먹을 수 있도록
-        # CV 기반 스케일링: CV가 높을수록 Bias를 더 크게 적용하여 Load Balancing 강화
-        current_cv = self.cv_ema.item()
-        # cv_scale을 CV에 비례하도록 설정 (최소 1.0, 상한선 없음)
-        # CV가 1.0일 때 1.0배, CV가 2.0일 때 2.0배, CV가 5.0일 때 5.0배까지 가능
-        cv_scale = torch.tensor(max(1.0, current_cv), device=mean_bias.device, dtype=mean_bias.dtype)  # 최소 1.0, 상한선 없음
-        
-        # [삭제] bias_max 클램핑 제거 - Bias가 ±1.0에 갇히지 않도록
-        # bias_max = getattr(self.config, "bias_max", 1.0)  # 삭제
-        # if bias_max > 0:
-        #     mean_bias = torch.tanh(mean_bias / bias_max) * bias_max  # 삭제
-        
-        # Bias가 Logit(10.0) 수준까지 커질 수 있도록 제한 해제
-        # mean_bias는 bias_predictor 출력으로 이미 충분히 클 수 있고,
-        # cv_scale을 곱하면 CV가 높을 때 -5.0 ~ +5.0 범위까지 가능
-        return mean_bias * cv_scale  # Bias가 수학적으로 유의미한 크기를 가지도록
-
-    @torch._dynamo.disable
-    def forward(self, x, hn, top_k=2, jitter_eps=0.01):
+    def forward(self, x, hn=None, top_k=2, jitter_eps=0.01, step_frac=0.0, layer_idx=0):
         """
-        [OSR (Orthogonal Sinkhorn Routing) - Pure Math Version]
-        학습하지 말고, 수학으로 패버리는 방식.
+        Agentic SPECTRA Routing (ALF + GLN + Global Intent)
         """
         batch_size, seq_len, _ = x.shape
-        tokens = batch_size * seq_len
+        x_flat = x.view(-1, self.hidden_size)
+        N = x_flat.size(0)
+        E = self.num_experts
+        k = self.config.num_experts_per_tok # Use config k, ignore Arg if needed
+        
+        zero = x_flat.sum() * 0.0
+        
+        # [Deadlock Prevention]
+        is_dummy_batch = (N == 0)
+        if is_dummy_batch:
+            # Create dummy to force connectivity
+            x_flat = torch.zeros(1, self.hidden_size, device=x.device, dtype=x.dtype)
+            N = 1
+            batch_size = 1
 
-        # Flatten for processing
-        x_flat = x.view(tokens, -1)  # [tokens, hidden]
+        # ----------------------------------------------------------------
+        # 1. Global Intent Injection (Memory-Efficient: single pooling, no GRU loop)
+        # ----------------------------------------------------------------
+        # Mean-pool the full sequence to get batch-level intent (1 matmul, not 64 GRU steps)
+        intent_batch = self.context_cell(x)  # [B, H] - handles 3D input internally
+        # Broadcast to all tokens: [B, H] -> [N, H]
+        intent = intent_batch.unsqueeze(1).expand(-1, seq_len, -1).reshape(-1, self.hidden_size)
+        if is_dummy_batch:
+            intent = torch.zeros_like(x_flat)
 
-        if hn is None:
-            hn_flat = torch.zeros(
-                tokens, self.num_experts * self.router_dim, device=x.device, dtype=x.dtype
+        # Priority from Intent + Current State
+        priority_scores = self.priority_proj(x_flat + intent)
+
+        # ----------------------------------------------------------------
+        # 2. Semantic Affinity (Sigmoid + Ortho)
+        # ----------------------------------------------------------------
+        x_norm = F.normalize(x_flat, p=2, dim=-1)
+        codebook = self.expert_codebook.to(x.dtype)
+        codes_norm = F.normalize(codebook, p=2, dim=1)
+        
+        # Cosine Similarity -> Sigmoid (DeepSeek ALF style standardizes range 0-1)
+        semantic_logits = F.linear(x_norm, codes_norm) 
+        # semantic_logits = torch.sigmoid(semantic_logits) # Sigmoid not typically used with Linear directly, 
+        # DeepSeek uses Sigmoid on the final logits or as a gate. 
+        # Here we stick to Linear for Logits but use GLN to normalize.
+        
+        # Base Logits
+        logits = semantic_logits + priority_scores
+
+        # ----------------------------------------------------------------
+        # 3. Gate Logit Normalization (GLN - Skywork)
+        # ----------------------------------------------------------------
+        # Normalize logits across experts to recover Bias Authority
+        mean_logits = logits.mean(dim=-1, keepdim=True)
+        std_logits = logits.std(dim=-1, keepdim=True) + 1e-6
+        logits_norm = self.lambda_gln * (logits - mean_logits) / std_logits
+        
+        # Deterministic Jitter
+        if self.training and jitter_eps > 0:
+            seed = (layer_idx * 16381 + N * 31 + E * 7) % (2**31)
+            gen = torch.Generator(device=x.device).manual_seed(int(seed))
+            logits_norm = logits_norm + torch.empty_like(logits_norm).uniform_(-jitter_eps, jitter_eps, generator=gen)
+
+        # ----------------------------------------------------------------
+        # 4. Agentic Load Balancing (DeepSeek V3 Sign-Update)
+        # ----------------------------------------------------------------
+        # Add Bias
+        biased_logits = logits_norm + self.expert_bias.unsqueeze(0)
+        
+        # [Deadlock Prevention] Always compute local_load and run all_reduce when dist is up,
+        # so all ranks participate in the same collective regardless of self.training.
+        with torch.no_grad():
+            probs = F.softmax(biased_logits.float(), dim=-1)
+            if is_dummy_batch:
+                local_load = torch.zeros(E, device=x.device, dtype=probs.dtype)
+            else:
+                local_load = probs.sum(0)
+            if dist.is_initialized():
+                dist.all_reduce(local_load, op=dist.ReduceOp.SUM)
+        if self.training:
+            with torch.no_grad():
+                # Target (Uniform)
+                target = local_load.sum() / E
+                # Load Error
+                load_error = local_load - target
+                # Sign Update (Robust to scale)
+                delta = -1.0 * self.bias_update_rate * load_error.sign()
+                if self._bias_delta_acc is None:
+                    self._bias_delta_acc = torch.zeros(E, device=x.device, dtype=self.expert_bias.dtype)
+                self._bias_delta_acc.add_(delta.to(self.expert_bias.dtype))
+
+        # ----------------------------------------------------------------
+        # 5. Top-K Selection & Output
+        # ----------------------------------------------------------------
+        topk_weights, topk_indices = torch.topk(biased_logits, k=k, dim=-1)
+        routing_weights = F.softmax(topk_weights, dim=-1).to(dtype=x.dtype)
+        
+        # Full Probs for Logging
+        routing_probs_full = torch.zeros(N, E, device=x.device, dtype=x.dtype)
+        routing_probs_full.scatter_(1, topk_indices, routing_weights)
+
+        # Losses
+        ortho_loss = self.compute_affinity_loss() * 0.05
+        balance_loss = zero # Aux-free
+
+        if is_dummy_batch:
+             return (
+                torch.empty(0, k, device=x.device, dtype=routing_weights.dtype), 
+                torch.empty(0, k, device=x.device, dtype=topk_indices.dtype),
+                None,  # expression_logits
+                torch.empty(0, self.hidden_size, device=x.device, dtype=x.dtype), # hn
+                zero, zero, zero,   
+                torch.empty(0, E, device=x.device, dtype=routing_probs_full.dtype), 
+                zero, zero, zero,
+                balance_loss,
+                zero,
+                ortho_loss,   
+                zero
             )
-        else:
-            hn_flat = hn.view(tokens, -1)
-
-        # 1. GRU & Projector (Context Aware)
-        # 얘는 그냥 "상황 파악"만 하면 됩니다. 밸런싱은 수학이 합니다.
-        routing_output_flat = self.load_balancer(x_flat, hn_flat)  # [tokens, E*R]
-        hn_next = routing_output_flat.view_as(hn_flat)
-        routing_output = routing_output_flat.view(batch_size, seq_len, self.num_experts, self.router_dim)
-
-        # Expression projection
-        proj = self.expression_projector(x_flat)  # [tokens, E*R]
-        proj = proj.view(batch_size, seq_len, self.num_experts, self.router_dim)
-
-        # 2. Normalize & Similarity
-        routing_vec = F.normalize(routing_output, p=2, dim=-1)  # [B, S, E, R]
-        expression_vec = F.normalize(proj, p=2, dim=-1)        # [B, S, E, R]
-        
-        # Cosine Similarity [B, S, E]
-        similarity = (routing_vec * expression_vec).sum(dim=-1)  # [B, S, E]
-        domain_orthogonality = similarity  # Alias for compatibility
-
-        # 3. [OSR] Repulsive Cost Calculation
-        # 전문가 간의 유사도를 계산하기 위해 대표 벡터 추출
-        # 계산 효율성을 위해 현재 배치의 expression_vec 평균을 사용 (Dynamic Orthogonality)
-        # [Experts, Dim]
-        current_expert_repr = expression_vec.mean(dim=(0, 1))  # [E, R]
-        current_expert_repr = F.normalize(current_expert_repr, p=2, dim=-1)
-        
-        # Expert 간 similarity matrix 계산 (pairwise_expert_similarity용)
-        expert_sim_matrix = torch.matmul(current_expert_repr, current_expert_repr.t())  # [E, E]
-        
-        flat_sim = similarity.view(-1, self.num_experts)  # [B*S, E]
-        
-        # Cost 계산 (척력 포함)
-        cost_matrix = self.compute_osr_cost(flat_sim, current_expert_repr)  # [B*S, E]
-        
-        # Expert similarity matrix 저장 (callback에서 사용)
-        if self.training:
-            with torch.no_grad():
-                self.last_expert_sim_matrix = expert_sim_matrix.detach()
-
-        # [NEW] GRU-based Bias Injection
-        # GRU state (hn_next)를 사용하여 Expert Bias를 예측하고 Cost에 반영
-        if self.training:
-             expert_bias = self.predict_expert_bias_from_gru(hn_next) # [Experts]
-             # Cost는 낮을수록 좋음. Bias가 높으면(선호되면) Cost를 낮춰야 함.
-             # cost = -sim + repulsion
-             # new_cost = -sim - bias + repulsion
-             cost_matrix = cost_matrix - expert_bias.unsqueeze(0)
-        
-        # 4. Sinkhorn (Pass-through Gradient) with Dynamic Epsilon
-        # Dynamic Epsilon based on CV (ASR Logic)
-        if self.training and self.adaptive_loss_scaling:
-            # CV가 높으면 epsilon을 키워서(Temperature Up) 더 Flat하게 만듭니다.
-            # Base: 0.1, CV=1.0 -> 0.1 * (1 + 1.0) = 0.2
-            # 척력이 강하면 이미 Flat해지므로, epsilon 증가폭을 조절합니다.
-            cv_val = self.cv_ema.item()
-            epsilon_factor = 1.0 + min(cv_val, 5.0)  # Max factor 6x
-            dynamic_epsilon = self.sinkhorn_epsilon * epsilon_factor
-        else:
-            dynamic_epsilon = self.sinkhorn_epsilon
-
-        
-        # Pure Math Sinkhorn - 학습 파라미터 0개
-        Q_flat = self.sinkhorn_algorithm(
-            cost_matrix,
-            epsilon=dynamic_epsilon,
-            iterations=self.sinkhorn_iterations
-        )
-        
-        routing_probs_full = Q_flat.view(batch_size, seq_len, self.num_experts)
-
-        # ========================================================================
-        # [LDR Phase 2] Priority-based Quota Routing (The Real Divider)
-        # Goal: CV = 0.0 (Hard Constraint) while preserving PPL via Bidding
-        # ========================================================================
-        quota_cap = None
-        quota_fallback_frac = None
-
-        if self.training and self.expert_choice_routing:
-            # Priority Quota (LDR-Optimal) Routing
-            N, E = flat_sim.shape  # [B*S, E] - semantic_logits
-            k = int(min(max(int(top_k), 1), E))
-
-            # [LDR Phase 2.1] Divider Step: Priority Score 계산
-            # "나 급해!" 점수. Intent(문맥)와 Token(현재 상태)을 결합하여 판단
-            # x_flat: [N, Hidden], hn_next: [N, Intent_Dim]
-
-            divider_input = torch.cat([x_flat, hn_next], dim=-1)  # [N, Hidden+Intent]
-            priority_scores = self.priority_head(divider_input)  # [N, 1]
-
-            # [LDR Phase 2.2] Bidding Step: Semantic + Priority
-            # Bid = "나 이거 잘해(Logits)" + "나 이거 꼭 해야돼(Priority)"
-            # Priority가 높으면 Semantic 점수가 낮아도 Expert가 가져가게 됨 (새치기 권한)
-            priority_scores_expanded = priority_scores.expand(-1, E)  # [N, E]로 브로드캐스트
-            # 안전하게 NaN/Inf 방지
-            priority_scores_expanded = torch.clamp(priority_scores_expanded, -10.0, 10.0)
-            bid_scores = flat_sim + priority_scores_expanded  # [N, E]
-
-            # [LDR Phase 2.3] Chooser Step: Expert Choice with Hard Capacity
-            # Expert가 주체가 되어 Bid가 높은 토큰을 정원(Capacity)만큼 가져감.
-            # Capacity: 각 Expert가 처리할 토큰 수 (Hard Limit)
-            # ceil(N * k / E * factor)
-            capacity = int(math.ceil(N * k / E * self.capacity_factor))
-            capacity = max(1, min(capacity, N * k))  # Safety clamp
-
-            # [Experts, Tokens] 형태로 전치하여 Top-K 수행
-            # values: 선택된 토큰의 Bid 점수, indices: 선택된 토큰의 ID (0~N-1)
-            # topk_indices: [E, Capacity] -> 각 Expert가 선택한 토큰 리스트
-            expert_topk_vals, expert_topk_token_ids = torch.topk(bid_scores.t(), k=capacity, dim=1)
-
-            # ========================================================================
-            # [LDR Phase 2.4] Inverse Mapping (Expert->Token Assignment)
-            # Expert 중심의 선택 결과를 Token 중심의 Dispatch 정보로 변환 (Scatter)
-            # ========================================================================
-
-            # Flatten & Shuffle Logic (Efficient Scatter)
-            # GPU 병렬 처리를 위해 Expert Choice 결과를 펼침
-            # source_experts: [E * Capacity] -> Expert ID (0,0,..,1,1,..)
-            # target_tokens: [E * Capacity] -> Token ID (선택된 토큰들)
-            source_experts = torch.arange(E, device=x.device).unsqueeze(1).expand(E, capacity).reshape(-1)
-            target_tokens = expert_topk_token_ids.reshape(-1)
-            target_scores = expert_topk_vals.reshape(-1)
-
-            # "Expert가 나를 선택했는가?" Mask 생성
-            # (Bid 점수를 Scatter)
-            chosen_bid_map = torch.full((N, E), float('-inf'), device=x.device, dtype=x.dtype)
-            chosen_bid_map.index_put_(
-                (target_tokens, source_experts),
-                target_scores
-            )
-
-            # Token 관점 Top-K (Final Dispatch)
-            # Expert들의 구애(Bid)를 받은 것들 중 상위 k개를 최종 확정
-            # 여기서 CV=0가 약간 깨질 수 있지만(중복 선택된 토큰 때문에),
-            # Capacity 제약 때문에 Expert의 Load는 물리적으로 상한선이 걸려있음 (Max Load <= Capacity).
-            # 따라서 CV 폭발은 원천 봉쇄됨.
-            final_scores, final_indices = torch.topk(chosen_bid_map, k=k, dim=-1)
-
-            # Softmax for Routing Weights (Gating)
-            routing_weights = F.softmax(final_scores, dim=-1)
-            
-            # [Fix] Handle dropped tokens (all -inf scores lead to NaN in softmax)
-            # If a token was not selected by any expert (dropped due to capacity), its scores are all -inf.
-            # Softmax([-inf, ...]) -> NaN. We replace these NaNs with 0.0 (effectively dropping the token).
-            if routing_weights.isnan().any():
-                 routing_weights = torch.nan_to_num(routing_weights, nan=0.0)
-
-            # Reshape to [B, S, k]
-            multiplier = routing_weights.view(batch_size, seq_len, k)
-            selected_experts = final_indices.view(batch_size, seq_len, k)
-            quota_cap = capacity
-            quota_fallback_frac = 0.0  # Priority Quota는 fallback이 없음 (항상 성공)
-
-            # routing_probs_full 재구성 (Bid Map 기반)
-            # chosen_bid_map에서 -inf가 아닌 부분만 사용하여 확률 재구성
-            routing_probs_full = F.softmax(chosen_bid_map.clamp(min=-20.0), dim=-1).view(batch_size, seq_len, E)
-        else:
-            top_k_probs, selected_experts = torch.topk(routing_probs_full, min(int(top_k), self.num_experts), dim=-1)
-            top_k_probs = top_k_probs.clamp_min(0.0)
-            multiplier = top_k_probs / (top_k_probs.sum(dim=-1, keepdim=True) + 1e-8)
-
-        # Expose last routing for monitoring callback (so it never falls back to argmax(routing_probs_full))
-        if self.training:
-            with torch.no_grad():
-                tok = batch_size * seq_len
-                k = selected_experts.size(-1)
-                self.last_selected_experts = selected_experts.reshape(tok, k).detach()
-                self.last_routing_weights = multiplier.reshape(tok, k).detach()
-                self.last_num_experts = int(self.num_experts)
-                # Quota stats (for debugging/plots)
-                self.last_quota_cap = int(quota_cap) if quota_cap is not None else None
-                self.last_quota_fallback_frac = float(quota_fallback_frac) if quota_fallback_frac is not None else 0.0
-                self.last_expert_choice_enabled = bool(self.training and self.expert_choice_routing)
-                # Also log the ingredients so cap is interpretable downstream
-                self.last_quota_tokens = int(tok)
-                self.last_quota_top_k = int(k)
-                self.last_quota_num_experts = int(self.num_experts)
-                self.last_quota_capacity_factor = float(self.expert_choice_capacity_factor)
-
-        # 6. Loss 계산
-        zero = torch.tensor(0.0, device=x.device, dtype=x.dtype, requires_grad=True)
-        speciality_loss = zero
-        contrastive_loss = zero
-        expression_reg_loss = zero
-        routing_uncertainty = zero
-        load_balancing_loss = zero
-        sinkhorn_loss = zero
-        balance_loss = zero  # Sinkhorn이 구조적으로 처리하므로 loss로 사용하지 않음
-        
-        # Ortho Loss (Expression Projector의 직교성)
-        # 1. Projector 자체의 직교성
-        ortho_loss = self.expression_projector.orthogonal_loss()
-        
-        # 2. [NEW] Enhanced Soft Orthogonality (Representation-level)
-        # "전문가들끼리 너무 닮지 마라" (음수 발산 방지 포함)
-        if self.training:
-            warmup_progress = min(1.0, float(self.training_step) / max(self.so_warmup_steps, 1))
-            so_lambda = self.so_lambda_max * warmup_progress
-            
-            if so_lambda > 0 and self.srip_enabled:
-                 # Apply to the computed expert representations (averaged over batch)
-                 so_loss = enhanced_soft_orthogonality_loss(
-                     current_expert_repr.unsqueeze(0), # Add batch dim for func logic
-                     lambda_so=so_lambda,
-                     use_srip=self.srip_enabled,
-                 )
-                 ortho_loss = ortho_loss + so_loss
-        
-        # [Sharpening] Entropy Minimization: "한 놈만 패라" (확실한 전문가 선택)
-        # routing_probs_full은 이미 Sinkhorn을 거친 확률입니다.
-        if self.training:
-            # Entropy 계산: 낮을수록 좋음 (Sharp = 확실한 선택)
-            probs = routing_probs_full + 1e-8  # Numerical stability
-            entropy = -(probs * torch.log(probs)).sum(dim=-1).mean()  # [B, S, E] -> scalar
-            entropy_loss = entropy
-        else:
-            entropy_loss = zero
-
-        # 7. Update CV EMA (Thermostat Feedback Loop)
-        if self.training:
-            with torch.no_grad():
-                # 배치의 Expert 사용량 계산 (Soft Probabilities 합)
-                # routing_probs_full: [Batch, Seq, Experts]
-                expert_load = routing_probs_full.sum(dim=(0, 1))  # [Experts]
-                
-                # Normalize
-                total_load = expert_load.sum()
-                if total_load > 0:
-                    expert_dist = expert_load / total_load
-                else:
-                    expert_dist = torch.ones_like(expert_load) / self.num_experts
-                
-                # CV Calculation: std / mean
-                # mean is 1/E
-                # std = sqrt(mean((x - mean)^2))
-                # CV = sqrt(E * sum((p - 1/E)^2))  (simplification for prob distribution)
-                # Actual definition: sigma / mu. mu = 1/E.
-                # sigma = sqrt(mean(p^2) - mean(p)^2) = sqrt(mean(p^2) - (1/E)^2)
-                # CV = sqrt(mean(p^2) - (1/E)^2) / (1/E)
-                #    = sqrt(E * sum(p^2) - 1)
-                
-                # Using standard definition on the counts directly might be more numerically stable if counts are large?
-                # Using probabilities is fine.
-                
-                # Variance of probabilities p_i
-                var_p = expert_dist.var(unbiased=False)
-                mean_p = expert_dist.mean()
-                current_cv = (var_p.sqrt() / (mean_p + 1e-6))
-                
-                # Update EMA
-                self.cv_ema.mul_(self.cv_ema_alpha).add_(current_cv * (1.0 - self.cv_ema_alpha))
-                
-                # Update Expert Load EMA for Bias Predictor
-                self.expert_load_ema.mul_(self.ema_alpha).add_(expert_dist * (1.0 - self.ema_alpha))
 
         return (
-            multiplier,
-            selected_experts,
-            None,  # expression_logits
-            hn_next,
-            speciality_loss,
-            domain_orthogonality,
-            contrastive_loss,
-            routing_probs_full,
-            expression_reg_loss,
-            routing_uncertainty,
-            entropy_loss,
-            load_balancing_loss,
-            sinkhorn_loss,
-            ortho_loss,
+            routing_weights,    
+            topk_indices,      
+            None,               
+            intent, # Return intent as 'hn' context            
+            zero, zero, zero,   
+            routing_probs_full, 
+            zero, zero, zero,
             balance_loss,
+            zero,
+            ortho_loss,         
+            zero
         )
-
 iterations = 0
 class SPECTRAMoE(nn.Module):
     """Hybrid Router: 하나의 linear layer에서 sigmoid로 expert 선택, sparsemixer로 가중치 계산"""
@@ -1805,7 +1201,7 @@ class SPECTRAMoE(nn.Module):
         iterations += 1
         self.iter = iterations
         self.router = global_router
-        
+
         # [EXOSKELETON] Skip expert creation if we'll inject base model experts later
         if not skip_expert_init:
             expert_intermediate_size = getattr(config, "moe_intermediate_size", 768)
@@ -1813,7 +1209,7 @@ class SPECTRAMoE(nn.Module):
         else:
             # Placeholder - will be replaced by base model experts during injection
             self.experts = None
-        
+
         # Only create shared experts if enabled (affects 31B vs 37B param count)
         self.n_shared_experts = getattr(config, "n_shared_experts", 0)
         if self.n_shared_experts > 0:
@@ -1822,50 +1218,49 @@ class SPECTRAMoE(nn.Module):
             self.shared_experts = None
 
         self.router_jitter_noise = getattr(config, 'router_jitter_noise', 0.01)
-        self.input_jitter_noise = getattr(config, 'input_jitter_noise', 0.0)   
+        self.input_jitter_noise = getattr(config, 'input_jitter_noise', 0.0)
 
         setattr(self.router, "_is_spectra_router", True)
         setattr(self.router.expression_projector, "_is_spectra_expression_projector", True)
 
         # Adaptive filter parameters for load balancing
-        
+
         # Enhanced Expert Utilization
         self.register_buffer("expert_specialization_ema", torch.zeros(self.num_experts, self.hidden_dim), persistent=True)
         self.register_buffer("expert_strength_ema", torch.zeros(self.num_experts), persistent=True) # New: Expert strength tracking
         self.routing_temperature = nn.Parameter(torch.ones(1))
         self.specialization_strength = getattr(config, "specialization_strength", 0.01)
-        
+
         # Routing parameters
         self.enable_uncertainty_broadcast = getattr(config, "enable_uncertainty_broadcast", True)
         self.uncertainty_threshold = getattr(config, "uncertainty_threshold", 0.7)
-        
+
         # shared_experts freeze 여부 (기본값은 True로 설정)
         self.freeze_shared_experts = getattr(config, 'freeze_shared_experts', True)
         if self.freeze_shared_experts:
             self._freeze_shared_experts()
-    
+
         # Orthogonal projector는 이제 global router에서 처리됨
         self.ortho_strength = getattr(config, 'ortho_strength', 1.0)
 
-    
     def _freeze_shared_experts(self):
         """shared_experts의 파라미터들을 freeze"""
         if self.shared_experts is not None:
             for param in self.shared_experts.parameters():
                 param.requires_grad = False
             logger.debug(f"Shared experts frozen for layer {self.iter}")
-    
+
     def _unfreeze_shared_experts(self):
         """shared_experts의 파라미터들을 unfreeze"""
         for param in self.shared_experts.parameters():
             param.requires_grad = True
         logger.debug(f"Shared experts unfrozen for layer {self.iter}")
-    
+
     def freeze_shared_experts_manual(self):
         """수동으로 shared_experts freeze"""
         self._freeze_shared_experts()
         self.freeze_shared_experts = True
-    
+
     def unfreeze_shared_experts_manual(self):
         """수동으로 shared_experts unfreeze"""
         self._unfreeze_shared_experts()
@@ -1875,16 +1270,36 @@ class SPECTRAMoE(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        global_routing_logits: torch.Tensor
+        global_routing_logits: Optional[torch.Tensor] = None,
+        **kwargs
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+        # [ZeRO-3 Fix] Removed Early Exit to ensure Graph Consistency via Router Dummy Path
+        # if hidden_states.shape[0] == 0 or hidden_states.numel() == 0: ... (Deleted)
+
+        # ============================================================
+        # [COMPONENT TEST MODE] 환경 변수 기반 컴포넌트 비활성화
+        # ============================================================
+        _TEST_MODE = os.environ.get("SPECTRA_TEST_MODE", "0") == "1"
+        _DISABLE_SHARED_EXPERTS = os.environ.get("SPECTRA_DISABLE_SHARED_EXPERTS", "0") == "1"
+
         residual = hidden_states
         final_hidden_states, routing_info = self._sparse_routing(hidden_states, global_routing_logits)
-        print(f'layer final hn? {final_hidden_states.isnan().sum()}')
         router_logits, hn, speciality_loss, cosine_similarities, contrastive_loss, expression_reg_loss, routing_uncertainty, entropy_loss, load_balancing_loss, sinkhorn_loss, ortho_loss, balance_loss = routing_info
-        if self.shared_experts is not None:
+
+        # shared_experts 비활성화 옵션
+        if _DISABLE_SHARED_EXPERTS:
+            if _TEST_MODE:
+                print(f"[TEST] Layer {self.iter}: Shared experts disabled")
+            # shared_experts 처리 건너뛰기
+            pass
+        elif self.shared_experts is not None:
             with torch.no_grad():
+                # [ZeRO-3 Fix] Manual Hydration for shared experts
+                for p in self.shared_experts.parameters():
+                    if hasattr(p, 'ds_numel') and p.numel() < p.ds_numel:
+                        p.all_gather()
                 pretriained_residual = self.shared_experts(residual)
-            
+
             # final_hidden_states를 pretrained_residual의 크기에 맞춰 normalize
             pretrained_norm = torch.norm(pretriained_residual, dim=-1, keepdim=True)
             final_norm = torch.norm(final_hidden_states, dim=-1, keepdim=True)
@@ -1900,40 +1315,19 @@ class SPECTRAMoE(nn.Module):
             # No shared experts, just use routed results
             pass
         if self.training:
-            final_hidden_states = final_hidden_states.requires_grad_(True)
-            if router_logits is not None:
-                router_logits = router_logits.requires_grad_(True)
-            # Loss의 gradient도 명시적으로 유지
-            if speciality_loss is not None and torch.is_tensor(speciality_loss):
-                speciality_loss = speciality_loss.requires_grad_(True)
-            if cosine_similarities is not None and torch.is_tensor(cosine_similarities):
-                cosine_similarities = cosine_similarities.requires_grad_(True)
-            if contrastive_loss is not None and torch.is_tensor(contrastive_loss):
-                contrastive_loss = contrastive_loss.requires_grad_(True)
-            if expression_reg_loss is not None and torch.is_tensor(expression_reg_loss):
-                expression_reg_loss = expression_reg_loss.requires_grad_(True)
-            if routing_uncertainty is not None and torch.is_tensor(routing_uncertainty):
-                routing_uncertainty = routing_uncertainty.requires_grad_(True)
-            if entropy_loss is not None and torch.is_tensor(entropy_loss):
-                entropy_loss = entropy_loss.requires_grad_(True)
-            if load_balancing_loss is not None and torch.is_tensor(load_balancing_loss):
-                load_balancing_loss = load_balancing_loss.requires_grad_(True)
-            if sinkhorn_loss is not None and torch.is_tensor(sinkhorn_loss):
-                sinkhorn_loss = sinkhorn_loss.requires_grad_(True)
-            if ortho_loss is not None and torch.is_tensor(ortho_loss):
-                ortho_loss = ortho_loss.requires_grad_(True)
-            if balance_loss is not None and torch.is_tensor(balance_loss):
-                balance_loss = balance_loss.requires_grad_(True)
-        return final_hidden_states, (router_logits, hn, speciality_loss, cosine_similarities, contrastive_loss, expression_reg_loss, routing_uncertainty, entropy_loss, load_balancing_loss, sinkhorn_loss, ortho_loss, balance_loss)    
-    
+            # Clean up: removed redundant requires_grad_ calls that can disconnect the graph
+            # and cause issues with DeepSpeed ZeRO-3 partitioned gradients.
+            final_hidden_states = final_hidden_states
+        return final_hidden_states, (router_logits, hn, speciality_loss, cosine_similarities, contrastive_loss, expression_reg_loss, routing_uncertainty, entropy_loss, load_balancing_loss, sinkhorn_loss, ortho_loss, balance_loss)
+
     def compute_pairwise_expert_similarity(self, expert_outputs: torch.Tensor, expert_mask: torch.Tensor) -> torch.Tensor:
         """
         Compute pairwise cosine similarity between expert outputs for the same inputs.
         Ideally, we want experts to be orthogonal (diverse).
         Returns scalar average similarity.
         """
-        
-        if self.expert_specialization_ema is not None:
+
+        if self.expert_specialization_ema is not None and self.expert_specialization_ema.numel() > 0:
              # Normalize
             normalized_specs = F.normalize(self.expert_specialization_ema, dim=-1)
             # Similarity matrix
@@ -1941,23 +1335,57 @@ class SPECTRAMoE(nn.Module):
             # We want to minimize off-diagonal elements
             mask = torch.eye(self.num_experts, device=sim_matrix.device).bool()
             off_diagonal = sim_matrix[~mask]
-            return off_diagonal.mean()
-            
-        return torch.tensor(0.0, device=self.router.load_balancer.weight_hh_l0.device)
+
+            # ZeRO-3 safety: Ensure we return a persistent scalar
+            if off_diagonal.numel() > 0:
+                return off_diagonal.mean()
+            return torch.tensor(0.0, device=self.expert_load_ema.device)
+
+        return torch.tensor(0.0, device=self.expert_load_ema.device)
 
     @torch._dynamo.disable  # Disable torch.compile for this method due to data-dependent branching
     def _sparse_routing(
         self,
-        hidden_states: torch.Tensor, 
+        hidden_states: torch.Tensor,
         global_routing_logits: torch.Tensor
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+        
         batch_size, sequence_length, hidden_dim = hidden_states.shape
-        print(f'layer hidden_states? {hidden_states.isnan().sum()}')
+        device = hidden_states.device
+        dtype = hidden_states.dtype
+
+        # ============================================================
+        # [COMPONENT TEST MODE] 환경 변수 기반 컴포넌트 비활성화
+        # ============================================================
+        _TEST_MODE = os.environ.get("SPECTRA_TEST_MODE", "0") == "1"
+        _DISABLE_EXPERT_DISPATCH = os.environ.get("SPECTRA_DISABLE_EXPERT_DISPATCH", "0") == "1"
+        _DISABLE_AUX_LOSSES = os.environ.get("SPECTRA_DISABLE_AUX_LOSSES", "0") == "1"
+        _DISABLE_ROUTER = os.environ.get("SPECTRA_DISABLE_ROUTER", "0") == "1"
+
+        # 더미 routing_info 생성 함수
+        def _create_dummy_routing_info(bs=None, seq=None, dev=None, dt=None):
+            bs = bs if bs is not None else batch_size
+            seq = seq if seq is not None else sequence_length
+            dev = dev if dev is not None else device
+            dt = dt if dt is not None else dtype
+            zero_scalar = torch.tensor(0.0, device=dev, dtype=dt)
+            dummy_logits = torch.zeros(bs * seq, self.num_experts, device=dev, dtype=dt)
+            dummy_hn = torch.zeros(bs, self.router.num_experts * self.router.router_dim, device=dev, dtype=dt)
+            return (dummy_logits, dummy_hn, zero_scalar, zero_scalar, zero_scalar, zero_scalar, zero_scalar, zero_scalar, zero_scalar, zero_scalar, zero_scalar, zero_scalar)
+
+        # Expert dispatch만 비활성화: hidden_states 그대로 반환
+        if _DISABLE_EXPERT_DISPATCH:
+            final_hidden_states = hidden_states.view(-1, hidden_dim)
+            routing_info = _create_dummy_routing_info()
+            if _TEST_MODE:
+                print(f"[TEST] Layer {self.iter}: Expert dispatch disabled, returning hidden_states directly")
+            return final_hidden_states, routing_info
+
         if self.training and self.input_jitter_noise > 0:
-            # Inplace 연산 대신 새로운 텐서 생성 (gradient checkpointing 호환)
-            jitter = torch.empty_like(hidden_states).uniform_(1.0 - self.input_jitter_noise, 1.0 + self.input_jitter_noise)
+            seed = (getattr(self, "iter", 0) * 16381 + batch_size * sequence_length * 31 + 7) % (2**31)
+            gen = torch.Generator(device=hidden_states.device).manual_seed(int(seed))
+            jitter = torch.empty_like(hidden_states).uniform_(1.0 - self.input_jitter_noise, 1.0 + self.input_jitter_noise, generator=gen)
             hidden_states = hidden_states * jitter
-            print(f'layer jitter hn? {hidden_states.isnan().sum()}')
         # DEBUG: Check input validity
         if torch.isnan(hidden_states).any():
              print(f"CRITICAL: Input to _sparse_routing layer {self.iter} is NaN! Mean={hidden_states.mean().item()}")
@@ -1965,121 +1393,126 @@ class SPECTRAMoE(nn.Module):
 
         # Global router에서 전체 라우팅 처리 (GRU + expression projection + sparsemixer)
         router_output = self.router(
-            hidden_states, 
+            hidden_states,
             global_routing_logits,
             top_k=self.top_k,
-            jitter_eps=self.router_jitter_noise
+            jitter_eps=self.router_jitter_noise,
+            layer_idx=getattr(self, "iter", 0),
         )
         # Unpack including full probabilities, expression_reg_loss, routing_uncertainty, entropy_loss, load_balancing_loss, sinkhorn_loss, ortho_loss, balance_loss
         routing_weights, selected_experts, expression_logits, hn, speciality_loss, cosine_similarities, contrastive_loss, routing_probs_full, expression_reg_loss, routing_uncertainty, entropy_loss, load_balancing_loss, sinkhorn_loss, ortho_loss, balance_loss = router_output
-        print(f'layer routing_weights? (pre-assert) {routing_weights.isnan().sum()}')
         # multiplier와 selected_experts는 이미 global router에서 sparsemixer를 통해 계산됨
         assert routing_weights.isnan().sum() == 0, f"{self.iter} layer routing_weights is nan Line: 826"
-        print(f'layer routing_weights? {routing_weights.isnan().sum()}')
         # Flatten routing outputs for per-token processing
         routing_weights = routing_weights.view(batch_size * sequence_length, -1)  # [tokens, top_k]
-        print(f'layer routing_weights? {routing_weights.isnan().sum()}')
         selected_experts = selected_experts.view(batch_size * sequence_length, -1)  # [tokens, top_k]
-        print(f'layer selected_experts? {selected_experts.isnan().sum()}')
         final_hidden_states = torch.zeros(
             (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
         )
-        print(f'layer final_hidden_states? {final_hidden_states.isnan().sum()}')
-        # Uncertainty-based broadcasting for uncertain tokens (training only)
+        # Expert mask from selected experts (always same ops for checkpoint recompute)
+        expert_mask = torch.nn.functional.one_hot(
+            selected_experts, num_classes=self.num_experts
+        ).bool()
+        # Uncertainty-based broadcasting for uncertain tokens (training only); no .any() branch
         if self.training and self.enable_uncertainty_broadcast and routing_uncertainty is not None:
-            # Reshape uncertainty to match token positions: [batch*seq_len]
             uncertainty_flat = routing_uncertainty.view(-1) if routing_uncertainty.dim() > 1 else routing_uncertainty
-            # Identify uncertain tokens (high entropy = low confidence)
             uncertain_mask = uncertainty_flat > self.uncertainty_threshold
-            # For uncertain tokens, broadcast to all experts
-            if uncertain_mask.any():
-                one_hot = torch.nn.functional.one_hot(
-                    selected_experts, num_classes=self.num_experts
-                )  # [tokens, top_k, E]
-                expert_mask = one_hot.bool()
-                uncertain_token_mask = uncertain_mask.view(-1, 1).expand(-1, self.top_k)  # [tokens, top_k]
-                expert_mask[uncertain_token_mask] = True
-            else:
-                expert_mask = torch.nn.functional.one_hot(
-                    selected_experts, num_classes=self.num_experts
-                ).bool()
-        else:
-            # Standard routing: One hot encode the selected experts to create an expert mask
-            # this will be used to easily index which expert is going to be sollicitated
-            expert_mask = torch.nn.functional.one_hot(
-                selected_experts, num_classes=self.num_experts
-            ).bool()
+            broadcast = uncertain_mask.view(-1, 1, 1).expand_as(expert_mask)
+            expert_mask = expert_mask | broadcast
 
         # =======================================================================
         # [UNIVERSAL EXOSKELETON CONTROLLER]
         # Dispatch to base model experts regardless of their internal structure (Fused or ModuleList)
         # =======================================================================
         hidden_states_flat = hidden_states.view(-1, hidden_dim)
-        
-        # Determine if we can use a "fused" call or need to loop
-        # Standard Transformers MoE uses nn.ModuleList. Specialized ones (Qwen3) use custom modules.
+
+        # Fused path only (user requirement).
         if not isinstance(self.experts, nn.ModuleList) and callable(self.experts):
-            # 🚀 Fused Expert Path (e.g. Qwen3VLMoeTextExperts)
-            # Most fused experts expect: (hidden_states, routing_weights, router_indices)
-            # We construct the expected full-rank routing_weights if necessary
-            full_routing_weights = torch.zeros(
-                hidden_states_flat.size(0), self.num_experts,
-                device=hidden_states.device, dtype=hidden_states.dtype
-            )
-            full_routing_weights.scatter_(1, selected_experts, routing_weights)
+            fwd_input = hidden_states_flat.view(batch_size, sequence_length, hidden_dim)
             
-            # Use original expert module's logic exactly as intended
-            final_hidden_states = self.experts(hidden_states_flat, full_routing_weights, selected_experts)
+            # [ZeRO-3 Fix] Dummy Dispatch ensures graph consistency
+            if fwd_input.numel() == 0:
+                 dummy_hidden = torch.zeros(1, 1, hidden_dim, device=device, dtype=dtype)
+                 dummy_weights = torch.zeros(1, self.num_experts, device=device, dtype=dtype)
+                 dummy_ind = torch.zeros(1, self.top_k, device=device, dtype=torch.long)
+                 dummy_out = self.experts(dummy_hidden, dummy_weights, dummy_ind)
+                 # [ZeRO-3 Fix] Connect graph to input: fwd_input (empty) -> fwd_out
+                 fwd_out = fwd_input.view(-1, hidden_dim) + dummy_out.sum() * 0
+            else:
+                 num_tokens = routing_weights.size(0)
+                 full_weights = torch.zeros(num_tokens, self.num_experts, device=device, dtype=routing_weights.dtype)
+                 full_weights.scatter_(1, selected_experts, routing_weights)
+                 fwd_out = self.experts(fwd_input, full_weights, selected_experts)
             
-            # --- Update Specialization EMA (Fused Path) ---
-            if self.training:
-                 with torch.no_grad():
-                    # Efficiently update EMA for all selected experts
-                    # This is critical for Spectra long-term load balancing
-                    for k in range(self.top_k):
-                        curr_exp_idx = selected_experts[:, k]  # [tokens]
-                        curr_weights = routing_weights[:, k]   # [tokens]
-                        # Weighted update of specialization EMA
-                        # Process in chunks or unique experts to avoid OOM if needed, but standard is fine
-                        unique_exps = curr_exp_idx.unique()
-                        for exp_id in unique_exps:
-                            mask = (curr_exp_idx == exp_id)
-                            if mask.any():
-                                mean_h = hidden_states_flat[mask].mean(dim=0)
-                                self.expert_specialization_ema[exp_id].lerp_(mean_h, 1.0 - self.router.ema_alpha)
+            final_hidden_states = fwd_out.view(batch_size * sequence_length, hidden_dim)
+
+            # --- Legacy EMA Update Removed ---
+            # Using simple stateless routing for stability
+            if self.training and hasattr(self, 'expert_specialization_ema'):
+                 # Placeholder to keep buffer alive if needed, but no logic
+                 pass
             # --- End EMA Update ---
-            
+
         else:
             # 🚀 Standard MoE Path (ModuleList / Loop)
-            expert_mask = expert_mask.permute(2, 0, 1) # [E, tokens, top_k]
-            for expert_idx in range(self.num_experts):
-                expert_layer = self.experts[expert_idx]
-                token_idx, topk_idx = torch.where(expert_mask[expert_idx])
-
-                if token_idx.numel() > 0:
-                    top_x_list = token_idx.tolist()
-                    idx_list = topk_idx.tolist()
-                    
-                    current_state = hidden_states_flat[top_x_list]
-                    # Compute expert output and weight it
-                    current_hidden_states = expert_layer(current_state) * routing_weights[top_x_list, idx_list].unsqueeze(-1)
-                    final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(hidden_states.dtype))
-                    
-                    # --- Update Specialization EMA (Loop Path) ---
-                    if self.training:
-                        with torch.no_grad():
-                            mean_h = current_state.mean(dim=0)
-                            self.expert_specialization_ema[expert_idx].lerp_(mean_h, 1.0 - self.router.ema_alpha)
+            # Unified path handling both empty and non-empty inputs
+            # No fixed padding to max_capacity to avoid OOM
             
+            expert_mask = expert_mask.permute(2, 0, 1)  # [E, tokens, top_k]
+            routing_weights_flat = routing_weights.view(-1)
+            
+            # [ZeRO-3 Optimization] Global Sparse Activation
+            local_expert_usage = (expert_mask.sum(dim=(1, 2)) > 0).long()  # [E]
+            
+            # Sync to find which experts are active GLOBALLY
+            if dist.is_initialized():
+                global_expert_usage = local_expert_usage.clone()
+                dist.all_reduce(global_expert_usage, op=dist.ReduceOp.MAX)
+            else:
+                global_expert_usage = local_expert_usage
+            
+            # Accumulator for dummy loss to ensure graph connectivity for unused experts
+            dummy_loss = torch.zeros(1, device=device, dtype=dtype)
+
+            for expert_idx in range(self.num_experts):
+                # [OOM FIX] Skip expert if NOBODY in the world is using it.
+                if global_expert_usage[expert_idx] == 0:
+                    continue
+
+                expert_layer = self.experts[expert_idx]
+                
+                # Get indices for this expert
+                token_idx, topk_idx = torch.where(expert_mask[expert_idx])
+                
+                if token_idx.numel() > 0:
+                    # [Normal Execution] Expert has assigned tokens
+                    current_idx = token_idx * self.top_k + topk_idx
+                    states = hidden_states_flat[current_idx]
+                    expert_out = expert_layer(states)
+                    scale = routing_weights_flat[current_idx].unsqueeze(1)
+                    final_hidden_states.index_add_(0, current_idx, expert_out * scale)
+                else:
+                    # [ZeRO-3 Safety] Expert is active GLOBALLY but NOT LOCALLY.
+                    # Run a 1-token dummy forward to:
+                    #   1) Trigger ZeRO-3 module hooks (matching normal forward exactly → no deadlock)
+                    #   2) Use minimal memory (1 token vs full batch)
+                    #   3) Multiply output by 0.0 → zero gradient, no effect on loss
+                    dummy_token = torch.zeros(1, hidden_dim, device=device, dtype=dtype)
+                    dummy_out = expert_layer(dummy_token)
+                    dummy_loss = dummy_loss + dummy_out.sum() * 0.0
+
+            # Connect dummy_loss to the output
+            final_hidden_states = final_hidden_states + dummy_loss
+
         final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
-        
+
         # 콜백을 위해 라우팅 정보를 모듈에 저장
         if self.training:
             with torch.no_grad():
                 self.last_selected_experts = selected_experts.detach()
                 self.last_routing_weights = routing_weights.detach()
                 self.last_num_experts = self.num_experts
-        
+
         return final_hidden_states, (routing_probs_full, hn, speciality_loss, cosine_similarities, contrastive_loss, expression_reg_loss, routing_uncertainty, entropy_loss, load_balancing_loss, sinkhorn_loss, ortho_loss, balance_loss)
 
 
@@ -2096,7 +1529,9 @@ class SPECTRARMSNorm(nn.Module):
         output = self._norm(x.float())
         # Llama does x.to(float16) * w whilst SPECTRA is (x * w).to(float16)
         # See https://github.com/huggingface/transformers/pull/29402
-        output = output * (1.0 + self.weight.float())
+        # [ZeRO-3 Fix] Handle un-gathered parameters (avoid Size([0]) mismatch)
+        if self.weight.numel() > 0:
+            output = output * (1.0 + self.weight.float())
         return output.type_as(x)
 
     def extra_repr(self):
@@ -2106,14 +1541,14 @@ class SPECTRARMSNorm(nn.Module):
 # =============================================================================
 # EXOSKELETON ARCHITECTURE COMPONENTS
 # =============================================================================
-# 
+#
 # The Exoskeleton architecture is designed to be a universal wrapper that can
 # inject SPECTRA's advanced routing mechanisms into any pretrained model without
 # reimplementing the model's core components (attention, layernorm, RoPE, etc.).
 #
 # Supported base models:
 #   - Qwen3-VL-MoE (modeling_qwen3_vl_moe.py)
-#   - Llama4 (modeling_llama4.py) 
+#   - Llama4 (modeling_llama4.py)
 #   - DeepSeek-V3 (modeling_deepseek_v3.py)
 #   - GLM4V-MoE (modeling_glm4v_moe.py)
 #   - GPT-OSS (modeling_gpt_oss.py)
@@ -2129,26 +1564,26 @@ class SPECTRARMSNorm(nn.Module):
 class SPECTRAExoskeletonMoEInjector:
     """
     Universal Exoskeleton MoE Injector for pretrained models.
-    
+
     This class wraps any transformer decoder layer and replaces its MoE/router
     component with SPECTRA's advanced routing mechanism while preserving:
     - Base model's attention implementation (FlashAttention, SDPA, eager, flex_attn)
     - Base model's positional encoding (RoPE variants, NoPE, ALiBi, etc.)
     - Base model's normalization layers (RMSNorm, LayerNorm, L2Norm)
     - Base model's shared experts (if any)
-    
+
     This design ensures compatibility with:
     - DeepSpeed ZeRO-3 (no manual parameter gathering)
     - Tensor/Sequence/Context/Pipeline Parallelism
     - Gradient checkpointing
     - torch.compile and torch dynamo
-    
+
     Usage:
         base_model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-VL-30B-A3B")
         injector = SPECTRAExoskeletonMoEInjector(spectra_config, spectra_router)
         spectra_model = injector.inject(base_model)
     """
-    
+
     # Mapping of base model types to their MoE attribute names
     MOE_ATTR_NAMES = {
         # Model type -> (moe_attr_name, router_attr_name, experts_attr_name, shared_experts_attr_name)
@@ -2161,7 +1596,7 @@ class SPECTRAExoskeletonMoEInjector:
         "gemma3": ("mlp", None, None, None),  # Dense model - will add MoE
         "default": ("mlp", "gate", "experts", None),
     }
-    
+
     def __init__(
         self,
         spectra_config: SPECTRATextConfig,
@@ -2171,7 +1606,7 @@ class SPECTRAExoskeletonMoEInjector:
     ):
         """
         Initialize the Exoskeleton MoE Injector.
-        
+
         Args:
             spectra_config: SPECTRA configuration for the MoE layer
             global_router: Pre-initialized SPECTRA global router (shared across layers)
@@ -2182,21 +1617,21 @@ class SPECTRAExoskeletonMoEInjector:
         self.global_router = global_router
         self.preserve_shared_experts = preserve_shared_experts
         self.copy_expert_weights = copy_expert_weights
-    
+
     def detect_model_type(self, model) -> str:
         """
         Auto-detect the base model architecture type from its class name or config.
-        
+
         Args:
             model: The pretrained model or module
-            
+
         Returns:
             str: One of the keys in MOE_ATTR_NAMES
         """
         class_name = model.__class__.__name__.lower()
         config = getattr(model, 'config', None)
         model_type = getattr(config, 'model_type', '') if config else ''
-        
+
         detection_patterns = {
             'qwen3_vl_moe': ['qwen3vlmoe', 'qwen3_vl_moe'],
             'llama4': ['llama4'],
@@ -2206,46 +1641,46 @@ class SPECTRAExoskeletonMoEInjector:
             'ernie4_5_moe': ['ernie4', 'ernie45moe'],
             'gemma3': ['gemma3', 'gemma-3'],
         }
-        
+
         for model_key, patterns in detection_patterns.items():
             for pattern in patterns:
                 if pattern in class_name or pattern in model_type:
                     return model_key
-        
+
         return 'default'
-    
+
     def get_moe_components(self, layer, model_type: str) -> dict:
         """
         Extract MoE components from a decoder layer based on model type.
-        
+
         Args:
             layer: A decoder layer module
             model_type: The detected model type
-            
+
         Returns:
             dict: Contains 'moe', 'router', 'experts', 'shared_experts' (some may be None)
         """
         attr_names = self.MOE_ATTR_NAMES.get(model_type, self.MOE_ATTR_NAMES['default'])
         moe_attr, router_attr, experts_attr, shared_attr = attr_names
-        
+
         moe = getattr(layer, moe_attr, None)
         if moe is None:
             return {'moe': None, 'router': None, 'experts': None, 'shared_experts': None}
-        
+
         # Heuristic: Check if 'moe' is actually a MoE block by looking for router/gate and experts
         # This handles cases where a module exists but is a dense MLP, not a MoE block.
         has_router = hasattr(moe, router_attr) and (router_attr is None or getattr(moe, router_attr, None) is not None)
         has_experts = hasattr(moe, experts_attr) and (experts_attr is None or getattr(moe, experts_attr, None) is not None)
-        
+
         # If neither router nor experts found, this is a dense layer, not MoE
         if router_attr and not has_router and not has_experts:
             logger.debug(f"Layer has '{moe_attr}' but it's a dense MLP (no {router_attr}/{experts_attr}), treating as None")
             return {'moe': None, 'router': None, 'experts': None, 'shared_experts': None}
-        
+
         router = getattr(moe, router_attr, None) if router_attr else None
         experts = getattr(moe, experts_attr, None) if experts_attr else None
         shared_experts = getattr(moe, shared_attr, None) if shared_attr else None
-        
+
         return {
             'moe': moe,
             'router': router,
@@ -2253,7 +1688,7 @@ class SPECTRAExoskeletonMoEInjector:
             'shared_experts': shared_experts,
             'moe_attr_name': moe_attr,
         }
-    
+
     def create_spectra_moe_replacement(
         self,
         base_moe_components: dict,
@@ -2261,81 +1696,78 @@ class SPECTRAExoskeletonMoEInjector:
     ) -> 'SPECTRAMoE':
         """
         Create a SPECTRAMoE module that replaces the base model's MoE.
-        
+
         **CRITICAL**: For existing MoE models (e.g., Qwen3-VL-MoE), we REUSE the base model's
         expert MLPs directly - DO NOT create new experts. Only the router is replaced.
-        
+
         For dense models being upcycled, new experts are created.
-        
+
         Args:
             base_moe_components: Dict from get_moe_components()
             layer_idx: Layer index for router state tracking
-            
+
         Returns:
             SPECTRAMoE: The replacement MoE module with SPECTRA router and base model experts
         """
         # Determine if we should skip expert creation (base model already has experts)
         has_base_experts = base_moe_components['experts'] is not None
-        
+
         spectra_moe = SPECTRAMoE(
             config=self.config,
             global_router=self.global_router,
             skip_expert_init=has_base_experts,  # Skip if base model already has experts
         )
         spectra_moe.iter = layer_idx
-        
+
         # =======================================================================
         # [CRITICAL FIX] REUSE base model experts - DO NOT copy weights to new experts!
         # This is NOT upcycling. Qwen3-VL-MoE already has experts, we just swap the router.
         # =======================================================================
         if has_base_experts:
-            logger.info(f"  Layer {layer_idx}: Reusing base model's {len(base_moe_components['experts']) if hasattr(base_moe_components['experts'], '__len__') else 'fused'} experts (router-only replacement)")
+            logger.debug(f"  Layer {layer_idx}: Reusing base model's {len(base_moe_components['experts']) if hasattr(base_moe_components['experts'], '__len__') else 'fused'} experts (router-only replacement)")
             # Direct assignment - use the SAME expert modules, no copying
             spectra_moe.experts = base_moe_components['experts']
         else:
             # No experts in base model - this is dense upcycling, keep new experts
-            logger.info(f"  Layer {layer_idx}: Base model has no experts, using newly initialized SPECTRA experts")
-        
+            logger.debug(f"  Layer {layer_idx}: Base model has no experts, using newly initialized SPECTRA experts")
+
         # Preserve shared experts if requested
         if self.preserve_shared_experts and base_moe_components['shared_experts'] is not None:
             spectra_moe.shared_experts = base_moe_components['shared_experts']
             # Freeze shared experts to preserve pretrained behavior
             for param in spectra_moe.shared_experts.parameters():
                 param.requires_grad = False
-        
+
         return spectra_moe
-    
+
     def inject_into_layer(self, layer, layer_idx: int, model_type: str) -> nn.Module:
         """
-        Inject SPECTRA MoE into a single decoder layer.
-        
-        This preserves the layer's:
-        - self_attn (attention mechanism)
-        - input_layernorm, post_attention_layernorm
-        - Any other components not related to MoE
-        
-        Args:
-            layer: The decoder layer to modify
-            layer_idx: Layer index
-            model_type: Detected model type
-            
-        Returns:
-            nn.Module: The modified layer with SPECTRA MoE
+        Inject SPECTRA MoE into a single decoder layer using surgical hijacking.
+
+        This method is ZeRO-3 SAFE because it does not replace the module object,
+        preserving original DeepSpeed hooks and metadata.
         """
+        # ============================================================
+        # [COMPONENT TEST MODE] SPECTRA 전체 비활성화 옵션
+        # ============================================================
+        _DISABLE_ALL = os.environ.get("SPECTRA_DISABLE_ALL", "0") == "1"
+        _TEST_MODE = os.environ.get("SPECTRA_TEST_MODE", "0") == "1"
+
+        if _DISABLE_ALL:
+            if _TEST_MODE:
+                print(f"[TEST] Layer {layer_idx}: SPECTRA disabled, keeping original Qwen3 MoE")
+            return layer  # SPECTRA injection 건너뛰기, 원래 Qwen3 MoE 유지
+
         moe_components = self.get_moe_components(layer, model_type)
-        
+
         if moe_components['moe'] is None:
-            # Dense layer - no MoE to replace; optionally add MoE (upcycling)
+            # Dense layer upcycling - still needs replacement for now as there's no base MoE structure
+            # But we make it ZeRO-3 aware by ensuring it's done inside zero.Init
             if layer_idx >= self.config.first_k_dense_replace:
-                logger.info(f"Layer {layer_idx}: Adding SPECTRA MoE to dense layer")
-                spectra_moe = SPECTRAMoE(
-                    config=self.config,
-                    global_router=self.global_router,
-                )
+                logger.debug(f"Layer {layer_idx}: Adding SPECTRA MoE to dense layer")
+                spectra_moe = SPECTRAMoE(config=self.config, global_router=self.global_router)
                 spectra_moe.iter = layer_idx
-                # Set the MoE as the layer's feed_forward/mlp
                 moe_attr = 'feed_forward' if hasattr(layer, 'feed_forward') else 'mlp'
-                # Copy weights from original MLP to all experts (upcycling)
                 original_mlp = getattr(layer, moe_attr, None)
                 if original_mlp and self.copy_expert_weights:
                     with torch.no_grad():
@@ -2348,71 +1780,110 @@ class SPECTRAExoskeletonMoEInjector:
                                 expert.down_proj.weight.copy_(original_mlp.down_proj.weight)
                 setattr(layer, moe_attr, spectra_moe)
             return layer
-        
-        # MoE layer - replace router with SPECTRA router
-        logger.info(f"Layer {layer_idx}: Replacing MoE router with SPECTRA router")
-        moe_attr_name = moe_components['moe_attr_name']
-        spectra_moe = self.create_spectra_moe_replacement(moe_components, layer_idx)
-        setattr(layer, moe_attr_name, spectra_moe)
-        
+
+        # MoE layer - SURGICAL HIJACKING
+        logger.debug(f"Layer {layer_idx}: Surgically hijacking MoE router with SPECTRA")
+        original_moe = moe_components['moe']
+
+        # [ZeRO-3 Fix] DO NOT call add_module('router', global_router) here if it's already registered.
+        # Registration happens once at the model level in self.inject().
+        # We store it as a protected reference to avoid PyTorch/ZeRO-3 re-registration.
+        object.__setattr__(original_moe, 'router', self.global_router)
+        original_moe.iter = layer_idx
+
+        # Copy config attributes needed by SPECTRAMoE.forward
+        for attr in ['top_k', 'num_experts', 'input_jitter_noise', 'router_jitter_noise',
+                    'enable_uncertainty_broadcast', 'uncertainty_threshold']:
+            val = getattr(self.config, attr, None)
+            # Fallback for different SPECTRATextConfig attribute names
+            if val is None:
+                if attr == 'num_experts': val = getattr(self.config, 'n_routed_experts', 1)
+                elif attr == 'top_k': val = getattr(self.config, 'num_experts_per_tok', 1)
+                else: val = 0.0 # Default for noise/uncertainty if missing
+            setattr(original_moe, attr, val)
+
+        # Initialize EMAs on the original module (using register_parameter for ZeRO-3)
+        num_experts = getattr(self.config, 'num_experts', getattr(self.config, 'n_routed_experts', 1))
+        if not hasattr(original_moe, 'expert_load_ema'):
+            original_moe.register_parameter('expert_load_ema', nn.Parameter(
+                torch.zeros(num_experts), requires_grad=False
+            ))
+        if not hasattr(original_moe, 'expert_specialization_ema'):
+            original_moe.register_parameter('expert_specialization_ema', nn.Parameter(
+                torch.zeros(num_experts, self.config.hidden_size), requires_grad=False
+            ))
+
+        # Ensure 'experts' and 'shared_experts' aliases exist for SPECTRAMoE.forward
+        if not hasattr(original_moe, 'experts') or original_moe.experts is None:
+            original_moe.experts = moe_components['experts']
+        if not hasattr(original_moe, 'shared_experts') or original_moe.shared_experts is None:
+            original_moe.shared_experts = moe_components['shared_experts']
+
+        # 2. Hijack the forward and helper methods
+        original_moe.forward = types.MethodType(SPECTRAMoE.forward, original_moe)
+        original_moe._sparse_routing = types.MethodType(SPECTRAMoE._sparse_routing, original_moe)
+        original_moe.compute_pairwise_expert_similarity = types.MethodType(SPECTRAMoE.compute_pairwise_expert_similarity, original_moe)
+
         return layer
-    
+
     def inject(self, model) -> nn.Module:
         """
-        Inject SPECTRA MoE into all decoder layers of a model.
-        
-        This is the main entry point for the Exoskeleton injection.
-        
-        Args:
-            model: The pretrained model to modify
-            
-        Returns:
-            nn.Module: The modified model with SPECTRA routing
+        Inject SPECTRA Exoskeleton into all decoder layers of a model using Surgical Hijacking.
         """
         model_type = self.detect_model_type(model)
-        logger.info(f"Detected model type: {model_type}")
-        
-        # Find decoder layers
+        logger.info(f"💉 Injecting SPECTRA Exoskeleton (Type: {model_type}) into base model...")
+
+        # 1. Register Global Router to the top-level model ONCE
+        # This is CRITICAL for ZeRO-3: a shared module must have ONE clear parent.
+        if not hasattr(model, 'spectra_global_router'):
+            model.add_module('spectra_global_router', self.global_router)
+
+        # Determine where the layers are
+        language_model = model
+        if hasattr(model, 'language_model'): language_model = model.language_model
+        elif hasattr(model, 'model'): language_model = model.model
+
         layers = None
-        if hasattr(model, 'model') and hasattr(model.model, 'layers'):
-            layers = model.model.layers
-        elif hasattr(model, 'transformer') and hasattr(model.transformer, 'h'):
-            layers = model.transformer.h
-        elif hasattr(model, 'language_model') and hasattr(model.language_model, 'layers'):
-            layers = model.language_model.layers
-        elif hasattr(model, 'layers'):
-            layers = model.layers
-        
+        if hasattr(language_model, 'layers'): layers = language_model.layers
+        elif hasattr(language_model, 'h'): layers = language_model.h # GPT-style
+        elif hasattr(language_model, 'transformer') and hasattr(language_model.transformer, 'layers'):
+            layers = language_model.transformer.layers
+
         if layers is None:
-            raise ValueError(
-                f"Cannot find decoder layers in model of type {type(model).__name__}. "
-                "Expected one of: model.model.layers, model.transformer.h, model.language_model.layers"
-            )
-        
-        # Inject into each layer
-        for layer_idx, layer in enumerate(layers):
-            self.inject_into_layer(layer, layer_idx, model_type)
-        
-        # Store global router reference in model for state tracking
-        if hasattr(model, 'model'):
-            model.model.global_router = self.global_router
-        else:
-            model.global_router = self.global_router
-        
-        logger.info(f"SPECTRA Exoskeleton injection complete: {len(layers)} layers processed")
+            logger.warning("⚠️ Could not find layers to inject MoE! Check model structure.")
+            return model
+
+        # Recursive injection
+        for i, layer in enumerate(layers):
+            self.inject_into_layer(layer, i, model_type)
+
+        # Add get_parameter_groups to the top-level model for LR separation support
+        def get_parameter_groups(self_model):
+            router_params = []
+            backbone_params = []
+            for name, param in self_model.named_parameters():
+                if 'router' in name or 'expert_load_ema' in name or 'expert_specialization_ema' in name:
+                    router_params.append(param)
+                else:
+                    backbone_params.append(param)
+            return {'router': router_params, 'backbone': backbone_params}
+
+        model.get_parameter_groups = types.MethodType(get_parameter_groups, model)
+        logger.info(f"✅ SPECTRA Exoskeleton injection complete ({len(layers)} layers hijacked)")
+
         return model
 
 
 class SPECTRARotaryEmbedding(nn.Module):
     """
     [DEPRECATED - Use Exoskeleton Architecture]
-    
+
     This is a Gemma3-specific RoPE implementation. For universal model support,
     use SPECTRAExoskeletonMoEInjector which preserves the base model's native
     positional encoding (RoPE, NoPE, ALiBi, etc.) without reimplementation.
-    
+
     WARNING: This class will be removed in a future version. Migrate to Exoskeleton.
-    
+
     The Exoskeleton architecture injects SPECTRA routing into pretrained models
     while preserving all base model components for maximum compatibility with:
     - Qwen3-VL-MoE, Llama4, DeepSeek-V3, GLM4V-MoE, GPT-OSS, Ernie4.5-MoE
@@ -2515,11 +1986,7 @@ def eager_attention_forward(
 
     key_states = repeat_kv(key, module.num_key_value_groups)
     value_states = repeat_kv(value, module.num_key_value_groups)
-    print(f'layer query?{query.shape}   {query.isnan().sum()}')
-    print(f'layer key_states? {key_states.shape} {key_states.isnan().sum()}')
-    print(f'layer value_states? {value_states.shape} {value_states.isnan().sum()}')
     attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
-    print(f"{attention_mask.shape}")
     if softcap is not None:
         attn_weights = attn_weights / softcap
         attn_weights = torch.tanh(attn_weights)
@@ -2565,14 +2032,14 @@ def eager_attention_forward(
 class SPECTRAAttention(nn.Module):
     """
     [DEPRECATED - Use Exoskeleton Architecture]
-    
+
     This is a Gemma3-specific attention implementation with Q/K normalization,
     sliding window attention, and logit softcapping. For universal model support,
     use SPECTRAExoskeletonMoEInjector which preserves the base model's native
     attention mechanism without reimplementation.
-    
+
     WARNING: This class will be removed in a future version. Migrate to Exoskeleton.
-    
+
     The Exoskeleton architecture:
     - Preserves base model attention (FlashAttention, SDPA, eager, flex_attn)
     - Preserves base model RoPE/positional encoding variants
@@ -2615,6 +2082,32 @@ class SPECTRAAttention(nn.Module):
         position_embeddings: torch.Tensor,
         attention_mask: Optional[torch.Tensor],
         past_key_value: Optional[Cache] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs: Unpack[FlashAttentionKwargs],
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Cache]]:
+        # [ZeRO-3 Fix] Explicitly gather all parameters (including biases)
+        # This resolves the 'size mismatch ... vec (0)' error where bias was not gathered.
+        import deepspeed
+        with deepspeed.zero.GatheredParameters(list(self.parameters()), modifier_rank=None):
+            return self._forward_impl(
+                hidden_states,
+                position_embeddings,
+                attention_mask,
+                past_key_value,
+                output_attentions,
+                use_cache,
+                cache_position,
+                **kwargs
+            )
+
+    def _forward_impl(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        past_key_value: Optional[Cache] = None,
         output_attentions: bool = False, # Added default value
         use_cache: bool = False, # Added default value
         cache_position: Optional[torch.LongTensor] = None,
@@ -2622,11 +2115,11 @@ class SPECTRAAttention(nn.Module):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Cache]]:
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
-        
+
         query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         key_states   = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        
+
         query_states = self.q_norm(query_states)
         key_states   = self.k_norm(key_states)
 
@@ -2645,7 +2138,7 @@ class SPECTRAAttention(nn.Module):
                 "sliding_window": self.sliding_window,
             }
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
-            
+
             # Here we need to slice as we use a static cache by default, but FA2 does not support it
             # if attention_mask is not None and self.config.attn_implementation == "flash_attention_2":
             #     if hasattr(past_key_value, "get_seq_length"):
@@ -2653,7 +2146,7 @@ class SPECTRAAttention(nn.Module):
             #     else:
             #         seq_len = key_states.shape[-1]
             #     key_states, value_states = key_states[:, :, :seq_len, :], value_states[:, :, :seq_len, :]
-        
+
         attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
             attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
@@ -2719,7 +2212,7 @@ class SPECTRADecoderLayer(GradientCheckpointingLayer):
     ) -> tuple[torch.FloatTensor, Optional[tuple[torch.FloatTensor, torch.FloatTensor]]]:
 
         residual = hidden_states
-        
+
         hidden_states = self.input_layernorm(hidden_states)
 
         # 하이브리드 rope-nope positional embedding 적용
@@ -2742,40 +2235,30 @@ class SPECTRADecoderLayer(GradientCheckpointingLayer):
         )
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = residual + hidden_states
-        
+
         residual = hidden_states
         hidden_states = self.pre_feedforward_layernorm(hidden_states)
         if self.layer_idx >= self.config.first_k_dense_replace:
-            hidden_states, (router_logits, hn, speciality_loss, cosine_similarities, contrastive_loss, expression_reg_loss, routing_uncertainty, entropy_loss, load_balancing_loss, sinkhorn_loss, ortho_loss, balance_loss) = self.moe(hidden_states, global_routing_hn)
+             # Case: MoE Layer
+             moe_output = self.moe(hidden_states, global_routing_hn)
+             if isinstance(moe_output, tuple) and len(moe_output) == 2:
+                hidden_states, routing_info = moe_output
+                (router_logits, hn, speciality_loss, cosine_similarities, contrastive_loss,
+                 expression_reg_loss, routing_uncertainty, entropy_loss, load_balancing_loss,
+                 sinkhorn_loss, ortho_loss, balance_loss) = routing_info
+             else:
+                # Fallback to direct unpacking if tuple structure is different
+                hidden_states, (router_logits, hn, speciality_loss, cosine_similarities, contrastive_loss,
+                               expression_reg_loss, routing_uncertainty, entropy_loss, load_balancing_loss,
+                               sinkhorn_loss, ortho_loss, balance_loss) = moe_output
         else:
-            with torch.no_grad():
-                hidden_states, (router_logits, hn, speciality_loss, cosine_similarities, contrastive_loss, expression_reg_loss, routing_uncertainty, entropy_loss, load_balancing_loss, sinkhorn_loss, ortho_loss, balance_loss) = self.moe(hidden_states), (None,)*12
+            # Case: Dense MLP Layer (No Routing)
+            hidden_states = self.moe(hidden_states)
+            router_logits = hn = speciality_loss = cosine_similarities = contrastive_loss = \
+            expression_reg_loss = routing_uncertainty = entropy_loss = load_balancing_loss = \
+            sinkhorn_loss = ortho_loss = balance_loss = None
+
         hidden_states = self.post_feedforward_layernorm(hidden_states)
-        if self.training:
-            hidden_states = hidden_states.requires_grad_(True)
-            if router_logits is not None:
-                router_logits = router_logits.requires_grad_(True)
-            # Loss의 gradient도 명시적으로 유지
-            if speciality_loss is not None and torch.is_tensor(speciality_loss):
-                speciality_loss = speciality_loss.requires_grad_(True)
-            if cosine_similarities is not None and torch.is_tensor(cosine_similarities):
-                cosine_similarities = cosine_similarities.requires_grad_(True)
-            if contrastive_loss is not None and torch.is_tensor(contrastive_loss):
-                contrastive_loss = contrastive_loss.requires_grad_(True)
-            if expression_reg_loss is not None and torch.is_tensor(expression_reg_loss):
-                expression_reg_loss = expression_reg_loss.requires_grad_(True)
-            if routing_uncertainty is not None and torch.is_tensor(routing_uncertainty):
-                routing_uncertainty = routing_uncertainty.requires_grad_(True)
-            if entropy_loss is not None and torch.is_tensor(entropy_loss):
-                entropy_loss = entropy_loss.requires_grad_(True)
-            if load_balancing_loss is not None and torch.is_tensor(load_balancing_loss):
-                load_balancing_loss = load_balancing_loss.requires_grad_(True)
-            if sinkhorn_loss is not None and torch.is_tensor(sinkhorn_loss):
-                sinkhorn_loss = sinkhorn_loss.requires_grad_(True)
-            if ortho_loss is not None and torch.is_tensor(ortho_loss):
-                ortho_loss = ortho_loss.requires_grad_(True)
-            if balance_loss is not None and torch.is_tensor(balance_loss):
-                balance_loss = balance_loss.requires_grad_(True)
         hidden_states = residual + hidden_states
         outputs = (hidden_states,)
         if output_attentions:
@@ -2820,7 +2303,7 @@ class SPECTRAPreTrainedModel(PreTrainedModel):
     _supports_quantized_cache = True
     _supports_static_cache = True
     _supports_attention_backend = True
-    
+
     _can_compile_fullgraph = True
     _supports_attention_backend = True
     _can_record_outputs = {
@@ -2911,18 +2394,16 @@ class SPECTRAPreTrainedModel(PreTrainedModel):
         **kwargs,
     ) -> SpecificPreTrainedModelType:
         """
-        Universal Exoskeleton Loading Mechanism.
-        
         This method loads a pretrained base model using its native architecture
         and then injects SPECTRA's advanced routing system into its decoder layers.
-        This ensures that we preserve the original model's high-performance 
-        Attention, RoPE, and Normalization implementations while gaining 
+        This ensures that we preserve the original model's high-performance
+        Attention, RoPE, and Normalization implementations while gaining
         SPECTRA's routing stability and expert specialization.
         """
         # Resolve configuration
         if config is None:
             config = AutoConfig.from_pretrained(pretrained_model_name_or_path, **kwargs.get("config_kwargs", {}))
-        
+
         # Ensure it's a SPECTRAConfig for MoE settings
         if not isinstance(config, (SPECTRAConfig, SPECTRATextConfig)):
             # Convert base config to SPECTRA config while preserving base model parameters
@@ -2933,24 +2414,24 @@ class SPECTRAPreTrainedModel(PreTrainedModel):
             else:
                 # Text-only case
                 config = SPECTRATextConfig(**config_dict)
-        
+
         # Determine strict text config
         text_config = config.text_config if hasattr(config, "text_config") else config
-        
+
         # Determine model class (LLM vs VLM) using AutoModel
         from transformers import AutoModelForCausalLM, AutoModelForVision2Seq
-        
+
         # Heuristic to detect VLM: config has vision_config OR model type contains 'vl'
         is_vlm = hasattr(config, "vision_config") or "vl" in str(pretrained_model_name_or_path).lower()
         model_class = AutoModelForVision2Seq if is_vlm else AutoModelForCausalLM
-        
+
         if is_vlm:
-            logger.info(f"Detected VLM architecture for {pretrained_model_name_or_path}")
+            logger.debug(f"Detected VLM architecture for {pretrained_model_name_or_path}")
         else:
-            logger.info(f"Detected CausalLM architecture for {pretrained_model_name_or_path}")
-            
-        logger.info(f"Loading Base Model Skeleton using {model_class.__name__}...")
-        
+            logger.debug(f"Detected CausalLM architecture for {pretrained_model_name_or_path}")
+
+        logger.debug(f"Loading Base Model Skeleton using {model_class.__name__}...")
+
         # 1. Load the base model skeleton and weights using native transformers classes
         # This preserves all optimized low-level CUDA kernels (FlashAttention, FlexAttn, etc.)
         # We explicitly assume 'trust_remote_code=True' for models like Qwen/DeepSeek
@@ -2969,16 +2450,16 @@ class SPECTRAPreTrainedModel(PreTrainedModel):
             weights_only=weights_only,
             **kwargs
         )
-        
+
         # 2. Universal Exoskeleton Injection
         # We replace the base model's router/gate with SPECTRA's global router mechanism
         force_upcycle = kwargs.get("force_upcycle", False)
-        
-        logger.info("Initializing SPECTRA Global Router...")
+
+        logger.debug("Initializing SPECTRA Global Router...")
         # Initialize SPECTRA Global Router
         # This shared router maintains states (GRU) across layers for hierarchical routing
         global_router = SPECTRARouter(text_config)
-        
+
         # Create and apply the Exoskeleton Injector
         injector = SPECTRAExoskeletonMoEInjector(
             spectra_config=text_config,
@@ -2986,15 +2467,15 @@ class SPECTRAPreTrainedModel(PreTrainedModel):
             preserve_shared_experts=True,
             copy_expert_weights=force_upcycle
         )
-        
-        logger.info("Injecting SPECTRA Routing Mechanism (Exoskeleton)...")
+
+        logger.debug("Injecting SPECTRA Routing Mechanism (Exoskeleton)...")
         # Swap existing MoE components or upcycle dense layers
         # This modifies base_model in-place
         base_model = injector.inject(base_model)
-        
+
         # 3. Explicitly initialize newly injected SPECTRA parameters
         # This ensures Xavier uniform initialization for stable initial routing logits
-        logger.info("Initializing Router Weights...")
+        logger.debug("Initializing Router Weights...")
         if hasattr(base_model, "_initialize_moe_router_and_temperature"):
             # If it's a SPECTRA-compatible class with the helper method
             base_model._initialize_moe_router_and_temperature()
@@ -3009,7 +2490,7 @@ class SPECTRAPreTrainedModel(PreTrainedModel):
                         nn.init.xavier_uniform_(module.weight)
                         if module.bias is not None: module.bias.data.zero_()
 
-        logger.info(f"SPECTRA Exoskeleton successfully injected into {pretrained_model_name_or_path}")
+        logger.debug(f"SPECTRA Exoskeleton successfully injected into {pretrained_model_name_or_path}")
         return base_model
 
     @torch.no_grad()
@@ -3052,7 +2533,7 @@ class SPECTRAPreTrainedModel(PreTrainedModel):
         learning rates to different parts of the model. This is particularly useful for MoE models
         where components like routers and experts can benefit from different learning schedules.
         """
-        
+
         router_params = []
         expert_params = []
         shared_expert_params = []
@@ -3073,7 +2554,7 @@ class SPECTRAPreTrainedModel(PreTrainedModel):
                 attention_params.append(param)
             else:
                 other_params.append(param)
-        
+
         # In a training script, you can assign different learning rates to these groups.
         # For example:
         # optimizer_grouped_parameters = [
@@ -3285,7 +2766,7 @@ class SPECTRATextModel(SPECTRAPreTrainedModel):
 
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
-        
+
         # It may already have been prepared by e.g. `generate`
         if not isinstance(causal_mask_mapping := attention_mask, dict):
             # Prepare mask arguments
@@ -3315,7 +2796,7 @@ class SPECTRATextModel(SPECTRAPreTrainedModel):
         all_self_attns = () if output_attentions else None
         all_router_logits = []  # 모든 MoE 레이어의 router_logits를 수집
         global_routing_hn = None
-        
+
         # 각 layer의 loss를 누적하기 위한 리스트
         all_speciality_losses = []
         all_cosine_similarities = []
@@ -3324,7 +2805,7 @@ class SPECTRATextModel(SPECTRAPreTrainedModel):
         for decoder_layer in self.layers[: self.config.num_hidden_layers]:
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
-        
+
             layer_outputs = decoder_layer(
                 hidden_states,
                 position_embeddings_global=position_embeddings_global,
@@ -3343,10 +2824,9 @@ class SPECTRATextModel(SPECTRAPreTrainedModel):
             if routing_result is not None:
                 router_logits = routing_result[0]
                 if router_logits is not None:
-                    all_router_logits.append(router_logits)  # 리스트에 추가
+                    all_router_logits.append(router_logits)
                 global_routing_hn = routing_result[1]
-                
-                # 각 layer의 값을 리스트에 저장 (덮어쓰지 않음)
+
                 layer_speciality_loss = routing_result[2]
                 layer_cosine_similarities = routing_result[3]
                 layer_contrastive_loss = routing_result[4]
@@ -3357,7 +2837,7 @@ class SPECTRATextModel(SPECTRAPreTrainedModel):
                 layer_sinkhorn_loss = routing_result[9] if len(routing_result) > 9 else None
                 layer_ortho_loss = routing_result[10] if len(routing_result) > 10 else None
                 layer_balance_loss = routing_result[11] if len(routing_result) > 11 else None
-                
+
                 if layer_speciality_loss is not None:
                     all_speciality_losses.append(layer_speciality_loss)
                 if layer_cosine_similarities is not None:
@@ -3396,6 +2876,10 @@ class SPECTRATextModel(SPECTRAPreTrainedModel):
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
 
+        # [Gradient Checkpointing] Deferred bias updates — expert_bias was constant during forward/recompute.
+        if self.training and hasattr(self, 'global_router'):
+            self.global_router.flush_bias_updates()
+
         hidden_states = self.norm(hidden_states)
 
         if output_hidden_states:
@@ -3403,30 +2887,30 @@ class SPECTRATextModel(SPECTRAPreTrainedModel):
 
         # router_logits를 튜플로 변환 (비어있으면 None)
         router_logits_tuple = tuple(all_router_logits) if all_router_logits else None
-        
+
         # 모든 layer의 loss를 집계 (gradient 유지)
         speciality_loss = None
         cosine_similarities = None
         contrastive_loss = None
         expression_reg_loss = None
-        
+
         # expression_reg_loss 집계
         if hasattr(self, 'all_expression_reg_losses') and self.all_expression_reg_losses:
             stacked = torch.stack(self.all_expression_reg_losses)
             expression_reg_loss = stacked.mean()
-            if self.training:
-                expression_reg_loss = expression_reg_loss.requires_grad_(True)
+            # Removed redundant requires_grad_ call
+            expression_reg_loss = expression_reg_loss
             # 다음 forward를 위해 초기화
             self.all_expression_reg_losses = []
-        
+
         if all_speciality_losses:
             # speciality_loss는 평균 (스칼라 값들의 평균) - gradient 유지
             stacked = torch.stack(all_speciality_losses)
             speciality_loss = stacked.mean()
             # gradient 명시적으로 유지
-            if self.training:
-                speciality_loss = speciality_loss.requires_grad_(True)
-        
+            # Removed redundant requires_grad_ call
+            speciality_loss = speciality_loss
+
         if all_cosine_similarities:
             # cosine_similarities는 평균 (텐서들의 평균) - gradient 유지
             # 모든 텐서가 동일한 shape인지 확인
@@ -3434,29 +2918,28 @@ class SPECTRATextModel(SPECTRAPreTrainedModel):
                 stacked = torch.stack(all_cosine_similarities)
                 cosine_similarities = stacked.mean(dim=0)
                 # gradient 명시적으로 유지
-                if self.training:
-                    cosine_similarities = cosine_similarities.requires_grad_(True)
+                # Removed redundant requires_grad_ call
+                cosine_similarities = cosine_similarities
             except RuntimeError as e:
                 # Shape이 다른 경우 각각 평균을 내고 다시 평균
                 if "size" in str(e).lower() or "shape" in str(e).lower():
                     # 각 텐서의 평균을 구한 후 스칼라로 변환
-                    means = [cs.mean() if torch.is_tensor(cs) and cs.numel() > 0 else torch.tensor(0.0, device=all_cosine_similarities[0].device, requires_grad=True) 
+                    means = [cs.mean() if torch.is_tensor(cs) and cs.numel() > 0 else torch.tensor(0.0, device=all_cosine_similarities[0].device, requires_grad=False)
                             for cs in all_cosine_similarities if cs is not None]
                     if means:
                         cosine_similarities = torch.stack(means).mean()
-                        if self.training:
-                            cosine_similarities = cosine_similarities.requires_grad_(True)
+                        # Removed redundant requires_grad_ call
+                        cosine_similarities = cosine_similarities
                 else:
                     raise
-        
+
         if all_contrastive_losses:
             # contrastive_loss는 평균 (스칼라 값들의 평균) - gradient 유지
             stacked = torch.stack(all_contrastive_losses)
             contrastive_loss = stacked.mean()
-            # gradient 명시적으로 유지
-            if self.training:
-                contrastive_loss = contrastive_loss.requires_grad_(True)
-        
+            # Removed redundant requires_grad_ call
+            contrastive_loss = contrastive_loss
+
         # routing_uncertainty 집계
         routing_uncertainty = None
         if hasattr(self, 'all_routing_uncertainties') and self.all_routing_uncertainties:
@@ -3464,66 +2947,66 @@ class SPECTRATextModel(SPECTRAPreTrainedModel):
             try:
                 stacked = torch.stack(self.all_routing_uncertainties)
                 routing_uncertainty = stacked.mean(dim=0)
-                if self.training:
-                    routing_uncertainty = routing_uncertainty.requires_grad_(True)
+                # Removed redundant requires_grad_ call
+                routing_uncertainty = routing_uncertainty
             except RuntimeError:
                 # Shape이 다른 경우 각각 평균을 내고 다시 평균
-                means = [ru.mean() if torch.is_tensor(ru) and ru.numel() > 0 else torch.tensor(0.0, device=self.all_routing_uncertainties[0].device) 
+                means = [ru.mean() if torch.is_tensor(ru) and ru.numel() > 0 else torch.tensor(0.0, device=self.all_routing_uncertainties[0].device, requires_grad=False)
                         for ru in self.all_routing_uncertainties if ru is not None]
                 if means:
                     routing_uncertainty = torch.stack(means).mean()
-                    if self.training:
-                        routing_uncertainty = routing_uncertainty.requires_grad_(True)
+                # Removed redundant requires_grad_ call
+                routing_uncertainty = routing_uncertainty
             # 다음 forward를 위해 초기화
             self.all_routing_uncertainties = []
-        
+
         # entropy_loss 집계 (CV 감소를 위한 gradient 있는 loss)
         entropy_loss = None
         if hasattr(self, 'all_entropy_losses') and self.all_entropy_losses:
             stacked = torch.stack(self.all_entropy_losses)
             entropy_loss = stacked.mean()
-            if self.training:
-                entropy_loss = entropy_loss.requires_grad_(True)
+            # Removed redundant requires_grad_ call
+            entropy_loss = entropy_loss
             # 다음 forward를 위해 초기화
             self.all_entropy_losses = []
-        
+
         # load_balancing_loss 집계 (CV 감소를 위한 gradient 있는 loss)
         load_balancing_loss = None
         if hasattr(self, 'all_load_balancing_losses') and self.all_load_balancing_losses:
             stacked = torch.stack(self.all_load_balancing_losses)
             load_balancing_loss = stacked.mean()
-            if self.training:
-                load_balancing_loss = load_balancing_loss.requires_grad_(True)
+            # Removed redundant requires_grad_ call
+            load_balancing_loss = load_balancing_loss
             # 다음 forward를 위해 초기화
             self.all_load_balancing_losses = []
-        
+
         # sinkhorn_loss 집계 (SpecHorn-G: GRU가 Sinkhorn을 학습하도록 하는 loss)
         sinkhorn_loss = None
         if hasattr(self, 'all_sinkhorn_losses') and self.all_sinkhorn_losses:
             stacked = torch.stack(self.all_sinkhorn_losses)
             sinkhorn_loss = stacked.mean()
-            if self.training:
-                sinkhorn_loss = sinkhorn_loss.requires_grad_(True)
+            # Removed redundant requires_grad_ call
+            sinkhorn_loss = sinkhorn_loss
             # 다음 forward를 위해 초기화
             self.all_sinkhorn_losses = []
-        
+
         # ortho_loss 집계 (전문가들의 가중치 직교성 Loss)
         ortho_loss = None
         if hasattr(self, 'all_ortho_losses') and self.all_ortho_losses:
             stacked = torch.stack(self.all_ortho_losses)
             ortho_loss = stacked.mean()
-            if self.training:
-                ortho_loss = ortho_loss.requires_grad_(True)
+            # Removed redundant requires_grad_ call
+            ortho_loss = ortho_loss
             # 다음 forward를 위해 초기화
             self.all_ortho_losses = []
-        
+
         # balance_loss 집계 (GRU Solver의 constraint violation loss)
         balance_loss = None
         if hasattr(self, 'all_balance_losses') and self.all_balance_losses:
             stacked = torch.stack(self.all_balance_losses)
             balance_loss = stacked.mean()
-            if self.training:
-                balance_loss = balance_loss.requires_grad_(True)
+            # Removed redundant requires_grad_ call
+            balance_loss = balance_loss
             # 다음 forward를 위해 초기화
             self.all_balance_losses = []
 
@@ -3553,7 +3036,7 @@ class SPECTRAForCausalLM(SPECTRAPreTrainedModel, GenerationMixin):
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
     config: SPECTRAConfig
     base_model_prefix = "language_model"
-    
+
     def save_pretrained(self, save_directory, safe_serialization=None, **kwargs):
         """Override to handle shared router parameters"""
         # Default to False if not specified to avoid shared tensor issues
@@ -3681,25 +3164,25 @@ class SPECTRAForCausalLM(SPECTRAPreTrainedModel, GenerationMixin):
         aux_loss = None
         if labels is not None:
             loss = self.loss_function(logits, labels, self.vocab_size, **loss_kwargs)
-            
+
             # Speciality loss: Output orthogonality (encourages diverse expert outputs)
             # [수정] Router가 이미 Adaptive Weight를 적용했으므로, 여기서는 1.0을 사용 (이중 스케일링 방지)
             speciality_loss_coef = getattr(self.model.config, "speciality_loss_coef", 1.0)  # 0.02 -> 1.0
             if outputs.speciality_loss is not None and speciality_loss_coef > 0:
                 loss += outputs.speciality_loss * speciality_loss_coef
-            
+
             # Contrastive loss: Input clustering (encourages experts to process distinct token types)
             # [수정] Router가 이미 Adaptive Weight를 적용했으므로, 여기서는 1.0을 사용
             contrastive_loss_coef = getattr(self.model.config, "contrastive_loss_coef", 1.0)  # 0.01 -> 1.0
             if outputs.contrastive_loss is not None and contrastive_loss_coef > 0:
                 loss += outputs.contrastive_loss * contrastive_loss_coef
-            
+
             # Expression projector regularization loss: Direct connection to expression_logits for gradient flow
             # This ensures expression_projector parameters receive gradients
             expression_reg_loss_coef = getattr(self.model.config, "expression_reg_loss_coef", 1.0)
             if outputs.expression_reg_loss is not None and expression_reg_loss_coef > 0:
                 loss += outputs.expression_reg_loss * expression_reg_loss_coef
-            
+
             # Expression projector loss: Ensure expression_logits contributes to loss for gradient flow
             # cosine_similarities (domain_orthogonality)를 loss에 추가하여 expression_projector가 학습되도록 함
             cosine_similarities_loss_coef = getattr(self.model.config, "cosine_similarities_loss_coef", 0.001)
@@ -3713,25 +3196,25 @@ class SPECTRAForCausalLM(SPECTRAPreTrainedModel, GenerationMixin):
                     # 스칼라인 경우 직접 사용
                     expr_loss = outputs.cosine_similarities * cosine_similarities_loss_coef
                     loss += expr_loss
-            
+
             # ======================================================================================
             # [Minimalist Loss: Sinkhorn + Sharpening]
             # Sinkhorn은 구조적으로 이미 부하 분산을 처리하므로 별도 loss 불필요
             # Sharpening만 entropy minimization으로 처리
             # ======================================================================================
-            
+
             # [Sharpening] Entropy Minimization: "한 놈만 패라" (확실한 전문가 선택)
             # router_entropy_coef는 양수로 사용 (entropy를 낮추는 방향)
             router_entropy_coef = getattr(self.model.config, "router_entropy_coef", 0.1)
             if outputs.entropy_loss is not None and router_entropy_coef > 0:
                 loss += outputs.entropy_loss * router_entropy_coef
-            
+
             # [Optional] Ortho Loss: 보험으로 약하게 유지 (학습 초반 가이드)
             # Sinkhorn + Sharpening만으로도 분리가 되지만, 초반 헤매지 않도록 도움
             ortho_loss_coef = getattr(self.model.config, "ortho_loss_coef", 0.01)  # 0.05 -> 0.01 (약하게)
             if outputs.ortho_loss is not None and ortho_loss_coef > 0:
                 loss += outputs.ortho_loss * ortho_loss_coef
-            
+
             # ======================================================================================
             # [제거된 Loss들]
             # - gslb_coef: Sinkhorn이 구조적으로 처리
@@ -3772,25 +3255,35 @@ class SPECTRAMultiModalProjector(nn.Module):
     def __init__(self, config: SPECTRAConfig, **kwargs):
         super().__init__()
 
+        vision_hidden_size = getattr(config.vision_config, 'hidden_size', 0) or 0
+        # [Fix] Force SigLIP (768) if config is missing or reports incorrect size (4352)
+        if vision_hidden_size == 0 or vision_hidden_size == 4352:
+            vision_hidden_size = 768
+
         self.mm_input_projection_weight = nn.Parameter(
-            torch.zeros(config.vision_config.hidden_size, config.text_config.hidden_size)
+            torch.zeros(vision_hidden_size, config.text_config.hidden_size)
         )
 
         self.mm_soft_emb_norm = SPECTRARMSNorm(
-            config.vision_config.hidden_size, eps=config.vision_config.layer_norm_eps
+            vision_hidden_size, eps=config.vision_config.layer_norm_eps
         )
 
         self.patches_per_image = int(config.vision_config.image_size // config.vision_config.patch_size)
         self.tokens_per_side = int(config.mm_tokens_per_image**0.5)
-        self.kernel_size = self.patches_per_image // self.tokens_per_side
-        self.avg_pool = nn.AvgPool2d(kernel_size=self.kernel_size, stride=self.kernel_size)
+        # [Fix] Use Adaptive Pooling to handle variable input resolutions from Vision Tower
+        self.avg_pool = nn.AdaptiveAvgPool2d((self.tokens_per_side, self.tokens_per_side))
 
     def forward(self, vision_outputs: torch.Tensor):
-        batch_size, _, seq_length = vision_outputs.shape
+        # [Fix] Dynamic shape unpacking: (Batch, SeqLen, Hidden)
+        # Note: Previous code mixed up variable names, corrected here.
+        batch_size, seq_len, hidden_size = vision_outputs.shape
+
+        # [Fix] Calculate dynamic spatial dimension (H=W=sqrt(SeqLen))
+        side_dim = int(seq_len ** 0.5)
 
         reshaped_vision_outputs = vision_outputs.transpose(1, 2)
         reshaped_vision_outputs = reshaped_vision_outputs.reshape(
-            batch_size, seq_length, self.patches_per_image, self.patches_per_image
+            batch_size, hidden_size, side_dim, side_dim
         )
         reshaped_vision_outputs = reshaped_vision_outputs.contiguous()
 
@@ -3798,9 +3291,13 @@ class SPECTRAMultiModalProjector(nn.Module):
         pooled_vision_outputs = pooled_vision_outputs.flatten(2)
         pooled_vision_outputs = pooled_vision_outputs.transpose(1, 2)
 
-        normed_vision_outputs = self.mm_soft_emb_norm(pooled_vision_outputs)
+        # [ZeRO-3 Fix] Explicitly gather parameters to ensure they are available
+        import deepspeed
+        params_to_gather = [self.mm_input_projection_weight, self.mm_soft_emb_norm.weight]
+        with deepspeed.zero.GatheredParameters(params_to_gather, modifier_rank=None):
+            normed_vision_outputs = self.mm_soft_emb_norm(pooled_vision_outputs)
+            projected_vision_outputs = torch.matmul(normed_vision_outputs, self.mm_input_projection_weight)
 
-        projected_vision_outputs = torch.matmul(normed_vision_outputs, self.mm_input_projection_weight)
         return projected_vision_outputs.type_as(vision_outputs)
 
 
@@ -3879,7 +3376,24 @@ class SPECTRAModel(SPECTRAPreTrainedModel):
         Returns:
             image_features (`torch.Tensor`): Image feature tensor of shape `(num_images, image_length, embed_dim)`).
         """
-        vision_outputs = self.visual(pixel_values=pixel_values).last_hidden_state
+        # [ZeRO-3 Fix] Ensure vision tower runs in no_grad to prevent backward pass from
+        # attempting to traverse into frozen/partitioned vision parameters.
+
+        # [Shape Fix] Handle 5D inputs (Batch, Time, Channel, Height, Width) for SigLIP/CLIP compatibility
+        # Qwen models often pass 5D tensors for video/multi-image support
+        if pixel_values.ndim == 5:
+            b, t, c, h, w = pixel_values.shape
+            pixel_values = pixel_values.view(b * t, c, h, w)
+
+        with torch.no_grad():
+            vision_outputs = self.visual(pixel_values=pixel_values, interpolate_pos_encoding=True).last_hidden_state
+
+        # Projector should likely be trainable, so we apply it OUTSIDE no_grad?
+        # Actually in Qwen3-VL, projector is usually part of the training.
+        # But here 'multi_modal_projector' is separate.
+        # If we include it in no_grad, we freeze the projector too!
+        # So we split the operation.
+
         image_features = self.multi_modal_projector(vision_outputs)
         return image_features
 
@@ -3981,12 +3495,19 @@ class SPECTRAModel(SPECTRAPreTrainedModel):
 
         # Merge text and images
         if pixel_values is not None:
+            # [Deadlock Prevention] Always run get_image_features when pixel_values exists so
+            # all ranks participate in GatheredParameters (ZeRO-3). Divergent code paths
+            # (e.g. only some ranks calling get_image_features) cause collective mismatch → deadlock.
             image_features = self.get_image_features(pixel_values)
             image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
-            special_image_mask = self.get_placeholder_mask(
-                input_ids, inputs_embeds=inputs_embeds, image_features=image_features
-            )
-            inputs_embeds = inputs_embeds.masked_scatter(special_image_mask, image_features)
+            has_image_tokens = (input_ids == self.config.image_token_id).any()
+            if has_image_tokens:
+                special_image_mask = self.get_placeholder_mask(
+                    input_ids, inputs_embeds=inputs_embeds, image_features=image_features
+                )
+                inputs_embeds = inputs_embeds.masked_scatter(special_image_mask, image_features)
+        else:
+            image_features = None
 
         # It may already have been prepared by e.g. `generate`
         if not isinstance(causal_mask_mapping := attention_mask, dict):
@@ -4038,7 +3559,7 @@ class SPECTRAModel(SPECTRAPreTrainedModel):
             past_key_values=outputs.past_key_values if use_cache else None,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
-            image_hidden_states=image_features if pixel_values is not None else None,
+            image_hidden_states=image_features,
             aux_loss=outputs.aux_loss,
             router_logits=outputs.router_logits,
             speciality_loss=outputs.speciality_loss,
@@ -4063,14 +3584,14 @@ class SPECTRAForConditionalGeneration(SPECTRAPreTrainedModel, GenerationMixin):
         r"\.post_attention_layernorm": ".post_feedforward_layernorm",
     }
     _tied_weights_keys = ["lm_head.weight"]
-    
+
     def save_pretrained(self, save_directory, safe_serialization=None, **kwargs):
         """Override to handle shared router parameters"""
         # Default to False if not specified to avoid shared tensor issues
         if safe_serialization is None:
             safe_serialization = False
         return super().save_pretrained(save_directory, safe_serialization=safe_serialization, **kwargs)
-  
+
     def __init__(self, config: SPECTRAConfig, vision_tower=None, **kwargs):
         super().__init__(config)
         self.model = SPECTRAModel(config, vision_tower=vision_tower)
@@ -4178,6 +3699,17 @@ class SPECTRAForConditionalGeneration(SPECTRAPreTrainedModel, GenerationMixin):
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        # [ZeRO-3 Fix] Untie lm_head.weight from embed_tokens.weight.
+        # Shared weights frequently cause sharding/gathering conflicts in ZeRO-3 + TP.
+        # By untieing them, we allow DeepSpeed to manage them independently.
+        # This increases VRAM usage by ~1.5GB but ensures training stability.
+        if not hasattr(self, "_weights_untied"):
+            # Gather is required to clone the current data correctly regardless of sharding state
+            with deepspeed.zero.GatheredParameters([self.lm_head.weight], modifier_rank=None):
+                new_weight = nn.Parameter(self.lm_head.weight.clone().detach())
+                new_weight.requires_grad = True
+            self.lm_head.weight = new_weight
+            self._weights_untied = True
 
         outputs: SPECTRAModelOutputWithPast = self.model(
             input_ids=input_ids,
@@ -4196,14 +3728,54 @@ class SPECTRAForConditionalGeneration(SPECTRAPreTrainedModel, GenerationMixin):
             **lm_kwargs,
         )
         hidden_states = outputs.last_hidden_state
+
+        # [ZeRO-3 + TP Fix] Re-gather sharded hidden states to match lm_head.
+        # If AutoTP sharded the model, outputs might be [Seq, 576] while lm_head expects full dimension.
+        # This gather bridges the gap between TP-sharded internals and standard container layers.
+        # This resolves the 'got input (1241), mat (1241x576)' mismatch.
+        if hasattr(self.config, "text_config") and hasattr(self.config.text_config, "hidden_size"):
+            if hidden_states.shape[-1] < self.config.text_config.hidden_size:
+                world_size = dist.get_world_size() if dist.is_initialized() else 1
+                if world_size > 1:
+                    # All-gather along the hidden dimension to restore full size
+                    # Use a specialized list for gathering to prevent memory fragmentation
+                    gathered_list = [torch.empty_like(hidden_states) for _ in range(world_size)]
+                    dist.all_gather(gathered_list, hidden_states)
+                    hidden_states = torch.cat(gathered_list, dim=-1)
+
         # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        logits = self.lm_head(hidden_states[:, slice_indices, :])
+
+        # [ZeRO-3 + TP Fix] Manual Bridge for Logit Calculation
+        # This bridges the gap between AutoTP-sharded activations and ZeRO-3-sharded weights.
+        # By manually gathering and slicing according to TP rank, we prevent size mismatches.
+        hs = hidden_states[:, slice_indices, :].contiguous()
+        p = self.lm_head.weight
+        if hasattr(p, 'ds_id'):
+            with deepspeed.zero.GatheredParameters([p], modifier_rank=None):
+                # Now p is the full weight [Vocab, Hidden]
+                hidden_dim = p.shape[-1]
+                shard_dim = hs.shape[-1]
+
+                # Check if it was sharded by TP (shard dimension usually matches the input)
+                if hidden_dim > shard_dim and shard_dim > 0:
+                    tp_size = max(1, hidden_dim // shard_dim)
+                    tp_rank = dist.get_rank() % tp_size
+                    start = tp_rank * shard_dim
+                    end = start + shard_dim
+                    w = p[:, start:end]
+                    logits = F.linear(hs, w)
+                else:
+                    logits = F.linear(hs, p)
+        else:
+            # Fallback for non-DeepSpeed or non-sharded environments
+            logits = self.lm_head(hs)
+
         if self.config.text_config.final_logit_softcapping is not None:
             logits = logits / self.config.text_config.final_logit_softcapping
             logits = torch.tanh(logits)
             logits = logits * self.config.text_config.final_logit_softcapping
-            
+
         loss = None
         aux_loss = None
         if labels is not None:
@@ -4226,56 +3798,37 @@ class SPECTRAForConditionalGeneration(SPECTRAPreTrainedModel, GenerationMixin):
             flat_logits = shift_logits.view(-1, self.config.text_config.vocab_size)
             flat_labels = shift_labels.view(-1).to(shift_logits.device)
             loss = loss_fct(flat_logits, flat_labels)
-            
+
             # Speciality loss: Output orthogonality (encourages diverse expert outputs)
             if outputs.speciality_loss is not None:
                 loss += outputs.speciality_loss * 0.02  # 가중치 적용
-            
+
             # Contrastive loss: Input clustering (encourages experts to process distinct token types)
             if outputs.contrastive_loss is not None:
                 loss += outputs.contrastive_loss * 0.01  # 가중치 적용
-            
+
             # Expression projector regularization loss: Direct connection to expression_logits for gradient flow
-            # This ensures expression_projector parameters receive gradients
             if outputs.expression_reg_loss is not None:
                 loss += outputs.expression_reg_loss
-            
+
             # Expression projector loss: Ensure expression_logits contributes to loss for gradient flow
-            # cosine_similarities (domain_orthogonality)를 loss에 추가하여 expression_projector가 학습되도록 함
             if outputs.cosine_similarities is not None:
-                # cosine_similarities는 [batch, seq, num_experts] 형태의 텐서 또는 스칼라
                 if torch.is_tensor(outputs.cosine_similarities) and outputs.cosine_similarities.numel() > 0:
-                    # 텐서인 경우 mean squared value를 최소화하여 expression diversity를 유지
-                    expr_loss = torch.mean(outputs.cosine_similarities ** 2) * 0.001  # 작은 가중치로 추가
+                    expr_loss = torch.mean(outputs.cosine_similarities ** 2) * 0.001
                     loss += expr_loss
                 elif isinstance(outputs.cosine_similarities, (int, float)):
-                    # 스칼라인 경우 직접 사용
                     expr_loss = outputs.cosine_similarities * 0.001
                     loss += expr_loss
-            
-            # ======================================================================================
-            # [Minimalist Loss: Sinkhorn + Sharpening]
-            # Sinkhorn은 구조적으로 이미 부하 분산을 처리하므로 별도 loss 불필요
-            # Sharpening만 entropy minimization으로 처리
-            # ======================================================================================
-            
-            # [Sharpening] Entropy Minimization: "한 놈만 패라" (확실한 전문가 선택)
-            # outputs.entropy_loss는 라우터에서 이미 계산되어 전달됨
+
+            # [Sharpening] Entropy Minimization
             router_entropy_coef = getattr(self.config.text_config, "router_entropy_coef", 0.1)
             if outputs.entropy_loss is not None and router_entropy_coef > 0:
                 loss += outputs.entropy_loss * router_entropy_coef
-            
-            # [Optional] Ortho Loss: 보험으로 약하게 유지 (학습 초반 가이드)
+
+            # [Optional] Ortho Loss
             ortho_loss_coef = getattr(self.config.text_config, "ortho_loss_coef", 0.01)
             if outputs.ortho_loss is not None and ortho_loss_coef > 0:
                 loss += outputs.ortho_loss * ortho_loss_coef
-            
-            # ======================================================================================
-            # [제거된 Loss들]
-            # - gslb_coef: Sinkhorn이 구조적으로 처리
-            # - usage_uniformity_coef: Sinkhorn이 구조적으로 처리
-            # - aux_loss: Sinkhorn이 구조적으로 처리
-            # ======================================================================================
 
         if not return_dict:
             output = (logits,) + outputs[1:]
@@ -4331,7 +3884,7 @@ class SPECTRAForConditionalGeneration(SPECTRAPreTrainedModel, GenerationMixin):
             model_inputs["pixel_values"] = pixel_values
 
         return model_inputs
-    
+
     @staticmethod
     def create_masks_for_generate(
         config: PretrainedConfig,
@@ -4387,7 +3940,7 @@ class SPECTRARouterTrainingMonitor:
         self.model = model
         self.optimizer = optimizer
         self.log_every = max(int(log_every), 1)
-        self.log_fn = log_fn if log_fn is not None else (lambda msg: logger.info(msg))
+        self.log_fn = log_fn if log_fn is not None else (lambda msg: logger.debug(msg))
         self._step = 0
         self._pre_step_snapshots: dict[str, dict[str, torch.Tensor]] = {}
 

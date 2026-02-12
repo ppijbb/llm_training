@@ -20,14 +20,26 @@ class LionOptimizer(DeepSpeedCPUAdam):
         self.beta2 = beta2
         self.weight_decay = weight_decay
         
+        # Filter kwargs to only include what DeepSpeedCPUAdam expects
+        valid_keys = {'bias_correction', 'amsgrad', 'adamw_mode', 'fp32_optimizer_states'}
+        ds_kwargs = {k: v for k, v in kwargs.items() if k in valid_keys}
+        
         # DeepSpeed CPU Adam을 기반으로 초기화
         super().__init__(
             model_params,
             lr=lr,
             weight_decay=weight_decay,
             betas=(beta1, beta2),
-            **kwargs
+            **ds_kwargs
         )
+
+    def __del__(self):
+        """Safe cleanup for DeepSpeedCPUAdam"""
+        if hasattr(self, 'ds_opt_adam') and self.ds_opt_adam is not None:
+            try:
+                self.ds_opt_adam.destroy_adam(self.opt_id)
+            except Exception:
+                pass
     
     def step(self, closure=None):
         """Custom Lion optimizer step"""
@@ -87,14 +99,26 @@ class AdaFactorOptimizer(DeepSpeedCPUAdam):
         self.cliping_threshold = cliping_threshold
         self.weight_decay = weight_decay
         
+        # Filter kwargs to only include what DeepSpeedCPUAdam expects
+        valid_keys = {'bias_correction', 'amsgrad', 'adamw_mode', 'fp32_optimizer_states'}
+        ds_kwargs = {k: v for k, v in kwargs.items() if k in valid_keys}
+        
         super().__init__(
             model_params,
             lr=lr,
             weight_decay=weight_decay,
             betas=(beta1, beta2),
             eps=eps1,
-            **kwargs
+            **ds_kwargs
         )
+
+    def __del__(self):
+        """Safe cleanup for DeepSpeedCPUAdam"""
+        if hasattr(self, 'ds_opt_adam') and self.ds_opt_adam is not None:
+            try:
+                self.ds_opt_adam.destroy_adam(self.opt_id)
+            except Exception:
+                pass
     
     def step(self, closure=None):
         """Custom AdaFactor optimizer step"""
@@ -165,13 +189,25 @@ class SophiaOptimizer(DeepSpeedCPUAdam):
         self.rho = rho
         self.weight_decay = weight_decay
         
+        # Filter kwargs to only include what DeepSpeedCPUAdam expects
+        valid_keys = {'bias_correction', 'amsgrad', 'adamw_mode', 'fp32_optimizer_states'}
+        ds_kwargs = {k: v for k, v in kwargs.items() if k in valid_keys}
+        
         super().__init__(
             model_params,
             lr=lr,
             weight_decay=weight_decay,
             betas=(beta1, beta2),
-            **kwargs
+            **ds_kwargs
         )
+
+    def __del__(self):
+        """Safe cleanup for DeepSpeedCPUAdam"""
+        if hasattr(self, 'ds_opt_adam') and self.ds_opt_adam is not None:
+            try:
+                self.ds_opt_adam.destroy_adam(self.opt_id)
+            except Exception:
+                pass
     
     def step(self, closure=None):
         """Custom Sophia optimizer step"""
@@ -236,6 +272,10 @@ class MuonOptimizer(DeepSpeedCPUAdam):
         adamw_eps=1e-8,
         **kwargs
     ):
+        # Filter kwargs to only include what DeepSpeedCPUAdam expects
+        valid_keys = {'bias_correction', 'amsgrad', 'adamw_mode', 'fp32_optimizer_states'}
+        ds_kwargs = {k: v for k, v in kwargs.items() if k in valid_keys}
+
         # DeepSpeed CPU Adam을 기반으로 초기화
         super().__init__(
             model_params,
@@ -243,8 +283,16 @@ class MuonOptimizer(DeepSpeedCPUAdam):
             weight_decay=weight_decay,
             betas=adamw_betas,
             eps=adamw_eps,
-            **kwargs
+            **ds_kwargs
         )
+
+    def __del__(self):
+        """Safe cleanup for DeepSpeedCPUAdam"""
+        if hasattr(self, 'ds_opt_adam') and self.ds_opt_adam is not None:
+            try:
+                self.ds_opt_adam.destroy_adam(self.opt_id)
+            except Exception:
+                pass
         
         # Muon-specific parameters
         self.momentum = momentum

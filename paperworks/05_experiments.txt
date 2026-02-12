@@ -1,0 +1,281 @@
+=================================================================
+EXPERIMENTS
+=================================================================
+
+We design experiments to validate SPECTRA as a \emph{routing methodology} under the exact implementation shipped in this repository. Our primary objective is to measure and improve routing quality (specialization, balance, stability) using metrics attributable to routing, and only then finalize downstream benchmark tables.
+
+
+-------------------------------------------------------------------
+5.1 EXPERIMENTAL SETUP
+-------------------------------------------------------------------
+
+**Goal (Current Codebase)**:
+Our primary goal is to validate routing quality under the exact implementation shipped in this repository. We therefore prioritize routing metrics (specialization, balance, stability) and run targeted sweeps to close the remaining load-balance gap (target CV < 0.1) before finalizing full benchmark tables.
+
+**Default Run (this repo's reference config)**:
+We report a default configuration based on `spectra_sft/config/spectra_small_config.json`, and then sweep only routing-sensitive hyperparameters:
+- Base model/tokenizer: `HuggingFaceTB/SmolVLM-256M-Instruct` (tokenizer path)
+- Dataset: `HuggingFaceTB/smoltalk` (SFT-style)
+- Routed experts: E = 32
+- Experts per token: k = 4
+- Router dimension: D = 32
+- Shared experts: 1
+- Dense-to-MoE replacement: `first_k_dense_replace = 0`
+- Attention backend: `flash_attention_2` (when available)
+
+**Training Setup (reported per run; no hard-coded hardware assumptions)**:
+- Mixed precision: bfloat16 (when enabled in config)
+- Gradient checkpointing: enabled
+- DeepSpeed: used when configured
+- Optional NEFTune embedding noise: controlled by `neftune_noise_alpha`
+We record exact optimizer/hardware/throughput details from logs per run, instead of baking fixed assumptions into the paper.
+
+**Router / OSR Hyperparameters (Sweep Targets)**:
+- `osr_repulsion_weight`: repulsive cost strength (specialization lever)
+- `sinkhorn_epsilon`, `sinkhorn_iterations`, `log_sinkhorn_enabled`: Sinkhorn temperature/iterations and log-domain stability (balance lever)
+- `router_entropy_coef`: routing sharpness (confidence vs. collapse/imbalance lever)
+- `expert_choice_routing`, `expert_choice_capacity_factor`: quota-constrained expert-choice selection (selection-stage balancing lever)
+- `sinkhorn_inference`: whether to apply Sinkhorn during inference
+- SOS-RMoE warmup knobs used in the current codebase: `srip_enabled`, `so_warmup_steps`, `so_lambda_max`
+
+**Note:** Sinkhorn enforces balanced *soft* assignments, but discrete top-k selection can reintroduce imbalance; quota-constrained selection is evaluated as a first-order mitigation.
+
+**Hardware**:
+We do not hard-code a single hardware setting. Instead, we report device counts, GPU type, throughput, and memory from logs per run.
+
+
+-------------------------------------------------------------------
+5.2 DATASETS
+-------------------------------------------------------------------
+
+**Training / Finetuning Dataset (current repo)**:
+- `HuggingFaceTB/smoltalk` (multi-domain conversational/instruction data)
+- We keep `max_samples` and `max_seq_length` configurable; for reproducibility we log them per run.
+
+**Evaluation datasets (planned; reported after routing sweeps stabilize)**:
+We will report downstream task metrics on standard suites (language understanding, code, math) after completing routing sweeps that close the CV gap. Until then, the paper emphasizes routing metrics which can be measured on held-out splits of the training distribution.
+
+
+-------------------------------------------------------------------
+5.3 BASELINE METHODS
+-------------------------------------------------------------------
+
+We compare SPECTRA against the following routing methods:
+
+**1. Switch Router (Top-1)**:
+Standard Switch Transformer routing [Fedus et al., 2021] with:
+- Top-1 expert selection
+- Load balancing auxiliary loss
+- No expert specialization mechanisms
+
+**2. Switch Router (Top-2)**:
+Top-2 variant of Switch routing:
+- Top-2 expert selection
+- Same load balancing as Top-1
+- More stable than Top-1 but 2× computation
+
+**3. Expert Choice Routing**:
+Reverse routing mechanism [Zhou et al., 2022]:
+- Experts select tokens instead of tokens selecting experts
+- Capacity factor = 1.25
+- Better load balance but different computation pattern
+
+**4. Hash Routing**:
+Deterministic hash-based routing [Roller et al., 2021]:
+- Perfect load balance by design
+- No learned routing (baseline for routing importance)
+
+**5. (Optional) Dense Baseline**:
+When applicable, we compare against a dense baseline to contextualize routing changes. Because this repo focuses on routing-mechanism validation, we treat dense comparisons as secondary.
+
+
+-------------------------------------------------------------------
+5.4 ABLATION VARIANTS (implementation-aligned)
+-------------------------------------------------------------------
+
+To understand the contribution of each component, we create the following ablation variants:
+
+**SPECTRA-Full (Ours)**:
+Complete method with all components.
+
+**SPECTRA w/o Expression (-Expression)**:
+Remove expression projector, use routing logits directly:
+- No orthogonal projection
+- Routing logits used as expression logits
+- All other components unchanged
+
+**SPECTRA w/o GRU (-GRU)**:
+Replace GRU with linear layer:
+- Linear: h → routing_logits (no sequential state)
+- No hidden state passing between layers
+- All other components unchanged
+
+**SPECTRA w/o Repulsion (-Repulsion / λ=0)**:
+Disable OSR repulsion term to test whether repulsion is the primary driver of expert separation.
+
+**SPECTRA w/o Quota Selection (-Quota)**:
+Disable quota-constrained selection to quantify how much imbalance arises from discrete top-k.
+
+**SPECTRA w/o Orthogonal Constraint (-OrthoConstraint)**:
+Remove orthogonal loss for expression projector:
+- No L_ortho in training objective
+- Projector still exists but not constrained
+- All other components unchanged
+
+**SPECTRA w/o All Enhancements (-All)**:
+Remove all novel components, equivalent to a simple learned router:
+- No expression projector
+- No GRU (linear routing)
+- No speciality penalty
+- No orthogonal constraints
+- Essentially a Switch-style router with cosine similarity
+
+
+-------------------------------------------------------------------
+5.5 EVALUATION METRICS
+-------------------------------------------------------------------
+
+**Routing Quality (primary; always reported)**:
+- **Load balancing**: expert entropy, CV, MaxVio, Gini, unused-expert rate
+- **Specialization**: expert overlap (Jaccard), Gram orthogonality, expert similarity matrix statistics
+- **Decision quality**: per-token routing entropy / confidence
+- **Stability**: checkpoint-to-checkpoint routing consistency; sequential top-k overlap over token positions
+
+**Downstream Task Performance (secondary; reported after sweeps)**:
+Standard benchmark suites will be run after routing sweeps stabilize the router.
+
+**Implementation note**:
+All routing metrics are computed by the repository’s monitoring callback (`eval/moe_monitoring_callback.py`) to ensure paper numbers match code.
+
+
+-------------------------------------------------------------------
+5.6 ANALYSIS METHODS
+-------------------------------------------------------------------
+
+**Expert Specialization Analysis**:
+We analyze what each expert specializes in by:
+1. Clustering tokens by routed expert
+2. Computing TF-IDF for each expert's token cluster
+3. Extracting top keywords for each expert
+4. Manually inspecting samples routed to each expert
+
+**Routing Pattern Visualization**:
+- Heatmaps: Expert selection across sequence positions
+- t-SNE: Visualization of expert representations in 2D
+- Attention-style plots: How routing changes across layers
+
+**Gradient Flow Analysis**:
+- Gradient norm statistics for routers vs. experts
+- Effective learning rate comparison
+- Loss landscape visualization around routing decisions
+
+**Ablation Study Design**:
+- Train all variants for same number of steps
+- Use same random seed for initialization
+- Compare performance at regular checkpoints (10%, 25%, 50%, 75%, 100% of training)
+- Statistical significance testing (t-test, p < 0.05)
+
+
+-------------------------------------------------------------------
+5.7 IMPLEMENTATION DETAILS
+-------------------------------------------------------------------
+
+**Code**: We report the exact versions from the runtime environment; the repo targets recent PyTorch/Transformers releases.
+
+**Initialization**:
+- Router GRU: Xavier uniform
+- Expression projector: Orthogonal initialization with 0.1× scaling
+- Experts: Copied from dense MLP weights
+- Shared experts: Copied from dense MLP, then frozen
+
+**Optimization**:
+We use differential learning rates for different components:
+- Router: 5e-5 (higher for faster learning)
+- Experts: 1e-5 (lower to preserve pretrained knowledge)
+- Other parameters: 1e-5
+
+**Gradient Clipping**: Global norm clipping at 1.0
+
+**Checkpointing**: configured per run (we record exact save/eval cadence in logs)
+
+**Reproducibility**:
+We fix seeds per run and log all hyperparameters to W&B; any nondeterminism settings are recorded in artifacts.
+
+**Evaluation Protocol**:
+- Evaluate routing metrics on a held-out validation split on a regular cadence
+- Export per-layer routing metrics (CV, MaxVio, entropy, gram orthogonality) and visualize trends over time
+
+
+-------------------------------------------------------------------
+5.8 EXPECTED OUTCOMES (paper-ready hypotheses)
+-------------------------------------------------------------------
+
+Based on our method design, we hypothesize:
+
+**H1: Task Performance**
+SPECTRA will outperform Switch routing on most benchmarks due to better expert specialization.
+
+**H2: Expert Specialization**
+SPECTRA will show lower expert overlap and higher Gram matrix orthogonality compared to baselines.
+
+**H3: Routing Stability**
+SPECTRA will show more consistent routing patterns over time due to speciality constraints.
+
+**H4: Computational Efficiency**
+SPECTRA will have similar computational cost to Switch routing (both O(d·E) with small constant factors).
+
+**H5: Ablation Importance**
+Each component (Expression, GRU, Speciality Penalty, Orthogonal Constraint) will contribute positively, with cumulative effect.
+
+**H6: Model Scaling**
+Benefits of SPECTRA will be more pronounced with larger models (LLaMA-7B > GPT-2-Medium).
+
+**H7: Specialized Domains**
+Performance gains will be larger on specialized domains (code, math, science) where expert specialization matters most.
+
+
+-------------------------------------------------------------------
+5.10 SWEEP PLAN (we will execute this)
+-------------------------------------------------------------------
+
+We run sweeps that directly target the observed gap: strong separation (high orthogonality) but suboptimal load balance (CV above target).
+
+**Sweep A (Quota selection; selection-stage balancing)**:
+- expert_choice_routing ∈ {false, true}
+- expert_choice_capacity_factor ∈ {1.0, 1.25, 1.5, 2.0}
+
+**Sweep B (Sinkhorn temperature/iterations; balance vs sharpness)**:
+- sinkhorn_epsilon ∈ {0.03, 0.05, 0.1, 0.2}
+- sinkhorn_iterations ∈ {2, 3, 5, 8}
+- log_sinkhorn_enabled ∈ {false, true}
+
+**Sweep C (Repulsion; specialization vs balance trade-off)**:
+- osr_repulsion_weight ∈ {0.0, 0.1, 0.3, 0.5, 0.8, 1.0}
+
+**Sweep D (Routing sharpness)**:
+- router_entropy_coef ∈ {0.0, 1e-4, 1e-3, 1e-2, 0.1}
+
+**Sweep E (Long-context effect; GRU benefit)**:
+- sequence length settings (within hardware limits): {2k, 8k, 32k, 128k}
+- compare -GRU vs full routing on routing consistency and sequential top-k overlap
+
+
+-------------------------------------------------------------------
+5.9 POTENTIAL ISSUES AND MITIGATIONS
+-------------------------------------------------------------------
+
+**Issue 1: Training Instability**
+- Mitigation: Careful learning rate tuning, gradient clipping, warmup period
+
+**Issue 2: Expert Collapse**
+- Mitigation: Load balancing losses, EMA-based adaptive filtering, routing entropy regularization
+
+**Issue 3: Computational Overhead**
+- Mitigation: Precomputed orthogonalization, shared router across layers, efficient Gram matrix computation
+
+**Issue 4: Hyperparameter Sensitivity**
+- Mitigation: Grid search for loss coefficients, multiple random seeds
+
+**Issue 5: Evaluation Variance**
+- Mitigation: Multiple evaluation runs, confidence intervals, statistical significance testing
+

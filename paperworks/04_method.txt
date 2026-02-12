@@ -1,0 +1,100 @@
+=================================================================
+METHOD: SPECTRA ROUTING
+=================================================================
+
+**3. SPECTRA: A Routing Methodology Based on Context, Orthogonality, and Optimal Transport**
+
+This section details the architecture and core ideas of our proposed routing mechanism, SPECTRA (Sinkhorn Projected Experts for Consistent TRAjectory routing). SPECTRA is a routing framework that combines context-aware sequential routing with orthogonality constraints and OSR (Orthogonal Sinkhorn Routing) that structurally enforce functional specialization among experts while ensuring optimal load balancing.
+
+**3.1. SPECTRA Architectural Overview**
+
+When given an input token `x`, the SPECTRA router selects the optimal `k` experts through four key components:
+
+1.  **GRU-based Sequential Router:** Generates dynamic routing representations by understanding the context of the input sequence.
+2.  **Orthogonal Expression Projector:** Projects the input token into a low-dimensional space representing the functional 'expression' of the experts.
+3.  **OSR (Orthogonal Sinkhorn Routing):** Uses a repulsive cost function and parameter-free Sinkhorn algorithm to ensure uniform expert utilization and automatic expert separation.
+4.  **Cosine Similarity-based Routing Decision:** Calculates the routing score based on the semantic similarity between the token's 'demand' and the expert's 'offering'.
+
+**3.2. Sequential Routing for Context Awareness**
+
+Unlike conventional routers that process each token independently, SPECTRA utilizes a GRU (Gated Recurrent Unit) to leverage previous information from the sequence:
+
+    r_t, h_t = GRU(x_t, h_{t-1})
+
+Here, `x_t` is the token embedding, `h_{t-1}` is the hidden state from the previous step, and `r_t` is the routing representation. This hidden state `h_t` is passed globally between layers, enabling consistent routing trajectories. We initialize `h_0` to zeros for determinism.
+
+**3.3. Orthogonality Constraints for Expert Specialization**
+
+SPECTRA employs orthogonality constraints in two stages:
+
+**1) Initialization & Projection:**
+The expression projector `P_expr` is initialized with orthogonal weights (`nn.init.orthogonal_`). This provides a good starting point where experts cover distinct subspaces.
+
+**2) Dynamic Representation Orthogonality (Soft Orthogonality):**
+Instead of just constraining static weights, we apply an **Enhanced Soft Orthogonality** loss to the *dynamic expert representations* (averaged over the batch). This ensures that the actual *activations* of experts remain distinct. We use a combination of Frobenius norm and Spectral norm (SRIP) to penalize the correlation between expert centroids:
+
+    L_ortho = 0.7 * ||G - I||²_F + 0.3 * σ(G - I)²
+
+where `G` is the Gram matrix of batch-averaged expert representations and `σ` denotes the spectral norm. This effectively prevents expert collapse during training.
+
+**3.4. OSR (Orthogonal Sinkhorn Routing)**
+
+To achieve optimal load balancing, SPECTRA employs **OSR**, a pure mathematical approach using a repulsive cost function and Sinkhorn-Knopp optimization.
+
+**3.4.1. Repulsive Cost Function**
+
+The core innovation is the cost function that structurally penalizes expert similarity:
+
+    Cost = -Similarity + λ · Repulsion + β · Penalty
+
+1.  **Similarity:** Cosine similarity between token routing vector and expert representation.
+2.  **Repulsion:** `|Similarity| @ (G ⊙ (1-I))²`. This penalizes experts that are highly correlated with the experts the token *already* likes. The squared term `(G ⊙ (1-I))²` ensures we repel both positively and negatively correlated experts (preventing "anti-parallel" degeneracy).
+3.  **Penalty:** `β · ReLU(|Similarity| - τ)²`. A hinge penalty (typically τ=0.7) that discourages overly confident alignments, keeping the transport problem well-conditioned.
+
+**3.4.2. Pure Math Sinkhorn Algorithm**
+
+OSR uses the standard Sinkhorn-Knopp algorithm with **zero learned parameters**. Given the cost matrix `C`, we initialize `Q = exp(-C / ε)` and iteratively normalize rows and columns to satisfy:
+- Row sums = 1.0 (probability distribution per token)
+- Column sums ≈ N/E (balanced load per expert)
+
+We use a log-domain stabilized implementation to handle low-temperature regimes (`ε` ≈ 0.05).
+
+**3.4.3. Quota-Constrained Sparse Selection (Expert-Choice)**
+
+While Sinkhorn produces balanced *soft* probabilities, discrete top-k selection can reintroduce imbalance. To mitigate this, we optionally apply **Quota-Constrained Selection** during training:
+1.  Compute optimal transport plan `Q` via Sinkhorn.
+2.  Assign tokens to experts based on `Q` but enforce a strict capacity limit: `Cap = ⌈α · N·k / E⌉` (where α is a capacity factor, e.g., 1.25).
+3.  If an expert is full, the token must choose its next-best available expert.
+
+This hybrid approach combines the global optimality of Sinkhorn with the hard constraints of Expert Choice routing.
+
+**3.5. Overall Training Objective**
+
+The total loss function is:
+
+    L_total = L_task + λ_entropy * L_entropy + λ_ortho * L_ortho
+
+-   `L_task`: Cross-Entropy loss.
+-   `L_entropy`: Minimizes routing entropy (`-Σ p log p`) to encourage confident selection (sharpening).
+-   `L_ortho`: The enhanced soft orthogonality loss described in 3.3.
+
+**Key Simplification:** SPECTRA does **not** require explicit auxiliary load-balancing losses (like the coefficient-heavy losses in Switch Transformer). Sinkhorn structurally enforces balance, and the repulsive cost structurally enforces separation.
+
+**3.6. Summary and Comparison**
+
+We compare SPECTRA with representative MoE routing mechanisms, including both foundational methods and state-of-the-art approaches from 2024-2025.
+
+| Method | Sequential Context | Orthogonality Enforcement | Load Balancing Mechanism | Routing Complexity |
+| :--- | :---: | :--- | :--- | :---: |
+| Switch [Fedus et al., 2021] | ✗ | None | Auxiliary Loss (Static) | O(d·E) |
+| Expert Choice [Zhou et al., 2022] | ✗ | None | Implicit (Experts choose tokens) | O(d·E) |
+| OMoE [Feng et al., 2025] | ✗ | Auxiliary Loss (Weight-level) | Auxiliary Loss | O(d·E) |
+| RoMA [Ren et al., 2025] | ✗ | Manifold Alignment Loss | Auxiliary Loss | O(d·E) |
+| **SPECTRA (Ours)** | **✓** (GRU) | **Structural** (OSR Repulsive Cost) | **Optimal Transport** (Sinkhorn) | **O(d·E + T·N·E)** |
+
+*Key Differences:*
+1.  **Structural Orthogonality:** Unlike OMoE/RoMA which rely on competing auxiliary losses, SPECTRA enforces separation directly in the routing transport cost via repulsion.
+2.  **Context Awareness:** SPECTRA is unique in using sequential state (GRU) to maintain routing consistency across the sequence.
+3.  **Parameter-free Balancing:** OSR achieves balance via Sinkhorn normalization without tuning complex load-balance loss coefficients.
+
+SPECTRA combines these features to overcome the limitations of prior work, offering a robust, specialized, and balanced routing mechanism.

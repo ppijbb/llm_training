@@ -1,0 +1,199 @@
+\begin{thebibliography}{27}
+\providecommand{\natexlab}[1]{#1}
+\providecommand{\url}[1]{\texttt{#1}}
+\expandafter\ifx\csname urlstyle\endcsname\relax
+  \providecommand{\doi}[1]{doi: #1}\else
+  \providecommand{\doi}{doi: \begingroup \urlstyle{rm}\Url}\fi
+
+\bibitem[Austin et~al.(2021)Austin, Odena, Nye, Bosma, Michalewski, Dohan,
+  Jiang, Cai, Terry, Le, et~al.]{austin2021program}
+Austin, J., Odena, A., Nye, M., Bosma, M., Michalewski, H., Dohan, D., Jiang,
+  E., Cai, C., Terry, M., Le, Q., et~al.
+\newblock Program synthesis with large language models.
+\newblock \emph{arXiv preprint arXiv:2108.07732}, 2021.
+
+\bibitem[Bansal et~al.(2018)Bansal, Gimpel, and Livescu]{bansal2018revisiting}
+Bansal, R., Gimpel, K., and Livescu, K.
+\newblock Revisiting (softmax) bias in neural machine translation.
+\newblock \emph{arXiv preprint arXiv:1805.11005}, 2018.
+
+\bibitem[Bisk et~al.(2020)Bisk, Zellers, LeBras, Gao, and Choi]{bisk2020piqa}
+Bisk, Y., Zellers, R., LeBras, R., Gao, J., and Choi, Y.
+\newblock Piqa: Reasoning about physical commonsense in natural language.
+\newblock \emph{Proceedings of the AAAI conference on artificial intelligence},
+  34\penalty0 (05):\penalty0 7432--7439, 2020.
+
+\bibitem[Brock et~al.(2017)Brock, Lim, Ritchie, and
+  Weston]{brock2017orthogonal}
+Brock, A., Lim, T., Ritchie, J.~M., and Weston, N.
+\newblock Orthogonal weight normalization: Solution to optimization over
+  multiple dependent stiefel manifolds in deep neural networks.
+\newblock \emph{arXiv preprint arXiv:1709.06079}, 2017.
+
+\bibitem[Brown et~al.(2020)Brown, Mann, Ryder, Subbiah, Kaplan, Dhariwal,
+  Neelakantan, Shyam, Sastry, Askell, et~al.]{brown2020language}
+Brown, T., Mann, B., Ryder, N., Subbiah, M., Kaplan, J.~D., Dhariwal, P.,
+  Neelakantan, A., Shyam, P., Sastry, G., Askell, A., et~al.
+\newblock Language models are few-shot learners.
+\newblock \emph{Advances in neural information processing systems},
+  33:\penalty0 1877--1901, 2020.
+
+\bibitem[Chang et~al.(2022)Chang, Gouk, and Hospedales]{chang2022expert}
+Chang, J., Gouk, H., and Hospedales, T.~M.
+\newblock Expert networks: A principled approach to improving expert
+  specialization.
+\newblock \emph{arXiv preprint arXiv:2202.06817}, 2022.
+
+\bibitem[Chen et~al.(2021)Chen, Tworek, Jun, Yuan, Pinto, Kaplan, Edwards,
+  Burda, Joseph, Brockman, et~al.]{chen2021evaluating}
+Chen, M., Tworek, J., Jun, H., Yuan, Q., Pinto, H. P. d.~O., Kaplan, J.,
+  Edwards, H., Burda, Y., Joseph, N., Brockman, G., et~al.
+\newblock Evaluating large language models trained on code.
+\newblock \emph{arXiv preprint arXiv:2107.03374}, 2021.
+
+\bibitem[Clark et~al.(2019)Clark, Lee, Chang, Kwiatkowski, Collins, and
+  Toutanova]{clark2019boolq}
+Clark, C., Lee, K., Chang, M.-W., Kwiatkowski, T., Collins, M., and Toutanova,
+  K.
+\newblock Boolq: Exploring the surprising difficulty of natural yes/no
+  questions.
+\newblock \emph{arXiv preprint arXiv:1905.10044}, 2019.
+
+\bibitem[Clark et~al.(2018)Clark, Cowhey, Etzioni, Khot, Sabharwal, Schoenick,
+  and Tafjord]{clark2018think}
+Clark, P., Cowhey, I., Etzioni, O., Khot, T., Sabharwal, A., Schoenick, C., and
+  Tafjord, O.
+\newblock Think you have solved question answering? try arc, the ai2 reasoning
+  challenge.
+\newblock \emph{arXiv preprint arXiv:1803.05457}, 2018.
+
+\bibitem[Cobbe et~al.(2021)Cobbe, Kosaraju, Bavarian, Chen, Jun, Kaiser,
+  Plappert, Tworek, Hilton, Nakano, et~al.]{cobbe2021training}
+Cobbe, K., Kosaraju, V., Bavarian, M., Chen, M., Jun, H., Kaiser, L., Plappert,
+  M., Tworek, J., Hilton, J., Nakano, R., et~al.
+\newblock Training verifiers to solve math word problems.
+\newblock \emph{arXiv preprint arXiv:2110.14168}, 2021.
+
+\bibitem[DeepSeek-AI(2024)]{deepseek2024}
+DeepSeek-AI.
+\newblock Deepseek-moe: Towards ultimate expert specialization in
+  mixture-of-experts language models, 2024.
+\newblock arXiv preprint.
+
+\bibitem[Du et~al.(2022)Du, Huang, Dai, Tong, Lepikhin, Xu, Krikun, Zhou, Yu,
+  Firat, et~al.]{du2021glam}
+Du, N., Huang, Y., Dai, A.~M., Tong, S., Lepikhin, D., Xu, Y., Krikun, M.,
+  Zhou, Y., Yu, A.~W., Firat, O., et~al.
+\newblock Glam: Efficient scaling of language models with mixture-of-experts.
+\newblock \emph{International Conference on Machine Learning}, pp.\
+  5547--5569, 2022.
+
+\bibitem[Fedus et~al.(2022)Fedus, Zoph, and Shazeer]{fedus2021switch}
+Fedus, W., Zoph, B., and Shazeer, N.
+\newblock Switch transformers: Scaling to trillion parameter models with simple
+  and efficient sparsity.
+\newblock \emph{Journal of Machine Learning Research}, 23\penalty0
+  (120):\penalty0 1--39, 2022.
+
+\bibitem[Gao et~al.(2020)Gao, Biderman, Black, Golding, Hoppe, Foster, Phang,
+  He, Thite, Nabeshima, et~al.]{gao2020pile}
+Gao, L., Biderman, S., Black, S., Golding, L., Hoppe, T., Foster, C., Phang,
+  J., He, H., Thite, A., Nabeshima, N., et~al.
+\newblock The pile: An 800gb dataset of diverse text for language modeling.
+\newblock \emph{arXiv preprint arXiv:2101.00027}, 2020.
+
+\bibitem[Gatys et~al.(2016)Gatys, Ecker, and Bethge]{gatys2016image}
+Gatys, L.~A., Ecker, A.~S., and Bethge, M.
+\newblock Image style transfer using convolutional neural networks.
+\newblock \emph{Proceedings of the IEEE conference on computer vision and
+  pattern recognition}, pp.\  2414--2423, 2016.
+
+\bibitem[Hazimeh et~al.(2021)Hazimeh, Zhao, Chowdhery, Sathiamoorthy, Chen,
+  Mazumder, Hong, and Chi]{hazimeh2021dselect}
+Hazimeh, H., Zhao, Z., Chowdhery, A., Sathiamoorthy, M., Chen, Y., Mazumder,
+  R., Hong, L., and Chi, E.
+\newblock Dselect-k: Differentiable selection in the mixture of experts with
+  applications to multi-task learning.
+\newblock \emph{Advances in Neural Information Processing Systems},
+  34:\penalty0 29335--29347, 2021.
+
+\bibitem[Hendrycks et~al.(2021)Hendrycks, Basart, Kadavath, Mazeika, Arora,
+  Guo, Burns, Puranik, He, Song, et~al.]{hendrycks2021measuring}
+Hendrycks, D., Basart, S., Kadavath, S., Mazeika, M., Arora, A., Guo, E.,
+  Burns, C., Puranik, S., He, H., Song, D., et~al.
+\newblock Measuring massive multitask language understanding.
+\newblock \emph{Proceedings of the International Conference on Learning
+  Representations}, 2021.
+
+\bibitem[Hu et~al.(2023)Hu, Li, Zhang, Wang, Wang, Wang, Li, Li, and
+  Hou]{hu2023moe}
+Hu, Y., Li, Z., Zhang, Y., Wang, X., Wang, P., Wang, H., Li, B., Li, L., and
+  Hou, L.
+\newblock Moe-infinity: Activation-aware expert offloading for efficient moe
+  inference.
+\newblock \emph{arXiv preprint arXiv:2309.15445}, 2023.
+
+\bibitem[Jacobs et~al.(1991)Jacobs, Jordan, Nowlan, and
+  Hinton]{jacobs1991adaptive}
+Jacobs, R.~A., Jordan, M.~I., Nowlan, S.~J., and Hinton, G.~E.
+\newblock Adaptive mixtures of local experts.
+\newblock \emph{Neural computation}, 3\penalty0 (1):\penalty0 79--87, 1991.
+
+\bibitem[Jiang et~al.(2024)Jiang, Sablayrolles, Mensch, Bamford, Chaplot,
+  Casas, Bressand, Lengyel, Lample, Saulnier, et~al.]{jiang2024mixtral}
+Jiang, A.~Q., Sablayrolles, A., Mensch, A., Bamford, C., Chaplot, D.~S., Casas,
+  D. d.~l., Bressand, F., Lengyel, G., Lample, G., Saulnier, L., et~al.
+\newblock Mixtral of experts.
+\newblock \emph{arXiv preprint arXiv:2401.04088}, 2024.
+
+\bibitem[Kaplan et~al.(2020)Kaplan, McCandlish, Henighan, Brown, Chess, Child,
+  Gray, Radford, Wu, and Amodei]{kaplan2020scaling}
+Kaplan, J., McCandlish, S., Henighan, T., Brown, T.~B., Chess, B., Child, R.,
+  Gray, S., Radford, A., Wu, J., and Amodei, D.
+\newblock Scaling laws for neural language models.
+\newblock \emph{arXiv preprint arXiv:2001.08361}, 2020.
+
+\bibitem[Lepikhin et~al.(2020)Lepikhin, Lee, Xu, Chen, Firat, Huang, Krikun,
+  Shazeer, and Chen]{lepikhin2020gshard}
+Lepikhin, D., Lee, H., Xu, Y., Chen, D., Firat, O., Huang, Y., Krikun, M.,
+  Shazeer, N., and Chen, Z.
+\newblock Gshard: Scaling giant models with conditional computation and
+  automatic sharding.
+\newblock \emph{arXiv preprint arXiv:2006.16668}, 2020.
+
+\bibitem[Ma et~al.(2023)Ma, Yan, Li, et~al.]{ma2023gated}
+Ma, C., Yan, X., Li, H., et~al.
+\newblock Gated recurrent units viewed through the lens of continuous time
+  dynamical systems.
+\newblock \emph{arXiv preprint arXiv:2303.12844}, 2023.
+
+\bibitem[Roller et~al.(2021)Roller, Sukhbaatar, Szlam, and
+  Weston]{roller2021hash}
+Roller, S., Sukhbaatar, S., Szlam, A., and Weston, J.
+\newblock Hash layers for large sparse models.
+\newblock \emph{Advances in Neural Information Processing Systems},
+  34:\penalty0 17555--17566, 2021.
+
+\bibitem[Shazeer et~al.(2017)Shazeer, Mirhoseini, Maziarz, Davis, Le, Hinton,
+  and Dean]{shazeer2017outrageously}
+Shazeer, N., Mirhoseini, A., Maziarz, K., Davis, A., Le, Q., Hinton, G., and
+  Dean, J.
+\newblock Outrageously large neural networks: The sparsely-gated
+  mixture-of-experts layer.
+\newblock \emph{arXiv preprint arXiv:1701.06538}, 2017.
+
+\bibitem[Zellers et~al.(2019)Zellers, Holtzman, Bisk, Farhadi, and
+  Choi]{zellers2019hellaswag}
+Zellers, R., Holtzman, A., Bisk, Y., Farhadi, A., and Choi, Y.
+\newblock Hellaswag: Can a machine really finish your sentence?
+\newblock \emph{Proceedings of the 57th Annual Meeting of the Association for
+  Computational Linguistics}, pp.\  4791--4800, 2019.
+
+\bibitem[Zhou et~al.(2022)Zhou, Wang, Cho, Jaakkola, Gururangan, and
+  Sap]{zhou2022expert}
+Zhou, Y., Wang, N., Cho, S., Jaakkola, T., Gururangan, S., and Sap, M.
+\newblock Expert choice routing: Optimizing multi-expert routing with
+  token-level expert selection.
+\newblock \emph{arXiv preprint arXiv:2202.09368}, 2022.
+
+\end{thebibliography}

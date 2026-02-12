@@ -457,7 +457,7 @@ def get_dynamic_lora_target_modules(model, logger: logging.Logger):
     
     # 4. Final validation: Only keep targets that actually exist in the model (excluding vision)
     validated_targets = set()
-    exclude_list = {"norm", "ln_f", "ln_1", "ln_2", "embed", "lm_head", "classification_head", "layernorm", "q_proj", "k_proj", "v_proj", "o_proj"}
+    exclude_list = {"norm", "ln_f", "ln_1", "ln_2", "embed", "lm_head", "classification_head", "layernorm", "gate_proj", "up_proj", "down_proj"}
     
     for target in target_modules:
         if target.lower() in exclude_list:

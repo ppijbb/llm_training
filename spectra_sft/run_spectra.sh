@@ -1,7 +1,11 @@
 #!/bin/bash
 
 # SPECTRA SFT Training Script with DeepSpeed Support
-# Usage: ./run_SPECTRA.sh [config_file] [num_gpus]
+# Usage: ./run_spectra.sh [config_file] [num_gpus]
+#        ./run_spectra.sh baseline [config_file] [num_gpus]  → SPECTRA 비활성화(Qwen3 원래 MoE), backward 에러 회피
+#
+# 참고: "tensor a (0) vs tensor b (2048)" backward 에러 시 원인 추적:
+#       DETECT_ANOMALY=1 ./run_spectra.sh baseline  → 실패한 backward 연산 위치가 로그에 출력됨 (한 번만 실행 후 로그 확인).
 
 set -e
 
@@ -11,6 +15,15 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
+
+# [baseline 모드] 첫 인자가 baseline 이면 SPECTRA 비활성화 (통과했을 때와 동일)
+RUN_BASELINE=0
+if [ "$1" = "baseline" ] || [ "$1" = "no-spectra" ]; then
+    RUN_BASELINE=1
+    export SPECTRA_DISABLE_ALL=1
+    shift
+    echo -e "${YELLOW}[baseline 모드] SPECTRA 비활성화 (Qwen3 원래 MoE만 사용)${NC}"
+fi
 
 echo -e "${GREEN}================================================================================${NC}"
 echo -e "${GREEN}        SPECTRA SFT DeepSpeed Training with Small Model Configuration      ${NC}"
@@ -38,7 +51,7 @@ else
     fi
 fi
 
-NUM_GPUS=4 # Test single GPU
+NUM_GPUS=2 # Test single GPU
 
 echo -e "${YELLOW}Project Root:${NC} $PROJECT_ROOT"
 echo -e "${YELLOW}Config File:${NC} $CONFIG_FILE"
@@ -67,7 +80,9 @@ export PYTHONPATH="$PROJECT_ROOT:$PYTHONPATH"
 if [ -z "$CUDA_VISIBLE_DEVICES" ]; then
     export CUDA_VISIBLE_DEVICES=$(seq 0 $((NUM_GPUS-1)) | paste -sd, -)
 fi
-export CUDA_VISIBLE_DEVICES=0,1,2,3
+export CUDA_VISIBLE_DEVICES=0,1
+# CRITICAL: NUM_GPUS를 CUDA_VISIBLE_DEVICES의 실제 GPU 개수로 재설정 (launcher가 LOCAL_RANK를 올바르게 설정하도록)
+NUM_GPUS=$(echo "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | wc -l)
 export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false
 # CUDA allocator tuning to reduce fragmentation and OOM risk
@@ -100,6 +115,7 @@ export NCCL_TIMEOUT=1800
 # export NCCL_DEBUG=INFO
 export NCCL_PROTO=LL
 export NCCL_ALGO=Ring
+# Enable DeepSpeed AutoTP when tensor_parallel.autotp_size > 1 in config (required to avoid OOM)
 export DEEPSPEED_AUTOTP=1
 export DS_AUTOTP=1
 export DEEPSPEED_ENABLE_TP=1
@@ -122,54 +138,67 @@ mkdir -p "$OUTPUT_DIR"
 
 echo -e "${YELLOW}Output Directory:${NC} $OUTPUT_DIR"
 echo -e "${YELLOW}CUDA Devices:${NC} $CUDA_VISIBLE_DEVICES"
+if [ "$RUN_BASELINE" = "1" ]; then
+    echo -e "${YELLOW}[baseline] SPECTRA_DISABLE_ALL=1 → Qwen3 원래 MoE만 사용 (backward 에러 회피)${NC}"
+fi
 
 # Check dependencies
-echo -e "${YELLOW}Checking dependencies...${NC}"
-for package in torch transformers trl peft datasets wandb deepspeed; do
-    if ! python -c "import $package" 2>/dev/null; then
-        echo -e "${RED}Error: $package is not installed${NC}"
-        python -c "import $package" 2>&1 | sed 's/^/    /'
-        echo "$package is not installed"
-        echo "Please install required packages:"
-        echo "pip install torch transformers trl peft datasets wandb deepspeed"
-        exit 1
-    fi
-done
-echo -e "${GREEN}All dependencies found!${NC}"
+# echo -e "${YELLOW}Checking dependencies...${NC}"
+# echo -e "Python path: $(which python)"
+# for package in torch transformers trl peft datasets wandb deepspeed; do
+#     if ! python -c "import $package" 2>/dev/null; then
+#         echo -e "${RED}Error: $package is not installed${NC}"
+#         python -c "import $package" 2>&1 | sed 's/^/    /'
+#         echo "$package is not installed"
+#         echo "Please install required packages:"
+#         echo "pip install torch transformers trl peft datasets wandb deepspeed"
+#         exit 1
+#     fi
+# done
+# echo -e "${GREEN}All dependencies found!${NC}"
 
 # Check GPU availability and memory
-if python3 -c "import torch; print(torch.cuda.is_available())" | grep -q "True"; then
-    GPU_COUNT=$(python3 -c "import torch; print(torch.cuda.device_count())")
-    echo -e "${GREEN}GPU detected: $GPU_COUNT device(s) available${NC}"
-    
-    # Check GPU memory for each device
-    python3 -c "
-import torch
-for i in range(torch.cuda.device_count()):
-    props = torch.cuda.get_device_properties(i)
-    memory_gb = props.total_memory / (1024**3)
-    print(f'GPU {i}: {props.name}, {memory_gb:.1f}GB VRAM')
-"
-else
-    echo -e "${RED}Error: No GPU detected. DeepSpeed requires CUDA.${NC}"
-    exit 1
-fi
+# if python3 -c "import torch; print(torch.cuda.is_available())" | grep -q "True"; then
+#     GPU_COUNT=$(python3 -c "import torch; print(torch.cuda.device_count())")
+#     echo -e "${GREEN}GPU detected: $GPU_COUNT device(s) available${NC}"
+#     
+#     # Check GPU memory for each device
+#     python3 -c "
+# import torch
+# for i in range(torch.cuda.device_count()):
+#     props = torch.cuda.get_device_properties(i)
+#     memory_gb = props.total_memory / (1024**3)
+#     print(f'GPU {i}: {props.name}, {memory_gb:.1f}GB VRAM')
+# "
+# else
+#     echo -e "${RED}Error: No GPU detected. DeepSpeed requires CUDA.${NC}"
+#     exit 1
+# fi
 
 # Check system memory for DeepSpeed CPU offload
-TOTAL_RAM_GB=$(free -g | awk 'NR==2{printf "%.0f", $2}')
-echo -e "${YELLOW}System RAM:${NC} ${TOTAL_RAM_GB}GB"
-if [ "$TOTAL_RAM_GB" -lt 32 ]; then
-    echo -e "${YELLOW}Warning: Less than 32GB RAM. DeepSpeed CPU offload may be slow.${NC}"
-fi
+# TOTAL_RAM_GB=$(free -g | awk 'NR==2{printf "%.0f", $2}')
+# echo -e "${YELLOW}System RAM:${NC} ${TOTAL_RAM_GB}GB"
+# if [ "$TOTAL_RAM_GB" -lt 32 ]; then
+#     echo -e "${YELLOW}Warning: Less than 32GB RAM. DeepSpeed CPU offload may be slow.${NC}"
+# fi
 
 # Determine the training command based on number of GPUs
 cd "$PROJECT_ROOT"
 
 echo -e "${GREEN}Starting DeepSpeed training with $NUM_GPUS GPUs...${NC}"
-TRAIN_CMD="accelerate launch \
+
+# baseline 모드: 커맨드라인 --baseline 전달 (env는 accelerate 자식에 안 넘어가서 인자로 전달)
+if [ "$RUN_BASELINE" = "1" ]; then
+    TRAIN_CMD="accelerate launch \
+    --config_file $SCRIPT_DIR/../spectra_sft/config/accelerate.yaml \
+    --num_processes $NUM_GPUS \
+        $SCRIPT_DIR/train_spectra.py --config $CONFIG_FILE --baseline"
+else
+    TRAIN_CMD="accelerate launch \
     --config_file $SCRIPT_DIR/../spectra_sft/config/accelerate.yaml \
     --num_processes $NUM_GPUS \
         $SCRIPT_DIR/train_spectra.py --config $CONFIG_FILE"
+fi
 
 # Run training with error handling
 if eval "$TRAIN_CMD"; then
@@ -198,7 +227,7 @@ else
     echo -e "${YELLOW}Troubleshooting tips:${NC}"
     echo "1. Try reducing batch size: per_device_train_batch_size=1"
     echo "2. Increase gradient accumulation: gradient_accumulation_steps=8"
-    echo "3. Use DeepSpeed ZeRO-3 with CPU offload"
+    echo "3. Use ZeRO-3 without param offload, or increase tensor_parallel / reduce batch or seq length (param offload 금지)"
     echo "4. Enable gradient checkpointing"
     echo "5. Reduce model size if initializing from scratch"
     exit 1

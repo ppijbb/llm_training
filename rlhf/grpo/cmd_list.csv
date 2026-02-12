@@ -1,0 +1,161 @@
+cmd,runnable_stage,next_stage,desc,category,need_num,need_surface,need_bridge,is_status,is_control
+plus,CellSelect,CellSelect,"Command function: Enter +N in the GM cell
+Command Usage: `plus #N`",cell selection,FALSE,FALSE,FALSE,FALSE,TRUE
+normal,CellSelect,CellSelect,"Command function: Input PD preset 3 2 3
+Command Usage: `normal`",cell selection,FALSE,FALSE,FALSE,FALSE,TRUE
+up,CellSelect,CellSelect,"Command function: Select the cell 1 row up
+Command Usage: `up`",cell selection,FALSE,FALSE,FALSE,FALSE,TRUE
+down,CellSelect,CellSelect,"Command function: Select the cell 1 row down
+Command Usage: `down`",cell selection,FALSE,FALSE,FALSE,FALSE,TRUE
+resume,CellSelect,CellSelect,"Command function: Select unfilled empty cell in the direction of progression
+Command Usage: `resume`",cell selection,FALSE,FALSE,FALSE,FALSE,TRUE
+backspace,CellSelect,CellSelect,"Command function: Clear one input value and move to the previous cell
+Command Usage: `backspace`",cell selection,FALSE,FALSE,FALSE,FALSE,TRUE
+clear,CellSelect,CellSelect,"Command function: Clear all current inspection items in the selected cell
+Command Usage: `clear`",cell selection,FALSE,FALSE,FALSE,FALSE,TRUE
+back,CellSelect,CellSelect,"Command function: Select previous cell
+Command Usage: `back`",cell selection,FALSE,FALSE,FALSE,FALSE,TRUE
+next,CellSelect,CellSelect,"Command function: Select next cell
+Command Usage: `next`",cell selection,FALSE,FALSE,FALSE,FALSE,TRUE
+repeat,CellSelect,CellSelect,"Command function: Repeat the last 3 values N times
+Command Usage: `repeat`",cell selection,FALSE,FALSE,FALSE,FALSE,TRUE
+discard,CellSelect,CellSelect,"Command function: Clear one input value and stay in the same cell
+Command Usage: `discard`",cell selection,FALSE,FALSE,FALSE,FALSE,TRUE
+undo,Global,Global,"Command function: Undo one action
+Command Usage: `undo`",screen control,FALSE,FALSE,FALSE,FALSE,TRUE
+redo,Global,Global,"Command function: Redo one undone action
+Command Usage: `redo`",screen control,FALSE,FALSE,FALSE,FALSE,TRUE
+export,Global,Global,"Command function: Export to PMS (currently OpenDental)
+Command Usage: `export`",screen control,FALSE,FALSE,FALSE,FALSE,TRUE
+key pad on,Global,Global,"Command function: Open the keypad window
+Command Usage: `key pad on`",screen control,FALSE,FALSE,FALSE,FALSE,TRUE
+key pad off,Global,Global,"Command function: Close the keypad window
+Command Usage: `key pad off`",screen control,FALSE,FALSE,FALSE,FALSE,TRUE
+delete,Global,Global,"Command function: Delete current chart
+Command Usage: `delete`",screen control,FALSE,FALSE,FALSE,FALSE,TRUE
+save,Global,Global,"Command function: Save current chart
+Command Usage: `save`",screen control,FALSE,FALSE,FALSE,FALSE,TRUE
+preview,Global,Global,"Command function: Open preview modal window
+Command Usage: `preview`",screen control,FALSE,FALSE,FALSE,FALSE,TRUE
+stop charting,Global,Stop,"Command function: Stop voice control and transcription
+Command Usage: `stop charting`",voice control,FALSE,FALSE,FALSE,FALSE,TRUE
+stop listening,Global,Stop,"Command function: Stop voice control and transcription
+Command Usage: `stop listening`",voice control,FALSE,FALSE,FALSE,FALSE,TRUE
+voice off,Global,Stop,"Command function: Stop voice control and transcription
+Command Usage: `voice off`",voice control,FALSE,FALSE,FALSE,FALSE,TRUE
+yes,Global,Global,"Command function: Confirm
+Command Usage: `yes`",screen control,FALSE,FALSE,FALSE,FALSE,TRUE
+no,Global,Global,"Command function: Cancel
+Command Usage: `no`",screen control,FALSE,FALSE,FALSE,FALSE,TRUE
+close,Global,Global,"Command function: Close the popup window
+Command Usage: `close`",voice control,FALSE,FALSE,FALSE,FALSE,TRUE
+mute,Global,Global,"Command function: Pause STT and maintain voice recognition status
+Command Usage: `mute`",voice control,FALSE,FALSE,FALSE,FALSE,TRUE
+pause,Global,Global,"Command function: Pause STT and maintain voice recognition status
+Command Usage: `pause`",voice control,FALSE,FALSE,FALSE,FALSE,TRUE
+continue,Global,Start,"Command function: Resume STT and maintain voice recognition status
+Command Usage: `continue`",voice control,FALSE,FALSE,FALSE,FALSE,TRUE
+create,Global,Start,"Command function: Create a new periodontal exam sheet for the selected patient
+Command Usage: `create`",screen control,FALSE,FALSE,FALSE,FALSE,TRUE
+close,Note,Global,"Command function: Close the popup window
+Command Usage: `close`",screen control,FALSE,FALSE,FALSE,FALSE,TRUE
+free text,Note,Note,"Command function: Enter free text note
+Command Usage: `free text`",screen control,FALSE,FALSE,FALSE,FALSE,TRUE
+clear text,Note,Note,"Command function: Clear free text note
+Command Usage: `clear text`",screen control,FALSE,FALSE,FALSE,FALSE,TRUE
+tooth number,Start,ToothSelect,"Command function: Select tooth #N
+Command Usage: `tooth number`",tooth selection,TRUE,FALSE,FALSE,FALSE,FALSE
+number,Start,ToothSelect,"Command function: Select tooth #N
+Command Usage: `number`",tooth selection,TRUE,FALSE,FALSE,FALSE,FALSE
+jump,Start,ToothSelect,"Command function: Jump to tooth #N
+Command Usage: `jump`",tooth selection,TRUE,FALSE,FALSE,FALSE,FALSE
+pocket depth,Start,CellSelect,"Command function: Enter PD value 0–19
+Command Usage: `number #N, pocket depth #N #N #N`",cell selection,TRUE,FALSE,FALSE,TRUE,FALSE
+probing,Start,CellSelect,"Command function: Enter PD value 0–19
+Command Usage: `nubmer #N, probing #N #N #N`",cell selection,TRUE,FALSE,FALSE,TRUE,FALSE
+gingival margin,Start,CellSelect,"Command function: Enter GM value −19 to +19
+Command Usage: `number #N, gingival margin #N #N #N`",cell selection,TRUE,FALSE,FALSE,TRUE,FALSE
+recession,Start,CellSelect,"Command function: Enter GM value −19 to +19
+Command Usage: `number #N, recession #N #N #N`",cell selection,TRUE,FALSE,FALSE,TRUE,FALSE
+mucogingival junction,Start,CellSelect,"Command function: Enter MGJ value 0–9
+Command Usage: `number #N, mucogingival junction #N #N #N`",cell selection,TRUE,FALSE,FALSE,TRUE,FALSE
+furcation,Start,CellSelect,"Command function: Enter Furc value 0, 1, 2, or 3
+Command Usage: `number #N, #SURFACE_DIRECTION, #SURFACE_THRID, furcation #N`, `number #N, #SURFACE_DIRECTION, furcation #N #N #N` ",cell selection,TRUE,TRUE,FALSE,TRUE,FALSE
+bleeding,Start,CellSelect,"Command function: Enter BOP value 0 or 1
+Command Usage: `number #N, #SURFACE_DIRECTION, #SURFACE_THRID, bleeding #N`, `number #N, #SURFACE_DIRECTION, bleding #N #N #N` ",cell selection,TRUE,TRUE,FALSE,TRUE,FALSE
+suppuration,Start,CellSelect,"Command function: Enter Sup value 0 or 1
+Command Usage: `number #N, #SURFACE_DIRECTION, #SURFACE_THRID, suppuration #N`, `number #N, #SURFACE_DIRECTION, suppuration #N #N #N` ",cell selection,TRUE,TRUE,FALSE,TRUE,FALSE
+mobility,Start,CellSelect,"Command function: Enter Mob value 0, 1, 2, or 3
+Command Usage: `number #N, mobility #N`",cell selection,TRUE,FALSE,FALSE,TRUE,FALSE
+calculus,Start,CellSelect,"Command function: Enter Calc value 0 or 1
+Command Usage: `number #N, #SURFACE_DIRECTION, #SURFACE_THRID, calculus`, `number #N, #SURFACE_DIRECTION, calculus #N #N #N`",cell selection,TRUE,TRUE,FALSE,TRUE,FALSE
+plaque,Start,CellSelect,"Command function: Enter Plaq value 0 or 1
+Command Usage: `number #N, #SURFACE_DIRECTION, #SURFACE_THRID, plaque`, `number #N, #SURFACE_DIRECTION, plaque #N #N #N`",cell selection,TRUE,TRUE,FALSE,TRUE,FALSE
+voice on,Stop,Start,"Command function: Start voice control and transcription
+Command Usage: `voice on`",voice control,FALSE,FALSE,FALSE,FALSE,TRUE
+mesial lingual of,ToothSelect,CellSelect,"Command function: Select the mesial lingual cell of tooth #N. This command selects SURFACE.
+Command Usage: `mesial lingual of #N`",cell selection,TRUE,FALSE,FALSE,FALSE,FALSE
+mesial palatal of,ToothSelect,CellSelect,"Command function: Select the mesial palatal cell of tooth #N. This command selects SURFACE.
+Command Usage: `mesial palatal of #N`",cell selection,TRUE,FALSE,FALSE,FALSE,FALSE
+middle buccal of,ToothSelect,CellSelect,"Command function: Select the middle buccal cell of tooth #N. This command selects SURFACE.
+Command Usage: `middle buccal of #N`",cell selection,TRUE,FALSE,FALSE,FALSE,FALSE
+middle lingual of,ToothSelect,CellSelect,"Command function: Select the middle lingual cell of tooth #N. This command selects SURFACE.
+Command Usage: `middle lingual of #N`",cell selection,TRUE,FALSE,FALSE,FALSE,FALSE
+middle palatal of,ToothSelect,CellSelect,"Command function: Select the middle palatal cell of tooth #N. This command selects SURFACE.
+Command Usage: `middle palatal of #N`",cell selection,TRUE,FALSE,FALSE,FALSE,FALSE
+distal buccal of,ToothSelect,CellSelect,"Command function: Select the distal buccal cell of tooth #N. This command selects SURFACE.
+Command Usage: `distal buccal of #N`",cell selection,TRUE,FALSE,FALSE,FALSE,FALSE
+distal lingual of,ToothSelect,CellSelect,"Command function: Select the distal lingual cell of tooth #N. This command selects SURFACE.
+Command Usage: `distal lingual of #N`",cell selection,TRUE,FALSE,FALSE,FALSE,FALSE
+distal palatal of,ToothSelect,CellSelect,"Command function: Select the distal palatal cell of tooth #N. This command selects SURFACE.
+Command Usage: `distal palatal of #N`",cell selection,TRUE,FALSE,FALSE,FALSE,FALSE
+mesial of,ToothSelect,CellSelect,"Command function: Select the mesial cell of tooth #N.  This command selects #SURFACE_THRID.
+Command Usage: `mesial of #N`",cell selection,TRUE,FALSE,FALSE,FALSE,FALSE
+middle of,ToothSelect,CellSelect,"Command function: Select the middle cell of tooth #N.  This command selects #SURFACE_THRID.
+Command Usage: `middle of #N`",cell selection,TRUE,FALSE,FALSE,FALSE,FALSE
+distal of,ToothSelect,CellSelect,"Command function: Select the distal cell of tooth #N.  This command selects #SURFACE_THRID.
+Command Usage: `distal of #N`",cell selection,TRUE,FALSE,FALSE,FALSE,FALSE
+buccal of,ToothSelect,CellSelect,"Command function: Select the buccal cell of tooth #N.  This command selects #SURFACE_DIRECTION.
+Command Usage: `buccal of #N`",cell selection,TRUE,FALSE,FALSE,FALSE,FALSE
+lingual of,ToothSelect,CellSelect,"Command function: Select the lingual cell of tooth #N.  This command selects #SURFACE_DIRECTION.
+Command Usage: `lingual of #N`",cell selection,TRUE,FALSE,FALSE,FALSE,FALSE
+palatal of,ToothSelect,CellSelect,"Command function: Select the palatal cell of tooth #N.  This command selects #SURFACE_DIRECTION.
+Command Usage: `palatal of #N`",cell selection,TRUE,FALSE,FALSE,FALSE,FALSE
+mesial,ToothSelect,CellSelect,"Command function: Select cell at mesial of current tooth.  This command selects #SURFACE_DIRECTION.
+Command Usage: `number #N, mesial`",cell selection,TRUE,FALSE,FALSE,FALSE,FALSE
+middle,ToothSelect,CellSelect,"Command function: Select cell at middle of current tooth. This command selects #SURFACE_DIRECTION.
+Command Usage: `number #N, middle`",cell selection,TRUE,FALSE,FALSE,FALSE,FALSE
+distal,ToothSelect,CellSelect,"Command function: Select cell at distal of current tooth.  This command selects #SURFACE_THRID.
+Command Usage: `number #N, distal`",cell selection,TRUE,FALSE,FALSE,FALSE,FALSE
+buccal,ToothSelect,CellSelect,"Command function: Select cell at buccal of current tooth.  This command selects #SURFACE_DIRECTION.
+Command Usage: `number #N, buccal`",cell selection,TRUE,FALSE,FALSE,FALSE,FALSE
+lingual,ToothSelect,CellSelect,"Command function: Select cell at lingual of current tooth. This command selects #SURFACE_DIRECTION.
+Command Usage: `number #N, lingual`",cell selection,TRUE,FALSE,FALSE,FALSE,FALSE
+palatal,ToothSelect,CellSelect,"Command function: Select cell at palatal of current tooth. This command selects #SURFACE_DIRECTION.
+Command Usage: `number #N, palatal`",cell selection,TRUE,FALSE,FALSE,FALSE,FALSE
+permanent,ToothSelect,Start,"Command function: Set selected tooth status to permanent
+Command Usage: `number #N, permanent`",tooth selection,TRUE,FALSE,FALSE,FALSE,FALSE
+missing,ToothSelect,Start,"Command function: Set selected tooth status to missing
+Command Usage: `number #N, missing`",tooth selection,TRUE,FALSE,FALSE,FALSE,FALSE
+root rest,ToothSelect,Start,"Command function: Set selected tooth status to root remnant
+Command Usage: `number #N, root rest`",tooth selection,TRUE,FALSE,FALSE,FALSE,FALSE
+impacted,ToothSelect,Start,"Command function: Set selected tooth status to impacted
+Command Usage: `number #N, impacted`",tooth selection,TRUE,FALSE,FALSE,FALSE,FALSE
+implant,ToothSelect,Start,"Command function: Set selected tooth status to implant
+Command Usage: `number #N,implant`",tooth selection,TRUE,FALSE,FALSE,FALSE,FALSE
+fixture,ToothSelect,Start,"Command function: Set selected tooth status to fixture
+Command Usage: `number #N, fixture`",tooth selection,TRUE,FALSE,FALSE,FALSE,FALSE
+crown,ToothSelect,Start,"Command function: Set selected tooth status to crown
+Command Usage: `number #N, crown`",tooth selection,TRUE,FALSE,FALSE,FALSE,FALSE
+remove bridge,ToothSelect,Start,"Command function: Remove bridge status from selected tooth
+Command Usage: `number #N, remove bridge`",tooth selection,TRUE,FALSE,FALSE,FALSE,FALSE
+bridge,ToothSelect,Start,"Command function: Set selected tooth status to bridge
+Command Usage: `number #N, number#N, bridge`. `number #N, #N, #N, bridge`",tooth selection,TRUE,FALSE,FALSE,FALSE,FALSE
+pontic,ToothSelect,Start,"Command function: Set selected tooth status to pontic
+Command Usage: `number #N, pontic`",tooth selection,TRUE,FALSE,TRUE,FALSE,FALSE
+primary teeth,ToothSelect,Start,"Command function: Set selected tooth status to primary tooth
+Command Usage: `number #N, primary teeth`",tooth selection,TRUE,FALSE,FALSE,FALSE,FALSE
+deselect,ToothSelect,ToothSelect,"Command function: Deselect current tooth
+Command Usage: `deselect`",tooth selection,FALSE,FALSE,FALSE,FALSE,TRUE
+menu,ToothSelect,ToothSelect,"Command function: Open the right-click menu for tooth status values
+Command Usage: `menu`",tooth selection,FALSE,FALSE,FALSE,FALSE,TRUE
