@@ -1025,7 +1025,15 @@ class SPECTRARouter(nn.Module):
         self.temperature = 0.1
 
         # [Gradient Checkpointing] Deferred bias updates
-        self._bias_delta_acc = None 
+        self._bias_delta_acc = None
+
+        # Curriculum / step tracking (align with trainable_spectra so step 1 is reachable)
+        self.curriculum_steps = getattr(config, "curriculum_steps", 10000)
+        self.register_buffer("training_step", torch.tensor(0, dtype=torch.long))
+
+    def _increment_step(self):
+        if self.training:
+            self.training_step.add_(1)
 
     def flush_bias_updates(self):
         """Apply accumulated bias delta (Sign-based) once."""
@@ -1050,6 +1058,8 @@ class SPECTRARouter(nn.Module):
         """
         Agentic SPECTRA Routing (ALF + GLN + Global Intent)
         """
+        if self.training:
+            self._increment_step()
         batch_size, seq_len, _ = x.shape
         x_flat = x.view(-1, self.hidden_size)
         N = x_flat.size(0)
@@ -1221,7 +1231,8 @@ class SPECTRAMoE(nn.Module):
         self.input_jitter_noise = getattr(config, 'input_jitter_noise', 0.0)
 
         setattr(self.router, "_is_spectra_router", True)
-        setattr(self.router.expression_projector, "_is_spectra_expression_projector", True)
+        if hasattr(self.router, "expression_projector"):
+            setattr(self.router.expression_projector, "_is_spectra_expression_projector", True)
 
         # Adaptive filter parameters for load balancing
 
@@ -1429,22 +1440,38 @@ class SPECTRAMoE(nn.Module):
         # Fused path only (user requirement).
         if not isinstance(self.experts, nn.ModuleList) and callable(self.experts):
             fwd_input = hidden_states_flat.view(batch_size, sequence_length, hidden_dim)
-            
-            # [ZeRO-3 Fix] Dummy Dispatch ensures graph consistency
-            if fwd_input.numel() == 0:
-                 dummy_hidden = torch.zeros(1, 1, hidden_dim, device=device, dtype=dtype)
-                 dummy_weights = torch.zeros(1, self.num_experts, device=device, dtype=dtype)
-                 dummy_ind = torch.zeros(1, self.top_k, device=device, dtype=torch.long)
-                 dummy_out = self.experts(dummy_hidden, dummy_weights, dummy_ind)
-                 # [ZeRO-3 Fix] Connect graph to input: fwd_input (empty) -> fwd_out
-                 fwd_out = fwd_input.view(-1, hidden_dim) + dummy_out.sum() * 0
+            num_tokens = batch_size * sequence_length
+
+            # [Deadlock Fix] All ranks must call experts() with the SAME shape so backward
+            # runs the same collectives. Pad to max_tokens across ranks when distributed.
+            if dist.is_initialized():
+                max_tokens_t = torch.tensor(num_tokens, device=device, dtype=torch.long)
+                dist.all_reduce(max_tokens_t, op=dist.ReduceOp.MAX)
+                max_tokens = max_tokens_t.item()
             else:
-                 num_tokens = routing_weights.size(0)
-                 full_weights = torch.zeros(num_tokens, self.num_experts, device=device, dtype=routing_weights.dtype)
-                 full_weights.scatter_(1, selected_experts, routing_weights)
-                 fwd_out = self.experts(fwd_input, full_weights, selected_experts)
-            
-            final_hidden_states = fwd_out.view(batch_size * sequence_length, hidden_dim)
+                max_tokens = num_tokens
+
+            # Use actual top_k from router output (may differ from self.top_k after inject)
+            top_k_actual = routing_weights.size(1)
+
+            if max_tokens == 0:
+                dummy_hidden = torch.zeros(1, 1, hidden_dim, device=device, dtype=dtype)
+                dummy_weights = torch.zeros(1, self.num_experts, device=device, dtype=dtype)
+                dummy_ind = torch.zeros(1, top_k_actual, device=device, dtype=torch.long)
+                fwd_out = self.experts(dummy_hidden, dummy_weights, dummy_ind)
+                final_hidden_states = fwd_out[:, :0, :].reshape(0, hidden_dim)
+            else:
+                fwd_input_padded = torch.zeros(1, max_tokens, hidden_dim, device=device, dtype=dtype)
+                if num_tokens > 0:
+                    fwd_input_padded[:, :num_tokens, :] = fwd_input.view(1, num_tokens, hidden_dim)
+                full_weights = torch.zeros(max_tokens, self.num_experts, device=device, dtype=routing_weights.dtype)
+                if num_tokens > 0:
+                    full_weights[:num_tokens].scatter_(1, selected_experts, routing_weights)
+                selected_padded = torch.zeros(max_tokens, top_k_actual, device=device, dtype=torch.long)
+                if num_tokens > 0:
+                    selected_padded[:num_tokens] = selected_experts
+                fwd_out = self.experts(fwd_input_padded, full_weights, selected_padded)
+                final_hidden_states = fwd_out[:, :num_tokens, :].reshape(num_tokens, hidden_dim)
 
             # --- Legacy EMA Update Removed ---
             # Using simple stateless routing for stability

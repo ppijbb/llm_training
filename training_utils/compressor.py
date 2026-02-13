@@ -316,24 +316,27 @@ if __name__ == "__main__":
         model_test(save_directory=test_dir)
         raise SystemExit(0)
 
-    MODEL_NAME = os.getenv("QUANTIZE_MODEL_NAME", "Gunulhona/Gemma-3-27B-v2")
-    HF_REPO_NAME = os.getenv("QUANTIZE_HF_REPO", "Gunulhona/Gemma-3-27B-v2-w4a16")
+    MODEL_NAME = os.getenv("QUANTIZE_MODEL_NAME", "Gunulhona/Gemma-3-4B")
+    HF_REPO_NAME = os.getenv("QUANTIZE_HF_REPO", "Gunulhona/Gemma-3-4B-w4a16")
+    print("=============================================")
+    print(f"Quantizing model: {MODEL_NAME} to {SAVE_DIR}")
+    print("=============================================")
+    model = quantize_gemma3(
+        model_name=MODEL_NAME,
+        save_directory=SAVE_DIR,
+        bits=4,
+        group_size=128,
+    )
 
-    # model = quantize_gemma3(
-    #     model_name=MODEL_NAME,
-    #     save_directory=SAVE_DIR,
-    #     bits=4,
-    #     group_size=128,
-    # )
+    if model is not None:
+        model_test(save_directory=SAVE_DIR)
+        token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
+        if token:
+            upload(save_directory=SAVE_DIR, hf_repo_name=HF_REPO_NAME, token=token)
+        else:
+            print("HF_TOKEN not set; skipping upload.")
 
-    # if model is not None:
-    #     model_test(save_directory=SAVE_DIR)
-    #     token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
-    #     if token:
-    #         upload(save_directory=SAVE_DIR, hf_repo_name=HF_REPO_NAME, token=token)
-    #     else:
-    #         print("HF_TOKEN not set; skipping upload.")
-    model_test(save_directory=SAVE_DIR)
-    token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
-    if token:
-        upload(save_directory=SAVE_DIR, hf_repo_name=HF_REPO_NAME, token=token)
+    # model_test(save_directory=SAVE_DIR)
+    # token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
+    # if token:
+    #     upload(save_directory=SAVE_DIR, hf_repo_name=HF_REPO_NAME, token=token)
